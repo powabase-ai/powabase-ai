@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentic-project-service"
+version = "0.1.0"
+description = "Per-project service for AI features: sources, knowledge bases, agents, and background tasks"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "flask>=3.0.0",
+    "flask-cors>=4.0.0",
+    "flask-sqlalchemy>=3.1.0",
+    "sqlalchemy>=2.0.0",
+    "psycopg[binary]>=3.1.0",
+    "celery[redis]>=5.3.0",
+    "redis>=5.0.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.0",
+    "pyjwt>=2.8.0",
+    "openai>=1.0.0",
+    "litellm>=1.90.1",  # floor for Anthropic adaptive-thinking (Opus 4.7/4.8) reasoning separation — see agentic/pyproject.toml
+    "flask-migrate>=4.0.0",
+    "pgvector>=0.3.0",
+    "gunicorn>=21.0.0",
+    # Ingest/extraction dependencies from agentic package
+    "python-docx>=1.1.0",
+    "pypdf>=4.0.0",
+    "beautifulsoup4>=4.12.0",
+    "defusedxml>=0.7.0",
+    "markdown>=3.5.0",
+    "tiktoken>=0.5.0",
+    "numpy>=1.26.0",
+    "pyyaml>=6.0.0",
+    "anyascii>=0.3.0",
+    # BM25s for fast pre-indexed sparse retrieval
+    "bm25s[core]>=0.2.0",
+    "PyStemmer>=2.2.0",
+    # Cron expression parsing for workflow scheduling
+    "croniter>=1.3",
+    # Prometheus instrumentation (observability dashboards). prometheus-client
+    # is declared explicitly: it's the registry/Counter/Histogram API used by
+    # celery.py for Wave 0 worker metrics. Without an explicit pin, we'd rely
+    # on prometheus-flask-exporter pulling it transitively — and the try/except
+    # ImportError in celery.py would silently no-op all worker metrics.
+    "prometheus-client>=0.20",
+    "prometheus-flask-exporter>=0.23.0",
+    # Core framework: powabase-agentic (PyPI; the import module stays `agentic`).
+    # The Docker image adds the [rerankers] extra. Pinned to the OSS release floor.
+    "powabase-agentic>=0.1.0rc1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.12.0",
+    "responses>=0.25.0",
+    "black>=24.0.0",
+    "ruff>=0.3.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentic_project_service"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"agentic_project_service.services.billing_cloud".msg = "Core must not import billing_cloud; call the billing_port facade. Charging logic is excluded from the OSS build."
+"agentic_project_service.services.billing_cloud.credits_client".msg = "Use billing_port.charge()."
+"agentic_project_service.services.billing_cloud.balance_cache".msg = "Use billing_port.check_balance()."
+"agentic_project_service.services.billing_cloud.billing_litellm".msg = "Metering is a cloud adapter concern."
+"agentic_project_service.services.billing_cloud.jwt_minter".msg = "Billing-JWT is a cloud adapter concern."
+
+[tool.ruff.lint.per-file-ignores]
+"src/agentic_project_service/services/billing_cloud/**" = ["TID"]
+"src/agentic_project_service/main.py" = ["TID"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["integration: requires database"]
+addopts = ["-v"]
+asyncio_mode = "strict"
