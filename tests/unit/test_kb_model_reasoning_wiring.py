@@ -25,6 +25,7 @@ import re
 from pathlib import Path
 from unittest.mock import patch
 
+import agentic
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -106,11 +107,9 @@ def test_query_enrichment_openai_routes_through_responses():
 _PS_SRC = Path(__file__).resolve().parents[2] / "src" / "agentic_project_service"
 _INDEXING_PY = _PS_SRC / "tasks" / "indexing.py"
 
-# Climbs from tests/unit/ up to the workspace root where the sibling
-# ``agentic`` package lives.
-_AGENTIC_SRC = (
-    Path(__file__).resolve().parents[5] / "agentic" / "src" / "agentic" / "knowledge"
-)
+# agentic ships as the powabase-agentic PyPI package; resolve its installed
+# on-disk location so the AST guards below can verify the real source.
+_AGENTIC_SRC = Path(agentic.__file__).resolve().parent / "knowledge"
 _DOC2JSON_PY = _AGENTIC_SRC / "indexing" / "doc2json.py"
 _TREE_SEARCH_PY = _AGENTIC_SRC / "retrieval" / "tree_search.py"
 

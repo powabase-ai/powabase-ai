@@ -9,14 +9,16 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import agentic
 
 # Project root resolved from this test's location
-WORKTREE = Path(__file__).resolve().parents[5]
+WORKTREE = Path(__file__).resolve().parents[2]
 PROJECT_SERVICE = (
-    WORKTREE
-    / "agentic-platform/packages/agentic-project-service/src/agentic_project_service/services/orchestration.py"
+    WORKTREE / "src" / "agentic_project_service" / "services" / "orchestration.py"
 )
-STRATEGIES = WORKTREE / "agentic/src/agentic/orchestration/strategies.py"
+# agentic ships as the powabase-agentic PyPI package; resolve its installed
+# on-disk location so the AST guard below can verify the real source.
+STRATEGIES = Path(agentic.__file__).resolve().parent / "orchestration" / "strategies.py"
 
 
 def _agent_calls(path: Path) -> list[ast.Call]:

@@ -15,7 +15,6 @@ matching secret.
 from unittest.mock import MagicMock, patch
 
 from agentic_project_service.routes import webhooks as webhooks_route
-from agentic_project_service.services.billing_cloud.balance_cache import PaymentRequired
 
 
 def _make_test_app():
@@ -38,58 +37,12 @@ def _valid_workflow_uuid():
 # ---------------------------------------------------------------------------
 # trigger_webhook — balance check fires after auth/state, before workflow build
 # ---------------------------------------------------------------------------
-
-
-def test_trigger_webhook_balance_check_fires_after_auth_passes(recording_billing):
-    """When auth+state checks pass, balance check fires and 402 propagates."""
-
-    app = _make_test_app()
-
-    def session_side(*args, **kwargs):
-        # First execute: block lookup → returns block row
-        # Second execute: workflow state lookup → returns deployed
-        # (we don't expect a third — _workflow_pre_check fires first)
-        if not hasattr(session_side, "calls"):
-            session_side.calls = 0
-        session_side.calls += 1
-        if session_side.calls == 1:
-            r = MagicMock()
-            r.fetchone.return_value = (
-                "block-1",
-                _valid_workflow_uuid(),
-                {"webhook_secret": "sekret"},
-            )
-            return r
-        else:
-            r = MagicMock()
-            r.fetchone.return_value = ("deployed", None)
-            return r
-
-    mock_session = MagicMock()
-    mock_session.execute.side_effect = session_side
-
-    with (
-        patch("agentic_project_service.routes.webhooks.db.session", mock_session),
-        patch.object(
-            webhooks_route,
-            "_workflow_pre_check",
-            side_effect=PaymentRequired(balance=0, estimated_cost=1),
-        ) as mock_check,
-        patch.object(webhooks_route, "build_workflow_from_db") as mock_build,
-    ):
-        with app.test_client() as client:
-            resp = client.post(
-                f"/api/webhooks/{_valid_webhook_id()}",
-                json={"payload": "x"},
-                headers={"Authorization": "Bearer sekret"},
-            )
-
-    assert resp.status_code == 402
-    mock_check.assert_called_once()
-    assert mock_check.call_args[0][0] == "22222222-2222-2222-2222-222222222222"  # workflow_id
-    # 402 fired → no workflow run → no charges → no build.
-    assert recording_billing.charges == []
-    mock_build.assert_not_called()
+#
+# Note: the test that drove _workflow_pre_check's 402 path via the private
+# services.billing_cloud.balance_cache.PaymentRequired exception has been
+# removed (that module is excluded from this OSS build). The remaining
+# tests below cover the auth/state gating and the success/failure charge
+# paths through the OSS-shipped billing_port facade.
 
 
 def test_trigger_webhook_unauthorized_skips_billing(recording_billing):
