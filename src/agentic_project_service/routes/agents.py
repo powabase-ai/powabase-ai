@@ -20,6 +20,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agentic import Agent
+from agentic.agent.rules import validate_condition
+from agentic.agent.hooks import (
+    BLOCKING_ONLY_HOOK_TYPES,
+    HOOK_EVENTS,
+    HOOK_TYPES,
+    TOOL_SCOPED_HOOK_EVENTS,
+    NON_BLOCKING_HOOK_EVENTS,
+)
 from agentic.agent.message import Message
 from agentic.execution.context import ExecutionContext
 from flask import Blueprint, Response, current_app, g, jsonify, request, stream_with_context
@@ -85,6 +93,18 @@ logger = logging.getLogger(__name__)
 _AGENT_RUN_ESTIMATED_COST = 1_000
 
 agents_bp = Blueprint("agents", __name__, url_prefix="/api/agents")
+
+
+def _preresponse_edited(events) -> bool:
+    """True if a PreResponse hook modified or blocked the answer for this run."""
+    for e in events:
+        if (
+            e.get("type") == "hook_result"
+            and e.get("hook_event") == "PreResponse"
+            and (e.get("modified") or e.get("blocked"))
+        ):
+            return True
+    return False
 
 
 def extract_reasoning_steps(messages: list[dict]) -> list[dict]:
@@ -840,6 +860,79 @@ def add_agent_hook(agent_id: str):
     config = data.get("config")
     if not event or not hook_type or config is None:
         return jsonify({"error": "event, type, and config are required"}), 400
+    if not isinstance(config, dict):
+        return jsonify({"error": "config must be an object"}), 400
+    if event not in HOOK_EVENTS:
+        return (
+            jsonify(
+                {"error": f"unknown hook event {event!r}; expected one of {sorted(HOOK_EVENTS)}"}
+            ),
+            400,
+        )
+    if hook_type not in HOOK_TYPES:
+        return (
+            jsonify(
+                {"error": f"unknown hook type {hook_type!r}; expected one of {sorted(HOOK_TYPES)}"}
+            ),
+            400,
+        )
+    if hook_type in BLOCKING_ONLY_HOOK_TYPES and event in NON_BLOCKING_HOOK_EVENTS:
+        # A rule/approval hook's only effect is blocking, and these events cannot
+        # block per the documented contract — the executor discards it. Don't
+        # persist a config that can never do anything.
+        return (
+            jsonify(
+                {
+                    "error": f"{hook_type!r} hooks cannot be used with {event!r}: that event cannot block "
+                    f"(non-blocking events: {sorted(NON_BLOCKING_HOOK_EVENTS)})"
+                }
+            ),
+            400,
+        )
+
+    if hook_type == "rule" and "condition" not in config and not config.get("rules"):
+        # A rule hook with no evaluable rules allows everything while looking
+        # like an active gate. Don't persist a config that can never deny.
+        return (
+            jsonify(
+                {
+                    "error": "rule hooks require a 'condition' key or a non-empty 'rules' list; "
+                    f"got config keys {sorted(config)}"
+                }
+            ),
+            400,
+        )
+    if data.get("matcher") and event not in TOOL_SCOPED_HOOK_EVENTS:
+        # `matcher` filters by tool name; non-tool events dispatch with
+        # tool_name="", so the hook would never match and never even produce an
+        # audit record.
+        return (
+            jsonify(
+                {
+                    "error": f"matcher is not supported for {event!r}: that event carries no tool name "
+                    f"(tool-scoped events: {sorted(TOOL_SCOPED_HOOK_EVENTS)})"
+                }
+            ),
+            400,
+        )
+
+    if hook_type == "rule":
+        # Validate each condition against the evaluator's own parser. An
+        # unparseable condition evaluates to "no match" = allow, so a typo'd
+        # operator yields a gate that denies nothing while reporting a clean
+        # pass. Config time is the last point where that is still visible.
+        rule_list = [config] if "condition" in config else config.get("rules", [])
+        if not isinstance(rule_list, list):
+            return jsonify({"error": "rule config 'rules' must be a list"}), 400
+        for i, rule in enumerate(rule_list):
+            if not isinstance(rule, dict):
+                return (
+                    jsonify({"error": f"rule at index {i} must be a JSON object"}),
+                    400,
+                )
+            err = validate_condition(rule.get("condition"))
+            if err:
+                return jsonify({"error": f"rule at index {i}: {err}"}), 400
 
     hook = Hook(
         agent_id=agent_id,
@@ -872,7 +965,7 @@ def add_agent_hook(agent_id: str):
 @require_auth
 def list_agent_hooks(agent_id: str):
     """List hooks configured for an agent."""
-    hooks = Hook.query.filter_by(agent_id=agent_id).order_by(Hook.position).all()
+    hooks = Hook.query.filter_by(agent_id=agent_id).order_by(Hook.position, Hook.created_at).all()
     return jsonify(
         {
             "hooks": [
@@ -1900,8 +1993,24 @@ def run_agent_stream(agent_id: str):
 
                 # β: terminal chunk + complete + persist all use the same
                 # final_content to keep live SSE, post-complete refetch, and
-                # reload-from-DB consistent (B1 fix).
+                # reload-from-DB consistent (B1 fix). EXCEPTION: when a
+                # PreResponse hook edited/blocked the answer, the streamed
+                # buffer holds the pre-edit text, so the terminal artifacts
+                # intentionally diverge to the vetted output.content below.
                 final_content = content_buffer if streaming_enabled else (output.content or "")
+                if (
+                    streaming_enabled
+                    and output.content is not None
+                    and _preresponse_edited(events_for_db)
+                ):
+                    # Live clients already received the pre-edit tokens.
+                    logger.warning(
+                        "PreResponse hook edited a STREAMED agent answer "
+                        "(run=%s); live clients saw pre-hook content before "
+                        "the correction.",
+                        run_id,
+                    )
+                    final_content = output.content
 
                 # M7 observability log — one line per terminal-of-run
                 duration_ms = int((time.monotonic() - started_at_monotonic) * 1000)
@@ -1915,7 +2024,11 @@ def run_agent_stream(agent_id: str):
                 )
 
                 # Yield final content
-                if final_content:
+                # `is not None`, not truthiness: a PreResponse hook may redact the
+                # answer to "" (withhold it entirely). Truthiness would skip the
+                # correction chunk, leaving a streaming consumer with the raw
+                # answer while the DB row and audit record say it was redacted.
+                if final_content is not None:
                     yield f"data: {json.dumps({'event': 'chunk', 'content': final_content})}\n\n"
 
                 # Persist the run

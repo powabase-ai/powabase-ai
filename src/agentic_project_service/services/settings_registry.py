@@ -1028,65 +1028,17 @@ def _build_registry() -> dict[str, SettingDef]:
     ]
 
     # =========================================================================
-    # Compaction
+    # Compaction — no configurable knobs
     # =========================================================================
-    cat = "compaction"
-
-    defs += [
-        SettingDef(
-            key="DEFAULT_COMPACTION_MODEL",
-            category=cat,
-            label="Compaction Model",
-            type="str",
-            default="gpt-5-mini",
-            choices=_LLM_MODEL_CHOICES,
-            subcategory="llm_model",
-            description="LLM model for context compaction.",
-        ),
-        SettingDef(
-            key="COMPACTION_KEEP_LAST_N",
-            category=cat,
-            label="Turns to Preserve",
-            type="int",
-            default=2,
-            min=0,
-            max=20,
-            description="Number of recent turns preserved during compaction.",
-        ),
-        SettingDef(
-            key="CHARS_PER_TOKEN",
-            category=cat,
-            label="Chars per Token Estimate",
-            type="int",
-            default=4,
-            min=1,
-            max=10,
-            advanced=True,
-            description="Rough characters-per-token estimate for token counting.",
-        ),
-        SettingDef(
-            key="COMPACTION_MAX_OUTPUT_TOKENS",
-            category=cat,
-            label="Max Output Tokens",
-            type="int",
-            default=8000,
-            min=500,
-            max=50000,
-            advanced=True,
-            description="Max tokens for the compaction summary response.",
-        ),
-        SettingDef(
-            key="COMPACTION_BUFFER",
-            category=cat,
-            label="Compact Buffer (tokens)",
-            type="int",
-            default=13000,
-            min=1000,
-            max=100000,
-            advanced=True,
-            description="Token buffer reserved when deciding whether to compact.",
-        ),
-    ]
+    # COMPACTION_BUFFER, CHARS_PER_TOKEN, and COMPACTION_MAX_OUTPUT_TOKENS were
+    # all removed for the same reason: none of them is ever reached by a
+    # get_setting() call, so moving the UI slider changes nothing.
+    # COMPACTION_BUFFER's dead-dial argument was that the buffer is the larger
+    # of a 13k floor and window * 8% (capped at window * 25%) — dominated by
+    # the fraction for every window this setting was reached for. The other
+    # two are dead for the more basic reason that nothing wires them up at
+    # all: `compaction.py`'s own module constants (`CHARS_PER_TOKEN`,
+    # `_MAX_OUTPUT_TOKENS`) are what's actually in effect.
 
     # =========================================================================
     # Sources
@@ -1149,7 +1101,6 @@ CATEGORY_META: dict[str, str] = {
     "tools": "Tools",
     "knowledge-indexing": "Knowledge Indexing",
     "knowledge-retrieval": "Knowledge Retrieval",
-    "compaction": "Compaction",
     "sources": "Sources",
 }
 

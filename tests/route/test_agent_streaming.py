@@ -1491,3 +1491,58 @@ def test_run_agent_stream_tool_based_no_citation_instruction_when_disabled(
     assert "include citations in brackets" not in captured["system_prompt"], (
         f"citation instruction unexpectedly present:\n{captured['system_prompt']}"
     )
+
+
+class TestPreResponseReconciliation:
+    """A PreResponse hook modification must persist AND reach the complete event
+    under streaming — the shared agent-path fix (regression for the same bug)."""
+
+    def test_preresponse_modification_persists_under_streaming(
+        self, client, app, mock_auth, auth_headers, react_agent_id, monkeypatch
+    ):
+        monkeypatch.setenv("AGENT_LLM_STREAMING_ENABLED", "true")
+
+        def fake_run(messages, *, context=None, tools=None, **kwargs):
+            context.emit_event({"type": "content_delta", "delta": "RAW ANSWER"})
+            context.emit_event(
+                {
+                    "type": "hook_result",
+                    "hook_id": "h1",
+                    "hook_event": "PreResponse",
+                    "status": "succeeded",
+                    "modified": True,
+                    "blocked": False,
+                    "latency_ms": 5,
+                    "message": None,
+                }
+            )
+            return _make_fake_agent_output("REDACTED")
+
+        with patch("agentic.agent.agent.Agent.run", side_effect=fake_run):
+            resp = client.post(
+                f"/api/agents/{react_agent_id}/run/stream",
+                json={"message": "unique-marker-xyz"},
+                headers=auth_headers,
+                buffered=True,
+            )
+            assert resp.status_code == 200
+
+        events = _parse_sse_events(resp.get_data())
+        complete = [e for e in events if e.get("event") == "complete"]
+        assert len(complete) == 1
+        assert complete[0]["content"] == "REDACTED"
+
+        # C1: the hook_result frame must be labeled `hook_result` on the wire.
+        hook_frames = [e for e in events if e.get("type") == "hook_result"]
+        assert len(hook_frames) == 1
+        assert hook_frames[0]["event"] == "hook_result"
+        assert hook_frames[0]["hook_event"] == "PreResponse"
+
+        with app.app_context():
+            row = db.session.execute(
+                text('SELECT content FROM "ai".agent_runs WHERE input_messages::text LIKE :q'),
+                {"q": "%unique-marker-xyz%"},
+            ).fetchone()
+            assert row is not None
+            assert row[0] == "REDACTED"
+            assert row[0] != "RAW ANSWER"
