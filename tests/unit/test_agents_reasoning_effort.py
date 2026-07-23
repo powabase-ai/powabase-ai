@@ -13,10 +13,10 @@ integration tests. Rationale:
    issue unrelated to this task; touching the DB to fix it is destructive and
    forbidden by project conventions.
 
-2. AST-based verification *directly* asserts the wire-up at all three sites
-   (lines 1182, 1572, 1849). It is strictly stronger than a single
-   route-level test that exercises only one path — and it survives future
-   refactors that move code around.
+2. AST-based verification *directly* asserts the wire-up at every site,
+   by structure rather than by line number. It is strictly stronger than a
+   single route-level test that exercises only one path — and it survives
+   future refactors that move code around.
 
 3. The fall-back AST/regex test was explicitly listed as an acceptable path
    in the task description.
@@ -29,8 +29,6 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-
-import pytest
 
 
 AGENTS_PY = (
@@ -91,8 +89,7 @@ class TestAgentConstructorWiring:
     reasoning_effort=agent_settings.get("reasoning_effort")."""
 
     def test_three_agent_call_sites_exist(self) -> None:
-        """Sanity: there should be exactly 3 Agent(...) construction sites
-        per the Task 6 plan (sites at lines ~1182, ~1572, ~1849)."""
+        """Sanity: there should be exactly 3 Agent(...) construction sites."""
         calls = _load_agent_calls()
         assert len(calls) == 3, (
             f"Expected exactly 3 Agent(...) call sites in {AGENTS_PY}, "
@@ -108,27 +105,4 @@ class TestAgentConstructorWiring:
             "These Agent(...) call sites are missing "
             'reasoning_effort=agent_settings.get("reasoning_effort"): '
             f"lines {missing}"
-        )
-
-    @pytest.mark.parametrize("expected_line", [1285, 1732, 2121])
-    def test_each_documented_site_has_reasoning_effort(self, expected_line: int) -> None:
-        """Each of the three documented call sites must wire reasoning_effort.
-
-        Locations are checked by approximate line number (±20 lines tolerance)
-        because surrounding code may shift in future refactors. The strict
-        check is the kwarg presence.
-        """
-        calls = _load_agent_calls()
-        # Find a call within +/- 20 lines of each documented site
-        nearby = [c for c in calls if abs(c.lineno - expected_line) <= 20]
-        assert nearby, (
-            f"No Agent(...) call site found near line {expected_line}; "
-            f"all call sites are at {[c.lineno for c in calls]}"
-        )
-        # Of the call(s) near this line, at least one must wire reasoning_effort.
-        wired = [c for c in nearby if _has_reasoning_effort_kwarg(c)]
-        assert wired, (
-            f"Agent(...) call site near line {expected_line} does not pass "
-            'reasoning_effort=agent_settings.get("reasoning_effort"). '
-            f"Closest call(s): line(s) {[c.lineno for c in nearby]}"
         )

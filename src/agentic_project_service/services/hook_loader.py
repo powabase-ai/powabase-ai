@@ -13,26 +13,9 @@ def load_hooks_for_agent(agent_id: str) -> list[HookConfig]:
     # Import here to avoid circular imports at module level
     from ..models.tenant import Hook
 
-    rows = Hook.query.filter_by(agent_id=agent_id, enabled=True).order_by(Hook.position).all()
-    return [
-        HookConfig(
-            event=row.event,
-            type=row.type,
-            config=row.config or {},
-            matcher=row.matcher,
-            enabled=row.enabled,
-        )
-        for row in rows
-    ]
-
-
-def load_hooks_for_orchestration(orchestration_id: str) -> list[HookConfig]:
-    """Load hook configs from ai.hooks for an orchestration."""
-    from ..models.tenant import Hook
-
     rows = (
-        Hook.query.filter_by(orchestration_id=orchestration_id, enabled=True)
-        .order_by(Hook.position)
+        Hook.query.filter_by(agent_id=agent_id, enabled=True)
+        .order_by(Hook.position, Hook.created_at)
         .all()
     )
     return [
@@ -42,6 +25,35 @@ def load_hooks_for_orchestration(orchestration_id: str) -> list[HookConfig]:
             config=row.config or {},
             matcher=row.matcher,
             enabled=row.enabled,
+            id=str(row.id),
+            position=row.position,
+        )
+        for row in rows
+    ]
+
+
+def load_hooks_for_orchestration(orchestration_id: str) -> list[HookConfig]:
+    """Load hook configs from ai.hooks for an orchestration."""
+    from ..models.tenant import Hook
+
+    # Defense-in-depth: `approval` hooks are rejected at create for
+    # orchestrations (no approve endpoint), but filter them at load too so a
+    # direct-SQL row can't hang a run on the un-serviceable approval wait.
+    rows = (
+        Hook.query.filter_by(orchestration_id=orchestration_id, enabled=True)
+        .filter(Hook.type != "approval")
+        .order_by(Hook.position, Hook.created_at)
+        .all()
+    )
+    return [
+        HookConfig(
+            event=row.event,
+            type=row.type,
+            config=row.config or {},
+            matcher=row.matcher,
+            enabled=row.enabled,
+            id=str(row.id),
+            position=row.position,
         )
         for row in rows
     ]

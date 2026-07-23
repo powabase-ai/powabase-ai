@@ -48,7 +48,7 @@ dependencies = [
     "prometheus-flask-exporter>=0.23.0",
     # Core framework: powabase-agentic (PyPI; the import module stays `agentic`).
     # The Docker image adds the [rerankers] extra. Pinned to the OSS release floor.
-    "powabase-agentic>=0.1.0rc1",
+    "powabase-agentic>=0.1.0rc2",
 ]
 
 [project.optional-dependencies]
