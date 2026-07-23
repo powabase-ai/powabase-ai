@@ -315,11 +315,10 @@ def _build_registry() -> dict[str, SettingDef]:
             advanced=True,
             description="Default max_result_chars for ToolDefinition base class.",
         ),
-        # EXA_API_KEY and FIRECRAWL_API_KEY are platform-paid secrets injected
-        # via pod env (AWS SM → ExternalSecret → project-secrets). They are NOT
-        # tenant-managed — web_search_handler / web_scrape_handler read them
-        # directly from os.environ. See agentic-platform/CLAUDE.md, "Operator
-        # runbook — Exa/Firecrawl platform keys".
+        # EXA_API_KEY and FIRECRAWL_API_KEY are operator-provided platform
+        # secrets injected via the environment. They are NOT tenant-managed —
+        # web_search_handler / web_scrape_handler read them directly from
+        # os.environ.
         SettingDef(
             key="FIRECRAWL_API_BASE",
             category=cat,

@@ -106,8 +106,8 @@ def test_query_enrichment_openai_routes_through_responses():
 _PS_SRC = Path(__file__).resolve().parents[2] / "src" / "agentic_project_service"
 _INDEXING_PY = _PS_SRC / "tasks" / "indexing.py"
 
-# tests/unit/ -> agentic-project-service -> packages -> agentic-platform ->
-# agentic-monorepo (repo root), where the core ``agentic`` package lives.
+# Climbs from tests/unit/ up to the workspace root where the sibling
+# ``agentic`` package lives.
 _AGENTIC_SRC = (
     Path(__file__).resolve().parents[5] / "agentic" / "src" / "agentic" / "knowledge"
 )

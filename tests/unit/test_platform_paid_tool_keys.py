@@ -61,8 +61,8 @@ class TestSettingsRegistryDoesNotExposePlatformKeys:
 
 class TestWebSearchHandlerReadsExaKeyFromEnv:
     """web_search_handler must read EXA_API_KEY from os.environ, not from
-    the per-project settings DB. The key is provisioned by the platform via
-    AWS SM -> ExternalSecret -> pod env, identical to MISTRAL_API_KEY etc.
+    the per-project settings DB. The key is operator-provisioned via the
+    environment, identical to MISTRAL_API_KEY etc.
     """
 
     def test_env_key_flows_into_exa_request_header(self, monkeypatch):

@@ -22,15 +22,14 @@ logger = logging.getLogger(__name__)
 # Conservative per-item cost estimate for the pre-check (flat metadata_enrichment
 # fee + llm_call recoup at platform rates).
 #
-# Derivation (cited from agentic-platform/packages/agentic-control-plane/
-# migrations/versions/0006_credit_ledger.py:209 — `('metadata_enrichment', 2,
-# '1k_tokens', ...)`):
+# Derivation:
 #   - ~2500 tokens per item × 2 credits/1k = 5 credits flat fee
 #   - + ~50 credits llm_call for gpt-5-mini-class models at $0.0005/call × the
-#     configured markup × 100_000 (see services/billing_cloud/billing_litellm.py:198 charge formula)
+#     configured markup × 100_000 (billing-adapter charge formula)
 #   - Total ~55. Round up to 60 for batch overhead + variable model pricing.
 #
-# When bumping: re-derive from the same two files, don't guess.
+# When bumping: re-derive the flat-fee and llm_call rates from the active
+# billing adapter's pricing tables, don't guess.
 _ENRICHMENT_PER_ITEM_MAX_CREDITS: int = 60
 
 # Floor when the KB is empty (no items yet) or count lookup fails.

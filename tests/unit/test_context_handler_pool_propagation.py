@@ -33,9 +33,9 @@ CONTEXT_HANDLER_PATH = (
     / "context_handler.py"
 )
 
-# agentic library is installed as a path dependency in agentic-platform's
-# pyproject. Resolve its on-disk location so the AST guards below can
-# verify the in-tree files even when the package is editable-installed.
+# agentic is installed as a path dependency in this workspace's pyproject.
+# Resolve its on-disk location so the AST guards below can verify the
+# in-tree files even when the package is editable-installed.
 _AGENTIC_SRC = Path(__file__).resolve().parents[5] / "agentic" / "src" / "agentic"
 AGENT_PATH = _AGENTIC_SRC / "agent" / "agent.py"
 STRATEGIES_PATH = _AGENTIC_SRC / "orchestration" / "strategies.py"

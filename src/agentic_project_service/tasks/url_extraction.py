@@ -119,8 +119,8 @@ def extract_url_source(
             # state in Studio) and ask Celery to retry. A plain `return`
             # would leave the source permanently `failed` for every URL
             # submitted during a misconfig window. countdown=600 / max_retries=24
-            # gives the operator ~4 hours to seed AWS SM + force-sync ESO
-            # + roll pods; after that the retry chain exhausts and Celery
+            # gives the operator ~4 hours to fix the missing key and roll the
+            # affected pods; after that the retry chain exhausts and Celery
             # raises MaxRetriesExceededError, which is NOT a Retry subclass
             # so it falls through to the generic `except Exception` clause
             # below and the source lands in `failed` with the underlying

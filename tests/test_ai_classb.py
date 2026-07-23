@@ -76,10 +76,8 @@ def engine():
 def _select_as(engine, role, table):
     """SET ROLE <role>; SELECT ... LIMIT 0 — a real query, not a catalog probe.
 
-    Mirrors packages/agentic-control-plane/tests/integration/
-    test_billing_service_role_fixture.py's pattern: exercise the actual
-    grant/RLS set rather than introspecting pg_catalog (which would pass
-    regardless of the connected role).
+    Exercises the actual grant/RLS set rather than introspecting pg_catalog
+    (which would pass regardless of the connected role).
     """
     with engine.connect() as conn:
         conn.execute(text(f"SET ROLE {role}"))
@@ -114,6 +112,6 @@ def test_service_role_still_has_full_access(engine, table):
 
     service_role BYPASSRLS and keeps its table GRANTs — this is the path
     project-service's own SQLAlchemy connection and PostgREST-as-service_role
-    (the platform's `/platform/rest` CP proxy) both use.
+    both use.
     """
     _select_as(engine, "service_role", table)

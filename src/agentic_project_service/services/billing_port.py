@@ -5,7 +5,7 @@ The public core NEVER charges. It calls this port; a registered ``BillingAdapter
 decides what a charge/balance-check means. The default adapter is a NO-OP, so the
 open-source build carries zero charging logic. The private cloud edition registers
 ``CloudBillingAdapter`` (services/billing_cloud) at app startup, restoring the full
-credit metering. See docs/superpowers/specs/2026-06-30-oss-edition-design.md §6.1.
+credit metering.
 
 All facade functions resolve the adapter at CALL time (not import time) so late
 registration by the cloud app-factory takes effect for decorators applied during
