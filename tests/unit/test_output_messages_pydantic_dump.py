@@ -9,15 +9,9 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-WORKTREE = Path(__file__).resolve().parents[5]
-ROUTES_AGENTS = (
-    WORKTREE
-    / "agentic-platform/packages/agentic-project-service/src/agentic_project_service/routes/agents.py"
-)
-ROUTES_ORCH = (
-    WORKTREE
-    / "agentic-platform/packages/agentic-project-service/src/agentic_project_service/routes/orchestrations.py"
-)
+WORKTREE = Path(__file__).resolve().parents[2]
+ROUTES_AGENTS = WORKTREE / "src" / "agentic_project_service" / "routes" / "agents.py"
+ROUTES_ORCH = WORKTREE / "src" / "agentic_project_service" / "routes" / "orchestrations.py"
 
 
 def _output_messages_assignments(path: Path) -> list[ast.AST]:

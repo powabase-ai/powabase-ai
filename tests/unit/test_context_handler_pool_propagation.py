@@ -22,6 +22,8 @@ import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import agentic
+
 from agentic_project_service.services import run_context
 
 
@@ -33,10 +35,10 @@ CONTEXT_HANDLER_PATH = (
     / "context_handler.py"
 )
 
-# agentic is installed as a path dependency in this workspace's pyproject.
-# Resolve its on-disk location so the AST guards below can verify the
-# in-tree files even when the package is editable-installed.
-_AGENTIC_SRC = Path(__file__).resolve().parents[5] / "agentic" / "src" / "agentic"
+# agentic ships as the powabase-agentic PyPI package; resolve its installed
+# on-disk location so the AST guards below can verify the real source
+# regardless of install mode (editable, wheel, etc).
+_AGENTIC_SRC = Path(agentic.__file__).resolve().parent
 AGENT_PATH = _AGENTIC_SRC / "agent" / "agent.py"
 STRATEGIES_PATH = _AGENTIC_SRC / "orchestration" / "strategies.py"
 

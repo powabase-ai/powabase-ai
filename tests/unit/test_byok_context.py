@@ -1,8 +1,9 @@
-"""Tests for current_byok_providers contextvar + list_byok_providers helper.
+"""Tests for list_byok_providers helper + with_llm_key BYOK resolution.
 
-current_byok_providers lives in services/billing_cloud/identity.py (CUT — the
-cloud-only BYOK contextvar). list_byok_providers lives in services/llm_availability.py
-(moved there so it works independent of billing — see that module's docstring).
+list_byok_providers lives in services/llm_availability.py (moved there so it
+works independent of billing — see that module's docstring). The companion
+current_byok_providers contextvar lives in the excluded services/billing_cloud
+package and is not tested here — see that package's own (private) test suite.
 
 Fixture-adaptation note: the v1.5 plan body sketched these tests with
 ``test_db_session`` and ``sample_project`` fixtures. Neither exists in this
@@ -14,21 +15,9 @@ pattern used by ``tests/test_ai_provider_keys_resolver.py``.
 
 from unittest.mock import MagicMock, patch
 
-from agentic_project_service.services.billing_cloud.identity import current_byok_providers
 from agentic_project_service.services.llm_availability import list_byok_providers
 from agentic_project_service.services import billing_port, llm_call
 from tests.support.billing import RecordingBillingAdapter
-
-
-def test_current_byok_providers_default_is_empty_frozenset():
-    assert current_byok_providers.get() == frozenset()
-
-
-def test_current_byok_providers_isolate_via_token():
-    token = current_byok_providers.set(frozenset({"openai"}))
-    assert current_byok_providers.get() == frozenset({"openai"})
-    current_byok_providers.reset(token)
-    assert current_byok_providers.get() == frozenset()
 
 
 def test_list_byok_providers_returns_frozen_set():

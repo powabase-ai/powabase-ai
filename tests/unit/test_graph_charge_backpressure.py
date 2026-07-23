@@ -1,94 +1,12 @@
 import asyncio as _real_asyncio
-from unittest.mock import MagicMock, patch
-from agentic_project_service.services.billing_cloud.credits_client import (
-    ChargeResult,
-    make_per_batch_billing_callback,
-)
+from unittest.mock import MagicMock
 
-
-def test_callback_accepts_action_and_aborts_on_402():
-    """The per-batch callback must charge the supplied action and signal 'abort'
-    when billing returns insufficient_credits."""
-    cb = make_per_batch_billing_callback(
-        config_id="cfg-1",
-        billing_org_id="org-1",
-        billing_project_id="proj-1",
-        enabled_sentinel="yes",
-        action="indexing_graphindex",
-    )
-    assert cb is not None
-
-    with patch(
-        "agentic_project_service.services.billing_cloud.credits_client.post_charge",
-        return_value=ChargeResult(success=False, failure_mode="insufficient_credits", balance=0),
-    ) as m:
-        decision = cb(5, ["0001", "0002", "0003", "0004", "0005"])
-
-    assert decision == "abort"
-    assert m.call_args.kwargs["action"] == "indexing_graphindex"
-
-
-def test_callback_continues_on_success():
-    cb = make_per_batch_billing_callback(
-        config_id="cfg-1",
-        billing_org_id="org-1",
-        billing_project_id="proj-1",
-        enabled_sentinel="yes",
-        action="indexing_graphindex",
-    )
-    with patch(
-        "agentic_project_service.services.billing_cloud.credits_client.post_charge",
-        return_value=ChargeResult(success=True, charge_id="c1", balance=100),
-    ):
-        assert cb(5, ["0001"]) == "continue"
-
-
-def test_per_batch_key_is_content_fingerprinted_and_deterministic():
-    """Pin the per-batch idempotency key — the one key the rest of the suite
-    leaves unpinned. It is make_idempotency_key(org, action, config_id,
-    str(batch_idx), content_fp) where content_fp = first 16 hex of sha256 over
-    the sorted, comma-joined batch_item_ids. A change to the derivation (dropping
-    the fingerprint, reordering parts, swapping the hash, or not sorting) breaks
-    the Celery-retry dedup contract and must fail here."""
-    import hashlib
-
-    from agentic_project_service.services.run_context import make_idempotency_key
-
-    cb = make_per_batch_billing_callback(
-        config_id="cfg-1",
-        billing_org_id="org-1",
-        billing_project_id="proj-1",
-        enabled_sentinel="yes",
-        action="metadata_enrichment",
-    )
-    assert cb is not None
-
-    def captured_key(batch_item_ids):
-        with patch(
-            "agentic_project_service.services.billing_cloud.credits_client.post_charge",
-            return_value=ChargeResult(success=True, charge_id="c", balance=100),
-        ) as m:
-            cb(len(batch_item_ids), batch_item_ids)
-        return m.call_args.kwargs["idempotency_key"]
-
-    def expected(idx, items):
-        fp = hashlib.sha256(",".join(sorted(items)).encode()).hexdigest()[:16]
-        return make_idempotency_key("org-1", "metadata_enrichment", "cfg-1", str(idx), fp)
-
-    # batch_idx 0 — exact-shape pin (reconstruct the key independently).
-    key0 = captured_key(["b", "a", "c"])
-    assert key0 == expected(0, ["b", "a", "c"])
-
-    # Order-independence: permuted items at batch_idx 1 → fingerprint unchanged,
-    # so the key differs from key0 only by the advanced batch index.
-    key1 = captured_key(["c", "a", "b"])
-    assert key1 == expected(1, ["a", "b", "c"])
-    assert key1 != key0
-
-    # Content-sensitivity: different items at batch_idx 2 → different fingerprint.
-    key2 = captured_key(["x", "y"])
-    assert key2 == expected(2, ["x", "y"])
-    assert key2 != key0
+# Note: the make_per_batch_billing_callback unit tests that used to live here
+# (abort-on-402, continue-on-success, idempotency-key fingerprinting) exercised
+# the private services.billing_cloud.credits_client adapter, which this OSS
+# build excludes. Removed along with the rest of the billing_cloud test suite.
+# The tests below drive the same per-batch backpressure contract through the
+# OSS-shipped billing_port facade instead.
 
 
 def test_reenrich_uses_single_event_loop(monkeypatch):

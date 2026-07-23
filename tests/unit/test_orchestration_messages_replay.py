@@ -20,10 +20,9 @@ from pathlib import Path
 
 from agentic_project_service.routes.orchestrations import _summary_from_events
 
-WORKTREE = Path(__file__).resolve().parents[5]
+WORKTREE = Path(__file__).resolve().parents[2]
 ROUTES_ORCHESTRATIONS = (
-    WORKTREE
-    / "agentic-platform/packages/agentic-project-service/src/agentic_project_service/routes/orchestrations.py"
+    WORKTREE / "src" / "agentic_project_service" / "routes" / "orchestrations.py"
 )
 
 

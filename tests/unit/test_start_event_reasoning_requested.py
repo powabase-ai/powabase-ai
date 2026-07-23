@@ -11,11 +11,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-WORKTREE = Path(__file__).resolve().parents[5]
-ROUTES_AGENTS = (
-    WORKTREE
-    / "agentic-platform/packages/agentic-project-service/src/agentic_project_service/routes/agents.py"
-)
+WORKTREE = Path(__file__).resolve().parents[2]
+ROUTES_AGENTS = WORKTREE / "src" / "agentic_project_service" / "routes" / "agents.py"
 
 
 def _start_event_dicts(path: Path) -> list[ast.Dict]:

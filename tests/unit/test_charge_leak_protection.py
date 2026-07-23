@@ -6,7 +6,7 @@ post_charge correctly aborts a run when billing returns 402.
 
 import logging
 from unittest import mock
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import litellm.exceptions as llme
 import pytest
@@ -383,68 +383,8 @@ def test_extraction_pre_check_uses_conservative_page_estimate():
     )
 
 
-def test_consecutive_empty_batches_abort_run():
-    """After 2 consecutive batches with 0 successes, callback returns 'abort'.
-
-    IMP-NEW-7 from PR #440 review: K was 3, which fails to trigger on small KBs
-    (e.g. 2-batch KBs) — a complete infrastructure outage would be silently
-    consumed as two "continue" batches. K=2 catches it after the first repeat.
-
-    Important 2 from PR #440 review: protects against the "5xx storm
-    bypassing circuit breaker" case — every item errors, batch_ok stays 0,
-    but no per-provider counter trips because errors are non-trippable or
-    distributed. Without this, the run continues consuming platform credits
-    for charging overhead on empty batches indefinitely.
-    """
-    from agentic_project_service.services.billing_cloud.credits_client import (
-        make_per_batch_billing_callback,
-    )
-
-    with patch(
-        "agentic_project_service.services.billing_cloud.credits_client.post_charge",
-        return_value=MagicMock(success=True, failure_mode=None),
-    ):
-        callback = make_per_batch_billing_callback(
-            config_id="cfg-1",
-            billing_org_id="org-1",
-            billing_project_id="proj-1",
-            enabled_sentinel="sentinel",
-        )
-
-    assert callback is not None
-
-    # 1 empty batch → still "continue"
-    assert callback(0, []) == "continue"
-    # 2nd consecutive empty → "abort"
-    result = callback(0, [])
-    assert result == "abort", f"Expected 'abort' after 2 consecutive empty batches; got {result!r}"
-
-
-def test_consecutive_empty_batches_resets_on_success():
-    """A successful batch (batch_ok > 0) resets the consecutive-empty counter.
-
-    After reset, 1 empty → still 'continue' (counter starts from 0 again).
-    """
-    from agentic_project_service.services.billing_cloud.credits_client import (
-        make_per_batch_billing_callback,
-    )
-
-    with patch(
-        "agentic_project_service.services.billing_cloud.credits_client.post_charge",
-        return_value=MagicMock(success=True, failure_mode=None),
-    ):
-        callback = make_per_batch_billing_callback(
-            config_id="cfg-2",
-            billing_org_id="org-2",
-            billing_project_id="proj-2",
-            enabled_sentinel="sentinel",
-        )
-
-    assert callback is not None
-
-    # 1 empty batch → continue (K=2, need 2 to abort)
-    assert callback(0, []) == "continue"
-    # 1 successful batch resets counter
-    assert callback(5, ["id-1", "id-2", "id-3", "id-4", "id-5"]) == "continue"
-    # 1 more empty batch after reset → NOT abort (counter restarted)
-    assert callback(0, []) == "continue"
+# Note: the consecutive-empty-batch-abort tests that used to live here
+# (K=2 circuit breaker on make_per_batch_billing_callback) exercised the
+# private services.billing_cloud.credits_client adapter, which this OSS
+# build excludes. Removed along with the rest of the billing_cloud test
+# suite — see the billing_port facade tests for the OSS-shipped equivalent.
