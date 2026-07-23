@@ -124,8 +124,8 @@ def seed_indexed_sources_watchdog(**kwargs):
 # Exposed by the worker via a tiny HTTP server on CELERY_METRICS_PORT (default
 # 9100). Consumed by Prometheus and the observability dashboards.
 #
-# Pool model: the deployments (Helm values + docker-compose) run Celery with
-# ``--pool=threads``. All worker threads share one Python interpreter and one
+# Pool model: this service is expected to run Celery with ``--pool=threads``.
+# All worker threads share one Python interpreter and one
 # Counter/Histogram instance, so the in-process registry is correct — no
 # multiproc machinery needed. If a future deployment switches to prefork,
 # this module needs prometheus_client.multiprocess + PROMETHEUS_MULTIPROC_DIR

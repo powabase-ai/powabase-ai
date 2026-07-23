@@ -7,12 +7,6 @@ ai-schema rows the developer cares about.
 
 `assert_safe_test_database` refuses to proceed in that case with a clear
 message pointing at the fix.
-
-Kept in sync with the sibling module at
-`packages/agentic-control-plane/tests/_db_safety.py` — when tightening
-detection logic here (e.g. case-insensitivity, alternate hostnames),
-update both. The control-plane variant additionally guards the
-CONTROL_PLANE_DATABASE_URL alternate name.
 """
 
 from sqlalchemy.engine import make_url
@@ -37,6 +31,6 @@ def assert_safe_test_database(url: str) -> None:
             f"pytest, e.g.:\n"
             f"  DATABASE_URL=postgresql+psycopg://supabase_admin:$POSTGRES_PASSWORD"
             f"@localhost:5432/postgres_test\n\n"
-            f"`make test` from agentic-platform/ creates and uses "
+            f"`make test` creates and uses "
             f"`postgres_test` automatically. See issue #164."
         )

@@ -1,9 +1,8 @@
 """Provider key validator with structured return so callers can
 distinguish 401/403 (user error → block) from 5xx/network (tolerate).
 
-Diverges from the control-plane copy: the Mistral branch in
-``_endpoint_for`` has been removed. Project-service only handles the
-four user-facing providers (openai, anthropic, google, openrouter).
+Project-service only handles the four user-facing providers (openai,
+anthropic, google, openrouter); no Mistral endpoint handling.
 """
 
 from __future__ import annotations

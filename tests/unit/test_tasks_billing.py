@@ -828,7 +828,7 @@ def test_url_extraction_retries_on_missing_firecrawl_env(monkeypatch, mock_db_se
     assert kwargs["max_retries"] == 24
     assert isinstance(kwargs["exc"], RuntimeError)
     # No charge fires on retry — billing must wait for the successful
-    # extraction attempt that follows AWS SM seed + ESO sync.
+    # extraction attempt that follows the operator fixing the missing key.
     assert rec.charges == []
 
 

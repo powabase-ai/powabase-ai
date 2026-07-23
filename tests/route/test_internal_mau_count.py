@@ -1,9 +1,8 @@
 """Tests for GET /api/internal/mau-count (B4 / C1).
 
-The CP hourly MAU drain (control-plane services/drain/mau.py::fetch_ps_mau_count)
-calls this per-project endpoint with the project's service_role_key to read the
-trailing-30d MAU / SSO-MAU / third-party-MAU counts, which it bills against the
-compute-tier bundle.
+An hourly MAU-drain job calls this per-project endpoint with the project's
+service_role_key to read the trailing-30d MAU / SSO-MAU / third-party-MAU
+counts, which it bills against the compute-tier bundle.
 
 These tests exercise:
   - service-role-only auth (a non-service-role JWT -> 403)

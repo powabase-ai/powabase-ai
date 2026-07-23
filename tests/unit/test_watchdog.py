@@ -391,8 +391,9 @@ def test_find_and_recover_orphans_redispatches_with_indexing_key_inputs(monkeypa
     """
     from agentic_project_service.tasks import watchdog
 
-    # Provisioner-set envs (present in prod); the watchdog no longer reads them
-    # directly — the adapter does — but set them so the test mirrors prod.
+    # These envs are normally injected by the deployment tooling; the watchdog
+    # no longer reads them directly — the adapter does — but set them here so
+    # the test mirrors a real deployment.
     monkeypatch.setenv("BILLING_ORG_ID", "org-watchdog")
     monkeypatch.setenv("PROJECT_ID", "proj-watchdog")
 

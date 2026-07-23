@@ -510,10 +510,10 @@ class TestImportUrlNotAffectedByContentDedup:
 
 class TestImportUrlReturns503OnMissingFirecrawlKey:
     """FIRECRAWL_API_KEY is platform-paid env-injected. When it's missing
-    from the pod env (AWS SM seed gap, ESO sync lag), POST /import-url must
-    return 503 — not 400. 400 implies the tenant did something wrong; under
-    the platform-paid model the tenant cannot fix this, so the status code
-    must signal operator-side unavailability.
+    from the pod env (e.g. a transient provisioning gap), POST /import-url
+    must return 503 — not 400. 400 implies the tenant did something wrong;
+    under the platform-paid model the tenant cannot fix this, so the status
+    code must signal operator-side unavailability.
 
     Counterfactual: revert sources.py:640 from 503 back to 400 → this test
     fails.

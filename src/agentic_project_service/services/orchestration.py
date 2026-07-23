@@ -58,11 +58,10 @@ def build_orchestration(orch_id: str) -> tuple[OrchestrationModel, Orchestration
 
     # Resolve provider keys ONCE for the orchestrator + every sub-agent.
     # Fixes issue #246's adjacent bug: the previous _resolve_api_key_for_model
-    # read from x-provider-key-* HTTP headers that nothing in CP/FE/PS sets
-    # (the org→project key migration in PRs #116/#120/#124 stripped the CP
-    # injection). For Anthropic / Google / OpenRouter (no env-var fallback on
-    # per-project pods) every orchestration run silently passed api_key=None
-    # to litellm. The canonical DB-based resolver in
+    # read provider keys from x-provider-key-* HTTP headers that nothing
+    # upstream sets anymore. For Anthropic / Google / OpenRouter (no env-var
+    # fallback on per-project pods) every orchestration run silently passed
+    # api_key=None to litellm. The canonical DB-based resolver in
     # services.ai_provider_keys_resolver is what routes/agents.py uses.
     provider_keys, dropped = get_user_provider_keys_with_dropped()
 

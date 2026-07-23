@@ -5,7 +5,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load .env from the agentic-platform root so POSTGRES_PASSWORD is available
+# Load .env from the repo root so POSTGRES_PASSWORD is available
 # without having to pass it on every pytest invocation.
 _env_path = Path(__file__).resolve().parents[3] / ".env"
 if _env_path.exists():
