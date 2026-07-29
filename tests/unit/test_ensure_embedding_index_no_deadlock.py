@@ -1,7 +1,7 @@
 """Unit tests for ensure_embedding_index — must skip CREATE INDEX when
 the partial HNSW index already exists.
 
-Why this matters (verified on Judocu prod, 2026-05-24):
+Why this matters (verified in production, 2026-05-24):
 
   ensure_embedding_index runs after every source's embeddings are stored
   (4 callsites in tasks/indexing.py, once per indexing strategy). With 128
@@ -12,7 +12,7 @@ Why this matters (verified on Judocu prod, 2026-05-24):
   ShareLock on the table to check the catalog. The same transaction is
   already holding RowExclusiveLock from INSERTing embeddings. Two concurrent
   transactions in this state deadlock — we observed ~1-2 deadlocks/sec
-  cluster-wide on judocu-prod.
+  cluster-wide in a production deployment.
 
   Fix: read pg_indexes first (a system view, lock-cheap), only fall through
   to CREATE INDEX when the index is genuinely absent. After the first source

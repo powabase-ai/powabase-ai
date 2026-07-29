@@ -9,7 +9,7 @@ The partial HNSW index in ai_schema.sql is defined as:
 For PostgreSQL to use this index, the query's ORDER BY expression must be
 syntactically identical to the index expression: the column must be cast to
 vector(N) with the same N as the index. Without the cast, the planner falls
-back to sequential scan — on Judocu prod (1.2M embeddings) that turned a
+back to sequential scan — in production (1.2M embeddings) that turned a
 sub-second query into an 85-second one.
 """
 
