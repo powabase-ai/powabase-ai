@@ -19,8 +19,6 @@ are recovered manually via ``POST /api/knowledge-bases/<kb_id>/reindex``
 for now; reintroducing automatic pending-orphan recovery requires either
 writing ``celery_task_id`` at dispatch time or matching by
 ``indexed_source_id`` instead of task ID.
-
-See: docs/superpowers/specs/2026-05-15-indexed-sources-watchdog-design.md
 """
 
 import json
