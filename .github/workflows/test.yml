@@ -1,0 +1,42 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast, database-free gate: the unit tier needs no Postgres and no secrets.
+  # `tests/conftest.py` os.environ.setdefault()s JWT_SECRET, CELERY_BROKER_URL,
+  # CELERY_RESULT_BACKEND, STORAGE_URL and DATABASE_URL, so this job deliberately
+  # sets no env of its own — anything declared here would be dead config that
+  # drifts from the conftest.
+  #
+  # The database-backed tier (tests/ minus tests/unit/) is NOT run here yet: its
+  # schema/role bootstrap is still being finished. Adding it as a permanently-red
+  # continue-on-error job would train readers to ignore this workflow, so it is
+  # left out until it can run green and gate.
+  unit:
+    name: pytest tests/unit (Python 3.13)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      # `--group dev` is explicit rather than relying on `dev` being uv's
+      # default-installed group, so renaming or re-scoping the group surfaces
+      # here as a hard error instead of silently shipping a venv without pytest.
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      # --no-sync: the step above already resolved and materialized the venv;
+      # this stops uv re-resolving mid-suite.
+      - name: Run unit tests
+        run: uv run --no-sync pytest tests/unit -q

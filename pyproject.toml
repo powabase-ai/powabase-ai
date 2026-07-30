@@ -51,7 +51,12 @@ dependencies = [
     "powabase-agentic>=0.1.0rc2",
 ]
 
-[project.optional-dependencies]
+# Development dependencies. Declared as a PEP 735 dependency-group rather than a
+# `dev` extra because the two behave oppositely under uv: `uv run` installs
+# groups automatically and `uv sync` preserves them, whereas an optional-extra is
+# skipped by `uv run` and actively PRUNED by a later `uv sync`. As an extra, a
+# plain `uv run pytest` failed with "Failed to spawn: pytest".
+[dependency-groups]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
