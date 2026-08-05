@@ -63,7 +63,7 @@ dev = [
 requires-dist = [
     { name = "anyascii", specifier = ">=0.3.0" },
     { name = "beautifulsoup4", specifier = ">=4.12.0" },
-    { name = "bm25s", extras = ["core"], specifier = ">=0.2.0" },
+    { name = "bm25s", extras = ["core"], specifier = ">=0.3.10" },
     { name = "celery", extras = ["redis"], specifier = ">=5.3.0" },
     { name = "croniter", specifier = ">=1.3" },
     { name = "defusedxml", specifier = ">=0.7.0" },
@@ -328,14 +328,14 @@ wheels = [
 
 [[package]]
 name = "bm25s"
-version = "0.3.2.post1"
+version = "0.3.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7a/29/2ac15c7cd9f204809891f5822c20b06806b985c0d24058dd54249780e300/bm25s-0.3.2.post1.tar.gz", hash = "sha256:66470f49fb9e8208e3d01d400d237ed09ecad9a03d7721f82cf520e3b2e29aee", size = 74932, upload-time = "2026-03-17T02:39:02.262Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/34/ab/8fac50e2095d26dd9ccaf3c35bddb96ff45a8cca9fc3ac0e98209971828f/bm25s-0.3.10.tar.gz", hash = "sha256:fafdfc45e6c064fc117b08de8f59b47564a3879d3ca593daa0b2a40b2c05da43", size = 80762, upload-time = "2026-07-22T20:54:28.824Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c8/00/1b927debe9dea2c605b3f13f18ce096658b049e0b477985979d6bf6a5595/bm25s-0.3.2.post1-py3-none-any.whl", hash = "sha256:ccb4d0a85168c2b1bdc86e513ea10a7ff14b638d33a173fe5c8ba14dd5d0fb78", size = 70149, upload-time = "2026-03-17T02:39:00.881Z" },
+    { url = "https://files.pythonhosted.org/packages/d4/06/7ec2175c185661a976589fffde16eb7c36d69eaa43eed26fe5ad0ce3cd25/bm25s-0.3.10-py3-none-any.whl", hash = "sha256:d271d4e1ad7ffdacb224f41bc54aba55159438ecf06439ffe929f088efa96858", size = 74687, upload-time = "2026-07-22T20:54:27.447Z" },
 ]
 
 [package.optional-dependencies]
