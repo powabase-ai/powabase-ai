@@ -22,6 +22,7 @@ from ..celery import celery_app
 from ..db import db, AI_SCHEMA
 from ..services.ai_provider_keys_resolver import get_all_user_provider_keys
 from ..services import billing_port as billing
+from ..services.rate_limit import external_limiter
 from ..services.settings_registry import EXTRACTION_METHOD_CHOICES, get_setting
 from ..services.storage import (
     StorageError,
@@ -249,7 +250,7 @@ def list_sources():
     query = f"""
         SELECT id, name, file_type, storage_path, extraction_status,
                derivatives, metadata, auto_metadata, error_message,
-               created_at, updated_at
+               created_at, updated_at, error_code
         FROM "{AI_SCHEMA}".sources
         {where_clause}
         ORDER BY {order_by}
@@ -271,6 +272,7 @@ def list_sources():
                 "metadata": row[6],
                 "auto_metadata": row[7],
                 "error_message": row[8],
+                "error_code": row[11],
                 "created_at": row[9].isoformat() if row[9] else None,
                 "updated_at": row[10].isoformat() if row[10] else None,
             }
@@ -543,21 +545,36 @@ def _discover_urls_crawl(url: str, max_pages: int) -> list[str]:
     firecrawl_key = os.environ.get("FIRECRAWL_API_KEY", "")
     firecrawl_base = get_setting("FIRECRAWL_API_BASE").rstrip("/")
 
-    try:
-        with httpx.Client(timeout=30) as client:
-            resp = client.post(
-                f"{firecrawl_base}/map",
-                headers={"Authorization": f"Bearer {firecrawl_key}"},
-                json={"url": url, "limit": max_pages},
-            )
-            resp.raise_for_status()
-            links = resp.json().get("links", [])
-            if links:
-                return [u for u in links if _validate_url(u)][:max_pages]
-    except Exception:
-        logger.warning(
-            "Firecrawl /v1/map failed, falling back to HTML link extraction", exc_info=True
-        )
+    rate_limit = get_setting("FIRECRAWL_RATE_LIMIT_PER_MINUTE")
+    if external_limiter.acquire_blocking("firecrawl", rate_limit, timeout_s=5.0):
+        try:
+            with httpx.Client(timeout=30) as client:
+                resp = client.post(
+                    f"{firecrawl_base}/map",
+                    headers={"Authorization": f"Bearer {firecrawl_key}"},
+                    json={"url": url, "limit": max_pages},
+                )
+                resp.raise_for_status()
+                links = resp.json().get("links", [])
+                if links:
+                    return [u for u in links if _validate_url(u)][:max_pages]
+        except Exception as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code in (401, 403):
+                # A rejected platform key silently downgrades every crawl to
+                # naive HTML link-scraping — make that operator-visible.
+                logger.error(
+                    "Firecrawl /v1/map auth failure (%s) — platform API key "
+                    "rejected; crawl discovery degraded to HTML fallback",
+                    status_code,
+                )
+            else:
+                logger.warning(
+                    "Firecrawl /v1/map failed, falling back to HTML link extraction",
+                    exc_info=True,
+                )
+    else:
+        logger.info("Firecrawl rate limited — skipping /map, using HTML fallback")
 
     # Fallback: scrape page HTML and extract <a href>
     try:
@@ -909,7 +926,7 @@ def get_source(source_id: str):
         text(f"""
             SELECT id, name, file_type, storage_path, extraction_status,
                    derivatives, metadata, auto_metadata, error_message,
-                   celery_task_id, created_at, updated_at
+                   celery_task_id, created_at, updated_at, error_code
             FROM "{AI_SCHEMA}".sources
             WHERE id = :id
         """),
@@ -931,6 +948,7 @@ def get_source(source_id: str):
             "metadata": row[6],
             "auto_metadata": row[7],
             "error_message": row[8],
+            "error_code": row[12],
             "celery_task_id": row[9],
             "created_at": row[10].isoformat() if row[10] else None,
             "updated_at": row[11].isoformat() if row[11] else None,
@@ -1262,7 +1280,7 @@ def reextract_source(source_id: str):
     db.session.execute(
         text(f"""
             UPDATE "{AI_SCHEMA}".sources
-            SET extraction_status = 'pending', error_message = NULL,
+            SET extraction_status = 'pending', error_message = NULL, error_code = NULL,
                 auto_metadata = CAST(:auto_metadata AS jsonb), updated_at = NOW()
             WHERE id = :id
         """),
