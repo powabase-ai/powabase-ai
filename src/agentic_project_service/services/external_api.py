@@ -1,5 +1,6 @@
 """Helpers for calling rate-limited external APIs (Firecrawl, Exa)."""
 
+import math
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -19,7 +20,9 @@ def parse_retry_after(value: str | None, default: float = 60.0, cap: float = 300
     value = value.strip()
     try:
         seconds = float(value)
-        if seconds < 0:
+        # Reject nan/inf explicitly: nan passes a `< 0` check and survives
+        # min(), and a nan countdown later blows up inside Celery's retry.
+        if not math.isfinite(seconds) or seconds < 0:
             return min(default, cap)
         return min(seconds, cap)
     except ValueError:
