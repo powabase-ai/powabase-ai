@@ -67,6 +67,7 @@ def test_web_scrape_second_429_returns_platform_error(monkeypatch):
     monkeypatch.setattr(builtin_mod.http_requests, "post", post)
     result = json.loads(builtin_mod.web_scrape_handler({"url": "https://example.com"}, {}))
     assert result["_platform_error"] is True
+    assert post.call_count == 2
 
 
 def test_web_scrape_long_retry_after_gives_up_immediately(monkeypatch):
@@ -125,3 +126,4 @@ def test_web_search_second_429_returns_platform_error(monkeypatch):
     monkeypatch.setattr(builtin_mod.http_requests, "post", post)
     result = json.loads(builtin_mod.web_search_handler({"query": "q"}, {}))
     assert result["_platform_error"] is True
+    assert post.call_count == 2
