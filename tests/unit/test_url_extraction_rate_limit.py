@@ -1,8 +1,8 @@
 # tests/unit/test_url_extraction_rate_limit.py
 """Rate-limit behavior of extract_url_source: pacing, 429 re-queue,
-permanent-vs-transient classification, and terminal error codes."""
+permanent-vs-transient classification, per-cause retry budgets, and
+terminal error codes."""
 
-import contextlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -96,22 +96,9 @@ def retry_spy(monkeypatch):
     return spy
 
 
-@contextlib.contextmanager
-def _at_retry_budget(retries):
-    """Run with a fabricated Celery request context that has already used
-    ``retries`` attempts, so the task's own pre-retry budget check — not a
-    mocked ``self.retry`` — decides whether the call is exhausted. Celery's
-    real ``Task.retry(exc=...)`` re-raises ``exc`` itself once the budget is
-    exhausted (never ``MaxRetriesExceededError``, which only fires when
-    ``retry()`` is called with no ``exc``), so exhaustion-path tests must not
-    mock ``self.retry`` to raise ``MaxRetriesExceededError`` — that isn't
-    real Celery behavior.
-    """
-    url_mod.extract_url_source.push_request(retries=retries, id="task-1", called_directly=False)
-    try:
-        yield
-    finally:
-        url_mod.extract_url_source.pop_request()
+def _requeued_counts(retry_spy):
+    """The per-cause retry_counts dict the task passed for its re-queue."""
+    return retry_spy.call_args.kwargs["kwargs"]["retry_counts"]
 
 
 def test_pacing_denial_requeues(status_calls, retry_spy, monkeypatch):
@@ -121,7 +108,7 @@ def test_pacing_denial_requeues(status_calls, retry_spy, monkeypatch):
         url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
     kwargs = retry_spy.call_args.kwargs
     assert 12.5 <= kwargs["countdown"] <= 17.5  # wait + jitter(0-5)
-    assert kwargs["max_retries"] == url_mod.RATE_LIMIT_MAX_RETRIES
+    assert _requeued_counts(retry_spy) == {"rate_limit": 1}
     # No terminal failure was written.
     assert not [c for c in status_calls if "failed" in c[0]]
 
@@ -133,15 +120,36 @@ def test_429_requeues_with_retry_after(status_calls, retry_spy, monkeypatch):
         url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
     kwargs = retry_spy.call_args.kwargs
     assert 42.0 <= kwargs["countdown"] <= 47.0
-    assert kwargs["max_retries"] == url_mod.RATE_LIMIT_MAX_RETRIES
+    assert _requeued_counts(retry_spy) == {"rate_limit": 1}
 
 
-def test_429_budget_exhausted_fails_with_rate_limited(status_calls, monkeypatch, caplog):
+def test_pacing_budget_exhaustion_fails_rate_limited(status_calls, retry_spy, monkeypatch, caplog):
+    _fake_httpx_client(monkeypatch, 200)
+    monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: 12.5)
+    result = url_mod.extract_url_source.run(
+        "src-1",
+        "bucket-1",
+        "https://example.com",
+        retry_counts={"rate_limit": url_mod.RATE_LIMIT_MAX_RETRIES},
+    )
+    assert result["status"] == "error"
+    retry_spy.assert_not_called()
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+    terminal = [c for c in status_calls if "failed" in c[0]]
+    assert terminal and terminal[-1][1].get("error_code") == "rate_limited"
+
+
+def test_429_budget_exhausted_fails_with_rate_limited(status_calls, retry_spy, monkeypatch, caplog):
     _fake_httpx_client(monkeypatch, 429, headers={"Retry-After": "42"})
     monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
-    with _at_retry_budget(url_mod.RATE_LIMIT_MAX_RETRIES):
-        result = url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
+    result = url_mod.extract_url_source.run(
+        "src-1",
+        "bucket-1",
+        "https://example.com",
+        retry_counts={"rate_limit": url_mod.RATE_LIMIT_MAX_RETRIES},
+    )
     assert result["status"] == "error"
+    retry_spy.assert_not_called()
     errors = [r for r in caplog.records if r.levelname == "ERROR"]
     assert errors, "budget exhaustion must log at ERROR level"
     assert not any("re-queueing" in r.getMessage() for r in caplog.records), (
@@ -164,17 +172,53 @@ def test_permanent_4xx_fails_immediately(status_calls, retry_spy, monkeypatch, c
     assert terminal and terminal[-1][1].get("error_code") == "permanent"
 
 
-def test_5xx_retries_then_transient(status_calls, monkeypatch, caplog):
+def test_5xx_retries_then_transient(status_calls, retry_spy, monkeypatch, caplog):
     _fake_httpx_client(monkeypatch, 503)
     monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
-    with _at_retry_budget(url_mod.extract_url_source.max_retries):
-        result = url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
+    result = url_mod.extract_url_source.run(
+        "src-1",
+        "bucket-1",
+        "https://example.com",
+        retry_counts={"transient": url_mod.extract_url_source.max_retries},
+    )
     assert result["status"] == "error"
+    retry_spy.assert_not_called()
     assert any(r.levelname == "ERROR" for r in caplog.records), (
         "transient exhaustion must log at ERROR level"
     )
     terminal = [c for c in status_calls if "failed" in c[0]]
     assert terminal and terminal[-1][1].get("error_code") == "transient"
+
+
+def test_transient_budget_unaffected_by_pacing_deferrals(status_calls, retry_spy, monkeypatch):
+    """Pacing deferrals must not consume the transient budget: 4 prior
+    rate-limit deferrals followed by a 503 still gets a transient retry."""
+    _fake_httpx_client(monkeypatch, 503)
+    monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
+    with pytest.raises(Retry):
+        url_mod.extract_url_source.run(
+            "src-1",
+            "bucket-1",
+            "https://example.com",
+            retry_counts={"rate_limit": 4},
+        )
+    assert _requeued_counts(retry_spy) == {"rate_limit": 4, "transient": 1}
+    assert not [c for c in status_calls if "failed" in c[0]]
+
+
+def test_missing_key_budget_exhaustion_internal(status_calls, retry_spy, monkeypatch, caplog):
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "")
+    result = url_mod.extract_url_source.run(
+        "src-1",
+        "bucket-1",
+        "https://example.com",
+        retry_counts={"missing_key": url_mod.MISSING_KEY_MAX_RETRIES},
+    )
+    assert result["status"] == "error"
+    retry_spy.assert_not_called()
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+    terminal = [c for c in status_calls if "failed" in c[0]]
+    assert terminal and terminal[-1][1].get("error_code") == "internal"
 
 
 def test_success_path_unaffected(status_calls, retry_spy, monkeypatch, mock_db_session):
