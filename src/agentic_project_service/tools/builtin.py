@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import litellm
@@ -12,7 +13,9 @@ import requests as http_requests
 from sqlalchemy import text
 
 from ..db import db
+from ..services.external_api import parse_retry_after
 from ..services.llm_call import with_llm_key
+from ..services.rate_limit import external_limiter
 from ..services.settings_registry import get_setting
 from ..services.storage import get_storage
 
@@ -856,6 +859,15 @@ def web_scrape_handler(arguments, context):
             }
         )
 
+    rate_limit = get_setting("FIRECRAWL_RATE_LIMIT_PER_MINUTE")
+    if not external_limiter.acquire_blocking("firecrawl", rate_limit, timeout_s=10.0):
+        return json.dumps(
+            {
+                "error": "Web scraping is temporarily rate limited. Please try again shortly.",
+                "_platform_error": True,
+            }
+        )
+
     max_chars = get_setting("WEB_SCRAPE_MAX_CHARS") or 200000
     firecrawl_base = get_setting("FIRECRAWL_API_BASE").rstrip("/")
 
@@ -875,6 +887,26 @@ def web_scrape_handler(arguments, context):
             json=payload,
             timeout=60,
         )
+        if resp.status_code == 429:
+            delay = parse_retry_after(resp.headers.get("Retry-After"))
+            if delay <= 15.0:
+                time.sleep(delay)
+                resp = http_requests.post(
+                    f"{firecrawl_base}/scrape",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=60,
+                )
+        if resp.status_code == 429:
+            return json.dumps(
+                {
+                    "error": "Web scraping is temporarily rate limited. Please try again shortly.",
+                    "_platform_error": True,
+                }
+            )
         resp.raise_for_status()
         data = resp.json().get("data", {})
     except Exception as e:
