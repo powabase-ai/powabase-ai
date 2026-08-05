@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.0](https://github.com/powabase-ai/powabase-ai/compare/v0.1.3...v0.2.0) (2026-08-05)
+
+
+### Features
+
+* rate-limit handling for Firecrawl/Exa with pacing, Retry-After re-queue, and sources.error_code ([7b46bae](https://github.com/powabase-ai/powabase-ai/commit/7b46baeb71ff54a0e6110ecb0074c3cb5957baa6))
+
+
+### Bug Fixes
+
+* **ci:** re-run the title check when the head moves ([#33](https://github.com/powabase-ai/powabase-ai/issues/33)) ([23d3cad](https://github.com/powabase-ai/powabase-ai/commit/23d3cad7c18aa209107bdbcf13bfa2aae8e9f33b))
+
+
+### Documentation
+
+* add a contributing guide ([#31](https://github.com/powabase-ai/powabase-ai/issues/31)) ([e3d4547](https://github.com/powabase-ai/powabase-ai/commit/e3d4547d85f2916f0660136ff37231dfebb228a9))
+
 ## [0.1.3](https://github.com/powabase-ai/powabase-ai/compare/v0.1.2...v0.1.3) (2026-08-05)
 
 

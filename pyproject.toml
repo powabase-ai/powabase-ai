@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentic-project-service"
-version = "0.1.3"
+version = "0.2.0"
 description = "Per-project service for AI features: sources, knowledge bases, agents, and background tasks"
 readme = "README.md"
 requires-python = ">=3.13"
