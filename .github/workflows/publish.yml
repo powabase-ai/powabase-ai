@@ -3,7 +3,10 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "image tag + AGENTIC_VERSION (powabase-agentic), e.g. 0.1.0rc1"
+        # Image tag ONLY. It used to double as AGENTIC_VERSION, which meant the
+        # tag had to already exist on PyPI as a powabase-agentic release. The
+        # agentic version now comes from uv.lock, so this is free of that.
+        description: "image tag, e.g. 0.1.0rc1"
         required: true
         type: string
       dry_run:
@@ -38,8 +41,6 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          build-args: |
-            AGENTIC_VERSION=${{ inputs.version }}
           platforms: linux/amd64,linux/arm64
           push: ${{ inputs.dry_run == false }}
           tags: ${{ env.IMAGE }}:${{ inputs.version }}
