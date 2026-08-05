@@ -34,8 +34,13 @@ from .extraction import (
 
 logger = logging.getLogger(__name__)
 
-# Shared budget for pacing deferrals and 429 re-queues (worst case ~15 min).
+# Per-cause retry budgets (tracked in the task's `retry_counts` kwarg, not
+# Celery's single request.retries counter — see the task docstring).
+# rate_limit covers pacing deferrals and 429 re-queues; worst case is
+# ~15 min of pacing, or ~80 min of 429s at the 300s Retry-After cap.
 RATE_LIMIT_MAX_RETRIES = 15
+# ~4 hours at countdown=600 for the operator to fix a missing platform key.
+MISSING_KEY_MAX_RETRIES = 24
 
 _IMAGE_RE = re.compile(r"!\[([^\]]*)\]\((https?://[^)]+)\)")
 
@@ -79,6 +84,7 @@ def extract_url_source(
     billing_idempotency_key: str | None = None,
     billing_org_id: str | None = None,
     billing_project_id: str | None = None,
+    retry_counts: dict[str, int] | None = None,
 ):
     """Scrape a single URL and store derivatives.
 
@@ -98,9 +104,21 @@ def extract_url_source(
             task's own args). Unused, but an in-flight task enqueued before the
             port migration still carries them; keeping them avoids a TypeError on
             a cross-deploy retry.
+        retry_counts: Per-cause retry counters ({"missing_key" | "rate_limit" |
+            "transient": n}), threaded through each re-queue via retry(kwargs=...)
+            so the causes have independent budgets — Celery's single
+            ``request.retries`` counter cannot distinguish them (a run of pacing
+            deferrals would otherwise eat the transient budget and vice versa).
+            Every retry site passes ``max_retries=None`` and does its own
+            pre-retry budget check, because ``Task.retry(exc=...)`` re-raises
+            ``exc`` itself on exhaustion, never MaxRetriesExceededError.
     """
     task_id = self.request.id
+    counts = dict(retry_counts or {})
     logger.info("Starting URL extraction task %s for source %s: %s", task_id, source_id, url)
+
+    def _requeue_kwargs() -> dict:
+        return {**(self.request.kwargs or {}), "retry_counts": counts}
 
     try:
         source = get_source(source_id)
@@ -120,22 +138,38 @@ def extract_url_source(
 
         firecrawl_key = os.environ.get("FIRECRAWL_API_KEY", "")
         if not firecrawl_key:
-            logger.error("FIRECRAWL_API_KEY missing from pod env — platform misconfiguration")
             # Mark the source `extracting` (it stays visible as a retry-able
             # state in Studio) and ask Celery to retry. A plain `return`
             # would leave the source permanently `failed` for every URL
-            # submitted during a misconfig window. countdown=600 / max_retries=24
-            # gives the operator ~4 hours to fix the missing key and roll the
-            # affected pods; after that the retry budget is exhausted and
-            # `self.retry(exc=...)` re-raises the RuntimeError passed as `exc`
-            # (not MaxRetriesExceededError, since `exc` was supplied — see the
-            # matching note below), so it falls through to the generic
-            # `except Exception` clause below and the source lands in `failed`
-            # with the underlying exception text.
+            # submitted during a misconfig window. countdown=600 with a
+            # budget of 24 gives the operator ~4 hours to fix the missing
+            # key and roll the affected pods.
+            used = counts.get("missing_key", 0)
+            if used >= MISSING_KEY_MAX_RETRIES:
+                logger.error(
+                    "FIRECRAWL_API_KEY still missing after %d retries — failing source %s",
+                    used,
+                    source_id,
+                )
+                update_source_status(
+                    source_id,
+                    "failed",
+                    "FIRECRAWL_API_KEY missing from pod env",
+                    task_id,
+                    error_code="internal",
+                )
+                return {
+                    "status": "error",
+                    "source_id": source_id,
+                    "error": "FIRECRAWL_API_KEY missing from pod env",
+                }
+            logger.error("FIRECRAWL_API_KEY missing from pod env — platform misconfiguration")
+            counts["missing_key"] = used + 1
             raise self.retry(
                 exc=RuntimeError("FIRECRAWL_API_KEY missing from pod env"),
                 countdown=600,
-                max_retries=24,
+                max_retries=None,
+                kwargs=_requeue_kwargs(),
             )
 
         # 1. Scrape via Firecrawl
@@ -144,15 +178,12 @@ def extract_url_source(
         rate_limit = get_setting("FIRECRAWL_RATE_LIMIT_PER_MINUTE")
         wait = external_limiter.try_acquire("firecrawl", rate_limit)
         if wait is not None:
-            # Celery's Task.retry(exc=...) re-raises `exc` itself (not
-            # MaxRetriesExceededError) once the budget is exhausted, so the
-            # exhaustion check has to happen BEFORE calling retry() — an
-            # `except MaxRetriesExceededError` here would never fire.
-            if self.request.retries >= RATE_LIMIT_MAX_RETRIES:
+            used = counts.get("rate_limit", 0)
+            if used >= RATE_LIMIT_MAX_RETRIES:
                 logger.error(
                     "Firecrawl pacing budget exhausted for source %s after %d attempts",
                     source_id,
-                    self.request.retries,
+                    used,
                 )
                 update_source_status(
                     source_id,
@@ -167,10 +198,12 @@ def extract_url_source(
                     "error": "Firecrawl rate limit pacing budget exhausted",
                 }
             logger.info("Firecrawl pacing: deferring source %s by %.1fs", source_id, wait)
+            counts["rate_limit"] = used + 1
             raise self.retry(
                 exc=RuntimeError("Firecrawl rate limit pacing"),
                 countdown=wait + random.uniform(0, 5),
-                max_retries=RATE_LIMIT_MAX_RETRIES,
+                max_retries=None,
+                kwargs=_requeue_kwargs(),
             )
 
         with httpx.Client(timeout=60) as client:
@@ -380,22 +413,31 @@ def extract_url_source(
     except StorageError as e:
         logger.error("Storage error during URL extraction: %s", e)
         update_source_status(source_id, "failed", str(e), task_id, error_code="transient")
-        raise self.retry(exc=e) from e
+        used = counts.get("transient", 0)
+        if used >= self.max_retries:
+            logger.error(
+                "Storage retry budget exhausted for source %s after %d attempts", source_id, used
+            )
+            return {"status": "error", "source_id": source_id, "error": str(e)}
+        counts["transient"] = used + 1
+        raise self.retry(exc=e, max_retries=None, kwargs=_requeue_kwargs()) from e
 
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         # Celery's Task.retry(exc=...) re-raises `exc` itself once the retry
         # budget is exhausted — it does NOT raise MaxRetriesExceededError
         # (that only happens when retry() is called with no `exc`). So each
-        # branch below checks self.request.retries against the budget BEFORE
-        # calling retry(), rather than catching MaxRetriesExceededError.
+        # branch below checks its per-cause counter against the budget BEFORE
+        # calling retry(), and every retry passes max_retries=None so Celery's
+        # own (shared-counter) exhaustion path can never preempt these checks.
         status_code = getattr(getattr(e, "response", None), "status_code", None)
         if status_code == 429:
             delay = parse_retry_after(e.response.headers.get("Retry-After")) + random.uniform(0, 5)
-            if self.request.retries >= RATE_LIMIT_MAX_RETRIES:
+            used = counts.get("rate_limit", 0)
+            if used >= RATE_LIMIT_MAX_RETRIES:
                 logger.error(
                     "Firecrawl 429 for source %s — retry budget exhausted after %d attempts",
                     source_id,
-                    self.request.retries,
+                    used,
                 )
                 update_source_status(
                     source_id,
@@ -406,7 +448,8 @@ def extract_url_source(
                 )
                 return {"status": "error", "source_id": source_id, "error": str(e)}
             logger.warning("Firecrawl 429 for source %s — re-queueing in %.1fs", source_id, delay)
-            raise self.retry(exc=e, countdown=delay, max_retries=RATE_LIMIT_MAX_RETRIES)
+            counts["rate_limit"] = used + 1
+            raise self.retry(exc=e, countdown=delay, max_retries=None, kwargs=_requeue_kwargs())
         if status_code in PERMANENT_STATUSES:
             logger.error(
                 "Firecrawl permanent error %s for source %s: %s", status_code, source_id, e
@@ -414,7 +457,8 @@ def extract_url_source(
             update_source_status(source_id, "failed", str(e), task_id, error_code="permanent")
             return {"status": "error", "source_id": source_id, "error": str(e)}
         # 5xx / transport errors: bounded retry on the task's default budget.
-        if self.request.retries >= self.max_retries:
+        used = counts.get("transient", 0)
+        if used >= self.max_retries:
             logger.error(
                 "Firecrawl transient error for source %s — retry budget exhausted: %s",
                 source_id,
@@ -422,7 +466,8 @@ def extract_url_source(
             )
             update_source_status(source_id, "failed", str(e), task_id, error_code="transient")
             return {"status": "error", "source_id": source_id, "error": str(e)}
-        raise self.retry(exc=e)
+        counts["transient"] = used + 1
+        raise self.retry(exc=e, max_retries=None, kwargs=_requeue_kwargs())
 
     except Retry:
         # Celery's self.retry() raises Retry; re-raise so the Celery worker

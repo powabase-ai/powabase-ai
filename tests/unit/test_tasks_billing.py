@@ -812,7 +812,11 @@ def test_url_extraction_retries_on_missing_firecrawl_env(monkeypatch, mock_db_se
     retry_mock.assert_called_once()
     kwargs = retry_mock.call_args.kwargs
     assert kwargs["countdown"] == 600
-    assert kwargs["max_retries"] == 24
+    # Budgets are per-cause now: the task threads its own counter through
+    # retry(kwargs=...) and passes max_retries=None so Celery's shared
+    # counter can never preempt the per-cause pre-checks.
+    assert kwargs["max_retries"] is None
+    assert kwargs["kwargs"]["retry_counts"] == {"missing_key": 1}
     assert isinstance(kwargs["exc"], RuntimeError)
     # No charge fires on retry — billing must wait for the successful
     # extraction attempt that follows the operator fixing the missing key.
