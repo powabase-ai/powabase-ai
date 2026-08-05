@@ -81,6 +81,7 @@ def update_source_status(
     status: str,
     error_message: str | None = None,
     celery_task_id: str | None = None,
+    error_code: str | None = None,
 ) -> None:
     """Update source extraction status."""
     db.session.execute(
@@ -88,6 +89,7 @@ def update_source_status(
             UPDATE "{AI_SCHEMA}".sources
             SET extraction_status = :status,
                 error_message = :error_message,
+                error_code = :error_code,
                 celery_task_id = :celery_task_id,
                 updated_at = NOW()
             WHERE id = :id
@@ -96,6 +98,7 @@ def update_source_status(
             "id": source_id,
             "status": status,
             "error_message": error_message,
+            "error_code": error_code,
             "celery_task_id": celery_task_id,
         },
     )

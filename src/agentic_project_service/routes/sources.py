@@ -249,7 +249,7 @@ def list_sources():
     query = f"""
         SELECT id, name, file_type, storage_path, extraction_status,
                derivatives, metadata, auto_metadata, error_message,
-               created_at, updated_at
+               created_at, updated_at, error_code
         FROM "{AI_SCHEMA}".sources
         {where_clause}
         ORDER BY {order_by}
@@ -271,6 +271,7 @@ def list_sources():
                 "metadata": row[6],
                 "auto_metadata": row[7],
                 "error_message": row[8],
+                "error_code": row[11],
                 "created_at": row[9].isoformat() if row[9] else None,
                 "updated_at": row[10].isoformat() if row[10] else None,
             }
@@ -909,7 +910,7 @@ def get_source(source_id: str):
         text(f"""
             SELECT id, name, file_type, storage_path, extraction_status,
                    derivatives, metadata, auto_metadata, error_message,
-                   celery_task_id, created_at, updated_at
+                   celery_task_id, created_at, updated_at, error_code
             FROM "{AI_SCHEMA}".sources
             WHERE id = :id
         """),
@@ -931,6 +932,7 @@ def get_source(source_id: str):
             "metadata": row[6],
             "auto_metadata": row[7],
             "error_message": row[8],
+            "error_code": row[12],
             "celery_task_id": row[9],
             "created_at": row[10].isoformat() if row[10] else None,
             "updated_at": row[11].isoformat() if row[11] else None,
