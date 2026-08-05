@@ -144,9 +144,7 @@ class TestMcpToolDiscovery:
         )
         return resp.get_json()["id"]
 
-    def test_discover_returns_tools(
-        self, client, mock_auth, auth_headers, test_agent, mocker
-    ):
+    def test_discover_returns_tools(self, client, mock_auth, auth_headers, test_agent, mocker):
         server_id = self._add_server(client, auth_headers, test_agent["id"])
         mocker.patch(
             "agentic_project_service.routes.agents.discover_mcp_tools",
@@ -171,9 +169,7 @@ class TestMcpToolDiscovery:
         assert tools[0]["description"] == "Create an issue"
         assert tools[0]["input_schema"] == {"type": "object"}
 
-    def test_discover_unknown_server_returns_404(
-        self, client, mock_auth, auth_headers, test_agent
-    ):
+    def test_discover_unknown_server_returns_404(self, client, mock_auth, auth_headers, test_agent):
         resp = client.get(
             f"/api/agents/{test_agent['id']}/mcp-servers/{uuid.uuid4()}/tools",
             headers=auth_headers,

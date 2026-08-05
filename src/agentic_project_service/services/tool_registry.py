@@ -745,7 +745,7 @@ def build_mcp_tools_for_agent(
 ) -> dict[str, "ToolDefinition"]:
     """Discover and build tools from MCP servers assigned to an agent."""
     from agentic.agent.tools import McpTool
-    from agentic.mcp.client import discover_mcp_tools
+    from agentic.mcp.client import McpError, discover_mcp_tools
 
     servers = AgentMcpServer.query.filter_by(agent_id=agent_id, enabled=True).all()
     tools: dict[str, ToolDefinition] = {}
@@ -753,9 +753,12 @@ def build_mcp_tools_for_agent(
     for server in servers:
         try:
             mcp_tools = discover_mcp_tools(server.url, server.headers or {})
-        except Exception:
+        except McpError as e:
             logger.warning(
-                "Failed to discover tools from MCP server %s (%s)", server.name, server.url
+                "Failed to discover tools from MCP server %s (%s): %s",
+                server.name,
+                server.url,
+                e,
             )
             continue
 

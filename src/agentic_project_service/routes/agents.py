@@ -864,7 +864,7 @@ def discover_mcp_server_tools(agent_id: str, server_id: str):
         return jsonify({"error": "MCP server not found"}), 404
 
     try:
-        tools = discover_mcp_tools(server.url, server.headers or {})
+        tools = discover_mcp_tools(server.url, server.headers or {}, timeout=10)
     except McpError as e:
         return jsonify({"error": str(e)}), 502
 
