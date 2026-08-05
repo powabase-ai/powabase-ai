@@ -47,3 +47,14 @@ class TestPermanentStatuses:
         assert 429 not in PERMANENT_STATUSES
         assert 500 not in PERMANENT_STATUSES
         assert 503 not in PERMANENT_STATUSES
+
+
+class TestNonFiniteRetryAfter:
+    def test_nan_returns_default(self):
+        assert parse_retry_after("nan") == 60.0
+
+    def test_inf_returns_default(self):
+        assert parse_retry_after("inf") == 60.0
+
+    def test_negative_inf_returns_default(self):
+        assert parse_retry_after("-inf") == 60.0
