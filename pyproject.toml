@@ -47,8 +47,10 @@ dependencies = [
     "prometheus-client>=0.20",
     "prometheus-flask-exporter>=0.23.0",
     # Core framework: powabase-agentic (PyPI; the import module stays `agentic`).
-    # The Docker image adds the [rerankers] extra. Pinned to the OSS release floor.
-    "powabase-agentic>=0.1.0rc3",
+    # The [rerankers] extra pulls zeroentropy. Open `>=` floor on purpose — a
+    # bounded range would make dependency automation edit this file as well as
+    # the lock.
+    "powabase-agentic[rerankers]>=0.1.0rc3",
 ]
 
 # Development dependencies. Declared as a PEP 735 dependency-group rather than a
