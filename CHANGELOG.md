@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/powabase-ai/powabase-ai/compare/v0.1.1...v0.1.2) (2026-08-05)
+
+
+### Bug Fixes
+
+* **deps:** pystemmer 3.1.0, which has a linux/arm64 wheel ([#24](https://github.com/powabase-ai/powabase-ai/issues/24)) ([78d3235](https://github.com/powabase-ai/powabase-ai/commit/78d3235056cd8e0c368dfe6204c3a88eda551a18))
+
 ## [0.1.1](https://github.com/powabase-ai/powabase-ai/compare/v0.1.0...v0.1.1) (2026-08-05)
 
 
