@@ -65,6 +65,7 @@ dev = [
     "responses>=0.25.0",
     "black>=24.0.0",
     "ruff>=0.3.0",
+    "fakeredis[lua]>=2.37.0",
 ]
 
 [tool.hatch.build.targets.wheel]
