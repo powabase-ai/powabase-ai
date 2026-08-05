@@ -6,16 +6,19 @@ downloads inline images, and updates the source record.
 
 import logging
 import os
+import random
 import re
 from datetime import datetime, timezone
 
 import httpx
 from ..celery import celery_app
-from celery.exceptions import Retry, SoftTimeLimitExceeded
+from celery.exceptions import MaxRetriesExceededError, Retry, SoftTimeLimitExceeded
 from sqlalchemy import text
 
 from ..db import AI_SCHEMA, db
 from ..services import billing_port as billing
+from ..services.external_api import PERMANENT_STATUSES, parse_retry_after
+from ..services.rate_limit import external_limiter
 from ..services.settings_registry import get_setting
 from ..services.storage import (
     StorageError,
@@ -30,6 +33,9 @@ from .extraction import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Shared budget for pacing deferrals and 429 re-queues (worst case ~15 min).
+RATE_LIMIT_MAX_RETRIES = 15
 
 _IMAGE_RE = re.compile(r"!\[([^\]]*)\]\((https?://[^)]+)\)")
 
@@ -135,6 +141,27 @@ def extract_url_source(
 
         # 1. Scrape via Firecrawl
         firecrawl_base = get_setting("FIRECRAWL_API_BASE").rstrip("/")
+
+        rate_limit = get_setting("FIRECRAWL_RATE_LIMIT_PER_MINUTE")
+        wait = external_limiter.try_acquire("firecrawl", rate_limit)
+        if wait is not None:
+            logger.info("Firecrawl pacing: deferring source %s by %.1fs", source_id, wait)
+            try:
+                raise self.retry(
+                    exc=RuntimeError("Firecrawl rate limit pacing"),
+                    countdown=wait + random.uniform(0, 5),
+                    max_retries=RATE_LIMIT_MAX_RETRIES,
+                )
+            except MaxRetriesExceededError as e:
+                update_source_status(
+                    source_id,
+                    "failed",
+                    "Scraping provider rate limit exceeded after retries",
+                    task_id,
+                    error_code="rate_limited",
+                )
+                return {"status": "error", "source_id": source_id, "error": str(e)}
+
         with httpx.Client(timeout=60) as client:
             resp = client.post(
                 f"{firecrawl_base}/scrape",
@@ -148,7 +175,11 @@ def extract_url_source(
         html_content = scrape_data.get("html", "")
         if not markdown_content and not html_content:
             update_source_status(
-                source_id, "failed", f"No content returned for URL: {url}", task_id
+                source_id,
+                "failed",
+                f"No content returned for URL: {url}",
+                task_id,
+                error_code="no_content",
             )
             return {
                 "status": "error",
@@ -330,13 +361,41 @@ def extract_url_source(
         ).scalar()
         if current == "cancelled":
             return {"status": "cancelled", "source_id": source_id}
-        update_source_status(source_id, "failed", "Extraction timed out", task_id)
+        update_source_status(
+            source_id, "failed", "Extraction timed out", task_id, error_code="timeout"
+        )
         return {"status": "error", "source_id": source_id, "error": "Extraction timed out"}
 
     except StorageError as e:
         logger.error("Storage error during URL extraction: %s", e)
-        update_source_status(source_id, "failed", str(e), task_id)
+        update_source_status(source_id, "failed", str(e), task_id, error_code="transient")
         raise self.retry(exc=e) from e
+
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        status_code = getattr(getattr(e, "response", None), "status_code", None)
+        if status_code == 429:
+            delay = parse_retry_after(e.response.headers.get("Retry-After")) + random.uniform(0, 5)
+            logger.warning("Firecrawl 429 for source %s — re-queueing in %.1fs", source_id, delay)
+            try:
+                raise self.retry(exc=e, countdown=delay, max_retries=RATE_LIMIT_MAX_RETRIES)
+            except MaxRetriesExceededError:
+                update_source_status(
+                    source_id,
+                    "failed",
+                    f"Scraping provider rate limit exceeded after retries: {e}",
+                    task_id,
+                    error_code="rate_limited",
+                )
+                return {"status": "error", "source_id": source_id, "error": str(e)}
+        if status_code in PERMANENT_STATUSES:
+            update_source_status(source_id, "failed", str(e), task_id, error_code="permanent")
+            return {"status": "error", "source_id": source_id, "error": str(e)}
+        # 5xx / transport errors: bounded retry on the task's default budget.
+        try:
+            raise self.retry(exc=e)
+        except MaxRetriesExceededError:
+            update_source_status(source_id, "failed", str(e), task_id, error_code="transient")
+            return {"status": "error", "source_id": source_id, "error": str(e)}
 
     except Retry:
         # Celery's self.retry() raises Retry; re-raise so the Celery worker
@@ -346,7 +405,7 @@ def extract_url_source(
 
     except Exception as e:
         logger.exception("URL extraction failed for source %s", source_id)
-        update_source_status(source_id, "failed", str(e), task_id)
+        update_source_status(source_id, "failed", str(e), task_id, error_code="internal")
         return {"status": "error", "source_id": source_id, "error": str(e)}
 
 

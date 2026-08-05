@@ -2,7 +2,6 @@
 """Rate-limit behavior of extract_url_source: pacing, 429 re-queue,
 permanent-vs-transient classification, and terminal error codes."""
 
-import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -35,9 +34,7 @@ def status_calls(monkeypatch):
         "update_source_status",
         lambda *a, **kw: calls.append((a, kw)),
     )
-    monkeypatch.setattr(
-        url_mod, "update_source_extraction_result", lambda *a, **kw: None
-    )
+    monkeypatch.setattr(url_mod, "update_source_extraction_result", lambda *a, **kw: None)
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
     monkeypatch.setattr(
         url_mod,
@@ -65,9 +62,7 @@ def _fake_httpx_client(monkeypatch, status_code, headers=None):
                 raise httpx.HTTPStatusError(
                     f"{self.status_code}",
                     request=httpx.Request("POST", "https://example.invalid/v1/scrape"),
-                    response=SimpleNamespace(
-                        status_code=self.status_code, headers=self.headers
-                    ),
+                    response=SimpleNamespace(status_code=self.status_code, headers=self.headers),
                 )
 
         def json(self):
@@ -102,9 +97,7 @@ def retry_spy(monkeypatch):
 
 def test_pacing_denial_requeues(status_calls, retry_spy, monkeypatch):
     _fake_httpx_client(monkeypatch, 200)
-    monkeypatch.setattr(
-        url_mod.external_limiter, "try_acquire", lambda *a, **kw: 12.5
-    )
+    monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: 12.5)
     with pytest.raises(Retry):
         url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
     kwargs = retry_spy.call_args.kwargs
@@ -116,9 +109,7 @@ def test_pacing_denial_requeues(status_calls, retry_spy, monkeypatch):
 
 def test_429_requeues_with_retry_after(status_calls, retry_spy, monkeypatch):
     _fake_httpx_client(monkeypatch, 429, headers={"Retry-After": "42"})
-    monkeypatch.setattr(
-        url_mod.external_limiter, "try_acquire", lambda *a, **kw: None
-    )
+    monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
     with pytest.raises(Retry):
         url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
     kwargs = retry_spy.call_args.kwargs
@@ -126,21 +117,15 @@ def test_429_requeues_with_retry_after(status_calls, retry_spy, monkeypatch):
     assert kwargs["max_retries"] == url_mod.RATE_LIMIT_MAX_RETRIES
 
 
-def test_429_budget_exhausted_fails_with_rate_limited(
-    status_calls, monkeypatch
-):
+def test_429_budget_exhausted_fails_with_rate_limited(status_calls, monkeypatch):
     _fake_httpx_client(monkeypatch, 429, headers={"Retry-After": "42"})
-    monkeypatch.setattr(
-        url_mod.external_limiter, "try_acquire", lambda *a, **kw: None
-    )
+    monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
     monkeypatch.setattr(
         url_mod.extract_url_source,
         "retry",
         MagicMock(side_effect=MaxRetriesExceededError()),
     )
-    result = url_mod.extract_url_source.run(
-        "src-1", "bucket-1", "https://example.com"
-    )
+    result = url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
     assert result["status"] == "error"
     terminal = [c for c in status_calls if "failed" in c[0]]
     assert terminal and terminal[-1][1].get("error_code") == "rate_limited"
@@ -148,12 +133,8 @@ def test_429_budget_exhausted_fails_with_rate_limited(
 
 def test_permanent_4xx_fails_immediately(status_calls, retry_spy, monkeypatch):
     _fake_httpx_client(monkeypatch, 404)
-    monkeypatch.setattr(
-        url_mod.external_limiter, "try_acquire", lambda *a, **kw: None
-    )
-    result = url_mod.extract_url_source.run(
-        "src-1", "bucket-1", "https://example.com"
-    )
+    monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
+    result = url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
     assert result["status"] == "error"
     retry_spy.assert_not_called()
     terminal = [c for c in status_calls if "failed" in c[0]]
@@ -162,17 +143,13 @@ def test_permanent_4xx_fails_immediately(status_calls, retry_spy, monkeypatch):
 
 def test_5xx_retries_then_transient(status_calls, monkeypatch):
     _fake_httpx_client(monkeypatch, 503)
-    monkeypatch.setattr(
-        url_mod.external_limiter, "try_acquire", lambda *a, **kw: None
-    )
+    monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
     monkeypatch.setattr(
         url_mod.extract_url_source,
         "retry",
         MagicMock(side_effect=MaxRetriesExceededError()),
     )
-    result = url_mod.extract_url_source.run(
-        "src-1", "bucket-1", "https://example.com"
-    )
+    result = url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
     assert result["status"] == "error"
     terminal = [c for c in status_calls if "failed" in c[0]]
     assert terminal and terminal[-1][1].get("error_code") == "transient"
@@ -180,20 +157,14 @@ def test_5xx_retries_then_transient(status_calls, monkeypatch):
 
 def test_success_path_unaffected(status_calls, retry_spy, monkeypatch, mock_db_session):
     _fake_httpx_client(monkeypatch, 200)
-    monkeypatch.setattr(
-        url_mod.external_limiter, "try_acquire", lambda *a, **kw: None
-    )
+    monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
     monkeypatch.setattr(
         url_mod,
         "get_storage",
-        lambda: SimpleNamespace(
-            ensure_bucket=lambda *a: None, upload=lambda **kw: "sources/x"
-        ),
+        lambda: SimpleNamespace(ensure_bucket=lambda *a: None, upload=lambda **kw: "sources/x"),
     )
     monkeypatch.setattr(url_mod, "get_derivative_storage_path", lambda *a, **kw: "x")
     monkeypatch.setattr(url_mod, "get_source_storage_path", lambda *a, **kw: "x")
     mock_db_session.execute.return_value.scalar.return_value = "extracting"
-    result = url_mod.extract_url_source.run(
-        "src-1", "bucket-1", "https://example.com"
-    )
+    result = url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
     assert result["status"] == "success"

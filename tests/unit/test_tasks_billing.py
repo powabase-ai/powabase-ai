@@ -661,6 +661,9 @@ def _stub_url_extraction(monkeypatch, url_mod, mock_db_session):
     monkeypatch.setattr(
         url_mod, "get_setting", lambda k: "fake-key" if k.startswith("FIRECRAWL") else 1
     )
+    # get_setting above returns the string "fake-key" for FIRECRAWL_RATE_LIMIT_PER_MINUTE
+    # too, which would break try_acquire's arithmetic — stub the limiter directly.
+    monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
 
     class FakeClient:
         def __init__(self, *_a, **_kw):
@@ -944,9 +947,9 @@ def test_extraction_charge_insufficient_credits_does_not_fail_op(monkeypatch, mo
     assert result["status"] == "success"
     assert result["source_id"] == "src-1"
     failed_calls = [c for c in status_calls if (len(c[0]) >= 2 and c[0][1] == "failed")]
-    assert (
-        failed_calls == []
-    ), f"Expected NO 'failed' status updates after post-success 402; got: {failed_calls}"
+    assert failed_calls == [], (
+        f"Expected NO 'failed' status updates after post-success 402; got: {failed_calls}"
+    )
 
 
 def test_url_extraction_charge_insufficient_credits_does_not_fail_op(monkeypatch, mock_db_session):
@@ -967,9 +970,9 @@ def test_url_extraction_charge_insufficient_credits_does_not_fail_op(monkeypatch
 
     assert result["status"] == "success"
     failed_calls = [c for c in status_calls if (len(c[0]) >= 2 and c[0][1] == "failed")]
-    assert (
-        failed_calls == []
-    ), f"Expected NO 'failed' status updates after post-success 402; got: {failed_calls}"
+    assert failed_calls == [], (
+        f"Expected NO 'failed' status updates after post-success 402; got: {failed_calls}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -982,6 +985,6 @@ def test_tasks_do_not_import_removed_insufficient_credits(filename: str):
     or reference would be dead code and a hint that try/except boilerplate
     was reintroduced."""
     src = _read(TASKS_DIR / filename)
-    assert (
-        "InsufficientCredits" not in src
-    ), f"{filename}: InsufficientCredits has been removed; remove the reference"
+    assert "InsufficientCredits" not in src, (
+        f"{filename}: InsufficientCredits has been removed; remove the reference"
+    )
