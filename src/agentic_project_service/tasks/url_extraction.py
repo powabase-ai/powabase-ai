@@ -126,13 +126,12 @@ def extract_url_source(
             # would leave the source permanently `failed` for every URL
             # submitted during a misconfig window. countdown=600 / max_retries=24
             # gives the operator ~4 hours to fix the missing key and roll the
-            # affected pods; after that the retry chain exhausts and Celery
-            # raises MaxRetriesExceededError, which is NOT a Retry subclass
-            # so it falls through to the generic `except Exception` clause
-            # below and the source lands in `failed` with the underlying
-            # exception text. If you add an exception clause between
-            # `except Retry` and `except Exception`, make sure it doesn't
-            # accidentally swallow MaxRetriesExceededError.
+            # affected pods; after that the retry budget is exhausted and
+            # `self.retry(exc=...)` re-raises the RuntimeError passed as `exc`
+            # (not MaxRetriesExceededError, since `exc` was supplied — see the
+            # matching note below), so it falls through to the generic
+            # `except Exception` clause below and the source lands in `failed`
+            # with the underlying exception text.
             raise self.retry(
                 exc=RuntimeError("FIRECRAWL_API_KEY missing from pod env"),
                 countdown=600,

@@ -1270,7 +1270,7 @@ def reextract_source(source_id: str):
     db.session.execute(
         text(f"""
             UPDATE "{AI_SCHEMA}".sources
-            SET extraction_status = 'pending', error_message = NULL,
+            SET extraction_status = 'pending', error_message = NULL, error_code = NULL,
                 auto_metadata = CAST(:auto_metadata AS jsonb), updated_at = NOW()
             WHERE id = :id
         """),
