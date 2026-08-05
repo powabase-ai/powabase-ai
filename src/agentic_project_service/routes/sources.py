@@ -22,6 +22,7 @@ from ..celery import celery_app
 from ..db import db, AI_SCHEMA
 from ..services.ai_provider_keys_resolver import get_all_user_provider_keys
 from ..services import billing_port as billing
+from ..services.rate_limit import external_limiter
 from ..services.settings_registry import EXTRACTION_METHOD_CHOICES, get_setting
 from ..services.storage import (
     StorageError,
@@ -544,21 +545,26 @@ def _discover_urls_crawl(url: str, max_pages: int) -> list[str]:
     firecrawl_key = os.environ.get("FIRECRAWL_API_KEY", "")
     firecrawl_base = get_setting("FIRECRAWL_API_BASE").rstrip("/")
 
-    try:
-        with httpx.Client(timeout=30) as client:
-            resp = client.post(
-                f"{firecrawl_base}/map",
-                headers={"Authorization": f"Bearer {firecrawl_key}"},
-                json={"url": url, "limit": max_pages},
+    rate_limit = get_setting("FIRECRAWL_RATE_LIMIT_PER_MINUTE")
+    if external_limiter.acquire_blocking("firecrawl", rate_limit, timeout_s=5.0):
+        try:
+            with httpx.Client(timeout=30) as client:
+                resp = client.post(
+                    f"{firecrawl_base}/map",
+                    headers={"Authorization": f"Bearer {firecrawl_key}"},
+                    json={"url": url, "limit": max_pages},
+                )
+                resp.raise_for_status()
+                links = resp.json().get("links", [])
+                if links:
+                    return [u for u in links if _validate_url(u)][:max_pages]
+        except Exception:
+            logger.warning(
+                "Firecrawl /v1/map failed, falling back to HTML link extraction",
+                exc_info=True,
             )
-            resp.raise_for_status()
-            links = resp.json().get("links", [])
-            if links:
-                return [u for u in links if _validate_url(u)][:max_pages]
-    except Exception:
-        logger.warning(
-            "Firecrawl /v1/map failed, falling back to HTML link extraction", exc_info=True
-        )
+    else:
+        logger.info("Firecrawl rate limited — skipping /map, using HTML fallback")
 
     # Fallback: scrape page HTML and extract <a href>
     try:
