@@ -220,22 +220,6 @@ def test_ocr_extraction_methods_set_matches_pdf_extractor_methods():
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def mock_db_session(monkeypatch):
-    """Stub the global db.session so task body can run without a real DB."""
-    from agentic_project_service.tasks import extraction as ext_mod
-    from agentic_project_service.tasks import indexing as idx_mod
-    from agentic_project_service.tasks import url_extraction as url_mod
-    from agentic_project_service.tasks import enrichment as enr_mod
-
-    fake_session = MagicMock()
-    monkeypatch.setattr(ext_mod.db, "session", fake_session, raising=False)
-    monkeypatch.setattr(idx_mod.db, "session", fake_session, raising=False)
-    monkeypatch.setattr(url_mod.db, "session", fake_session, raising=False)
-    monkeypatch.setattr(enr_mod.db, "session", fake_session, raising=False)
-    return fake_session
-
-
 def _ext_source() -> dict:
     return {
         "id": "src-1",
