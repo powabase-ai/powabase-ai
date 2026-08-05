@@ -136,32 +136,43 @@ def test_429_requeues_with_retry_after(status_calls, retry_spy, monkeypatch):
     assert kwargs["max_retries"] == url_mod.RATE_LIMIT_MAX_RETRIES
 
 
-def test_429_budget_exhausted_fails_with_rate_limited(status_calls, monkeypatch):
+def test_429_budget_exhausted_fails_with_rate_limited(status_calls, monkeypatch, caplog):
     _fake_httpx_client(monkeypatch, 429, headers={"Retry-After": "42"})
     monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
     with _at_retry_budget(url_mod.RATE_LIMIT_MAX_RETRIES):
         result = url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
     assert result["status"] == "error"
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors, "budget exhaustion must log at ERROR level"
+    assert not any("re-queueing" in r.getMessage() for r in caplog.records), (
+        "the failing attempt must not log a misleading re-queue message"
+    )
     terminal = [c for c in status_calls if "failed" in c[0]]
     assert terminal and terminal[-1][1].get("error_code") == "rate_limited"
 
 
-def test_permanent_4xx_fails_immediately(status_calls, retry_spy, monkeypatch):
+def test_permanent_4xx_fails_immediately(status_calls, retry_spy, monkeypatch, caplog):
     _fake_httpx_client(monkeypatch, 404)
     monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
     result = url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
     assert result["status"] == "error"
     retry_spy.assert_not_called()
+    assert any(r.levelname == "ERROR" for r in caplog.records), (
+        "permanent failures must log at ERROR level"
+    )
     terminal = [c for c in status_calls if "failed" in c[0]]
     assert terminal and terminal[-1][1].get("error_code") == "permanent"
 
 
-def test_5xx_retries_then_transient(status_calls, monkeypatch):
+def test_5xx_retries_then_transient(status_calls, monkeypatch, caplog):
     _fake_httpx_client(monkeypatch, 503)
     monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
     with _at_retry_budget(url_mod.extract_url_source.max_retries):
         result = url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
     assert result["status"] == "error"
+    assert any(r.levelname == "ERROR" for r in caplog.records), (
+        "transient exhaustion must log at ERROR level"
+    )
     terminal = [c for c in status_calls if "failed" in c[0]]
     assert terminal and terminal[-1][1].get("error_code") == "transient"
 

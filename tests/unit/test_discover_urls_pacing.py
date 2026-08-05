@@ -71,3 +71,45 @@ def test_allowed_limiter_calls_map(monkeypatch):
     monkeypatch.setattr(sources_mod.httpx, "Client", FakeClient)
     urls = sources_mod._discover_urls_crawl("https://example.com", 10)
     assert urls == ["https://example.com/a"]
+
+
+def test_map_auth_failure_logs_error(monkeypatch, caplog):
+    """A 401/403 from Firecrawl /map means the platform key is bad —
+    that must be loud (ERROR), not a silent WARNING-level fallback."""
+    import httpx as _httpx
+
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "revoked-key")
+    monkeypatch.setattr(sources_mod, "get_setting", _settings)
+    monkeypatch.setattr(
+        sources_mod.external_limiter, "acquire_blocking", lambda *a, **kw: True
+    )
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, **kw):
+            raise _httpx.HTTPStatusError(
+                "401",
+                request=_httpx.Request("POST", url),
+                response=type("R", (), {"status_code": 401})(),
+            )
+
+        def get(self, url, **kw):
+            r = MagicMock()
+            r.raise_for_status.return_value = None
+            r.text = '<a href="https://example.com/page1">x</a>'
+            return r
+
+    monkeypatch.setattr(sources_mod.httpx, "Client", FakeClient)
+    urls = sources_mod._discover_urls_crawl("https://example.com", 10)
+    assert "https://example.com/page1" in urls  # fallback still works
+    assert any(r.levelname == "ERROR" for r in caplog.records), (
+        "auth failure against Firecrawl must log at ERROR level"
+    )
