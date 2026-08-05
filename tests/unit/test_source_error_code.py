@@ -37,3 +37,18 @@ def test_source_serializers_include_error_code():
     src = inspect.getsource(sources_mod)
     # Both raw-SQL serializers must select and emit the column.
     assert src.count('"error_code"') >= 2, "list_sources and get_source must both emit error_code"
+
+
+def test_reextract_route_clears_error_code():
+    """A re-extracted source must not keep serving a stale failure class
+    (e.g. error_code='rate_limited') while its status is reset to pending."""
+    import inspect
+
+    from agentic_project_service.routes.sources import reextract_source
+
+    src = inspect.getsource(reextract_source)
+    assert "error_message = NULL" in src, "sanity check: reset UPDATE not found as expected"
+    assert "error_code = NULL" in src, (
+        "reextract's UPDATE resets error_message but not error_code — "
+        "a re-extracted source keeps serving its stale failure class while pending"
+    )
