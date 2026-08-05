@@ -92,22 +92,16 @@ def _exa_resp(status, headers=None):
 
 
 def test_web_search_denied_by_limiter_returns_platform_error(monkeypatch):
-    monkeypatch.setattr(
-        builtin_mod.external_limiter, "acquire_blocking", lambda *a, **kw: False
-    )
+    monkeypatch.setattr(builtin_mod.external_limiter, "acquire_blocking", lambda *a, **kw: False)
     result = json.loads(builtin_mod.web_search_handler({"query": "q"}, {}))
     assert result["_platform_error"] is True
     assert "rate limited" in result["error"].lower()
 
 
 def test_web_search_retries_once_on_429(monkeypatch):
-    monkeypatch.setattr(
-        builtin_mod.external_limiter, "acquire_blocking", lambda *a, **kw: True
-    )
+    monkeypatch.setattr(builtin_mod.external_limiter, "acquire_blocking", lambda *a, **kw: True)
     monkeypatch.setattr(builtin_mod.time, "sleep", lambda s: None)
-    post = MagicMock(
-        side_effect=[_exa_resp(429, headers={"Retry-After": "2"}), _exa_resp(200)]
-    )
+    post = MagicMock(side_effect=[_exa_resp(429, headers={"Retry-After": "2"}), _exa_resp(200)])
     monkeypatch.setattr(builtin_mod.http_requests, "post", post)
     result = json.loads(builtin_mod.web_search_handler({"query": "q"}, {}))
     # web_search_handler's success path returns a bare JSON array of results
@@ -118,9 +112,7 @@ def test_web_search_retries_once_on_429(monkeypatch):
 
 
 def test_web_search_second_429_returns_platform_error(monkeypatch):
-    monkeypatch.setattr(
-        builtin_mod.external_limiter, "acquire_blocking", lambda *a, **kw: True
-    )
+    monkeypatch.setattr(builtin_mod.external_limiter, "acquire_blocking", lambda *a, **kw: True)
     monkeypatch.setattr(builtin_mod.time, "sleep", lambda s: None)
     post = MagicMock(return_value=_exa_resp(429, headers={"Retry-After": "2"}))
     monkeypatch.setattr(builtin_mod.http_requests, "post", post)

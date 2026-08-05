@@ -15,9 +15,7 @@ def _settings(key):
 def test_denied_limiter_skips_map_and_uses_fallback(monkeypatch):
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
     monkeypatch.setattr(sources_mod, "get_setting", _settings)
-    monkeypatch.setattr(
-        sources_mod.external_limiter, "acquire_blocking", lambda *a, **kw: False
-    )
+    monkeypatch.setattr(sources_mod.external_limiter, "acquire_blocking", lambda *a, **kw: False)
 
     calls = []
 
@@ -52,9 +50,7 @@ def test_denied_limiter_skips_map_and_uses_fallback(monkeypatch):
 def test_allowed_limiter_calls_map(monkeypatch):
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
     monkeypatch.setattr(sources_mod, "get_setting", _settings)
-    monkeypatch.setattr(
-        sources_mod.external_limiter, "acquire_blocking", lambda *a, **kw: True
-    )
+    monkeypatch.setattr(sources_mod.external_limiter, "acquire_blocking", lambda *a, **kw: True)
 
     class FakeClient:
         def __init__(self, *a, **kw):

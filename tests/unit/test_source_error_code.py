@@ -36,6 +36,4 @@ def test_source_serializers_include_error_code():
 
     src = inspect.getsource(sources_mod)
     # Both raw-SQL serializers must select and emit the column.
-    assert src.count('"error_code"') >= 2, (
-        "list_sources and get_source must both emit error_code"
-    )
+    assert src.count('"error_code"') >= 2, "list_sources and get_source must both emit error_code"
