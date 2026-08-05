@@ -329,6 +329,34 @@ def _build_registry() -> dict[str, SettingDef]:
             description="Base URL for Firecrawl API. Change for self-hosted instances.",
         ),
         SettingDef(
+            key="FIRECRAWL_RATE_LIMIT_PER_MINUTE",
+            category=cat,
+            label="Firecrawl Rate Limit (per minute)",
+            type="int",
+            default=30,
+            min=1,
+            max=5000,
+            advanced=True,
+            description=(
+                "Max Firecrawl requests per minute for this project. "
+                "Keeps concurrent scrapes within the shared account's plan limit."
+            ),
+        ),
+        SettingDef(
+            key="EXA_RATE_LIMIT_PER_MINUTE",
+            category=cat,
+            label="Exa Rate Limit (per minute)",
+            type="int",
+            default=60,
+            min=1,
+            max=5000,
+            advanced=True,
+            description=(
+                "Max Exa search requests per minute for this project. "
+                "Keeps concurrent searches within the shared account's plan limit."
+            ),
+        ),
+        SettingDef(
             key="VISION_MODEL",
             category=cat,
             label="Vision Analysis Model",
