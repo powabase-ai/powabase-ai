@@ -179,7 +179,7 @@ def test_5xx_retries_then_transient(status_calls, retry_spy, monkeypatch, caplog
         "src-1",
         "bucket-1",
         "https://example.com",
-        retry_counts={"transient": url_mod.extract_url_source.max_retries},
+        retry_counts={"transient": url_mod.TRANSIENT_MAX_RETRIES},
     )
     assert result["status"] == "error"
     retry_spy.assert_not_called()
@@ -219,6 +219,26 @@ def test_missing_key_budget_exhaustion_internal(status_calls, retry_spy, monkeyp
     assert any(r.levelname == "ERROR" for r in caplog.records)
     terminal = [c for c in status_calls if "failed" in c[0]]
     assert terminal and terminal[-1][1].get("error_code") == "internal"
+
+
+def test_429_requeues_via_real_retry_despite_prior_celery_retries(status_calls, monkeypatch):
+    """Exercises the REAL Task.retry: with 3 prior retries on Celery's shared
+    request.retries counter and per-cause budget remaining, a 429 must still
+    raise Retry. Celery resolves a per-call ``max_retries=None`` to the task
+    default (NOT unlimited), so unless the task itself declares
+    ``max_retries=None``, the shared counter re-raises the original exception
+    here — stranding the source in 'extracting' with no status update."""
+    _fake_httpx_client(monkeypatch, 429, headers={"Retry-After": "42"})
+    monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
+    url_mod.extract_url_source.push_request(
+        retries=3, id="task-1", called_directly=False, is_eager=True
+    )
+    try:
+        with pytest.raises(Retry):
+            url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
+    finally:
+        url_mod.extract_url_source.pop_request()
+    assert not [c for c in status_calls if "failed" in c[0]]
 
 
 def test_success_path_unaffected(status_calls, retry_spy, monkeypatch, mock_db_session):
