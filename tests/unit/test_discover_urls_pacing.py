@@ -80,9 +80,7 @@ def test_map_auth_failure_logs_error(monkeypatch, caplog):
 
     monkeypatch.setenv("FIRECRAWL_API_KEY", "revoked-key")
     monkeypatch.setattr(sources_mod, "get_setting", _settings)
-    monkeypatch.setattr(
-        sources_mod.external_limiter, "acquire_blocking", lambda *a, **kw: True
-    )
+    monkeypatch.setattr(sources_mod.external_limiter, "acquire_blocking", lambda *a, **kw: True)
 
     class FakeClient:
         def __init__(self, *a, **kw):
