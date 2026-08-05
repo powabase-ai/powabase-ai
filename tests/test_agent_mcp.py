@@ -1,5 +1,10 @@
 """Tests for agent MCP server CRUD endpoints."""
 
+import uuid
+
+from agentic.mcp import McpError
+from agentic.mcp.types import McpToolInfo
+
 
 class TestMcpServerCRUD:
     def test_add_mcp_server(self, client, mock_auth, auth_headers, test_agent):
@@ -124,3 +129,75 @@ class TestMcpServerCRUD:
             headers=auth_headers,
         )
         assert resp.status_code == 404
+
+
+class TestMcpToolDiscovery:
+    def _add_server(self, client, auth_headers, agent_id):
+        resp = client.post(
+            f"/api/agents/{agent_id}/mcp-servers",
+            json={
+                "name": "github",
+                "transport": "http",
+                "url": "https://mcp-github.example.com",
+            },
+            headers=auth_headers,
+        )
+        return resp.get_json()["id"]
+
+    def test_discover_returns_tools(
+        self, client, mock_auth, auth_headers, test_agent, mocker
+    ):
+        server_id = self._add_server(client, auth_headers, test_agent["id"])
+        mocker.patch(
+            "agentic_project_service.routes.agents.discover_mcp_tools",
+            return_value=[
+                McpToolInfo(
+                    name="create_issue",
+                    description="Create an issue",
+                    input_schema={"type": "object"},
+                )
+            ],
+        )
+
+        resp = client.get(
+            f"/api/agents/{test_agent['id']}/mcp-servers/{server_id}/tools",
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 200
+        tools = resp.get_json()["tools"]
+        assert len(tools) == 1
+        assert tools[0]["name"] == "create_issue"
+        assert tools[0]["description"] == "Create an issue"
+        assert tools[0]["input_schema"] == {"type": "object"}
+
+    def test_discover_unknown_server_returns_404(
+        self, client, mock_auth, auth_headers, test_agent
+    ):
+        resp = client.get(
+            f"/api/agents/{test_agent['id']}/mcp-servers/{uuid.uuid4()}/tools",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 404
+        assert resp.get_json()["error"] == "MCP server not found"
+
+    def test_discover_surfaces_server_error_as_502(
+        self, client, mock_auth, auth_headers, test_agent, mocker
+    ):
+        server_id = self._add_server(client, auth_headers, test_agent["id"])
+        mocker.patch(
+            "agentic_project_service.routes.agents.discover_mcp_tools",
+            side_effect=McpError(
+                "MCP server returned HTTP 406: Not Acceptable: Client must "
+                "accept both application/json and text/event-stream"
+            ),
+        )
+
+        resp = client.get(
+            f"/api/agents/{test_agent['id']}/mcp-servers/{server_id}/tools",
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 502
+        assert "406" in resp.get_json()["error"]
+        assert "Not Acceptable" in resp.get_json()["error"]
