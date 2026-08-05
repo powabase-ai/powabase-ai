@@ -197,3 +197,81 @@ class TestMcpToolDiscovery:
         assert resp.status_code == 502
         assert "406" in resp.get_json()["error"]
         assert "Not Acceptable" in resp.get_json()["error"]
+
+    def test_discover_server_of_another_agent_is_404_and_never_contacted(
+        self, client, mock_auth, auth_headers, test_agent, mocker
+    ):
+        server_id = self._add_server(client, auth_headers, test_agent["id"])
+        other_agent = client.post(
+            "/api/agents",
+            json={"name": "Other Agent", "model": "gpt-4o-mini"},
+            headers=auth_headers,
+        ).get_json()
+        spy = mocker.patch("agentic_project_service.routes.agents.discover_mcp_tools")
+
+        resp = client.get(
+            f"/api/agents/{other_agent['id']}/mcp-servers/{server_id}/tools",
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 404
+        assert resp.get_json()["error"] == "MCP server not found"
+        # The tenancy check must gate the outbound request, not just the
+        # response shape.
+        spy.assert_not_called()
+
+    def test_discover_bounds_the_reflected_error_message(
+        self, client, mock_auth, auth_headers, test_agent, mocker
+    ):
+        # Only the client's HTTP-error path truncates upstream text. A server
+        # answering 200 with a huge JSON-RPC error.message reaches this route
+        # unbounded, so the route must cap what it reflects.
+        server_id = self._add_server(client, auth_headers, test_agent["id"])
+        mocker.patch(
+            "agentic_project_service.routes.agents.discover_mcp_tools",
+            side_effect=McpError("MCP tools/list failed: " + "x" * 10_000),
+        )
+
+        resp = client.get(
+            f"/api/agents/{test_agent['id']}/mcp-servers/{server_id}/tools",
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 502
+        assert len(resp.get_json()["error"]) <= 500
+
+
+class TestMcpDegradeLogging:
+    def test_discovery_failure_log_names_the_agent_and_keeps_the_traceback(
+        self, app, client, mock_auth, auth_headers, test_agent, mocker, caplog
+    ):
+        client.post(
+            f"/api/agents/{test_agent['id']}/mcp-servers",
+            json={
+                "name": "github",
+                "transport": "http",
+                "url": "https://mcp-github.example.com",
+            },
+            headers=auth_headers,
+        )
+        mocker.patch(
+            "agentic.mcp.client.discover_mcp_tools",
+            side_effect=RuntimeError("boom"),
+        )
+
+        from agentic_project_service.db import db
+        from agentic_project_service.services import tool_registry
+
+        with app.app_context(), caplog.at_level("WARNING"):
+            tools = tool_registry.build_mcp_tools_for_agent(
+                test_agent["id"], db.session
+            )
+
+        assert tools == {}
+        record = next(r for r in caplog.records if "MCP server" in r.message)
+        # Server names are only unique per agent, so without the agent id the
+        # log cannot answer "whose server failed".
+        assert str(test_agent["id"]) in record.getMessage()
+        # The broad except exists so agent runs degrade; when it eventually
+        # catches a programming error, the traceback must be in the log.
+        assert record.exc_info

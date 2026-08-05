@@ -866,7 +866,10 @@ def discover_mcp_server_tools(agent_id: str, server_id: str):
     try:
         tools = discover_mcp_tools(server.url, server.headers or {}, timeout=10)
     except McpError as e:
-        return jsonify({"error": str(e)}), 502
+        # Cap the reflection here rather than trusting the client library to
+        # truncate: a server answering 200 with a huge JSON-RPC error.message
+        # arrives unbounded.
+        return jsonify({"error": str(e)[:500]}), 502
 
     return jsonify(
         {
