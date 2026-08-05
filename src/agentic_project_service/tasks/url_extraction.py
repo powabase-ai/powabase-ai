@@ -144,12 +144,16 @@ def extract_url_source(
         rate_limit = get_setting("FIRECRAWL_RATE_LIMIT_PER_MINUTE")
         wait = external_limiter.try_acquire("firecrawl", rate_limit)
         if wait is not None:
-            logger.info("Firecrawl pacing: deferring source %s by %.1fs", source_id, wait)
             # Celery's Task.retry(exc=...) re-raises `exc` itself (not
             # MaxRetriesExceededError) once the budget is exhausted, so the
             # exhaustion check has to happen BEFORE calling retry() — an
             # `except MaxRetriesExceededError` here would never fire.
             if self.request.retries >= RATE_LIMIT_MAX_RETRIES:
+                logger.error(
+                    "Firecrawl pacing budget exhausted for source %s after %d attempts",
+                    source_id,
+                    self.request.retries,
+                )
                 update_source_status(
                     source_id,
                     "failed",
@@ -162,6 +166,7 @@ def extract_url_source(
                     "source_id": source_id,
                     "error": "Firecrawl rate limit pacing budget exhausted",
                 }
+            logger.info("Firecrawl pacing: deferring source %s by %.1fs", source_id, wait)
             raise self.retry(
                 exc=RuntimeError("Firecrawl rate limit pacing"),
                 countdown=wait + random.uniform(0, 5),
@@ -386,8 +391,12 @@ def extract_url_source(
         status_code = getattr(getattr(e, "response", None), "status_code", None)
         if status_code == 429:
             delay = parse_retry_after(e.response.headers.get("Retry-After")) + random.uniform(0, 5)
-            logger.warning("Firecrawl 429 for source %s — re-queueing in %.1fs", source_id, delay)
             if self.request.retries >= RATE_LIMIT_MAX_RETRIES:
+                logger.error(
+                    "Firecrawl 429 for source %s — retry budget exhausted after %d attempts",
+                    source_id,
+                    self.request.retries,
+                )
                 update_source_status(
                     source_id,
                     "failed",
@@ -396,12 +405,21 @@ def extract_url_source(
                     error_code="rate_limited",
                 )
                 return {"status": "error", "source_id": source_id, "error": str(e)}
+            logger.warning("Firecrawl 429 for source %s — re-queueing in %.1fs", source_id, delay)
             raise self.retry(exc=e, countdown=delay, max_retries=RATE_LIMIT_MAX_RETRIES)
         if status_code in PERMANENT_STATUSES:
+            logger.error(
+                "Firecrawl permanent error %s for source %s: %s", status_code, source_id, e
+            )
             update_source_status(source_id, "failed", str(e), task_id, error_code="permanent")
             return {"status": "error", "source_id": source_id, "error": str(e)}
         # 5xx / transport errors: bounded retry on the task's default budget.
         if self.request.retries >= self.max_retries:
+            logger.error(
+                "Firecrawl transient error for source %s — retry budget exhausted: %s",
+                source_id,
+                e,
+            )
             update_source_status(source_id, "failed", str(e), task_id, error_code="transient")
             return {"status": "error", "source_id": source_id, "error": str(e)}
         raise self.retry(exc=e)

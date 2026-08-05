@@ -558,11 +558,21 @@ def _discover_urls_crawl(url: str, max_pages: int) -> list[str]:
                 links = resp.json().get("links", [])
                 if links:
                     return [u for u in links if _validate_url(u)][:max_pages]
-        except Exception:
-            logger.warning(
-                "Firecrawl /v1/map failed, falling back to HTML link extraction",
-                exc_info=True,
-            )
+        except Exception as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code in (401, 403):
+                # A rejected platform key silently downgrades every crawl to
+                # naive HTML link-scraping — make that operator-visible.
+                logger.error(
+                    "Firecrawl /v1/map auth failure (%s) — platform API key "
+                    "rejected; crawl discovery degraded to HTML fallback",
+                    status_code,
+                )
+            else:
+                logger.warning(
+                    "Firecrawl /v1/map failed, falling back to HTML link extraction",
+                    exc_info=True,
+                )
     else:
         logger.info("Firecrawl rate limited — skipping /map, using HTML fallback")
 
