@@ -1,19 +1,17 @@
 name: Publish
 on:
+  # Fired when the release PR is merged. Separate from the release job on
+  # purpose: a failed publish is then independently re-runnable from the Actions
+  # tab without re-cutting the release. Registry tags are immutable, so a
+  # half-finished release must be resumable, not repeatable.
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
-      version:
-        # Image tag ONLY. It used to double as AGENTIC_VERSION, which meant the
-        # tag had to already exist on PyPI as a powabase-agentic release. The
-        # agentic version now comes from uv.lock, so this is free of that.
-        description: "image tag, e.g. 0.1.0rc1"
+      tag:
+        description: "Existing release tag to (re)publish, e.g. v0.1.1"
         required: true
         type: string
-      dry_run:
-        description: "Build only; push nothing"
-        required: true
-        default: true
-        type: boolean
 
 permissions:
   contents: read
@@ -27,7 +25,20 @@ jobs:
     name: powabase-ai → ghcr (amd64+arm64)
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve version
+        id: v
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.release.tag_name || inputs.tag }}"
+          test -n "$REF" || { echo "::error::no release tag and no tag input"; exit 1; }
+          echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
+          echo "ref=${REF}"       >> "$GITHUB_OUTPUT"
+
+      # Build the released commit, not the branch tip. Without `ref:` a re-run
+      # after further merges would publish an image the tag does not name.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.v.outputs.ref }}
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - name: Login to ghcr
@@ -36,11 +47,32 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build (+push on real run)
+
+      # The agentic version is a property of the LOCK, not of this repo's tag or
+      # of the git SHA, so it cannot be derived from either — it has to be read
+      # out and recorded as a label. Without it, answering "which agentic does
+      # this image contain?" means pulling the image and looking inside.
+      - name: Read the locked agentic version
+        id: agentic
+        run: |
+          set -euo pipefail
+          V=$(awk '/^\[\[package\]\]/{b=""} {b=b"\n"$0} /^version = /{if (b ~ /name = "powabase-agentic"/){print $3; exit}}' uv.lock | tr -d '"')
+          test -n "$V" || { echo "::error::could not read powabase-agentic from uv.lock"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ inputs.dry_run == false }}
-          tags: ${{ env.IMAGE }}:${{ inputs.version }}
+          # No build-args. The agentic version comes from uv.lock — see Dockerfile.
+          # No dry-run branch either: every `release: published` run is real, and
+          # a push an input can skip is a push that can silently not happen.
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.powabase.agentic.version=${{ steps.agentic.outputs.version }}
