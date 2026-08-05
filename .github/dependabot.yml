@@ -1,0 +1,14 @@
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      # `fix` because a dependency change alters runtime behaviour and must cut
+      # a release. `chore` would update the lock and publish no image carrying
+      # it — a silent no-op. Applies to every production dependency in this
+      # ecosystem entry, not just one of them.
+      prefix: "fix"
+      prefix-development: "chore"
+      include: "scope"
