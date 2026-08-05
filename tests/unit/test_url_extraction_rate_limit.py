@@ -2,12 +2,13 @@
 """Rate-limit behavior of extract_url_source: pacing, 429 re-queue,
 permanent-vs-transient classification, and terminal error codes."""
 
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
-from celery.exceptions import MaxRetriesExceededError, Retry
+from celery.exceptions import Retry
 
 import agentic_project_service.tasks.url_extraction as url_mod
 
@@ -95,6 +96,24 @@ def retry_spy(monkeypatch):
     return spy
 
 
+@contextlib.contextmanager
+def _at_retry_budget(retries):
+    """Run with a fabricated Celery request context that has already used
+    ``retries`` attempts, so the task's own pre-retry budget check — not a
+    mocked ``self.retry`` — decides whether the call is exhausted. Celery's
+    real ``Task.retry(exc=...)`` re-raises ``exc`` itself once the budget is
+    exhausted (never ``MaxRetriesExceededError``, which only fires when
+    ``retry()`` is called with no ``exc``), so exhaustion-path tests must not
+    mock ``self.retry`` to raise ``MaxRetriesExceededError`` — that isn't
+    real Celery behavior.
+    """
+    url_mod.extract_url_source.push_request(retries=retries, id="task-1", called_directly=False)
+    try:
+        yield
+    finally:
+        url_mod.extract_url_source.pop_request()
+
+
 def test_pacing_denial_requeues(status_calls, retry_spy, monkeypatch):
     _fake_httpx_client(monkeypatch, 200)
     monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: 12.5)
@@ -120,12 +139,8 @@ def test_429_requeues_with_retry_after(status_calls, retry_spy, monkeypatch):
 def test_429_budget_exhausted_fails_with_rate_limited(status_calls, monkeypatch):
     _fake_httpx_client(monkeypatch, 429, headers={"Retry-After": "42"})
     monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
-    monkeypatch.setattr(
-        url_mod.extract_url_source,
-        "retry",
-        MagicMock(side_effect=MaxRetriesExceededError()),
-    )
-    result = url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
+    with _at_retry_budget(url_mod.RATE_LIMIT_MAX_RETRIES):
+        result = url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
     assert result["status"] == "error"
     terminal = [c for c in status_calls if "failed" in c[0]]
     assert terminal and terminal[-1][1].get("error_code") == "rate_limited"
@@ -144,12 +159,8 @@ def test_permanent_4xx_fails_immediately(status_calls, retry_spy, monkeypatch):
 def test_5xx_retries_then_transient(status_calls, monkeypatch):
     _fake_httpx_client(monkeypatch, 503)
     monkeypatch.setattr(url_mod.external_limiter, "try_acquire", lambda *a, **kw: None)
-    monkeypatch.setattr(
-        url_mod.extract_url_source,
-        "retry",
-        MagicMock(side_effect=MaxRetriesExceededError()),
-    )
-    result = url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
+    with _at_retry_budget(url_mod.extract_url_source.max_retries):
+        result = url_mod.extract_url_source.run("src-1", "bucket-1", "https://example.com")
     assert result["status"] == "error"
     terminal = [c for c in status_calls if "failed" in c[0]]
     assert terminal and terminal[-1][1].get("error_code") == "transient"

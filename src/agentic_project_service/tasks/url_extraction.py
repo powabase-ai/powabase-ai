@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 import httpx
 from ..celery import celery_app
-from celery.exceptions import MaxRetriesExceededError, Retry, SoftTimeLimitExceeded
+from celery.exceptions import Retry, SoftTimeLimitExceeded
 from sqlalchemy import text
 
 from ..db import AI_SCHEMA, db
@@ -146,13 +146,11 @@ def extract_url_source(
         wait = external_limiter.try_acquire("firecrawl", rate_limit)
         if wait is not None:
             logger.info("Firecrawl pacing: deferring source %s by %.1fs", source_id, wait)
-            try:
-                raise self.retry(
-                    exc=RuntimeError("Firecrawl rate limit pacing"),
-                    countdown=wait + random.uniform(0, 5),
-                    max_retries=RATE_LIMIT_MAX_RETRIES,
-                )
-            except MaxRetriesExceededError as e:
+            # Celery's Task.retry(exc=...) re-raises `exc` itself (not
+            # MaxRetriesExceededError) once the budget is exhausted, so the
+            # exhaustion check has to happen BEFORE calling retry() — an
+            # `except MaxRetriesExceededError` here would never fire.
+            if self.request.retries >= RATE_LIMIT_MAX_RETRIES:
                 update_source_status(
                     source_id,
                     "failed",
@@ -160,7 +158,16 @@ def extract_url_source(
                     task_id,
                     error_code="rate_limited",
                 )
-                return {"status": "error", "source_id": source_id, "error": str(e)}
+                return {
+                    "status": "error",
+                    "source_id": source_id,
+                    "error": "Firecrawl rate limit pacing budget exhausted",
+                }
+            raise self.retry(
+                exc=RuntimeError("Firecrawl rate limit pacing"),
+                countdown=wait + random.uniform(0, 5),
+                max_retries=RATE_LIMIT_MAX_RETRIES,
+            )
 
         with httpx.Client(timeout=60) as client:
             resp = client.post(
@@ -372,13 +379,16 @@ def extract_url_source(
         raise self.retry(exc=e) from e
 
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        # Celery's Task.retry(exc=...) re-raises `exc` itself once the retry
+        # budget is exhausted — it does NOT raise MaxRetriesExceededError
+        # (that only happens when retry() is called with no `exc`). So each
+        # branch below checks self.request.retries against the budget BEFORE
+        # calling retry(), rather than catching MaxRetriesExceededError.
         status_code = getattr(getattr(e, "response", None), "status_code", None)
         if status_code == 429:
             delay = parse_retry_after(e.response.headers.get("Retry-After")) + random.uniform(0, 5)
             logger.warning("Firecrawl 429 for source %s — re-queueing in %.1fs", source_id, delay)
-            try:
-                raise self.retry(exc=e, countdown=delay, max_retries=RATE_LIMIT_MAX_RETRIES)
-            except MaxRetriesExceededError:
+            if self.request.retries >= RATE_LIMIT_MAX_RETRIES:
                 update_source_status(
                     source_id,
                     "failed",
@@ -387,15 +397,15 @@ def extract_url_source(
                     error_code="rate_limited",
                 )
                 return {"status": "error", "source_id": source_id, "error": str(e)}
+            raise self.retry(exc=e, countdown=delay, max_retries=RATE_LIMIT_MAX_RETRIES)
         if status_code in PERMANENT_STATUSES:
             update_source_status(source_id, "failed", str(e), task_id, error_code="permanent")
             return {"status": "error", "source_id": source_id, "error": str(e)}
         # 5xx / transport errors: bounded retry on the task's default budget.
-        try:
-            raise self.retry(exc=e)
-        except MaxRetriesExceededError:
+        if self.request.retries >= self.max_retries:
             update_source_status(source_id, "failed", str(e), task_id, error_code="transient")
             return {"status": "error", "source_id": source_id, "error": str(e)}
+        raise self.retry(exc=e)
 
     except Retry:
         # Celery's self.retry() raises Retry; re-raise so the Celery worker
