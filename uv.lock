@@ -12,7 +12,7 @@ resolution-markers = [
 
 [[package]]
 name = "agentic-project-service"
-version = "0.1.2"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "anyascii" },
@@ -78,7 +78,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "openai", specifier = ">=1.0.0" },
     { name = "pgvector", specifier = ">=0.3.0" },
-    { name = "powabase-agentic", extras = ["rerankers"], specifier = ">=0.1.0rc3" },
+    { name = "powabase-agentic", extras = ["rerankers"], specifier = ">=0.3.0" },
     { name = "prometheus-client", specifier = ">=0.20" },
     { name = "prometheus-flask-exporter", specifier = ">=0.23.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1.0" },
@@ -2308,7 +2308,7 @@ wheels = [
 
 [[package]]
 name = "powabase-agentic"
-version = "0.2.0"
+version = "0.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -2333,9 +2333,9 @@ dependencies = [
     { name = "seaborn" },
     { name = "tiktoken" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/69/87/bc29fe52e3b7624285a26e7dc00f20d1059b78b8be68eaf8181a3b0bc4a6/powabase_agentic-0.2.0.tar.gz", hash = "sha256:db2bb85ae814088b2434fce85becc06fe955ac69daf4cb8bcfbcadc72ff3175d", size = 490746, upload-time = "2026-08-05T04:00:30.123Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ca/75/716af1db94465d6401445579e721773287c1249f4393f68f690da05df8aa/powabase_agentic-0.3.0.tar.gz", hash = "sha256:68805897cbf304c31c564c691db445b9a3068777ec51d7356029ffa4a46928d8", size = 499767, upload-time = "2026-08-06T08:47:34.661Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d8/c2/3c56999c22b439f1e6ca515a6870f2461ebedee476c7b5b60389168da960/powabase_agentic-0.2.0-py3-none-any.whl", hash = "sha256:560c8f7f02fc0642b3913affc24fe172134984f8129f1e7943bf253dba12b73a", size = 254633, upload-time = "2026-08-05T04:00:28.692Z" },
+    { url = "https://files.pythonhosted.org/packages/15/1a/140278963579e58772ea48a621ef5b8167eb8ee2997142e03ba7593ef5bb/powabase_agentic-0.3.0-py3-none-any.whl", hash = "sha256:9c3f1cf822d77303f08a8930c261236097d53ac0a5ffdacc036451d7fa940966", size = 257194, upload-time = "2026-08-06T08:47:33.31Z" },
 ]
 
 [package.optional-dependencies]
