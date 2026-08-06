@@ -30,6 +30,7 @@ from agentic.agent.hooks import (
 )
 from agentic.agent.message import Message
 from agentic.execution.context import ExecutionContext
+from agentic.mcp import McpError, discover_mcp_tools
 from flask import Blueprint, Response, current_app, g, jsonify, request, stream_with_context
 from sqlalchemy import text
 
@@ -848,6 +849,43 @@ def delete_mcp_server(agent_id: str, server_id: str):
     db.session.delete(server)
     db.session.commit()
     return jsonify({"deleted": True})
+
+
+@agents_bp.route("/<agent_id>/mcp-servers/<server_id>/tools", methods=["GET"])
+@require_auth
+def discover_mcp_server_tools(agent_id: str, server_id: str):
+    """List the tools an MCP server currently advertises.
+
+    Queries the server live. Results are not cached, and a disabled server is
+    not excluded — connectivity is worth verifying before switching one on.
+    """
+    server = db.session.get(AgentMcpServer, server_id)
+    if not server or str(server.agent_id) != agent_id:
+        return jsonify({"error": "MCP server not found"}), 404
+
+    try:
+        tools = discover_mcp_tools(server.url, server.headers or {}, timeout=10)
+    except McpError as e:
+        # Cap the reflection here rather than trusting the client library to
+        # truncate: a server answering 200 with a huge JSON-RPC error.message
+        # arrives unbounded.
+        return jsonify({"error": str(e)[:500]}), 502
+
+    return jsonify(
+        {
+            "tools": [
+                {
+                    # str() because these originate from an untrusted server
+                    # this endpoint exists to poke — a non-string here would
+                    # crash the Studio's render, not just look odd.
+                    "name": str(t.name),
+                    "description": str(t.description),
+                    "input_schema": t.input_schema,
+                }
+                for t in tools
+            ]
+        }
+    )
 
 
 @agents_bp.route("/<agent_id>/hooks", methods=["POST"])

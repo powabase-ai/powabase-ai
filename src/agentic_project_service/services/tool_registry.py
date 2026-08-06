@@ -753,9 +753,18 @@ def build_mcp_tools_for_agent(
     for server in servers:
         try:
             mcp_tools = discover_mcp_tools(server.url, server.headers or {})
-        except Exception:
+        except Exception as e:
+            # Server names are only unique per agent — without the agent id
+            # this log cannot answer "whose server failed". exc_info because
+            # the broad except will eventually catch a programming error, and
+            # a one-line message is useless for that.
             logger.warning(
-                "Failed to discover tools from MCP server %s (%s)", server.name, server.url
+                "Failed to discover tools from MCP server %s (%s) for agent %s: %s",
+                server.name,
+                server.url,
+                agent_id,
+                e,
+                exc_info=True,
             )
             continue
 

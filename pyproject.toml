@@ -49,8 +49,9 @@ dependencies = [
     # Core framework: powabase-agentic (PyPI; the import module stays `agentic`).
     # The [rerankers] extra pulls zeroentropy. Open `>=` floor on purpose — a
     # bounded range would make dependency automation edit this file as well as
-    # the lock.
-    "powabase-agentic[rerankers]>=0.1.0rc3",
+    # the lock. Floor at 0.3.0: first release with McpError and the
+    # Streamable HTTP-compliant client.
+    "powabase-agentic[rerankers]>=0.3.0",
 ]
 
 # Development dependencies. Declared as a PEP 735 dependency-group rather than a

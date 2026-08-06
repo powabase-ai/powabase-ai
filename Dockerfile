@@ -20,8 +20,10 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv PATH="/opt/venv/bin:$PATH"
 
 COPY pyproject.toml uv.lock README.md ./
 COPY src/ src/
-# --frozen: fail the build if uv.lock does not match pyproject.toml, so the
-#   lock can never disagree with the image the way it did before this change.
+# --locked: fail the build if uv.lock does not match pyproject.toml, so the
+#   lock can never disagree with the image. (--frozen does NOT do this — it
+#   installs the lock as-is without validating it against pyproject, which
+#   would let a stale lock silently ship the wrong dependency versions.)
 # --no-editable: uv installs the root project EDITABLE by default (uv.lock
 #   records `source = { editable = "." }`). Editable would leave a path
 #   reference in the venv rather than the package, making the runtime stage's
@@ -29,7 +31,7 @@ COPY src/ src/
 #   `pip install .` behaviour and lets that COPY be deleted.
 # NO `--extra` flag: the extra is on a DEPENDENCY (see pyproject.toml), which
 #   is a different namespace from this project's optional-dependencies.
-RUN uv sync --frozen --no-editable
+RUN uv sync --locked --no-editable
 
 FROM python:3.13-slim
 WORKDIR /app
