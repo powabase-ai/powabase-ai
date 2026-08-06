@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0](https://github.com/powabase-ai/powabase-ai/compare/v0.2.0...v0.3.0) (2026-08-06)
+
+
+### Features
+
+* **agents:** add MCP server tools-discovery endpoint ([#30](https://github.com/powabase-ai/powabase-ai/issues/30)) ([65b57ae](https://github.com/powabase-ai/powabase-ai/commit/65b57aea06fa1fcc189288449f91a728065eafb4))
+
+
+### Bug Fixes
+
+* **deps:** bump gunicorn from 25.1.0 to 26.0.0 ([#18](https://github.com/powabase-ai/powabase-ai/issues/18)) ([5ffa1a2](https://github.com/powabase-ai/powabase-ai/commit/5ffa1a2d043d56521179d446aa458dc8805b75e5))
+* **deps:** bump pyjwt from 2.11.0 to 2.13.0 ([#16](https://github.com/powabase-ai/powabase-ai/issues/16)) ([82e2840](https://github.com/powabase-ai/powabase-ai/commit/82e2840dc0cdf496f65f22362b25958bb7009a13))
+* **deps:** update bm25s[core] requirement from &gt;=0.2.0 to &gt;=0.3.10 ([#17](https://github.com/powabase-ai/powabase-ai/issues/17)) ([fb1723c](https://github.com/powabase-ai/powabase-ai/commit/fb1723cd0d1510eaf7ef5c0085d7b13c546769ea))
+
 ## [0.2.0](https://github.com/powabase-ai/powabase-ai/compare/v0.1.3...v0.2.0) (2026-08-05)
 
 
