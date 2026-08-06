@@ -336,22 +336,36 @@ def _make_search_handler(db_session):
 def build_kb_tools_for_agent(
     agent_id: str,
     db_session,
+    runtime_kb_configs: list[dict] | None = None,
 ) -> dict[str, KnowledgeSearchTool]:
-    """Auto-generate knowledge search tools from agent KB assignments."""
+    """Auto-generate knowledge search tools from agent KB assignments.
+
+    ``runtime_kb_configs`` are per-request additions (already validated by the
+    route): each joins the same single ``knowledge_search`` tool for this run
+    only, and an entry naming an already-attached KB replaces that
+    attachment's config for the run.
+    """
     tools: dict[str, KnowledgeSearchTool] = {}
+    runtime_kb_configs = runtime_kb_configs or []
 
     assignments = AgentKnowledgeBase.query.filter_by(agent_id=agent_id).all()
-    if not assignments:
+    if not assignments and not runtime_kb_configs:
         return tools
 
     search_handler = _make_search_handler(db_session)
 
-    # Load KB metadata for names/descriptions
-    kb_ids = [str(a.knowledge_base_id) for a in assignments]
+    # Load KB metadata for names/descriptions (attached + runtime, deduped)
+    kb_ids = list(
+        dict.fromkeys(
+            [str(a.knowledge_base_id) for a in assignments]
+            + [str(c["id"]) for c in runtime_kb_configs]
+        )
+    )
     kb_rows = KnowledgeBase.query.filter(KnowledgeBase.id.in_(kb_ids)).all()
     kb_map = {str(kb.id): kb for kb in kb_rows}
 
-    all_configs = []
+    configs_by_id: dict[str, dict] = {}
+    raw_config_by_id: dict[str, dict] = {}
     for assignment in assignments:
         kb = kb_map.get(str(assignment.knowledge_base_id))
         if not kb:
@@ -373,20 +387,41 @@ def build_kb_tools_for_agent(
         )
         resolved_method = config.get("retrieval_method") or kb_retrieval_config.get("method")
 
-        all_configs.append(
-            {
-                "id": str(kb.id),
-                "name": kb.name,
-                "retrieval_method": resolved_method,
-                "top_k": resolved_top_k,
-            }
-        )
+        configs_by_id[str(kb.id)] = {
+            "id": str(kb.id),
+            "name": kb.name,
+            "retrieval_method": resolved_method,
+            "top_k": resolved_top_k,
+        }
+        raw_config_by_id[str(kb.id)] = config
 
+    for entry in runtime_kb_configs:
+        kb = kb_map.get(str(entry["id"]))
+        if not kb:
+            continue  # route validated existence; defensive skip
+        kb_retrieval_config = kb.retrieval_config or {}
+        cfg = {
+            "id": str(kb.id),
+            "name": kb.name,
+            "retrieval_method": entry.get("retrieval_method")
+            or kb_retrieval_config.get("method"),
+            "top_k": entry.get("top_k")
+            or kb_retrieval_config.get("top_k")
+            or get_setting("KB_DEFAULT_TOP_K"),
+            "runtime": True,
+        }
+        for key in ("similarity_threshold", "filter_metadata", "source_ids"):
+            if entry.get(key) is not None:
+                cfg[key] = entry[key]
+        configs_by_id[str(kb.id)] = cfg  # runtime overrides attached
+        raw_config_by_id[str(kb.id)] = entry
+
+    all_configs = list(configs_by_id.values())
     if not all_configs:
         return tools
 
     if len(all_configs) == 1:
-        single_config = assignments[0].config or {}
+        single_config = raw_config_by_id.get(all_configs[0]["id"], {})
         max_tokens = single_config.get(
             "max_context_tokens", get_setting("KB_DEFAULT_MAX_CONTEXT_TOKENS")
         )
@@ -574,12 +609,15 @@ def load_all_tools_for_agent(
     db_session,
     max_tool_output_length: int | None = None,
     default_max_result_chars: int | None = None,
+    runtime_kb_configs: list[dict] | None = None,
 ) -> dict[str, ToolDefinition]:
     """Load all tools assigned to an agent: built-in + custom.
 
     Args:
         max_tool_output_length: Override for CustomTool HTTP response truncation.
         default_max_result_chars: Override for ToolDefinition.max_result_chars.
+        runtime_kb_configs: Per-request KB configs merged into the agent's
+            knowledge_search tool for this run only.
     """
     tools: dict[str, ToolDefinition] = {}
     app = _get_flask_app()
@@ -724,7 +762,7 @@ def load_all_tools_for_agent(
                 tools[tool_row.name] = custom_tool
 
     # 2. Knowledge search tools (auto-generated from ai.agent_knowledge_bases)
-    kb_tools = build_kb_tools_for_agent(agent_id, db_session)
+    kb_tools = build_kb_tools_for_agent(agent_id, db_session, runtime_kb_configs=runtime_kb_configs)
     tools.update(kb_tools)
 
     # 3. MCP tools
