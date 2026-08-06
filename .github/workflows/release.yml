@@ -34,7 +34,80 @@ jobs:
           private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
 
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
           token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # release-please rewrites `version` in pyproject.toml. uv.lock records the
+      # ROOT project's version as well, so that bump leaves the lock stale — and
+      # the Dockerfile builds with `uv sync --locked`, which REFUSES a lock that
+      # disagrees with pyproject rather than quietly installing it.
+      #
+      # Without the steps below, a release PR merges a tree whose image cannot
+      # build. The failure lands after the point of no return: release-please has
+      # already cut the tag and the GitHub Release, and publish.yml then dies on
+      # `uv sync --locked`. Recovering means a fix-forward release, because the
+      # tag now points at a tree that never builds. This is not hypothetical —
+      # it is exactly what happened to v0.3.0.
+      #
+      # The lock is regenerated ON THE RELEASE BRANCH, before a human merges it,
+      # so main is never in the inconsistent state to begin with.
+      #
+      # Guarded on prs_created: a run that only *published* a release (no new PR)
+      # has nothing to sync.
+      # Print release-please's outputs unconditionally. The steps below are
+      # guarded on them, so if an output name ever changes the guards would
+      # simply stop firing — the lock would go unsynced and nothing would say so
+      # until a later Publish died. This turns that into one visible line in the
+      # log of the run that caused it.
+      - name: Report what release-please did
+        env:
+          RELEASES: ${{ steps.release.outputs.releases_created }}
+          PRS: ${{ steps.release.outputs.prs_created }}
+          PR: ${{ steps.release.outputs.pr }}
+        run: |
+          echo "releases_created=${RELEASES:-<UNSET — guard below will not fire>}"
+          echo "prs_created=${PRS:-<UNSET — guard below will not fire>}"
+          echo "pr=${PR:-<unset>}"
+
+      - name: Check out the release PR branch
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          # The App token, not GITHUB_TOKEN: this checkout's credentials are what
+          # the push below uses, and a push made with GITHUB_TOKEN would not start
+          # the PR's own checks — the same trap documented on the token step above.
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Set up uv
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+          # Pinned to the version the Dockerfile installs. A floating uv here
+          # could write a lock the image build then rejects, which would recreate
+          # this very failure from the opposite direction.
+          version: "0.8.19"
+
+      - name: Sync uv.lock with the version release-please just wrote
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        run: |
+          set -euo pipefail
+          uv lock
+          if git diff --quiet -- uv.lock; then
+            echo "::notice::uv.lock already agrees with pyproject; nothing to sync"
+            exit 0
+          fi
+          git config user.name "powabase-release-bot[bot]"
+          git config user.email "powabase-release-bot[bot]@users.noreply.github.com"
+          git add uv.lock
+          git commit -m "chore: sync uv.lock with the released version"
+          git push
+          # Assert the tree the release PR now carries actually builds. `uv lock`
+          # succeeding does not prove `--locked` will accept it, and `--locked` is
+          # what the image build runs.
+          uv sync --locked --no-editable
+          echo "::notice::uv.lock synced and verified against --locked"
