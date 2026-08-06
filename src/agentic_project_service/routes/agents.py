@@ -875,8 +875,11 @@ def discover_mcp_server_tools(agent_id: str, server_id: str):
         {
             "tools": [
                 {
-                    "name": t.name,
-                    "description": t.description,
+                    # str() because these originate from an untrusted server
+                    # this endpoint exists to poke — a non-string here would
+                    # crash the Studio's render, not just look odd.
+                    "name": str(t.name),
+                    "description": str(t.description),
                     "input_schema": t.input_schema,
                 }
                 for t in tools
