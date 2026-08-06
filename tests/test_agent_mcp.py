@@ -172,6 +172,40 @@ class TestMcpToolDiscovery:
         # there), and the interactive timeout must all reach the client.
         spy.assert_called_once_with("https://mcp-github.example.com", {}, timeout=10)
 
+    def test_discover_passes_stored_headers_through(
+        self, client, mock_auth, auth_headers, test_agent, mocker
+    ):
+        # The empty-dict case above cannot catch headers being dropped, since
+        # dropped and empty look identical. A server whose auth lives in its
+        # stored headers would then silently discover nothing.
+        add = client.post(
+            f"/api/agents/{test_agent['id']}/mcp-servers",
+            json={
+                "name": "authed",
+                "transport": "http",
+                "url": "https://authed.example.com",
+                "headers": {"Authorization": "Bearer stored-token"},
+            },
+            headers=auth_headers,
+        )
+        server_id = add.get_json()["id"]
+        spy = mocker.patch(
+            "agentic_project_service.routes.agents.discover_mcp_tools",
+            return_value=[],
+        )
+
+        resp = client.get(
+            f"/api/agents/{test_agent['id']}/mcp-servers/{server_id}/tools",
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 200
+        spy.assert_called_once_with(
+            "https://authed.example.com",
+            {"Authorization": "Bearer stored-token"},
+            timeout=10,
+        )
+
     def test_discover_unknown_server_returns_404(self, client, mock_auth, auth_headers, test_agent):
         resp = client.get(
             f"/api/agents/{test_agent['id']}/mcp-servers/{uuid.uuid4()}/tools",
