@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/powabase-ai/powabase-ai/compare/v0.3.0...v0.3.1) (2026-08-06)
+
+
+### Bug Fixes
+
+* **ci:** sync uv.lock on the release PR so the image can build ([#39](https://github.com/powabase-ai/powabase-ai/issues/39)) ([84e6419](https://github.com/powabase-ai/powabase-ai/commit/84e6419c32a69ddaaadaf2ece101c9e40645bed9))
+
 ## [0.3.0](https://github.com/powabase-ai/powabase-ai/compare/v0.2.0...v0.3.0) (2026-08-06)
 
 
