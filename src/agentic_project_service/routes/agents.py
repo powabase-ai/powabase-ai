@@ -79,6 +79,7 @@ from ..services.ai_provider_keys_resolver import (
     ProviderKeyDecryptDropped,
     resolve_api_key_or_raise_for_drop,
 )
+from ._runtime_kb import validate_runtime_knowledge_bases
 
 logger = logging.getLogger(__name__)
 
@@ -1225,6 +1226,14 @@ def run_agent(agent_id: str):
             }
         ), 400
 
+    if data.get("runtime_knowledge_bases"):
+        return jsonify(
+            {
+                "error": "'runtime_knowledge_bases' requires the streaming endpoint "
+                "POST /api/agents/{agent_id}/run/stream — the non-streaming run has no tool loop"
+            }
+        ), 400
+
     # Pre-op balance check (free-tier hard cap) via the billing port — the
     # no-op adapter makes this inert in OSS/unit-test/local-dev builds; the
     # cloud adapter enforces the cap against BILLING_ORG_ID. Internal ops
@@ -1602,6 +1611,10 @@ def run_agent_stream(agent_id: str):
             }
         ), 400
 
+    runtime_kb_configs, runtime_kb_error = validate_runtime_knowledge_bases(data, db.session)
+    if runtime_kb_error:
+        return jsonify({"error": runtime_kb_error}), 400
+
     # Pre-op balance check (free-tier hard cap). Done BEFORE entering the
     # SSE generator so 402/503 propagate as a normal HTTP error to the
     # caller. Internal atomic ops are billed by Task 15 — this is just the
@@ -1821,6 +1834,7 @@ def run_agent_stream(agent_id: str):
                 db.session,
                 max_tool_output_length=max_tool_output,
                 default_max_result_chars=max_result_chars,
+                runtime_kb_configs=runtime_kb_configs or None,
             )
 
             # Citation handling — gate on context being available either from
