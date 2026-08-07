@@ -775,7 +775,8 @@ class TestSSEStreamingFlow:
         return_value={"sub": "user-1", "role": "authenticated"},
     )
     def test_agent_error_emits_error_event(self, _mock_jwt, mock_db, mock_chat):
-        """If run_copilot_chat raises, an error SSE event should be emitted."""
+        """If run_copilot_chat raises, an error SSE event should be emitted with a
+        generic message — the raw exception text must not reach the client."""
         app = _make_test_app()
 
         mock_session = MagicMock()
@@ -804,7 +805,11 @@ class TestSSEStreamingFlow:
 
         assert "error" in event_types
         error_event = next(e for e in events if e["event"] == "error")
-        assert "LLM exploded" in error_event["error"]
+        assert (
+            error_event["error"]
+            == "Sorry — something went wrong while answering. Please try again."
+        )
+        assert "LLM exploded" not in error_event["error"]
 
     def test_queue_timeout_raises_empty(self):
         """Verify that q.get(timeout=...) raises Empty when nothing is enqueued."""

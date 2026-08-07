@@ -163,6 +163,30 @@ def resolve_api_key_for_model(model: str, provider_keys: dict[str, str]) -> str 
     ) or None
 
 
+def project_has_byok_for_model(model: str) -> bool:
+    """True when the project has a BYOK key for ``model``'s provider.
+
+    When true, an LLM call on ``model`` uses the user's own key and
+    BillingLogger's recoupable skip-gate fires — so the call bills the user's
+    upstream provider, not our credits. Used to decide whether a copilot turn
+    needs a credit-balance gate (only AI-on-us turns do). Side-effect-free:
+    ``list_byok_providers`` reads provider names without decrypting or
+    self-healing (unlike ``get_all_user_provider_keys``).
+    """
+    from .llm_availability import list_byok_providers
+
+    try:
+        _, provider, _, _ = litellm.get_llm_provider(model)
+        byok_name = _BYOK_PROVIDER_ALIAS.get(provider, provider)
+        return byok_name in list_byok_providers()
+    except Exception:
+        # Fail-closed: on any resolution/DB error, report "no BYOK" so the caller
+        # gates on balance (a turn that can't confirm BYOK shouldn't bypass the
+        # credit check). The turn still surfaces a real error downstream if the
+        # key genuinely can't resolve.
+        return False
+
+
 class ProviderKeyDecryptDropped(Exception):
     """A stored provider key was just dropped because it could not be decrypted.
 

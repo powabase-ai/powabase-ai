@@ -3,17 +3,21 @@
 import contextvars
 import json
 import logging
+import os
 import queue
 import threading
 import uuid
 from queue import Empty
 
+import redis
 from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from sqlalchemy import text
 
 from ..auth import require_auth
 from ..db import db, AI_SCHEMA
-from ..services.copilot import run_copilot_chat
+from ..services import billing_port as billing
+from ..services.ai_provider_keys_resolver import project_has_byok_for_model
+from ..services.copilot import get_copilot_model, run_copilot_chat
 from ..services.copilot_config import (
     COPILOT_MODEL_OPTIONS,
     STATUS_MESSAGES,
@@ -25,6 +29,97 @@ from ..services.settings_registry import get_setting, validate_setting, SETTINGS
 logger = logging.getLogger(__name__)
 
 copilot_bp = Blueprint("copilot", __name__, url_prefix="/api/copilot")
+
+# ---------------------------------------------------------------------------
+# Credit gate (BYOK-aware)
+# ---------------------------------------------------------------------------
+# A copilot turn's only credit charge is the recoupable `llm_call` (no flat
+# dispatch fee, unlike agent/workflow runs). We gate on "any positive balance"
+# rather than a precise per-turn estimate: a rejected turn never runs, and a turn
+# that runs charges its real cost recoupably — driving the balance negative and
+# blocking the NEXT turn. That stops unlimited turns at zero balance without
+# guessing a turn's cost (a too-high estimate would wrongly block small balances).
+_COPILOT_TURN_ESTIMATED_CREDITS = 1
+
+
+def _gate_copilot_turn(model: str) -> None:
+    """Pre-turn credit gate. No-op under BYOK; otherwise the port decides.
+
+    Raises whatever the installed billing adapter raises — 402 out of credits,
+    503 billing unreachable (fail-closed). NoopBillingAdapter never raises, which
+    is the OSS-edition contract.
+    """
+    if project_has_byok_for_model(model):
+        return
+    billing.check_balance(estimated_cost=_COPILOT_TURN_ESTIMATED_CREDITS)
+
+
+# A workflow's copilot session is long-lived, so history grows without bound.
+# Feed the agent only a trailing window of the most recent messages (mirrors
+# routes/project_copilot.py) — otherwise a long-lived session eventually
+# exceeds the model context window, and an orphaned trailing 'user' row (see
+# the turn-lock block below) would wedge the session FOREVER instead of aging
+# out of the window.
+_MAX_HISTORY_MESSAGES = 40
+
+# ---------------------------------------------------------------------------
+# In-flight turn lock (concurrent-turn safety)
+# ---------------------------------------------------------------------------
+# Nothing else serializes concurrent POST .../chat calls against a session.
+# Two overlapping turns would each insert a 'user' message before either
+# assistant reply lands (the reply is persisted by the background worker
+# seconds later), producing two consecutive 'user' rows — the LLM provider
+# 400s on the *next* turn. Reject a second turn outright instead of letting
+# that happen: a Redis SET-NX+EX marker keyed on the session id, released via
+# compare-and-delete when the turn finishes (mirrors routes/project_copilot.py).
+# The EX TTL is a backstop only — it guarantees the marker can never wedge a
+# session forever if a worker crashes/is killed before its release runs.
+_TURN_LOCK_TTL_SECONDS = 360  # exceeds the 300s in-flight q.get timeout + margin
+_RELEASE_TURN_LOCK_LUA = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] "
+    "then return redis.call('del', KEYS[1]) else return 0 end"
+)
+
+_redis_client: redis.Redis | None = None
+
+
+def _get_redis() -> redis.Redis:
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"))
+    return _redis_client
+
+
+def _turn_lock_key(session_id: str) -> str:
+    return f"copilot_turn_lock:{session_id}"
+
+
+def _try_acquire_turn_lock(session_id: str) -> str | None:
+    """Mark a turn in-flight for this session. Returns a release token on
+    success, or None if another turn already holds the lock.
+
+    Fails OPEN on a Redis error (mirrors ``routes/project_copilot.py``): this
+    lock exists to avoid a role-alternation 400 from the LLM provider, not to
+    protect a safety-critical resource, so a Redis outage should degrade to
+    "no serialization" rather than take chat down entirely.
+    """
+    token = uuid.uuid4().hex
+    try:
+        r = _get_redis()
+        acquired = r.set(_turn_lock_key(session_id), token, nx=True, ex=_TURN_LOCK_TTL_SECONDS)
+    except Exception:
+        logger.warning("Failed to acquire copilot turn lock; failing open", exc_info=True)
+        return token
+    return token if acquired else None
+
+
+def _release_turn_lock(session_id: str, token: str) -> None:
+    """Compare-and-delete: only release if we still hold it, so a stale token
+    (e.g. after our own TTL already expired) can't release a newer turn's lock."""
+    try:
+        _get_redis().eval(_RELEASE_TURN_LOCK_LUA, 1, _turn_lock_key(session_id), token)
+    except Exception:
+        logger.warning("Failed to release copilot turn lock", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -189,42 +284,96 @@ def chat(session_id: str):
     if not session_row:
         return jsonify({"error": "Session not found"}), 404
 
-    # Inject workflow_id so the copilot can query execution logs
-    workflow_state["workflow_id"] = str(session_row[0])
+    # Reject a second concurrent turn on this session outright (see the
+    # "In-flight turn lock" block above) rather than letting it race the
+    # in-flight one and corrupt the history's user/assistant alternation.
+    turn_token = _try_acquire_turn_lock(session_id)
+    if turn_token is None:
+        return jsonify({"error": "a copilot turn is already in progress"}), 409
 
-    # Persist user message
-    user_msg_id = str(uuid.uuid4())
-    db.session.execute(
-        text(f"""
-            INSERT INTO "{AI_SCHEMA}".copilot_messages (id, session_id, role, content)
-            VALUES (:id, :sid, 'user', :content)
-        """),
-        {"id": user_msg_id, "sid": session_id, "content": user_message},
-    )
-    db.session.commit()
+    try:
+        # Credit gate (parity with the project copilot): an AI-on-us turn bills
+        # credits, so refuse it (402) when out of credits — a broke AI-on-us project
+        # must not run unlimited turns into a negative balance. BYOK / billing-off
+        # no-op. Before any persist so a rejected turn leaves no orphan row.
+        _gate_copilot_turn(get_copilot_model())
 
-    # Load conversation history
-    history_rows = db.session.execute(
-        text(f"""
-            SELECT role, content FROM "{AI_SCHEMA}".copilot_messages
-            WHERE session_id = :sid
-            ORDER BY created_at ASC
-        """),
-        {"sid": session_id},
-    ).fetchall()
+        # Inject workflow_id so the copilot can query execution logs
+        workflow_state["workflow_id"] = str(session_row[0])
 
-    messages = [{"role": r[0], "content": r[1]} for r in history_rows]
+        # Persist user message
+        user_msg_id = str(uuid.uuid4())
+        db.session.execute(
+            text(f"""
+                INSERT INTO "{AI_SCHEMA}".copilot_messages (id, session_id, role, content)
+                VALUES (:id, :sid, 'user', :content)
+            """),
+            {"id": user_msg_id, "sid": session_id, "content": user_message},
+        )
+        db.session.commit()
 
-    # Update session timestamp
-    db.session.execute(
-        text(f"""
-            UPDATE "{AI_SCHEMA}".copilot_sessions
-            SET updated_at = now()
-            WHERE id = :id
-        """),
-        {"id": session_id},
-    )
-    db.session.commit()
+        # Trailing window: take the most recent N by created_at, then re-order ASC
+        # so the agent sees them chronologically (the just-inserted user message
+        # is the newest, so it is always included). Mirrors routes/project_copilot.py.
+        history_rows = db.session.execute(
+            text(f"""
+                SELECT role, content FROM (
+                    SELECT role, content, created_at
+                    FROM "{AI_SCHEMA}".copilot_messages
+                    WHERE session_id = :sid
+                    ORDER BY created_at DESC
+                    LIMIT :lim
+                ) recent
+                ORDER BY created_at ASC
+            """),
+            {"sid": session_id, "lim": _MAX_HISTORY_MESSAGES},
+        ).fetchall()
+
+        messages = [{"role": r[0], "content": r[1]} for r in history_rows]
+        # The window can begin with an assistant message (history is user/assistant
+        # alternating and the newest row — always included — is the just-inserted
+        # user turn, so an even-length window starts assistant-first). Anthropic 400s
+        # unless the first non-system message is 'user', which would make EVERY turn
+        # fail once a session passes _MAX_HISTORY_MESSAGES. Trim to a user boundary.
+        while messages and messages[0]["role"] != "user":
+            messages.pop(0)
+        # A turn that died between its user-row commit and its assistant insert
+        # (pod eviction/OOM — even the placeholder persist in run_agent below
+        # never ran) leaves an orphaned 'user' row, so the window contains a
+        # user,user pair the LLM provider 400s on. Repair the alternation for
+        # the model's eyes only — substitute a structural placeholder assistant
+        # message between consecutive user rows instead of dropping a row
+        # (dropping would lose the user's words; placeholder-not-drop mirrors
+        # project_copilot's _build_input_messages). The DB keeps the orphan;
+        # the trailing window ages it out.
+        repaired: list[dict] = []
+        for m in messages:
+            if repaired and m["role"] == "user" and repaired[-1]["role"] == "user":
+                repaired.append(
+                    {
+                        "role": "assistant",
+                        "content": "(No reply was recorded for the previous message.)",
+                    }
+                )
+            repaired.append(m)
+        messages = repaired
+
+        # Update session timestamp
+        db.session.execute(
+            text(f"""
+                UPDATE "{AI_SCHEMA}".copilot_sessions
+                SET updated_at = now()
+                WHERE id = :id
+            """),
+            {"id": session_id},
+        )
+        db.session.commit()
+    except Exception:
+        # Nothing kicked off a background turn (the worker thread below owns the
+        # release from this point on) — release the lock ourselves so a 402/DB
+        # failure here doesn't wedge the session until the TTL backstop expires.
+        _release_turn_lock(session_id, turn_token)
+        raise
 
     def generate():
         q: queue.Queue = queue.Queue()
@@ -314,11 +463,54 @@ def chat(session_id: str):
                         )
                         db.session.commit()
                     except Exception as persist_err:
-                        logger.error("Failed to persist assistant message: %s", persist_err)
+                        # The reply was generated (and billed) but not saved. Don't
+                        # report DONE-success: the history reload won't contain this
+                        # answer, so the UI would flash it and then lose it on the
+                        # next mount. Surface it as an error turn instead (parity
+                        # with routes/project_copilot.py).
+                        logger.error(
+                            "Failed to persist assistant message: %s", persist_err, exc_info=True
+                        )
+                        db.session.rollback()
+                        # The user row for this turn is already committed (~204-211).
+                        # Without also landing an assistant row here, the session is
+                        # left with a mid-history user,user pair that this copilot has
+                        # no trailing window to age out of — 400ing every subsequent
+                        # turn until the session is deleted. Persist a placeholder
+                        # assistant row (best-effort) to keep the alternation valid,
+                        # mirroring routes/project_copilot.py's round-2 I1 fix.
+                        try:
+                            db.session.execute(
+                                text(f"""
+                                    INSERT INTO "{AI_SCHEMA}".copilot_messages
+                                        (id, session_id, role, content, workflow_diff)
+                                    VALUES (:id, :sid, 'assistant', :content, NULL)
+                                """),
+                                {
+                                    "id": assistant_msg_id,
+                                    "sid": session_id,
+                                    "content": "Sorry — the reply could not be saved. Please try again.",
+                                },
+                            )
+                            db.session.commit()
+                        except Exception as placeholder_err:
+                            logger.error(
+                                "Failed to persist placeholder assistant message: %s",
+                                placeholder_err,
+                            )
+                            db.session.rollback()
+                        q.put(("DONE", None, None, persist_err))
+                        return
                     q.put(("DONE", content, diff, None))
                 except Exception as e:
-                    # Persist error message so the user sees it on return
-                    error_content = f"Error: {e}"
+                    # Persist error message so the user sees it on return. Log the
+                    # real exception server-side but never echo it to the client —
+                    # str(e) can leak internal details (parity with
+                    # routes/project_copilot.py's generic error handling).
+                    logger.error("Copilot agent error: %s", e, exc_info=True)
+                    error_content = (
+                        "Sorry — something went wrong while answering. Please try again."
+                    )
                     try:
                         db.session.execute(
                             text(f"""
@@ -338,6 +530,11 @@ def chat(session_id: str):
                     q.put(("DONE", None, None, e))
                 finally:
                     db.session.remove()
+                    # The turn is over (success or failure) — free the session
+                    # for the next turn. This is the ONLY release path once the
+                    # worker thread has started (see the try/except in `chat`
+                    # for the pre-thread failure paths).
+                    _release_turn_lock(session_id, turn_token)
 
         # Propagate Flask before_request contextvars (current_byok_providers,
         # byok_lookup_degraded, run_id_var) into the worker thread.
@@ -376,11 +573,15 @@ def chat(session_id: str):
             yield f"data: {json.dumps(complete_event)}\n\n"
 
         except Exception as e:
+            # Log the real exception server-side but never echo it to the
+            # client — str(e) can leak internal details (parity with
+            # routes/project_copilot.py's generic error handling).
             logger.error("Copilot chat error: %s", e, exc_info=True)
-            error_event = {"event": "error", "error": str(e)}
+            _generic = "Sorry — something went wrong while answering. Please try again."
+            error_event = {"event": "error", "error": _generic}
             yield f"data: {json.dumps(error_event)}\n\n"
 
-    return Response(
+    response = Response(
         stream_with_context(generate()),
         mimetype="text/event-stream",
         headers={
@@ -388,6 +589,14 @@ def chat(session_id: str):
             "X-Accel-Buffering": "no",
         },
     )
+    # Belt-and-braces release: if the SSE generator is never iterated (e.g. the
+    # client disconnects before the WSGI server starts streaming), the worker
+    # thread that owns the "normal" release path (the `finally` in `run_agent`
+    # above) never even starts, leaking the lock for up to the TTL. Release on
+    # response teardown too — the compare-and-delete in `_release_turn_lock`
+    # makes a double release (this plus the worker's) harmless.
+    response.call_on_close(lambda: _release_turn_lock(session_id, turn_token))
+    return response
 
 
 # ---------------------------------------------------------------------------
