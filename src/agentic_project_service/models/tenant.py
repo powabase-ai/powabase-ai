@@ -983,6 +983,59 @@ class CopilotMessage(db.Model):
     )
 
 
+class ProjectCopilotSession(db.Model):
+    """The Project Copilot chat session — one resumable session per project.
+
+    Unlike ai.copilot_sessions (the Workflow Copilot, keyed by workflow_id), the
+    Project Copilot is project-scoped onboarding/guidance, so there is no parent
+    entity FK — at most one active session per project.
+
+    Table: ai.project_copilot_sessions
+    """
+
+    __tablename__ = "project_copilot_sessions"
+    __table_args__ = {"schema": "ai"}
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=sa_text("gen_random_uuid()")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        db.DateTime(timezone=True), nullable=False, server_default=sa_text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        db.DateTime(timezone=True), nullable=False, server_default=sa_text("now()")
+    )
+
+
+class ProjectCopilotMessage(db.Model):
+    """A message in a Project Copilot session.
+
+    ``guide_event`` records any guide-bubble sequence the copilot triggered on
+    this turn (``{"sequence_id": "..."}``) so a reloaded session can show what
+    was launched.
+
+    Table: ai.project_copilot_messages
+    """
+
+    __tablename__ = "project_copilot_messages"
+    __table_args__ = {"schema": "ai"}
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=sa_text("gen_random_uuid()")
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ai.project_copilot_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    role: Mapped[str] = mapped_column(db.String(20), nullable=False)
+    content: Mapped[str] = mapped_column(db.Text, nullable=False)
+    guide_event: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        db.DateTime(timezone=True), nullable=False, server_default=sa_text("now()")
+    )
+
+
 class EnrichmentConfig(db.Model):
     """Metadata enrichment configuration for a knowledge base.
 
