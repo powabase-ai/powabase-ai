@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/powabase-ai/powabase-ai/compare/v0.3.1...v0.4.0) (2026-08-07)
+
+
+### Features
+
+* **agents:** runtime knowledge base references on run/stream ([#42](https://github.com/powabase-ai/powabase-ai/issues/42)) ([78f4d72](https://github.com/powabase-ai/powabase-ai/commit/78f4d72bf948825831904265b765e57c2f8b8e05))
+
 ## [0.3.1](https://github.com/powabase-ai/powabase-ai/compare/v0.3.0...v0.3.1) (2026-08-06)
 
 
