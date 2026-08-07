@@ -45,6 +45,7 @@ from ..services.run_context import (
     set_run_id,
 )
 from ..services.session import _load_tool_calls_for_runs, persist_agent_run
+from ._runtime_kb import validate_runtime_knowledge_bases
 
 logger = logging.getLogger(__name__)
 
@@ -863,7 +864,39 @@ def get_orchestration_session_messages(orch_id: str, session_id: str):
 @orchestrations_bp.route("/<orch_id>/run/stream", methods=["POST"])
 @require_auth
 def run_orchestration_stream(orch_id: str):
-    """Run an orchestration with SSE streaming."""
+    """Run an orchestration with SSE streaming.
+
+    `runtime_knowledge_bases` (optional): a list of up to 10 objects,
+    ``{id, top_k?, retrieval_method?, similarity_threshold?, filter_metadata?,
+    source_ids?, max_context_tokens?}``. Each entry joins the run's
+    ``knowledge_search`` tool for THIS request only — nothing is persisted,
+    so follow-up messages must re-send it. An entry naming a knowledge base
+    that is also attached to a sub-agent overrides that attachment's config
+    for the run. Every entry is validated up front — id existence, AND each
+    config knob's type/range (`top_k` an int 1-100, `retrieval_method` one
+    of the known enum values, `similarity_threshold` a number 0-1,
+    `filter_metadata` an object, `source_ids` each indexed into THAT entry's
+    knowledge base, `max_context_tokens` an int within the same bounds as
+    the `KB_DEFAULT_MAX_CONTEXT_TOKENS` setting) — and the request 400s
+    before the stream opens if any id is malformed/unknown, any knob is out
+    of range or the wrong type, any entry carries an unknown key (typos like
+    `top_K` are rejected, not ignored), or the list exceeds 10 entries. Combinable
+    with the context fields; combined with the preload `knowledge_bases`
+    field, BOTH retrievals run (no dedup) and the run's `context_handler_id`
+    still points at the preload one. `max_context_tokens` is honored only
+    for a sub-agent whose `knowledge_search` tool resolves to exactly one
+    knowledge base (its attached KBs + runtime entries combined) — within one
+    request, a sub-agent with no attached KBs honors it while a sibling with
+    several falls back to the project default.
+
+    Security: this is NOT enforced server-side. Any caller authorized to run
+    this orchestration — i.e. any authenticated project JWT — can reference
+    any knowledge base in the project via this field. This matches the
+    project-wide access posture of the `ai` schema (an authenticated
+    project JWT already reaches every KB in the project through it); it is
+    documented here rather than enforced. Expose this endpoint from trusted
+    backends only.
+    """
     data = request.get_json()
     message = data.get("message")
     if not message:
@@ -871,6 +904,10 @@ def run_orchestration_stream(orch_id: str):
 
     session_id = data.get("session_id")
     user_id = get_current_user_id()
+
+    runtime_kb_configs, runtime_kb_error = validate_runtime_knowledge_bases(data, db.session)
+    if runtime_kb_error:
+        return jsonify({"error": runtime_kb_error}), 400
 
     # Pre-op balance check (free-tier hard cap) via the billing port. Done
     # outside the generator so 402/503 propagate as a normal HTTP error
@@ -928,7 +965,9 @@ def run_orchestration_stream(orch_id: str):
                 update_orchestration_run,
             )
 
-            orch_row, orchestration = build_orchestration(orch_id)
+            orch_row, orchestration = build_orchestration(
+                orch_id, runtime_kb_configs=runtime_kb_configs or None
+            )
 
             hooks = load_hooks_for_orchestration(orch_id)
 

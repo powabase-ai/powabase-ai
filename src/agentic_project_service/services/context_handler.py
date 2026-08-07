@@ -575,6 +575,7 @@ def execute_retrieval(
                     "type": "kb_retrieval_error",
                     "knowledge_base_id": kb_id,
                     "message": str(outcome["error"]),
+                    "error_type": type(outcome["error"]).__name__,
                     "timestamp": datetime.now(UTC).isoformat(),
                 }
             )
@@ -999,6 +1000,7 @@ async def execute_retrieval_async(
                     "type": "kb_retrieval_error",
                     "knowledge_base_id": kb_id,
                     "message": str(e),
+                    "error_type": type(e).__name__,
                     "timestamp": datetime.now(UTC).isoformat(),
                 }
             )

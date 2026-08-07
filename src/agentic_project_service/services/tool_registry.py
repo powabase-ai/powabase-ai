@@ -268,6 +268,43 @@ def _get_flask_app():
 
 _BUILTIN_DEFS = {d["name"]: d for d in BUILTIN_TOOL_DEFINITIONS}
 
+_KB_ERROR_NOTE_MESSAGE_LIMIT = 160
+
+
+def _sanitize_kb_error_note(error: dict) -> str:
+    """Build a bounded, sanitized note for one kb_retrieval_error record.
+
+    ``error["message"]`` is ``str(exception)`` as recorded by
+    context_handler.py — for a SQLAlchemy/psycopg failure that can contain
+    the full SQL statement, bound parameters, and driver internals. None of
+    that may reach the LLM (it gets pasted into tool-result content and
+    paraphrased back to end users, and caller-influenced values inside a
+    driver string make it an injection vector). Only the first line of the
+    message, truncated, plus the exception's class name, are surfaced here.
+    The full message is still logged (warning, in _search_single_kb) and
+    persisted on the context_handler row for debugging.
+    """
+    kb_id = error.get("knowledge_base_id")
+    error_type = error.get("error_type")
+    message = error.get("message")
+
+    first_line = ""
+    if message:
+        lines = str(message).splitlines()
+        if lines:
+            first_line = lines[0][:_KB_ERROR_NOTE_MESSAGE_LIMIT]
+
+    if error_type and first_line:
+        detail = f"{error_type}: {first_line}"
+    elif error_type:
+        detail = error_type
+    elif first_line:
+        detail = first_line
+    else:
+        detail = "unknown error"
+
+    return f"{kb_id}: {detail}"
+
 
 def _make_search_handler(db_session):
     """Create a search handler closure that wraps create_and_execute().
@@ -307,6 +344,21 @@ def _make_search_handler(db_session):
         formatted = result.get("formatted_context", "")
         metadata = {"context_handler_id": handler_id}
 
+        # context_truncation entries are benign budget events, not failures —
+        # only kb_retrieval_error entries (per-KB search failures) must
+        # surface, otherwise a failing search silently yields empty/partial
+        # context and the LLM answers from priors with no signal anything
+        # went wrong.
+        kb_errors = [
+            e
+            for e in result.get("errors", [])
+            if isinstance(e, dict) and e.get("type") == "kb_retrieval_error"
+        ]
+        error_note = None
+        if kb_errors:
+            details = "; ".join(_sanitize_kb_error_note(e) for e in kb_errors)
+            error_note = f"[knowledge_search errors: {details}]"
+
         if isinstance(formatted, list):
             block_types = [b.get("type", "unknown") for b in formatted if isinstance(b, dict)]
             image_count = block_types.count("image_url")
@@ -322,13 +374,18 @@ def _make_search_handler(db_session):
                 {"type": "text", "text": "Retrieved context from knowledge base:"},
                 *formatted,
             ]
+            if error_note:
+                content.append({"type": "text", "text": error_note})
             return content, metadata
         else:
             logger.info(
                 "KB search handler returning text-only: %d chars",
                 len(str(formatted)),
             )
-        return str(formatted), metadata
+        text_content = str(formatted)
+        if error_note:
+            text_content = f"{text_content}\n\n{error_note}" if text_content else error_note
+        return text_content, metadata
 
     return _ensure_app_context(_raw_handler, app)
 
@@ -336,22 +393,36 @@ def _make_search_handler(db_session):
 def build_kb_tools_for_agent(
     agent_id: str,
     db_session,
+    runtime_kb_configs: list[dict] | None = None,
 ) -> dict[str, KnowledgeSearchTool]:
-    """Auto-generate knowledge search tools from agent KB assignments."""
+    """Auto-generate knowledge search tools from agent KB assignments.
+
+    ``runtime_kb_configs`` are per-request additions (already validated by the
+    route): each joins the same single ``knowledge_search`` tool for this run
+    only, and an entry naming an already-attached KB replaces that
+    attachment's config for the run.
+    """
     tools: dict[str, KnowledgeSearchTool] = {}
+    runtime_kb_configs = runtime_kb_configs or []
 
     assignments = AgentKnowledgeBase.query.filter_by(agent_id=agent_id).all()
-    if not assignments:
+    if not assignments and not runtime_kb_configs:
         return tools
 
     search_handler = _make_search_handler(db_session)
 
-    # Load KB metadata for names/descriptions
-    kb_ids = [str(a.knowledge_base_id) for a in assignments]
+    # Load KB metadata for names/descriptions (attached + runtime, deduped)
+    kb_ids = list(
+        dict.fromkeys(
+            [str(a.knowledge_base_id) for a in assignments]
+            + [str(c["id"]) for c in runtime_kb_configs]
+        )
+    )
     kb_rows = KnowledgeBase.query.filter(KnowledgeBase.id.in_(kb_ids)).all()
     kb_map = {str(kb.id): kb for kb in kb_rows}
 
-    all_configs = []
+    configs_by_id: dict[str, dict] = {}
+    raw_config_by_id: dict[str, dict] = {}
     for assignment in assignments:
         kb = kb_map.get(str(assignment.knowledge_base_id))
         if not kb:
@@ -373,20 +444,47 @@ def build_kb_tools_for_agent(
         )
         resolved_method = config.get("retrieval_method") or kb_retrieval_config.get("method")
 
-        all_configs.append(
-            {
-                "id": str(kb.id),
-                "name": kb.name,
-                "retrieval_method": resolved_method,
-                "top_k": resolved_top_k,
-            }
-        )
+        configs_by_id[str(kb.id)] = {
+            "id": str(kb.id),
+            "name": kb.name,
+            "retrieval_method": resolved_method,
+            "top_k": resolved_top_k,
+        }
+        raw_config_by_id[str(kb.id)] = config
 
+    for entry in runtime_kb_configs:
+        kb = kb_map.get(str(entry["id"]))
+        if not kb:
+            # Route validated existence at request time, but a delete between
+            # validation and this build (TOCTOU) can still land here — log so
+            # the drop isn't silent.
+            logger.warning(
+                "runtime KB %s not found at tool-build time — dropped from knowledge_search",
+                entry["id"],
+            )
+            continue
+        kb_retrieval_config = kb.retrieval_config or {}
+        cfg = {
+            "id": str(kb.id),
+            "name": kb.name,
+            "retrieval_method": entry.get("retrieval_method") or kb_retrieval_config.get("method"),
+            "top_k": entry.get("top_k")
+            or kb_retrieval_config.get("top_k")
+            or get_setting("KB_DEFAULT_TOP_K"),
+            "runtime": True,
+        }
+        for key in ("similarity_threshold", "filter_metadata", "source_ids"):
+            if entry.get(key) is not None:
+                cfg[key] = entry[key]
+        configs_by_id[str(kb.id)] = cfg  # runtime overrides attached
+        raw_config_by_id[str(kb.id)] = entry
+
+    all_configs = list(configs_by_id.values())
     if not all_configs:
         return tools
 
     if len(all_configs) == 1:
-        single_config = assignments[0].config or {}
+        single_config = raw_config_by_id.get(all_configs[0]["id"], {})
         max_tokens = single_config.get(
             "max_context_tokens", get_setting("KB_DEFAULT_MAX_CONTEXT_TOKENS")
         )
@@ -574,12 +672,15 @@ def load_all_tools_for_agent(
     db_session,
     max_tool_output_length: int | None = None,
     default_max_result_chars: int | None = None,
+    runtime_kb_configs: list[dict] | None = None,
 ) -> dict[str, ToolDefinition]:
     """Load all tools assigned to an agent: built-in + custom.
 
     Args:
         max_tool_output_length: Override for CustomTool HTTP response truncation.
         default_max_result_chars: Override for ToolDefinition.max_result_chars.
+        runtime_kb_configs: Per-request KB configs merged into the agent's
+            knowledge_search tool for this run only.
     """
     tools: dict[str, ToolDefinition] = {}
     app = _get_flask_app()
@@ -724,7 +825,7 @@ def load_all_tools_for_agent(
                 tools[tool_row.name] = custom_tool
 
     # 2. Knowledge search tools (auto-generated from ai.agent_knowledge_bases)
-    kb_tools = build_kb_tools_for_agent(agent_id, db_session)
+    kb_tools = build_kb_tools_for_agent(agent_id, db_session, runtime_kb_configs=runtime_kb_configs)
     tools.update(kb_tools)
 
     # 3. MCP tools

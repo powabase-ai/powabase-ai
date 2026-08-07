@@ -79,6 +79,7 @@ from ..services.ai_provider_keys_resolver import (
     ProviderKeyDecryptDropped,
     resolve_api_key_or_raise_for_drop,
 )
+from ._runtime_kb import validate_runtime_knowledge_bases
 
 logger = logging.getLogger(__name__)
 
@@ -1200,6 +1201,9 @@ def run_agent(agent_id: str):
     - Session history for multi-turn conversations
     - Knowledge base search with token limiting
     - agentic.Agent class for LLM calls
+
+    `runtime_knowledge_bases` is rejected with 400 here — this endpoint has
+    no tool loop; use POST .../run/stream instead.
     """
     data = request.get_json() or {}
     message = data.get("message")
@@ -1222,6 +1226,14 @@ def run_agent(agent_id: str):
         return jsonify(
             {
                 "error": "Only one of 'knowledge_bases', 'context_handler_id', 'context_override', or 'context_items' may be provided"
+            }
+        ), 400
+
+    if data.get("runtime_knowledge_bases") is not None:
+        return jsonify(
+            {
+                "error": "'runtime_knowledge_bases' requires the streaming endpoint "
+                "POST /api/agents/{agent_id}/run/stream — the non-streaming run has no tool loop"
             }
         ), 400
 
@@ -1576,6 +1588,36 @@ def run_agent_stream(agent_id: str):
     - `chunk`: Content chunk as it streams
     - `complete`: Final response with metadata
     - `error`: Error information if something fails
+
+    `runtime_knowledge_bases` (optional): a list of up to 10 objects,
+    ``{id, top_k?, retrieval_method?, similarity_threshold?, filter_metadata?,
+    source_ids?, max_context_tokens?}``. Each entry joins the run's
+    ``knowledge_search`` tool for THIS request only — nothing is persisted,
+    so follow-up messages must re-send it. An entry naming a knowledge base
+    that is also attached to the agent overrides that attachment's config
+    for the run. Every entry is validated up front — id existence, AND each
+    config knob's type/range (`top_k` an int 1-100, `retrieval_method` one
+    of the known enum values, `similarity_threshold` a number 0-1,
+    `filter_metadata` an object, `source_ids` each indexed into THAT entry's
+    knowledge base, `max_context_tokens` an int within the same bounds as
+    the `KB_DEFAULT_MAX_CONTEXT_TOKENS` setting) — and the request 400s
+    before the stream opens if any id is malformed/unknown, any knob is out
+    of range or the wrong type, any entry carries an unknown key (typos like
+    `top_K` are rejected, not ignored), or the list exceeds 10 entries. Combinable
+    with the context fields above; combined with the preload
+    `knowledge_bases` field, BOTH retrievals run (no dedup) and the run's
+    `context_handler_id` still points at the preload one. `max_context_tokens`
+    is honored only when the run's `knowledge_search` tool covers exactly one
+    knowledge base (attached + runtime combined); multi-KB runs use the
+    project default.
+
+    Security: this is NOT enforced server-side. Any caller authorized to run
+    this agent — i.e. any authenticated project JWT — can reference any
+    knowledge base in the project via this field, regardless of which KBs
+    are attached to the agent. This matches the project-wide access posture
+    of the `ai` schema (an authenticated project JWT already reaches every
+    KB in the project through it); it is documented here rather than
+    enforced. Expose this endpoint from trusted backends only.
     """
     # Parse request
     data = request.get_json() or {}
@@ -1601,6 +1643,10 @@ def run_agent_stream(agent_id: str):
                 "error": "Only one of 'knowledge_bases', 'context_handler_id', 'context_override', or 'context_items' may be provided"
             }
         ), 400
+
+    runtime_kb_configs, runtime_kb_error = validate_runtime_knowledge_bases(data, db.session)
+    if runtime_kb_error:
+        return jsonify({"error": runtime_kb_error}), 400
 
     # Pre-op balance check (free-tier hard cap). Done BEFORE entering the
     # SSE generator so 402/503 propagate as a normal HTTP error to the
@@ -1821,6 +1867,7 @@ def run_agent_stream(agent_id: str):
                 db.session,
                 max_tool_output_length=max_tool_output,
                 default_max_result_chars=max_result_chars,
+                runtime_kb_configs=runtime_kb_configs or None,
             )
 
             # Citation handling — gate on context being available either from
