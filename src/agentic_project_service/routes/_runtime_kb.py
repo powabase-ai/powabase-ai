@@ -16,6 +16,16 @@ RUNTIME_KB_MAX_ENTRIES = 10
 
 _VALID_RETRIEVAL_METHODS = {"vector_search", "full_text", "hybrid", "tree_search"}
 
+_ALLOWED_ENTRY_KEYS = {
+    "id",
+    "top_k",
+    "retrieval_method",
+    "similarity_threshold",
+    "filter_metadata",
+    "source_ids",
+    "max_context_tokens",
+}
+
 # Bounds mirror the settings registry's KB_DEFAULT_MAX_CONTEXT_TOKENS
 # definition — a per-entry override must stay inside the same range the
 # project-wide default is constrained to.
@@ -63,6 +73,9 @@ def validate_runtime_knowledge_bases(data, db_session, ai_schema: str = AI_SCHEM
     for entry in raw:
         if not isinstance(entry, dict) or not entry.get("id"):
             return [], "each 'runtime_knowledge_bases' entry must be an object with an 'id'"
+        unknown_keys = set(entry) - _ALLOWED_ENTRY_KEYS
+        if unknown_keys:
+            return [], f"unknown key(s) in runtime_knowledge_bases entry: {sorted(unknown_keys)}"
         try:
             norm_id = _normalize_uuid(entry["id"])
         except (ValueError, AttributeError, TypeError):
@@ -98,6 +111,11 @@ def validate_runtime_knowledge_bases(data, db_session, ai_schema: str = AI_SCHEM
         if filter_metadata is not None and not isinstance(filter_metadata, dict):
             return [], f"'filter_metadata' must be an object: {filter_metadata!r}"
 
+        # NOTE: this only validates the knob's range — it is silently ignored
+        # at tool-build time whenever the run's knowledge_search tool covers
+        # more than one KB (attached + runtime combined), which resets to
+        # KB_DEFAULT_MAX_CONTEXT_TOKENS instead of picking a winner among
+        # per-KB values. Honored only for single-KB runs.
         max_context_tokens = entry.get("max_context_tokens")
         if max_context_tokens is not None:
             invalid_type = isinstance(max_context_tokens, bool) or not isinstance(

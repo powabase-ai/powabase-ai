@@ -230,3 +230,40 @@ def test_exactly_max_entries_passes():
     configs, err = validate_runtime_knowledge_bases(data, _db_returning_ids(ids))
     assert err is None
     assert len(configs) == RUNTIME_KB_MAX_ENTRIES
+
+
+def test_unknown_key_typo_rejected():
+    """A near-miss key like 'top_K' must 400 by name, not silently pass
+    through unvalidated and unused — the caller's intent (a top_k override)
+    would otherwise be dropped with no signal."""
+    data = {"runtime_knowledge_bases": [{"id": _KB_1, "top_K": 5}]}
+    _, err = validate_runtime_knowledge_bases(data, MagicMock())
+    assert err is not None
+    assert "unknown key" in err
+    assert "top_K" in err
+
+
+def test_unknown_key_camel_case_rejected():
+    data = {"runtime_knowledge_bases": [{"id": _KB_1, "sourceIds": [_SRC_1]}]}
+    _, err = validate_runtime_knowledge_bases(data, MagicMock())
+    assert err is not None
+    assert "unknown key" in err
+    assert "sourceIds" in err
+
+
+def test_all_valid_keys_entry_passes():
+    entry = {
+        "id": _KB_1,
+        "top_k": 5,
+        "retrieval_method": "hybrid",
+        "similarity_threshold": 0.5,
+        "filter_metadata": {"key": "value"},
+        "source_ids": [_SRC_1],
+        "max_context_tokens": 16000,
+    }
+    configs, err = validate_runtime_knowledge_bases(
+        {"runtime_knowledge_bases": [entry]},
+        _db_returning_ids_then([[_KB_1], [_SRC_1]]),
+    )
+    assert err is None
+    assert configs == [entry]

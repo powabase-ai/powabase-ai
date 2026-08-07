@@ -1605,7 +1605,10 @@ def run_agent_stream(agent_id: str):
     of range or the wrong type, or the list exceeds 10 entries. Combinable
     with the context fields above; combined with the preload
     `knowledge_bases` field, BOTH retrievals run (no dedup) and the run's
-    `context_handler_id` still points at the preload one.
+    `context_handler_id` still points at the preload one. `max_context_tokens`
+    is honored only when the run's `knowledge_search` tool covers exactly one
+    knowledge base (attached + runtime combined); multi-KB runs use the
+    project default.
 
     Security: this is NOT enforced server-side. Any caller authorized to run
     this agent — i.e. any authenticated project JWT — can reference any
