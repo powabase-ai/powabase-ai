@@ -5,4 +5,4 @@ Handles sources, knowledge bases, agents, and background processing
 for a single project's Supabase instance.
 """
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
