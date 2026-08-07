@@ -1602,7 +1602,8 @@ def run_agent_stream(agent_id: str):
     knowledge base, `max_context_tokens` an int within the same bounds as
     the `KB_DEFAULT_MAX_CONTEXT_TOKENS` setting) — and the request 400s
     before the stream opens if any id is malformed/unknown, any knob is out
-    of range or the wrong type, or the list exceeds 10 entries. Combinable
+    of range or the wrong type, any entry carries an unknown key (typos like
+    `top_K` are rejected, not ignored), or the list exceeds 10 entries. Combinable
     with the context fields above; combined with the preload
     `knowledge_bases` field, BOTH retrievals run (no dedup) and the run's
     `context_handler_id` still points at the preload one. `max_context_tokens`
