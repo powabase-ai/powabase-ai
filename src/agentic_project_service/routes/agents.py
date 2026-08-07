@@ -1591,12 +1591,18 @@ def run_agent_stream(agent_id: str):
 
     `runtime_knowledge_bases` (optional): a list of up to 10 objects,
     ``{id, top_k?, retrieval_method?, similarity_threshold?, filter_metadata?,
-    source_ids?}``. Each entry joins the run's ``knowledge_search`` tool for
-    THIS request only — nothing is persisted, so follow-up messages must
-    re-send it. An entry naming a knowledge base that is also attached to the
-    agent overrides that attachment's config for the run. All ids are
-    validated up front and the request 400s before the stream opens if any
-    id is malformed, unknown, or the list exceeds 10 entries. Combinable
+    source_ids?, max_context_tokens?}``. Each entry joins the run's
+    ``knowledge_search`` tool for THIS request only — nothing is persisted,
+    so follow-up messages must re-send it. An entry naming a knowledge base
+    that is also attached to the agent overrides that attachment's config
+    for the run. Every entry is validated up front — id existence, AND each
+    config knob's type/range (`top_k` an int 1-100, `retrieval_method` one
+    of the known enum values, `similarity_threshold` a number 0-1,
+    `filter_metadata` an object, `source_ids` each indexed into THAT entry's
+    knowledge base, `max_context_tokens` an int within the same bounds as
+    the `KB_DEFAULT_MAX_CONTEXT_TOKENS` setting) — and the request 400s
+    before the stream opens if any id is malformed/unknown, any knob is out
+    of range or the wrong type, or the list exceeds 10 entries. Combinable
     with the context fields above; combined with the preload
     `knowledge_bases` field, BOTH retrievals run (no dedup) and the run's
     `context_handler_id` still points at the preload one.

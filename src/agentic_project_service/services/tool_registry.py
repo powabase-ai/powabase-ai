@@ -268,6 +268,43 @@ def _get_flask_app():
 
 _BUILTIN_DEFS = {d["name"]: d for d in BUILTIN_TOOL_DEFINITIONS}
 
+_KB_ERROR_NOTE_MESSAGE_LIMIT = 160
+
+
+def _sanitize_kb_error_note(error: dict) -> str:
+    """Build a bounded, sanitized note for one kb_retrieval_error record.
+
+    ``error["message"]`` is ``str(exception)`` as recorded by
+    context_handler.py — for a SQLAlchemy/psycopg failure that can contain
+    the full SQL statement, bound parameters, and driver internals. None of
+    that may reach the LLM (it gets pasted into tool-result content and
+    paraphrased back to end users, and caller-influenced values inside a
+    driver string make it an injection vector). Only the first line of the
+    message, truncated, plus the exception's class name, are surfaced here.
+    The full message is still logged (warning, in _search_single_kb) and
+    persisted on the context_handler row for debugging.
+    """
+    kb_id = error.get("knowledge_base_id")
+    error_type = error.get("error_type")
+    message = error.get("message")
+
+    first_line = ""
+    if message:
+        lines = str(message).splitlines()
+        if lines:
+            first_line = lines[0][:_KB_ERROR_NOTE_MESSAGE_LIMIT]
+
+    if error_type and first_line:
+        detail = f"{error_type}: {first_line}"
+    elif error_type:
+        detail = error_type
+    elif first_line:
+        detail = first_line
+    else:
+        detail = "unknown error"
+
+    return f"{kb_id}: {detail}"
+
 
 def _make_search_handler(db_session):
     """Create a search handler closure that wraps create_and_execute().
@@ -319,9 +356,7 @@ def _make_search_handler(db_session):
         ]
         error_note = None
         if kb_errors:
-            details = "; ".join(
-                f"{e.get('knowledge_base_id')}: {e.get('message')}" for e in kb_errors
-            )
+            details = "; ".join(_sanitize_kb_error_note(e) for e in kb_errors)
             error_note = f"[knowledge_search errors: {details}]"
 
         if isinstance(formatted, list):

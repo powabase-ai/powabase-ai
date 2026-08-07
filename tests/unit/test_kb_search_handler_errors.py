@@ -88,6 +88,59 @@ def test_context_truncation_only_errors_do_not_trigger_note():
     assert content == "ctx text"
 
 
+def test_raw_exception_text_is_not_pasted_unbounded_into_llm_context():
+    """N1: the raw ``message`` (str(exception)) can carry a full SQL
+    statement + bound params for a SQLAlchemy/psycopg failure. Only the
+    first line, truncated to 160 chars, plus the error_type, may reach the
+    LLM — everything after the first newline must be absent from the note,
+    however sensitive it is."""
+    first_line = "connection failed: " + ("a" * 140) + "UNIQUE_TAIL_MARKER_BEYOND_160"
+    sql_leak = "SELECT * FROM secret_table WHERE token = 'abc123'"
+    message = f"{first_line}\n{sql_leak}\nMORE INTERNAL DETAIL"
+    content, _metadata = _handler(
+        {
+            "formatted_context": "",
+            "errors": [
+                {
+                    "type": "kb_retrieval_error",
+                    "knowledge_base_id": "kb-1",
+                    "error_type": "OperationalError",
+                    "message": message,
+                    "timestamp": "2026-01-01T00:00:00+00:00",
+                }
+            ],
+        }
+    )
+    assert sql_leak not in content
+    assert "MORE INTERNAL DETAIL" not in content
+    assert "OperationalError" in content
+    assert "kb-1" in content
+    # Only the first 160 chars of the first line may appear.
+    assert first_line[:160] in content
+    assert "UNIQUE_TAIL_MARKER_BEYOND_160" not in content
+
+
+def test_error_record_missing_error_type_still_produces_sane_note():
+    """A record without ``error_type`` (e.g. one persisted before this fix
+    landed) must still produce a bounded note, falling back to just the
+    truncated first line."""
+    content, _metadata = _handler(
+        {
+            "formatted_context": "",
+            "errors": [
+                {
+                    "type": "kb_retrieval_error",
+                    "knowledge_base_id": "kb-2",
+                    "message": "boom",
+                    "timestamp": "2026-01-01T00:00:00+00:00",
+                }
+            ],
+        }
+    )
+    assert "kb-2" in content
+    assert "boom" in content
+
+
 def test_multimodal_errors_append_trailing_text_block():
     content, _metadata = _handler(
         {

@@ -10,10 +10,18 @@ import uuid
 from sqlalchemy import text
 
 from ..db import AI_SCHEMA
+from ..services.settings_registry import SETTINGS_REGISTRY
 
 RUNTIME_KB_MAX_ENTRIES = 10
 
 _VALID_RETRIEVAL_METHODS = {"vector_search", "full_text", "hybrid", "tree_search"}
+
+# Bounds mirror the settings registry's KB_DEFAULT_MAX_CONTEXT_TOKENS
+# definition — a per-entry override must stay inside the same range the
+# project-wide default is constrained to.
+_MAX_CONTEXT_TOKENS_DEF = SETTINGS_REGISTRY["KB_DEFAULT_MAX_CONTEXT_TOKENS"]
+_MAX_CONTEXT_TOKENS_MIN = _MAX_CONTEXT_TOKENS_DEF.min
+_MAX_CONTEXT_TOKENS_MAX = _MAX_CONTEXT_TOKENS_DEF.max
 
 
 def _normalize_uuid(value):
@@ -90,6 +98,20 @@ def validate_runtime_knowledge_bases(data, db_session, ai_schema: str = AI_SCHEM
         if filter_metadata is not None and not isinstance(filter_metadata, dict):
             return [], f"'filter_metadata' must be an object: {filter_metadata!r}"
 
+        max_context_tokens = entry.get("max_context_tokens")
+        if max_context_tokens is not None:
+            invalid_type = isinstance(max_context_tokens, bool) or not isinstance(
+                max_context_tokens, int
+            )
+            if invalid_type or not (
+                _MAX_CONTEXT_TOKENS_MIN <= max_context_tokens <= _MAX_CONTEXT_TOKENS_MAX
+            ):
+                return [], (
+                    f"'max_context_tokens' must be an integer between "
+                    f"{_MAX_CONTEXT_TOKENS_MIN:.0f} and {_MAX_CONTEXT_TOKENS_MAX:.0f}: "
+                    f"{max_context_tokens!r}"
+                )
+
         source_ids = entry.get("source_ids")
         if source_ids is not None:
             normalized_source_ids, err = _parse_source_ids(source_ids)
@@ -109,17 +131,26 @@ def validate_runtime_knowledge_bases(data, db_session, ai_schema: str = AI_SCHEM
     if missing:
         return [], f"unknown knowledge base id(s): {', '.join(missing)}"
 
-    all_source_ids = sorted(
-        {sid for entry in normalized_entries for sid in entry.get("source_ids") or []}
-    )
-    if all_source_ids:
-        source_rows = db_session.execute(
-            text(f'SELECT id FROM "{ai_schema}".sources WHERE id = ANY(:ids)'),
-            {"ids": all_source_ids},
+    # source_ids must be indexed into THAT entry's knowledge base, not just
+    # present somewhere in the project — a source that exists but isn't
+    # indexed into this KB silently filters retrieval to zero chunks
+    # downstream, with no signal to the caller. One query per entry with
+    # source_ids (the cap above bounds this to RUNTIME_KB_MAX_ENTRIES).
+    for entry in normalized_entries:
+        entry_source_ids = entry.get("source_ids")
+        if not entry_source_ids:
+            continue
+        kb_id = entry["id"]
+        indexed_rows = db_session.execute(
+            text(
+                f'SELECT source_id FROM "{ai_schema}".indexed_sources '
+                "WHERE knowledge_base_id = :kb_id AND source_id = ANY(:ids)"
+            ),
+            {"kb_id": kb_id, "ids": entry_source_ids},
         )
-        found_sources = {str(row[0]) for row in source_rows}
-        missing_sources = [i for i in all_source_ids if i not in found_sources]
-        if missing_sources:
-            return [], f"unknown source id(s): {', '.join(missing_sources)}"
+        indexed = {str(row[0]) for row in indexed_rows}
+        missing = [sid for sid in entry_source_ids if sid not in indexed]
+        if missing:
+            return [], f"source id(s) not in knowledge base {kb_id}: {', '.join(missing)}"
 
     return normalized_entries, None

@@ -32,9 +32,11 @@ def test_entry_without_id_rejected():
 
 
 def test_cap_enforced():
-    data = {
-        "runtime_knowledge_bases": [{"id": f"kb-{i}"} for i in range(RUNTIME_KB_MAX_ENTRIES + 1)]
-    }
+    """Uses VALID distinct UUIDs so this pins the cap itself, not the (earlier)
+    UUID-parse rejection — the cap check must fire even when every id would
+    otherwise pass validation."""
+    ids = [f"33333333-3333-3333-3333-{i:012d}" for i in range(RUNTIME_KB_MAX_ENTRIES + 1)]
+    data = {"runtime_knowledge_bases": [{"id": i} for i in ids]}
     _, err = validate_runtime_knowledge_bases(data, MagicMock())
     assert err is not None and str(RUNTIME_KB_MAX_ENTRIES) in err
 
@@ -152,13 +154,58 @@ def test_source_ids_rejected_when_not_a_list():
     assert err is not None and "source_ids" in err
 
 
-def test_source_ids_rejected_when_unknown_in_db():
-    """A stale source id must 400 up front — otherwise it silently filters
-    retrieval to zero chunks downstream."""
+def test_source_ids_rejected_when_not_indexed_in_that_kb():
+    """A source that exists in the project but is not indexed into THIS
+    entry's knowledge base must 400 up front — otherwise it silently filters
+    retrieval to zero chunks downstream. The check queries
+    ai.indexed_sources scoped to (knowledge_base_id, source_id), not
+    ai.sources project-wide, so a source indexed in a DIFFERENT KB still
+    fails here."""
     db = _db_returning_ids_then([[_KB_1], []])
     data = {"runtime_knowledge_bases": [{"id": _KB_1, "source_ids": [_SRC_1]}]}
     _, err = validate_runtime_knowledge_bases(data, db)
-    assert err is not None and "unknown source id" in err and _SRC_1 in err
+    assert err is not None
+    assert "not in knowledge base" in err
+    assert _KB_1 in err
+    assert _SRC_1 in err
+
+
+def test_source_ids_membership_checked_per_kb_not_project_wide():
+    """Two entries each with their own source_ids must each be checked
+    against THEIR OWN knowledge base's indexed_sources — a source indexed
+    into kb-1 does not validate an entry for kb-2 referencing it."""
+    # KB existence: [_KB_1, _KB_2]. Then per-entry indexed_sources checks:
+    # entry for _KB_1 finds _SRC_1 indexed (ok); entry for _KB_2 does NOT
+    # find _SRC_1 indexed (fails).
+    db = _db_returning_ids_then([[_KB_1, _KB_2], [_SRC_1], []])
+    data = {
+        "runtime_knowledge_bases": [
+            {"id": _KB_1, "source_ids": [_SRC_1]},
+            {"id": _KB_2, "source_ids": [_SRC_1]},
+        ]
+    }
+    _, err = validate_runtime_knowledge_bases(data, db)
+    assert err is not None
+    assert "not in knowledge base" in err
+    assert _KB_2 in err
+
+
+def test_max_context_tokens_rejected_out_of_range_or_wrong_type():
+    """Bounds mirror the settings registry's KB_DEFAULT_MAX_CONTEXT_TOKENS
+    (min 1000 / max 128000, int, not bool)."""
+    for bad in (999, 128001, "5000", True):
+        data = {"runtime_knowledge_bases": [{"id": _KB_1, "max_context_tokens": bad}]}
+        _, err = validate_runtime_knowledge_bases(data, MagicMock())
+        assert err is not None and "max_context_tokens" in err, (
+            f"max_context_tokens={bad!r} should be rejected"
+        )
+
+
+def test_max_context_tokens_accepted_within_bounds():
+    data = {"runtime_knowledge_bases": [{"id": _KB_1, "max_context_tokens": 16000}]}
+    configs, err = validate_runtime_knowledge_bases(data, _db_returning_ids([_KB_1]))
+    assert err is None
+    assert configs == [{"id": _KB_1, "max_context_tokens": 16000}]
 
 
 def test_valid_knobs_accepted():
