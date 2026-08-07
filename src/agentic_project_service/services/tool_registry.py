@@ -307,6 +307,23 @@ def _make_search_handler(db_session):
         formatted = result.get("formatted_context", "")
         metadata = {"context_handler_id": handler_id}
 
+        # context_truncation entries are benign budget events, not failures —
+        # only kb_retrieval_error entries (per-KB search failures) must
+        # surface, otherwise a failing search silently yields empty/partial
+        # context and the LLM answers from priors with no signal anything
+        # went wrong.
+        kb_errors = [
+            e
+            for e in result.get("errors", [])
+            if isinstance(e, dict) and e.get("type") == "kb_retrieval_error"
+        ]
+        error_note = None
+        if kb_errors:
+            details = "; ".join(
+                f"{e.get('knowledge_base_id')}: {e.get('message')}" for e in kb_errors
+            )
+            error_note = f"[knowledge_search errors: {details}]"
+
         if isinstance(formatted, list):
             block_types = [b.get("type", "unknown") for b in formatted if isinstance(b, dict)]
             image_count = block_types.count("image_url")
@@ -322,13 +339,18 @@ def _make_search_handler(db_session):
                 {"type": "text", "text": "Retrieved context from knowledge base:"},
                 *formatted,
             ]
+            if error_note:
+                content.append({"type": "text", "text": error_note})
             return content, metadata
         else:
             logger.info(
                 "KB search handler returning text-only: %d chars",
                 len(str(formatted)),
             )
-        return str(formatted), metadata
+        text_content = str(formatted)
+        if error_note:
+            text_content = f"{text_content}\n\n{error_note}" if text_content else error_note
+        return text_content, metadata
 
     return _ensure_app_context(_raw_handler, app)
 
@@ -398,7 +420,14 @@ def build_kb_tools_for_agent(
     for entry in runtime_kb_configs:
         kb = kb_map.get(str(entry["id"]))
         if not kb:
-            continue  # route validated existence; defensive skip
+            # Route validated existence at request time, but a delete between
+            # validation and this build (TOCTOU) can still land here — log so
+            # the drop isn't silent.
+            logger.warning(
+                "runtime KB %s not found at tool-build time — dropped from knowledge_search",
+                entry["id"],
+            )
+            continue
         kb_retrieval_config = kb.retrieval_config or {}
         cfg = {
             "id": str(kb.id),

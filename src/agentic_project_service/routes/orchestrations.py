@@ -878,9 +878,13 @@ def run_orchestration_stream(orch_id: str):
     field, BOTH retrievals run (no dedup) and the run's `context_handler_id`
     still points at the preload one.
 
-    Security: any caller authorized to run this orchestration can reference
-    any knowledge base in the project via this field — expose this endpoint
-    from trusted backends only.
+    Security: this is NOT enforced server-side. Any caller authorized to run
+    this orchestration — i.e. any authenticated project JWT — can reference
+    any knowledge base in the project via this field. This matches the
+    project-wide access posture of the `ai` schema (an authenticated
+    project JWT already reaches every KB in the project through it); it is
+    documented here rather than enforced. Expose this endpoint from trusted
+    backends only.
     """
     data = request.get_json()
     message = data.get("message")

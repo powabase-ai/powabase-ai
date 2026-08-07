@@ -1229,7 +1229,7 @@ def run_agent(agent_id: str):
             }
         ), 400
 
-    if data.get("runtime_knowledge_bases"):
+    if data.get("runtime_knowledge_bases") is not None:
         return jsonify(
             {
                 "error": "'runtime_knowledge_bases' requires the streaming endpoint "
@@ -1601,10 +1601,13 @@ def run_agent_stream(agent_id: str):
     `knowledge_bases` field, BOTH retrievals run (no dedup) and the run's
     `context_handler_id` still points at the preload one.
 
-    Security: any caller authorized to run this agent can reference any
+    Security: this is NOT enforced server-side. Any caller authorized to run
+    this agent — i.e. any authenticated project JWT — can reference any
     knowledge base in the project via this field, regardless of which KBs
-    are attached to the agent — expose this endpoint from trusted backends
-    only.
+    are attached to the agent. This matches the project-wide access posture
+    of the `ai` schema (an authenticated project JWT already reaches every
+    KB in the project through it); it is documented here rather than
+    enforced. Expose this endpoint from trusted backends only.
     """
     # Parse request
     data = request.get_json() or {}

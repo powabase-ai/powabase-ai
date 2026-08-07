@@ -122,6 +122,22 @@ def test_no_assignments_and_no_runtime_returns_empty(env):
     assert tool_registry.build_kb_tools_for_agent("agent-1", MagicMock()) == {}
 
 
+def test_runtime_kb_missing_at_build_time_logs_warning_and_is_dropped(env, caplog):
+    """TOCTOU: the KB was deleted between the route's validation query and
+    tool-build time. The defensive ``if not kb: continue`` skip must not be
+    silent — it must log which KB id was dropped from knowledge_search."""
+    import logging
+
+    env["kbs"] = []  # kb-ghost no longer exists by build time
+    env["install"]()
+    with caplog.at_level(logging.WARNING, logger=tool_registry.__name__):
+        tools = tool_registry.build_kb_tools_for_agent(
+            "agent-1", MagicMock(), runtime_kb_configs=[{"id": "kb-ghost"}]
+        )
+    assert tools == {}
+    assert any("kb-ghost" in record.getMessage() for record in caplog.records)
+
+
 def test_load_all_tools_threads_runtime_configs(monkeypatch):
     seen = {}
 
