@@ -45,6 +45,7 @@ from ..services.run_context import (
     set_run_id,
 )
 from ..services.session import _load_tool_calls_for_runs, persist_agent_run
+from ._runtime_kb import validate_runtime_knowledge_bases
 
 logger = logging.getLogger(__name__)
 
@@ -872,6 +873,10 @@ def run_orchestration_stream(orch_id: str):
     session_id = data.get("session_id")
     user_id = get_current_user_id()
 
+    runtime_kb_configs, runtime_kb_error = validate_runtime_knowledge_bases(data, db.session)
+    if runtime_kb_error:
+        return jsonify({"error": runtime_kb_error}), 400
+
     # Pre-op balance check (free-tier hard cap) via the billing port. Done
     # outside the generator so 402/503 propagate as a normal HTTP error
     # response BEFORE the SSE stream begins. The no-op adapter makes this
@@ -928,7 +933,9 @@ def run_orchestration_stream(orch_id: str):
                 update_orchestration_run,
             )
 
-            orch_row, orchestration = build_orchestration(orch_id)
+            orch_row, orchestration = build_orchestration(
+                orch_id, runtime_kb_configs=runtime_kb_configs or None
+            )
 
             hooks = load_hooks_for_orchestration(orch_id)
 

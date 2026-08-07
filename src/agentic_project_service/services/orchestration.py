@@ -29,7 +29,10 @@ from ..services.tool_registry import load_all_tools_for_agent
 logger = logging.getLogger(__name__)
 
 
-def build_orchestration(orch_id: str) -> tuple[OrchestrationModel, Orchestration]:
+def build_orchestration(
+    orch_id: str,
+    runtime_kb_configs: list[dict] | None = None,
+) -> tuple[OrchestrationModel, Orchestration]:
     """Build a core Orchestration object from DB models.
 
     Returns (orm_model, core_orchestration).
@@ -110,6 +113,7 @@ def build_orchestration(orch_id: str) -> tuple[OrchestrationModel, Orchestration
                 db.session,
                 max_tool_output_length=get_setting("MAX_TOOL_OUTPUT_LENGTH"),
                 default_max_result_chars=get_setting("DEFAULT_MAX_RESULT_CHARS"),
+                runtime_kb_configs=runtime_kb_configs,
             )
 
             entity_config = entity.config or {}
