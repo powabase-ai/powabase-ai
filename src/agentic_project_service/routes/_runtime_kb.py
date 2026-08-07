@@ -5,6 +5,8 @@ which validates nothing): unknown ids, malformed entries, and oversized lists
 all 400 before any stream opens.
 """
 
+import uuid
+
 from sqlalchemy import text
 
 from ..db import AI_SCHEMA
@@ -23,6 +25,10 @@ def validate_runtime_knowledge_bases(data, db_session, ai_schema: str = AI_SCHEM
     for entry in raw:
         if not isinstance(entry, dict) or not entry.get("id"):
             return [], "each 'runtime_knowledge_bases' entry must be an object with an 'id'"
+        try:
+            uuid.UUID(str(entry["id"]))
+        except (ValueError, AttributeError, TypeError):
+            return [], f"invalid knowledge base id: {entry.get('id')!r}"
     ids = [str(entry["id"]) for entry in raw]
     rows = db_session.execute(
         text(f'SELECT id FROM "{ai_schema}".knowledge_bases WHERE id = ANY(:ids)'),

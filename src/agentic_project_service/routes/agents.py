@@ -1201,6 +1201,9 @@ def run_agent(agent_id: str):
     - Session history for multi-turn conversations
     - Knowledge base search with token limiting
     - agentic.Agent class for LLM calls
+
+    `runtime_knowledge_bases` is rejected with 400 here — this endpoint has
+    no tool loop; use POST .../run/stream instead.
     """
     data = request.get_json() or {}
     message = data.get("message")
@@ -1585,6 +1588,23 @@ def run_agent_stream(agent_id: str):
     - `chunk`: Content chunk as it streams
     - `complete`: Final response with metadata
     - `error`: Error information if something fails
+
+    `runtime_knowledge_bases` (optional): a list of up to 10 objects,
+    ``{id, top_k?, retrieval_method?, similarity_threshold?, filter_metadata?,
+    source_ids?}``. Each entry joins the run's ``knowledge_search`` tool for
+    THIS request only — nothing is persisted, so follow-up messages must
+    re-send it. An entry naming a knowledge base that is also attached to the
+    agent overrides that attachment's config for the run. All ids are
+    validated up front and the request 400s before the stream opens if any
+    id is malformed, unknown, or the list exceeds 10 entries. Combinable
+    with the context fields above; combined with the preload
+    `knowledge_bases` field, BOTH retrievals run (no dedup) and the run's
+    `context_handler_id` still points at the preload one.
+
+    Security: any caller authorized to run this agent can reference any
+    knowledge base in the project via this field, regardless of which KBs
+    are attached to the agent — expose this endpoint from trusted backends
+    only.
     """
     # Parse request
     data = request.get_json() or {}

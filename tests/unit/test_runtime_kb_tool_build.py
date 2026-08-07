@@ -144,7 +144,5 @@ def test_load_all_tools_threads_runtime_configs(monkeypatch):
         query = _EmptyQuery()
 
     monkeypatch.setattr(tool_registry, "AgentTool", FakeAgentTool)
-    tool_registry.load_all_tools_for_agent(
-        "agent-1", None, runtime_kb_configs=[{"id": "kb-r"}]
-    )
+    tool_registry.load_all_tools_for_agent("agent-1", None, runtime_kb_configs=[{"id": "kb-r"}])
     assert seen["runtime"] == [{"id": "kb-r"}]

@@ -864,7 +864,24 @@ def get_orchestration_session_messages(orch_id: str, session_id: str):
 @orchestrations_bp.route("/<orch_id>/run/stream", methods=["POST"])
 @require_auth
 def run_orchestration_stream(orch_id: str):
-    """Run an orchestration with SSE streaming."""
+    """Run an orchestration with SSE streaming.
+
+    `runtime_knowledge_bases` (optional): a list of up to 10 objects,
+    ``{id, top_k?, retrieval_method?, similarity_threshold?, filter_metadata?,
+    source_ids?}``. Each entry joins the run's ``knowledge_search`` tool for
+    THIS request only — nothing is persisted, so follow-up messages must
+    re-send it. An entry naming a knowledge base that is also attached to a
+    sub-agent overrides that attachment's config for the run. All ids are
+    validated up front and the request 400s before the stream opens if any
+    id is malformed, unknown, or the list exceeds 10 entries. Combinable
+    with the context fields; combined with the preload `knowledge_bases`
+    field, BOTH retrievals run (no dedup) and the run's `context_handler_id`
+    still points at the preload one.
+
+    Security: any caller authorized to run this orchestration can reference
+    any knowledge base in the project via this field — expose this endpoint
+    from trusted backends only.
+    """
     data = request.get_json()
     message = data.get("message")
     if not message:

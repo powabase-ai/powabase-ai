@@ -403,8 +403,7 @@ def build_kb_tools_for_agent(
         cfg = {
             "id": str(kb.id),
             "name": kb.name,
-            "retrieval_method": entry.get("retrieval_method")
-            or kb_retrieval_config.get("method"),
+            "retrieval_method": entry.get("retrieval_method") or kb_retrieval_config.get("method"),
             "top_k": entry.get("top_k")
             or kb_retrieval_config.get("top_k")
             or get_setting("KB_DEFAULT_TOP_K"),
