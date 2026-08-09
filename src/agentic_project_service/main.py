@@ -134,8 +134,11 @@ def create_app(testing: bool = False):
     try:
         import litellm
         from .services.copilot_config import COPILOT_MODEL_OPTIONS
+        from .services.project_copilot import PROJECT_COPILOT_MODEL
 
-        for _label, model_id in COPILOT_MODEL_OPTIONS:
+        # Workflow-copilot picker models + the pinned Project Copilot model.
+        _models_to_check = [m for _label, m in COPILOT_MODEL_OPTIONS] + [PROJECT_COPILOT_MODEL]
+        for model_id in _models_to_check:
             try:
                 info = litellm.get_model_info(model_id)
             except Exception:
