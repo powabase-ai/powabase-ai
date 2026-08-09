@@ -142,7 +142,9 @@ def db_cleanup(app):
                 '"ai".knowledge_bases, '
                 '"ai".agents, '
                 '"ai".tools, '
-                '"ai".ai_provider_keys '
+                '"ai".ai_provider_keys, '
+                '"ai".project_copilot_messages, '
+                '"ai".project_copilot_sessions '
                 "CASCADE"
             )
         )

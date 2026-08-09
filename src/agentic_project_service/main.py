@@ -30,6 +30,7 @@ from .routes.webhooks import webhooks_bp
 from .routes.database import database_bp
 from .routes.config import config_bp
 from .routes.copilot import copilot_bp
+from .routes.project_copilot import project_copilot_bp
 from .routes.tools import tools_bp
 from .routes.orchestrations import orchestrations_bp
 from .routes.settings import settings_bp
@@ -212,6 +213,7 @@ def create_app(testing: bool = False):
     app.register_blueprint(database_bp)
     app.register_blueprint(config_bp)
     app.register_blueprint(copilot_bp)
+    app.register_blueprint(project_copilot_bp)
     app.register_blueprint(tools_bp)
     app.register_blueprint(orchestrations_bp)
     app.register_blueprint(settings_bp)
