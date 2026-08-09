@@ -32,6 +32,7 @@ def _create_celery():
             "agentic_project_service.tasks.scheduler",
             "agentic_project_service.tasks.cleanup",
             "agentic_project_service.tasks.watchdog",
+            "agentic_project_service.tasks.docs_refresh",
         ],
     )
 
@@ -112,6 +113,19 @@ def seed_indexed_sources_watchdog(**kwargs):
     from .tasks.watchdog import seed_watchdog
 
     seed_watchdog()
+
+
+@worker_ready.connect
+def seed_docs_refresh(**kwargs):
+    """Bootstrap the self-rescheduling docs-KB refresh on the singleton docs
+    project ONLY (gated by DOCS_KB_REFRESH_ENABLED). No Celery beat process runs
+    in this deployment, so periodic work self-reschedules from worker_ready —
+    same pattern as the scheduler/watchdog above."""
+    if os.getenv("DOCS_KB_REFRESH_ENABLED", "false").lower() != "true":
+        return
+    from .tasks.docs_refresh import refresh_docs_kb_task
+
+    refresh_docs_kb_task.delay()
 
 
 # ---------------------------------------------------------------------------

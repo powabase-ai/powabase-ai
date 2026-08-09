@@ -37,6 +37,7 @@ from .routes.settings import settings_bp
 from .routes.ai_provider_keys import ai_provider_keys_bp
 from .routes.observability import observability_bp
 from .routes.internal import internal_bp
+from .routes.internal_docs import internal_docs_bp
 
 # Import ORM models so they register with SQLAlchemy metadata
 from .models import tenant  # noqa: F401
@@ -223,6 +224,12 @@ def create_app(testing: bool = False):
     app.register_blueprint(ai_provider_keys_bp)
     app.register_blueprint(observability_bp)
     app.register_blueprint(internal_bp)
+    app.register_blueprint(internal_docs_bp)
+
+    # CLI commands (e.g. `flask docs refresh-kb`)
+    from .cli import register_cli
+
+    register_cli(app)
 
     # Bind Flask context to the existing Celery app (broker config
     # lives in celery.py — no second Celery instance created here)
