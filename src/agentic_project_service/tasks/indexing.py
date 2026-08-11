@@ -1547,8 +1547,17 @@ def _run_index_body(
 
         # Clean up all embeddings for this indexed source FIRST
         # (prevents search queries from finding embeddings with missing content)
-        # Left uncommitted on purpose so it can ride the fenced transaction
-        # below rather than becoming durable ahead of the result it belongs to.
+        #
+        # This DELETE does NOT ride the fenced transaction below, despite
+        # carrying no commit of its own: the ToC store's
+        # delete_by_indexed_source further down commits unconditionally, and
+        # that commit flushes this statement and delete_chunks along with it.
+        # So the destructive half of a re-index is durable well before the
+        # fence decides anything -- only the INSERT side is fenced. A task that
+        # then loses the fence rolls back what it wrote but not what it
+        # deleted. Deliberate residual: losing the fence means a sibling
+        # re-claimed the row and is re-indexing the same source, so the
+        # artifacts are on their way back.
         db.session.execute(
             text(f"""
                 DELETE FROM "{AI_SCHEMA}".embeddings
@@ -1754,11 +1763,13 @@ def _run_index_body(
     if matched == 0:
         db.session.rollback()
         logger.info(
-            "index_source: %s superseded before commit; DB writes rolled back and no "
-            "side effect ran -- the sparse-index removals, the chunk_embed sparse "
-            "append, billing and enrichment are all gated on the fenced commit. The "
-            "page_index/graph_index/full_document strategies still write their own "
-            "sparse entries before the fence, so those are not covered",
+            "index_source: %s superseded before commit; this task's still-uncommitted "
+            "writes were rolled back and no post-commit side effect ran -- the "
+            "sparse-index removals, the chunk_embed sparse append, billing and "
+            "enrichment are all gated on the fenced commit. The rollback covers "
+            "chunk_embed only: page_index/graph_index/full_document/doc2json commit "
+            "their artifact rows inside their own run functions, ahead of the fence, "
+            "and graph_index/full_document write their sparse entries there too",
             indexed_source_id,
         )
         return {"status": "skipped", "reason": "superseded",
@@ -1823,7 +1834,7 @@ def _run_index_body(
     indexing_action = _resolve_indexing_action(strategy)
     actual_quantity = _quantity_from_stats(stats)
     # billing.charge never raises; ChargeOutcome reports outcome. A
-    # post-success 402 is bounded over-serve per spec line 54.
+    # post-success 402 is bounded over-serve.
     billing.charge(
         action=indexing_action,
         idempotency_action=idempotency_action,
