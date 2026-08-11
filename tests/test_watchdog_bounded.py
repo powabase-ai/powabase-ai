@@ -214,9 +214,64 @@ def test_broker_outage_fails_every_orphan_not_just_the_first(app, orphan):
     when EVERY row takes that path. Three rows, all failing to dispatch: all
     three must end terminal.
     """
-    ids = [orphan(attempts=0) for _ in range(3)]
+    # attempts=1, not 0: the claim increments on the way into 'indexing', so a
+    # real orphan always carries >= 1. Seeding 0 would exercise a state that
+    # cannot occur and would collide with the reindex reset value.
+    ids = [orphan(attempts=1) for _ in range(3)]
 
     _run_watchdog_with_broken_broker(app)
 
     statuses = [_row(app, i).index_status for i in ids]
     assert statuses == ["failed", "failed", "failed"], statuses
+
+
+def test_a_concurrent_reindex_is_not_clobbered_by_a_stale_terminal_write(app, orphan):
+    """A user's Reindex during a broker outage must survive this loop.
+
+    'pending' does not identify the reconciler's own row -- ten writers produce
+    it, and the /reindex routes set it without clearing celery_task_id. The
+    reset commits for every row up front and each .delay() is then attempted in
+    turn, so against a sick broker the window is wide. A Reindex landing inside
+    it was flipped straight back to 'failed' by this loop, and the index_source
+    it queued could not claim a non-'pending' row -- so it exited skipped and
+    the reindex silently did nothing.
+
+    attempts is what separates them: the reset leaves it untouched, every
+    reindex route zeroes it.
+    """
+    from agentic_project_service.tasks import watchdog
+
+    is_id = orphan(attempts=2)
+
+    def _reindex_then_fail(*a, **kw):
+        # Exactly the window: the row has been reset and committed, and this is
+        # the dispatch that never reaches the broker.
+        with app.app_context():
+            db.session.execute(
+                text("""UPDATE ai.indexed_sources
+                        SET index_status = 'pending', attempts = 0,
+                            error_message = NULL, last_dispatched_at = NOW()
+                        WHERE id = :id"""),
+                {"id": is_id},
+            )
+            db.session.commit()
+        raise OSError("broker unreachable")
+
+    fake_redis = MagicMock()
+    fake_redis.lrange.return_value = []
+    fake_inspect = MagicMock()
+    fake_inspect.active.return_value = {"w": []}
+    fake_inspect.reserved.return_value = {"w": []}
+    with (
+        app.app_context(),
+        patch.object(watchdog, "_get_redis", return_value=(fake_redis, "t:lock")),
+        patch.object(watchdog.celery_app.control, "inspect", return_value=fake_inspect),
+        patch("agentic_project_service.tasks.indexing.index_source.delay",
+              side_effect=_reindex_then_fail),
+        patch.object(watchdog, "get_all_user_provider_keys", return_value={}),
+    ):
+        watchdog._run_one_tick()
+
+    row = _row(app, is_id)
+    assert row.index_status == "pending"   # the user's reindex intent survives
+    assert row.attempts == 0               # ... with its fresh budget
