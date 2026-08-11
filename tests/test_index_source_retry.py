@@ -108,17 +108,36 @@ def test_storage_error_and_worker_death_share_one_bound(app, test_knowledge_base
     assert redispatch.call_count < indexing.MAX_ATTEMPTS
 
 
-def test_storage_error_does_not_invoke_celery_retry(app, test_knowledge_base, mocker):
-    """The StorageError path must not call self.retry — a second, uncomposed counter."""
+def test_storage_error_retries_via_delay_not_celery_retry(app, test_knowledge_base, mocker):
+    """The retry goes through .delay(), NOT self.retry — one counter, not two.
+
+    The earlier version of this test asserted only ``retry.assert_not_called()``.
+    That cannot fail from anything being broken: it passes just as well when
+    _handle_storage_error does nothing at all, which is exactly what a mutation
+    run showed (handler gutted -> its three siblings failed, this one passed).
+    A negative assertion needs a positive beside it, or it is not evidence.
+
+    So assert the whole disposition: the retry happened, and it happened
+    through the path that shares the ``attempts`` budget. self.retry would be a
+    second counter Celery increments independently, which is what allowed a row
+    to execute max_retries + MAX_ATTEMPTS times before this change.
+    """
     from agentic_project_service.tasks import indexing
 
     src_id, is_id = _seed_indexing(app, test_knowledge_base["id"], "owner-B", attempts=1)
     retry = mocker.patch.object(indexing.index_source, "retry")
-    mocker.patch.object(indexing.index_source, "delay")
+    delay = mocker.patch.object(indexing.index_source, "delay")
 
     with app.app_context():
         indexing._handle_storage_error(
             knowledge_base_id=test_knowledge_base["id"], source_id=src_id,
             indexed_source_id=is_id, task_id="owner-B", provider_keys={},
         )
-    retry.assert_not_called()
+        row = db.session.execute(
+            text("SELECT index_status FROM ai.indexed_sources WHERE id = :id"),
+            {"id": is_id},
+        ).fetchone()
+
+    delay.assert_called_once()          # a retry DID happen ...
+    retry.assert_not_called()           # ... and not through Celery's own counter
+    assert row.index_status == "pending"  # ... leaving the row claimable again
