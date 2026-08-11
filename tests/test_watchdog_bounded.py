@@ -1,11 +1,12 @@
 """Reconciler bounds retries: attempts>=MAX -> failed (neutral), else pending."""
 
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 
 from agentic_project_service.db import db
 
@@ -246,15 +247,23 @@ def test_a_concurrent_reindex_is_not_clobbered_by_a_stale_terminal_write(app, or
     def _reindex_then_fail(*a, **kw):
         # Exactly the window: the row has been reset and committed, and this is
         # the dispatch that never reaches the broker.
-        with app.app_context():
-            db.session.execute(
+        #
+        # On its OWN connection, not db.session. This callback already runs
+        # inside the watchdog's app context and transaction; writing through
+        # the shared session would commit the watchdog's in-flight work too and
+        # leave the suite's state poisoned for later tests. A separate
+        # connection is also what the thing being simulated actually is -- a
+        # concurrent HTTP request.
+        eng = create_engine(os.environ["DATABASE_URL"])
+        with eng.begin() as conn:
+            conn.execute(
                 text("""UPDATE ai.indexed_sources
                         SET index_status = 'pending', attempts = 0,
                             error_message = NULL, last_dispatched_at = NOW()
                         WHERE id = :id"""),
                 {"id": is_id},
             )
-            db.session.commit()
+        eng.dispose()
         raise OSError("broker unreachable")
 
     fake_redis = MagicMock()
