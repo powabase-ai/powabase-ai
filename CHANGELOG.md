@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/powabase-ai/powabase-ai/compare/v0.4.0...v0.5.0) (2026-08-11)
+
+
+### Features
+
+* **indexing:** bound the retry loop and fence every terminal write ([#50](https://github.com/powabase-ai/powabase-ai/issues/50)) ([975be6e](https://github.com/powabase-ai/powabase-ai/commit/975be6ea7ebe90ca619ee3b629c36387ba95e2c3))
+
 ## [0.4.0](https://github.com/powabase-ai/powabase-ai/compare/v0.3.1...v0.4.0) (2026-08-07)
 
 
