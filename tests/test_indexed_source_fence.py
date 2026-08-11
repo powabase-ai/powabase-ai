@@ -82,3 +82,70 @@ def test_superseded_execution_leaves_zero_chunks(app, test_knowledge_base, mocke
         ).fetchone().c
         assert n_chunks == 0   # superseded -> fence rolled back the chunk inserts
         assert n_emb == 0      # ... and the embedding inserts
+
+
+def test_superseded_execution_fires_no_side_effects(app, test_knowledge_base, mocker):
+    """A superseded task performs NO BM25 build, billing, or enrichment."""
+    from agentic_project_service.tasks import indexing
+
+    src_id, is_id = _seed_indexing(app, test_knowledge_base["id"], owner_task_id="owner-B")
+    mocker.patch.object(indexing, "get_text_derivative_content", return_value="hello world")
+    mocker.patch.object(indexing, "get_page_texts_from_derivative", return_value=None)
+    mocker.patch(
+        "agentic.knowledge.embedder.litellm.LiteLLMEmbedder.aembed_batch",
+        return_value=[[0.1] * 1536],
+    )
+    bm25 = mocker.patch(
+        "agentic_project_service.services.sparse_retrieval."
+        "sparse_index_store.SparseIndexStore.add_and_save"
+    )
+    charge = mocker.patch("agentic_project_service.services.billing_port.charge")
+
+    with app.app_context():
+        indexing._run_index_body(
+            knowledge_base_id=test_knowledge_base["id"], source_id=src_id,
+            indexed_source_id=is_id, task_id="loser-A", provider_keys={},
+            idempotency_action="indexing", idempotency_parts=[is_id],
+        )
+
+    bm25.assert_not_called()     # superseded -> no BM25 append
+    charge.assert_not_called()   # superseded -> no billing
+
+
+def test_owner_execution_fires_each_side_effect_once(app, test_knowledge_base, mocker):
+    """The owner commits, then fires BM25 + billing exactly once each."""
+    from agentic_project_service.tasks import indexing
+
+    src_id, is_id = _seed_indexing(app, test_knowledge_base["id"], owner_task_id="owner-B")
+    mocker.patch.object(indexing, "get_text_derivative_content", return_value="hello world")
+    mocker.patch.object(indexing, "get_page_texts_from_derivative", return_value=None)
+    mocker.patch(
+        "agentic.knowledge.embedder.litellm.LiteLLMEmbedder.aembed_batch",
+        return_value=[[0.1] * 1536],
+    )
+    bm25 = mocker.patch(
+        "agentic_project_service.services.sparse_retrieval."
+        "sparse_index_store.SparseIndexStore.add_and_save"
+    )
+    charge = mocker.patch("agentic_project_service.services.billing_port.charge")
+
+    with app.app_context():
+        # Same call as the superseded test, but task_id MATCHES the row owner.
+        indexing._run_index_body(
+            knowledge_base_id=test_knowledge_base["id"], source_id=src_id,
+            indexed_source_id=is_id, task_id="owner-B", provider_keys={},
+            idempotency_action="indexing", idempotency_parts=[is_id],
+        )
+        row = db.session.execute(
+            text("SELECT index_status FROM ai.indexed_sources WHERE id = :id"),
+            {"id": is_id},
+        ).fetchone()
+        n = db.session.execute(
+            text("SELECT COUNT(*) AS c FROM ai.chunks WHERE indexed_source_id = :id"),
+            {"id": is_id},
+        ).fetchone().c
+
+    assert row.index_status == "indexed"   # owner committed
+    assert n == 1                          # exactly one chunk set persisted
+    bm25.assert_called_once()
+    charge.assert_called_once()

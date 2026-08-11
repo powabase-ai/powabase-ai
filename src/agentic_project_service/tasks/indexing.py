@@ -520,8 +520,22 @@ async def run_indexing(
     page_texts: list[str] | None = None,
     extraction_method: str | None = None,
     provider_keys: dict[str, str] | None = None,  # unused after #437
+    side_out: dict | None = None,
 ) -> dict:
-    """Run the actual indexing process asynchronously."""
+    """Run the actual indexing process asynchronously.
+
+    ``side_out`` is an optional caller-owned dict that collects the inputs the
+    caller needs for its POST-COMMIT side effects: the embedding dimension, the
+    new chunk ids, and the chunk texts for the sparse index. It is a second
+    channel on purpose -- none of it may ride in the returned ``stats``, which
+    is persisted verbatim into a jsonb column and read by clients. The chunk
+    texts alone are the whole document, so merging the two would write a second
+    copy of every source into the database.
+
+    It is left empty when there is nothing to do (no chunks), so a caller that
+    always passes a fresh dict gets "no side effects" by default rather than by
+    remembering to handle an early return.
+    """
     import time
 
     from agentic.knowledge.chunking import MarkdownHeaderChunking
@@ -630,29 +644,11 @@ async def run_indexing(
     )
     _store_secs = time.monotonic() - _t_store
 
-    # Build/update BM25s sparse index for fast keyword search
-    from ..services.sparse_retrieval import SparseIndexStore
-
-    _t_bm25 = time.monotonic()
-    if _should_build_bm25_now(kb_id):
-        sparse_store = SparseIndexStore(knowledge_base_id=kb_id)
-        sparse_store.add_and_save(
-            documents=[c["text"] for c in chunk_dicts],
-            item_ids=chunk_ids,
-            item_table="chunks",
-        )
-        _bm25_secs = time.monotonic() - _t_bm25
-        logger.info(f"Updated BM25s sparse index: {len(chunk_ids)} chunks added")
-    else:
-        _bm25_secs = 0.0
-        logger.info("Skipped BM25 update (KB does not require BM25 or auto-indexing is off)")
-
     _run_indexing_total = time.monotonic() - _run_indexing_t0
     logger.info(
-        "run_indexing_timing aindex=%.2f store_chunks=%.2f bm25=%.2f total=%.2f chunks=%d",
+        "run_indexing_timing aindex=%.2f store_chunks=%.2f total=%.2f chunks=%d",
         _aindex_secs,
         _store_secs,
-        _bm25_secs,
         _run_indexing_total,
         len(chunk_ids),
     )
@@ -669,6 +665,13 @@ async def run_indexing(
         "embedding_dim": embedding_dim,
         "embedding_model": embedding_model,
     }
+
+    # Second channel: the caller runs these AFTER it commits, so the sparse
+    # index can never end up holding ids for chunks that got rolled back.
+    if side_out is not None:
+        side_out["embedding_dim"] = embedding_dim
+        side_out["chunk_ids"] = chunk_ids
+        side_out["bm25_documents"] = [c["text"] for c in chunk_dicts]
 
     return stats
 
@@ -1384,6 +1387,13 @@ def _run_index_body(
     source = get_source(source_id)
     strategy = indexing_config.get("strategy", "chunk_embed")
     strategy_changed = False
+    # Sparse-index ids superseded by this run. Collected before the deletes
+    # below, applied only after the fenced commit -- see the side-effect block.
+    chunk_ids_to_remove: list[str] = []
+    fd_ids_to_remove: list[str] = []
+    gi_ids_to_remove: list[str] = []
+    # Side-effect inputs from the strategy run, kept out of `stats`.
+    side: dict = {}
 
     if indexed_source_id:
         # Read old snapshot BEFORE overwriting to detect strategy changes
@@ -1409,8 +1419,6 @@ def _run_index_body(
         # Each call is a no-op (0 rows deleted) if no artifacts exist for that type.
 
         # First, query IDs before deletion for sparse index cleanup
-        from ..services.sparse_retrieval import SparseIndexStore
-
         chunk_ids_to_remove = [
             str(r[0])
             for r in db.session.execute(
@@ -1467,15 +1475,10 @@ def _run_index_body(
             knowledge_base_id=knowledge_base_id,
         )
         d2j_store.delete_by_indexed_source(indexed_source_id)
-        # Remove deleted items from sparse indexes
-        if _should_build_bm25_now(knowledge_base_id):
-            sparse_store = SparseIndexStore(knowledge_base_id=knowledge_base_id)
-            if chunk_ids_to_remove:
-                sparse_store.remove_and_save(chunk_ids_to_remove, item_table="chunks")
-            if fd_ids_to_remove:
-                sparse_store.remove_and_save(fd_ids_to_remove, item_table="full_documents")
-            if gi_ids_to_remove:
-                sparse_store.remove_and_save(gi_ids_to_remove, item_table="graph_index_nodes")
+        # The matching sparse-index removals are deliberately NOT done here:
+        # they would mutate a shared on-disk index before this run has proved
+        # it owns the row, so a superseded task would strip the live index and
+        # then roll its own DB writes back. They run after the fenced commit.
 
         logger.info(
             "Cleared all artifact tables for re-indexing (old_strategy=%s, new_strategy=%s)",
@@ -1591,6 +1594,7 @@ def _run_index_body(
                 page_texts=page_texts,
                 extraction_method=extraction_method,
                 provider_keys=provider_keys,
+                side_out=side,
             )
         )
 
@@ -1603,14 +1607,65 @@ def _run_index_body(
     if matched == 0:
         db.session.rollback()
         logger.info(
-            "index_source: %s superseded before commit; DB writes rolled back, but the "
-            "BM25 sparse-index write that ran before the fence is not undone and may "
-            "leave entries for rolled-back chunk ids",
+            "index_source: %s superseded before commit; DB writes rolled back and no "
+            "side effect ran -- the sparse-index removals, the chunk_embed sparse "
+            "append, billing and enrichment are all gated on the fenced commit. The "
+            "page_index/graph_index/full_document strategies still write their own "
+            "sparse entries before the fence, so those are not covered",
             indexed_source_id,
         )
         return {"status": "skipped", "reason": "superseded",
                 "indexed_source_id": indexed_source_id}
     db.session.commit()
+
+    # --- side effects: owner only, and only once a result is durably committed.
+    # The status row is ALREADY committed as 'indexed', so an exception escaping
+    # here would reach index_source's `except Exception` and relabel a
+    # durably-correct row as 'failed'. Log and carry on instead, the way the
+    # auto-enrichment block below already does.
+    try:
+        from ..services.base_vector_store import ensure_embedding_index
+        from ..services.sparse_retrieval import SparseIndexStore
+
+        # (1) hnsw index for this embedding dimension. It cannot live in the
+        #     insert path: CREATE INDEX takes a ShareLock that conflicts with
+        #     the RowExclusiveLock the uncommitted INSERTs hold.
+        embedding_dim = side.get("embedding_dim")
+        if embedding_dim:
+            ensure_embedding_index(db.session, AI_SCHEMA, embedding_dim)
+            db.session.commit()
+
+        # (2) sparse index: the removals deferred out of the clear-and-reindex
+        #     branch above, then the incremental append for the chunks this run
+        #     just committed. Removals go first so the superseded ids are gone
+        #     before the new ones land. Both now happen only for the owner and
+        #     only after the commit, so no sparse entry can point at a chunk
+        #     that was rolled back.
+        if _should_build_bm25_now(knowledge_base_id):
+            sparse_store = SparseIndexStore(knowledge_base_id=knowledge_base_id)
+            if chunk_ids_to_remove:
+                sparse_store.remove_and_save(chunk_ids_to_remove, item_table="chunks")
+            if fd_ids_to_remove:
+                sparse_store.remove_and_save(fd_ids_to_remove, item_table="full_documents")
+            if gi_ids_to_remove:
+                sparse_store.remove_and_save(gi_ids_to_remove, item_table="graph_index_nodes")
+            if side.get("bm25_documents"):
+                sparse_store.add_and_save(
+                    documents=side["bm25_documents"],
+                    item_ids=side["chunk_ids"],
+                    item_table="chunks",
+                )
+    except Exception:
+        # Roll back so a failed ensure_embedding_index does not leave the
+        # session unusable for the rest of the task. Hygiene only: nothing
+        # below this point touches the session before its own try.
+        db.session.rollback()
+        logger.error(
+            "index_source: post-commit side effect failed for %s; the indexed result "
+            "stands (the sparse index may be stale until the next reindex)",
+            indexed_source_id,
+            exc_info=True,
+        )
 
     # Bill the indexing action with the actual 1k-token quantity. The
     # billing-configured check now lives in the adapter (no-op when
