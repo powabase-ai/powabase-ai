@@ -762,6 +762,7 @@ def index_source_into_kb(kb_id: str, source_id: str) -> dict:
                 indexing_config_snapshot = CAST(:config AS jsonb),
                 error_message = NULL,
                 attempts = 0,
+                celery_task_id = NULL,
                 last_dispatched_at = NOW()
             RETURNING id
         """),
@@ -1000,6 +1001,7 @@ def reindex_kb(kb_id: str):
                 SET index_status = 'pending',
                     error_message = NULL,
                     attempts = 0,
+                    celery_task_id = NULL,
                     last_dispatched_at = NOW()
                 WHERE id = ANY(:ids)
             """),
@@ -1061,6 +1063,7 @@ def reindex_kb(kb_id: str):
                 SET index_status = 'pending',
                     error_message = NULL,
                     attempts = 0,
+                    celery_task_id = NULL,
                     last_dispatched_at = NOW()
                 WHERE id = ANY(:ids)
             """),
@@ -1113,6 +1116,7 @@ def reindex_kb(kb_id: str):
             SET index_status = 'pending',
                 error_message = NULL,
                 attempts = 0,
+                celery_task_id = NULL,
                 last_dispatched_at = NOW()
             WHERE knowledge_base_id = :kb_id
         """),
