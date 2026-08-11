@@ -1140,9 +1140,19 @@ def reindex_kb(kb_id: str):
 
 
 def _mark_reenriching(kb_id: str, indexed_source_id: str | None, task_id: str) -> None:
-    """Mark reenrich target(s) 'indexing', stamped with the reenrich task's own
-    id + a fresh last_dispatched_at -- so the reconciler's liveness check treats
-    them as live and does NOT hijack them into a full index_source re-index."""
+    """Mark reenrich target(s) 'indexing', stamped with this task's id and a
+    fresh last_dispatched_at.
+
+    The fresh timestamp is what defers the reconciler: its orphan predicate
+    only selects rows whose last_dispatched_at is older than the staleness
+    window (see ORPHAN_QUERY), so a just-marked row is out of scope until that
+    window expires. The stamped id does NOT help there -- the reconciler builds
+    its alive set from index_source tasks only, so a reenrich id never matches
+    it and that clause stays true throughout. The id is what makes
+    _unmark_reenriching reversible against our own mark and nothing else.
+
+    A reenrichment still running when the window expires is therefore back in
+    scope, and can be hijacked into a full re-index."""
     sql = f"""
         UPDATE "{AI_SCHEMA}".indexed_sources
         SET index_status = 'indexing', error_message = NULL,
@@ -1210,11 +1220,15 @@ def run_graph_reenrichment(kb_id: str):
     # default in the billing port (ctx-gated by the adapter), so no billing key
     # inputs are threaded here.
 
-    # The row must carry the reenrich task's OWN id while it is 'indexing'.
-    # Reenrichment runs over ALREADY-indexed sources, so leaving the completed
-    # index run's celery_task_id in place (the original order did) made the row
-    # satisfy every clause of the reconciler's orphan predicate, and it got
-    # hijacked into a full index_source re-index.
+    # Mark before dispatch, under an id minted here.
+    #
+    # Reenrichment runs over ALREADY-indexed sources, so a row marked without
+    # touching its dispatch bookkeeping (the original order did exactly that)
+    # kept the completed index run's celery_task_id AND its long-past
+    # last_dispatched_at -- satisfying every clause of the reconciler's orphan
+    # predicate immediately, which hijacked it into a full index_source
+    # re-index. The fresh last_dispatched_at is what stops that; see
+    # _mark_reenriching for what the stamped id does and does not buy.
     #
     # Mint the id here rather than reading it back off .delay(): taking it from
     # the dispatch forces mark-AFTER-dispatch, and the task can finish first.
