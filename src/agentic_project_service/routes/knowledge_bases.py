@@ -1156,6 +1156,23 @@ def _mark_reenriching(kb_id: str, indexed_source_id: str | None, task_id: str) -
     db.session.commit()
 
 
+def _unmark_reenriching(kb_id: str, indexed_source_id: str | None, task_id: str) -> None:
+    """Undo _mark_reenriching after a dispatch that never reached the broker.
+
+    Fenced on the id we stamped, so it reverses only our own mark and yields to
+    anything that has since moved the row on."""
+    sql = f"""
+        UPDATE "{AI_SCHEMA}".indexed_sources
+        SET index_status = 'indexed', celery_task_id = NULL
+        WHERE knowledge_base_id = :kb_id AND celery_task_id = :tid
+    """ + (" AND id = :id" if indexed_source_id else "")
+    params = {"kb_id": kb_id, "tid": task_id}
+    if indexed_source_id:
+        params["id"] = indexed_source_id
+    db.session.execute(text(sql), params)
+    db.session.commit()
+
+
 @knowledge_bases_bp.route("/<kb_id>/graph-enrichment/run", methods=["POST"])
 @require_auth
 def run_graph_reenrichment(kb_id: str):
@@ -1193,31 +1210,41 @@ def run_graph_reenrichment(kb_id: str):
     # default in the billing port (ctx-gated by the adapter), so no billing key
     # inputs are threaded here.
 
-    # Dispatch FIRST so the task id exists, then mark. Marking before dispatch
-    # (the old order) left the row 'indexing' with no celery_task_id of its
-    # own; since reenrichment runs over ALREADY-indexed sources, those rows
-    # still carried the completed index run's celery_task_id, long gone from
-    # the alive set -- so the row satisfied every clause of the reconciler's
-    # orphan predicate and got hijacked into a full index_source re-index.
-    # Stamping the reenrich task's own id makes the liveness check skip it.
+    # The row must carry the reenrich task's OWN id while it is 'indexing'.
+    # Reenrichment runs over ALREADY-indexed sources, so leaving the completed
+    # index run's celery_task_id in place (the original order did) made the row
+    # satisfy every clause of the reconciler's orphan predicate, and it got
+    # hijacked into a full index_source re-index.
+    #
+    # Mint the id here rather than reading it back off .delay(): taking it from
+    # the dispatch forces mark-AFTER-dispatch, and the task can finish first.
+    # Its fast exits restore 'indexed' with a NULL celery_task_id, and a mark
+    # landing after that puts the row back to 'indexing' behind an already-dead
+    # task id with a fresh last_dispatched_at -- the orphan shape again, two
+    # minutes later. Marking first and dispatching under that id has no such
+    # window.
+    tid = str(uuid.uuid4())
+    _mark_reenriching(kb_id, indexed_source_id, tid)
+
     try:
-        task = reenrich_graph_references.delay(
-            kb_id,
-            retry_failed=retry_failed,
-            indexed_source_id=indexed_source_id,
+        reenrich_graph_references.apply_async(
+            args=[kb_id],
+            kwargs={
+                "retry_failed": retry_failed,
+                "indexed_source_id": indexed_source_id,
+            },
+            task_id=tid,
         )
     except Exception:
-        # Nothing has been marked yet at this point, so there is nothing to
-        # restore -- unlike the old mark-before-dispatch order.
+        # The mark is committed and nothing was queued to clear it, so undo it.
         logger.exception("Failed to dispatch re-enrichment task for KB %s", kb_id)
+        _unmark_reenriching(kb_id, indexed_source_id, tid)
         return jsonify({"error": "Failed to start re-enrichment task"}), 500
-
-    _mark_reenriching(kb_id, indexed_source_id, task.id)
 
     return jsonify(
         {
             "status": "started",
-            "task_id": task.id,
+            "task_id": tid,
             "knowledge_base_id": kb_id,
             "retry_failed": retry_failed,
         }
