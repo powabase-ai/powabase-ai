@@ -761,6 +761,7 @@ def index_source_into_kb(kb_id: str, source_id: str) -> dict:
                 index_status = 'pending',
                 indexing_config_snapshot = CAST(:config AS jsonb),
                 error_message = NULL,
+                attempts = 0,
                 last_dispatched_at = NOW()
             RETURNING id
         """),
@@ -998,6 +999,7 @@ def reindex_kb(kb_id: str):
                 UPDATE "{AI_SCHEMA}".indexed_sources
                 SET index_status = 'pending',
                     error_message = NULL,
+                    attempts = 0,
                     last_dispatched_at = NOW()
                 WHERE id = ANY(:ids)
             """),
@@ -1058,6 +1060,7 @@ def reindex_kb(kb_id: str):
                 UPDATE "{AI_SCHEMA}".indexed_sources
                 SET index_status = 'pending',
                     error_message = NULL,
+                    attempts = 0,
                     last_dispatched_at = NOW()
                 WHERE id = ANY(:ids)
             """),
@@ -1109,6 +1112,7 @@ def reindex_kb(kb_id: str):
             UPDATE "{AI_SCHEMA}".indexed_sources
             SET index_status = 'pending',
                 error_message = NULL,
+                attempts = 0,
                 last_dispatched_at = NOW()
             WHERE knowledge_base_id = :kb_id
         """),
