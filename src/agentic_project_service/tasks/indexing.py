@@ -448,14 +448,45 @@ def _handle_storage_error(
         # Only re-dispatch if we still owned the row (fence). A superseded task
         # matched 0 rows and must NOT spawn a spurious duplicate.
         if result.rowcount:
-            index_source.delay(
-                knowledge_base_id,
-                source_id,
-                indexed_source_id=indexed_source_id,
-                provider_keys=provider_keys,
-                idempotency_action=idempotency_action,
-                idempotency_parts=idempotency_parts,
-            )
+            try:
+                index_source.delay(
+                    knowledge_base_id,
+                    source_id,
+                    indexed_source_id=indexed_source_id,
+                    provider_keys=provider_keys,
+                    idempotency_action=idempotency_action,
+                    idempotency_parts=idempotency_parts,
+                )
+            except Exception:
+                # The reset above is already committed, so a publish that never
+                # reached the broker leaves a 'pending' row with nobody coming
+                # for it -- and ORPHAN_QUERY only ever selects 'indexing', so
+                # nothing would find it again. Make it terminal instead.
+                logger.error(
+                    "Failed to .delay() a storage-error retry for indexed_source_id=%s",
+                    indexed_source_id,
+                    exc_info=True,
+                )
+                # Retake the row first: the reset dropped our task id, so the
+                # ownership fence below has nothing to match on until we put it
+                # back. Retaking is itself conditional on the row still being
+                # the unclaimed 'pending' one we just wrote, so a concurrent
+                # claim wins and the terminal write becomes a no-op.
+                db.session.execute(
+                    text(f"""UPDATE "{AI_SCHEMA}".indexed_sources
+                             SET celery_task_id = :task_id
+                             WHERE id = :id AND index_status = 'pending'
+                               AND celery_task_id IS NULL"""),
+                    {"id": indexed_source_id, "task_id": task_id},
+                )
+                db.session.commit()
+                # Names the observation, not a cause: from here the only thing
+                # known is that the retry could not be queued.
+                _fenced_mark_failed(
+                    indexed_source_id,
+                    task_id,
+                    f"Indexing failed after {attempts} attempts (the retry could not be queued).",
+                )
     else:
         # Cause is known here (a persistent storage error), so name it -- unlike
         # the reconciler path where the cause is not observable. FENCED: a
