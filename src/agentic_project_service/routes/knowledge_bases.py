@@ -1139,6 +1139,23 @@ def reindex_kb(kb_id: str):
     )
 
 
+def _mark_reenriching(kb_id: str, indexed_source_id: str | None, task_id: str) -> None:
+    """Mark reenrich target(s) 'indexing', stamped with the reenrich task's own
+    id + a fresh last_dispatched_at -- so the reconciler's liveness check treats
+    them as live and does NOT hijack them into a full index_source re-index."""
+    sql = f"""
+        UPDATE "{AI_SCHEMA}".indexed_sources
+        SET index_status = 'indexing', error_message = NULL,
+            celery_task_id = :tid, last_dispatched_at = NOW()
+        WHERE knowledge_base_id = :kb_id
+    """ + (" AND id = :id" if indexed_source_id else "")
+    params = {"kb_id": kb_id, "tid": task_id}
+    if indexed_source_id:
+        params["id"] = indexed_source_id
+    db.session.execute(text(sql), params)
+    db.session.commit()
+
+
 @knowledge_bases_bp.route("/<kb_id>/graph-enrichment/run", methods=["POST"])
 @require_auth
 def run_graph_reenrichment(kb_id: str):
@@ -1176,27 +1193,13 @@ def run_graph_reenrichment(kb_id: str):
     # default in the billing port (ctx-gated by the adapter), so no billing key
     # inputs are threaded here.
 
-    # Mark affected sources as "indexing" so frontend polling kicks in
-    if indexed_source_id:
-        db.session.execute(
-            text(f"""
-                UPDATE "{AI_SCHEMA}".indexed_sources
-                SET index_status = 'indexing', error_message = NULL
-                WHERE id = :id AND knowledge_base_id = :kb_id
-            """),
-            {"id": indexed_source_id, "kb_id": kb_id},
-        )
-    else:
-        db.session.execute(
-            text(f"""
-                UPDATE "{AI_SCHEMA}".indexed_sources
-                SET index_status = 'indexing', error_message = NULL
-                WHERE knowledge_base_id = :kb_id
-            """),
-            {"kb_id": kb_id},
-        )
-    db.session.commit()
-
+    # Dispatch FIRST so the task id exists, then mark. Marking before dispatch
+    # (the old order) left the row 'indexing' with no celery_task_id of its
+    # own; since reenrichment runs over ALREADY-indexed sources, those rows
+    # still carried the completed index run's celery_task_id, long gone from
+    # the alive set -- so the row satisfied every clause of the reconciler's
+    # orphan predicate and got hijacked into a full index_source re-index.
+    # Stamping the reenrich task's own id makes the liveness check skip it.
     try:
         task = reenrich_graph_references.delay(
             kb_id,
@@ -1204,24 +1207,12 @@ def run_graph_reenrichment(kb_id: str):
             indexed_source_id=indexed_source_id,
         )
     except Exception:
-        # Restore status if task dispatch fails (e.g. Redis down)
-        if indexed_source_id:
-            db.session.execute(
-                text(
-                    f"UPDATE \"{AI_SCHEMA}\".indexed_sources SET index_status = 'indexed' WHERE id = :id"
-                ),
-                {"id": indexed_source_id},
-            )
-        else:
-            db.session.execute(
-                text(
-                    f"UPDATE \"{AI_SCHEMA}\".indexed_sources SET index_status = 'indexed' WHERE knowledge_base_id = :kb_id"
-                ),
-                {"kb_id": kb_id},
-            )
-        db.session.commit()
+        # Nothing has been marked yet at this point, so there is nothing to
+        # restore -- unlike the old mark-before-dispatch order.
         logger.exception("Failed to dispatch re-enrichment task for KB %s", kb_id)
         return jsonify({"error": "Failed to start re-enrichment task"}), 500
+
+    _mark_reenriching(kb_id, indexed_source_id, task.id)
 
     return jsonify(
         {
