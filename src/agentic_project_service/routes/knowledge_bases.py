@@ -1190,12 +1190,18 @@ def _mark_reenriching(kb_id: str, indexed_source_id: str | None, task_id: str) -
 def _unmark_reenriching(kb_id: str, indexed_source_id: str | None, task_id: str) -> None:
     """Undo _mark_reenriching after a dispatch that never reached the broker.
 
-    Fenced on the id we stamped, so it reverses only our own mark and yields to
-    anything that has since moved the row on."""
+    Fenced on the id we stamped AND on the row still being 'indexing', so it
+    reverses only our own mark and yields to anything that has since moved the
+    row on. The id alone does not deliver that second half: a row that still
+    carries our id but has been written terminal by someone else would be
+    flipped back to 'indexed' by an id-only predicate -- which is precisely
+    what this docstring promised and did not do."""
     sql = f"""
         UPDATE "{AI_SCHEMA}".indexed_sources
         SET index_status = 'indexed', celery_task_id = NULL
-        WHERE knowledge_base_id = :kb_id AND celery_task_id = :tid
+        WHERE knowledge_base_id = :kb_id
+          AND celery_task_id = :tid
+          AND index_status = 'indexing'
     """ + (" AND id = :id" if indexed_source_id else "")
     params = {"kb_id": kb_id, "tid": task_id}
     if indexed_source_id:

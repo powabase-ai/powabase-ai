@@ -106,3 +106,55 @@ def test_kb_wide_mark_does_not_steal_a_live_task_fence(app, test_knowledge_base)
 
     assert row.index_status == "indexing"
     assert row.celery_task_id == "live-worker"   # the live owner keeps the fence
+
+
+def test_completion_restores_only_rows_this_task_owns(app, test_knowledge_base):
+    """The completion write is fenced on our task id, not just scoped by KB.
+
+    Dropping both `AND celery_task_id = :tid` fences in indexing.py left the
+    whole suite green — the half of the fix that argues "a guard at one end
+    only is a guard until the next caller" had no test at all. This is it.
+
+    Two rows in the same KB, both 'indexing': one marked by us, one owned by a
+    different task. The completion must restore ours and leave theirs alone.
+    """
+    from agentic_project_service.tasks.indexing import _restore_indexed_status
+
+    ours = _seed(app, test_knowledge_base["id"], "indexing", task_id="our-reenrich")
+    theirs = _seed(app, test_knowledge_base["id"], "indexing", task_id="other-worker")
+
+    with app.app_context():
+        _restore_indexed_status(test_knowledge_base["id"], None, "our-reenrich")
+        rows = {
+            str(r.id): r
+            for r in db.session.execute(
+                text("SELECT id, index_status, celery_task_id FROM ai.indexed_sources "
+                     "WHERE id = ANY(:ids)"),
+                {"ids": [ours, theirs]},
+            ).fetchall()
+        }
+
+    assert rows[ours].index_status == "indexed"          # ours restored
+    assert rows[ours].celery_task_id is None
+    assert rows[theirs].index_status == "indexing"       # theirs untouched
+    assert rows[theirs].celery_task_id == "other-worker"
+
+
+def test_unmark_yields_to_a_row_someone_else_moved_on(app, test_knowledge_base):
+    """_unmark_reenriching must not resurrect a row written terminal elsewhere.
+
+    Its docstring promised it "yields to anything that has since moved the row
+    on", but it fenced on the id alone. A row still carrying our id that
+    someone else wrote 'failed' would be flipped back to 'indexed'.
+    """
+    from agentic_project_service.routes.knowledge_bases import _unmark_reenriching
+
+    is_id = _seed(app, test_knowledge_base["id"], "failed", task_id="our-reenrich")
+
+    with app.app_context():
+        _unmark_reenriching(test_knowledge_base["id"], None, "our-reenrich")
+        row = db.session.execute(
+            text("SELECT index_status FROM ai.indexed_sources WHERE id=:id"), {"id": is_id}
+        ).fetchone()
+
+    assert row.index_status == "failed"   # left terminal, not resurrected

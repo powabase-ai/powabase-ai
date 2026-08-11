@@ -31,7 +31,7 @@ import redis
 from sqlalchemy import text
 
 from ..celery import celery_app
-from ..db import AI_SCHEMA, db
+from ..db import AI_SCHEMA, commit_scoped_write, db
 from ..services.ai_provider_keys_resolver import get_all_user_provider_keys
 from ..services import billing_port as billing
 
@@ -307,14 +307,27 @@ def _find_and_recover_orphans(alive_ids: set[str]) -> int:
                 row.id,
                 exc_info=True,
             )
-            db.session.execute(
-                text(f"""
+            # Through commit_scoped_write, NOT a bare execute+commit. This runs
+            # inside an except handler inside the per-row loop, and the case
+            # that reaches it is a broker outage -- i.e. every row fails, one
+            # after another. A write that raises here would escape the handler,
+            # escape the loop, and strand every orphan after the first, in the
+            # component whose job is to un-strand them.
+            #
+            # Fenced on index_status, not ownership: the reset left this row
+            # 'pending' still carrying the DEAD task's id, and the reconciler
+            # holds no id of its own, so status is the only predicate with
+            # meaning here. It yields correctly too -- a task that has since
+            # claimed the row flipped it to 'indexing', and this matches
+            # nothing, which is why the rowcount is worth logging.
+            failed_rows = commit_scoped_write(
+                f"""
                     UPDATE "{AI_SCHEMA}".indexed_sources
                     SET index_status = 'failed',
                         error_message = :msg
                     WHERE id = :id
                       AND index_status = 'pending'
-                """),
+                """,
                 {
                     "id": row.id,
                     # Names only what is known here: the retry could not be
@@ -322,8 +335,15 @@ def _find_and_recover_orphans(alive_ids: set[str]) -> int:
                     # layer, so it is not guessed at.
                     "msg": "Indexing could not be re-queued after the worker stopped.",
                 },
+                what="watchdog unqueueable-recovery terminal write",
             )
-            db.session.commit()
+            if not failed_rows:
+                logger.warning(
+                    "Watchdog: could not mark indexed_source_id=%s failed after a "
+                    "dispatch failure; it was moved on by someone else, or the "
+                    "write did not land",
+                    row.id,
+                )
 
     logger.info(
         "Watchdog: recovered %d/%d orphaned indexed_sources rows",

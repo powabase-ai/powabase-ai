@@ -165,3 +165,58 @@ def test_unqueueable_recovery_is_terminal_not_stranded(app, orphan):
     assert row.error_message is not None
     # cause-neutral: the reconciler cannot see WHY the broker refused
     assert "could not be re-queued" in row.error_message
+
+
+def test_exhausted_rows_are_never_re_dispatched(app, orphan):
+    """A row written 'failed' at the bound must not also be handed to .delay().
+
+    The dispatch loop iterates `recoverable`, not `rows`. Nothing pinned that:
+    changing it to `rows` re-dispatches the very rows the bound just retired --
+    the exact unbounded-retry behaviour this whole change exists to stop -- and
+    the suite stayed green. This asserts the split directly.
+    """
+    from agentic_project_service.tasks import indexing, watchdog
+
+    at_bound = orphan(attempts=indexing.MAX_ATTEMPTS)
+    under_bound = orphan(attempts=indexing.MAX_ATTEMPTS - 1)
+
+    fake_redis = MagicMock()
+    fake_redis.lrange.return_value = []
+    fake_inspect = MagicMock()
+    fake_inspect.active.return_value = {"w": []}
+    fake_inspect.reserved.return_value = {"w": []}
+    with (
+        app.app_context(),
+        patch.object(watchdog, "_get_redis", return_value=(fake_redis, "t:lock")),
+        patch.object(watchdog.celery_app.control, "inspect", return_value=fake_inspect),
+        patch("agentic_project_service.tasks.indexing.index_source.delay") as delay,
+        patch.object(watchdog, "get_all_user_provider_keys", return_value={}),
+    ):
+        watchdog._run_one_tick()
+
+    assert _row(app, at_bound).index_status == "failed"
+    assert _row(app, under_bound).index_status == "pending"
+    # exactly one dispatch, and it is the under-bound row
+    assert delay.call_count == 1
+    dispatched_ids = {str(a) for c in delay.call_args_list for a in c.args} | {
+        str(v) for c in delay.call_args_list for v in c.kwargs.values()
+    }
+    assert under_bound in dispatched_ids
+    assert at_bound not in dispatched_ids   # the retired row was NOT re-queued
+
+
+def test_broker_outage_fails_every_orphan_not_just_the_first(app, orphan):
+    """A dispatch failure on one row must not stop the rest being handled.
+
+    The terminal write lives inside the loop's `except` block. Written as a
+    bare execute+commit it can raise, escape the handler, escape the loop, and
+    strand every orphan after the first -- in a broker outage, which is exactly
+    when EVERY row takes that path. Three rows, all failing to dispatch: all
+    three must end terminal.
+    """
+    ids = [orphan(attempts=0) for _ in range(3)]
+
+    _run_watchdog_with_broken_broker(app)
+
+    statuses = [_row(app, i).index_status for i in ids]
+    assert statuses == ["failed", "failed", "failed"], statuses

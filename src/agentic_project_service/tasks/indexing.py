@@ -16,7 +16,7 @@ from sqlalchemy import text
 
 from agentic.llm.cost_accumulator import init_accumulator, install
 
-from ..db import db, AI_SCHEMA
+from ..db import db, AI_SCHEMA, commit_scoped_write
 from ..services import billing_port as billing
 from ..services.llm_call import (
     cached_byok_resolver,
@@ -2204,8 +2204,10 @@ def _restore_indexed_status(
     params = {"kb_id": knowledge_base_id, "tid": task_id}
     if indexed_source_id:
         params["id"] = indexed_source_id
-    db.session.execute(text(sql), params)
-    db.session.commit()
+    # Through the helper: every caller is an early-exit path inside the task's
+    # own error handling, where a raise here would replace the real failure
+    # with this one.
+    commit_scoped_write(sql, params, what="reenrich early-exit restore")
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=120)
@@ -2428,21 +2430,50 @@ def reenrich_graph_references(
         # Selecting every row in the KB was the write that turned an over-broad
         # mark into silent corruption: a source merely queued, or one a live
         # index_source task was still working on, got stamped 'indexed' here
-        # regardless of whether it had ever been indexed. The mark is scoped
-        # now, but this end is fenced too -- a guard at one end only is a guard
-        # until the next caller.
-        sql = f"""
-            SELECT id FROM "{AI_SCHEMA}".indexed_sources
-            WHERE knowledge_base_id = :kb_id
-              AND index_status = 'indexing'
-              AND celery_task_id = :tid
-        """ + (" AND id = :id" if indexed_source_id else "")
-        params = {"kb_id": knowledge_base_id, "tid": self.request.id}
-        if indexed_source_id:
-            params["id"] = indexed_source_id
-        for row in db.session.execute(text(sql), params).fetchall():
-            update_indexed_source_config_snapshot(str(row[0]), indexing_config)
-            update_indexed_source_status(str(row[0]), "indexed")
+        # regardless of whether it had ever been indexed.
+        #
+        # ONE fenced UPDATE, not a fenced SELECT feeding unfenced writes. The
+        # first version of this fix read the owned ids and then drove
+        # update_indexed_source_*() per row -- and those helpers are unfenced
+        # and commit. The predicate was therefore evaluated once, at SELECT
+        # time, and the writes landed unconditionally afterwards: anything that
+        # took the row in between got its status and config overwritten by us.
+        # A fence that is only consulted before the write is not a fence.
+        #
+        # Doing it as a single statement makes the predicate and the write
+        # atomic, and collapses N commits into one.
+        restored = commit_scoped_write(
+            f"""
+                UPDATE "{AI_SCHEMA}".indexed_sources
+                SET index_status = 'indexed',
+                    indexing_config_snapshot = CAST(:cfg AS jsonb),
+                    error_message = NULL,
+                    celery_task_id = NULL
+                WHERE knowledge_base_id = :kb_id
+                  AND index_status = 'indexing'
+                  AND celery_task_id = :tid
+            """ + (" AND id = :id" if indexed_source_id else ""),
+            (
+                {
+                    "kb_id": knowledge_base_id,
+                    "tid": self.request.id,
+                    "cfg": json.dumps(indexing_config),
+                    "id": indexed_source_id,
+                }
+                if indexed_source_id
+                else {
+                    "kb_id": knowledge_base_id,
+                    "tid": self.request.id,
+                    "cfg": json.dumps(indexing_config),
+                }
+            ),
+            what="reenrich completion restore",
+        )
+        logger.info(
+            "Graph re-enrichment restored 'indexed' on %d row(s) it owned for KB %s",
+            restored,
+            knowledge_base_id,
+        )
 
         logger.info(
             "Graph re-enrichment complete for KB %s: %d tocs, %d refs, %d embedded, %d errors",
