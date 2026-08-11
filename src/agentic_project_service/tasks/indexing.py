@@ -1432,6 +1432,35 @@ def index_source(
                 logger.info(f"Indexed source {indexed_source_id} already cancelled, skipping")
                 return {"status": "cancelled", "source_id": source_id}
 
+        if indexed_source_id is None:
+            # Get or create indexed_source record
+            result = db.session.execute(
+                text(f"""
+                    SELECT id FROM "{AI_SCHEMA}".indexed_sources
+                    WHERE knowledge_base_id = :kb_id AND source_id = :source_id
+                """),
+                {"kb_id": knowledge_base_id, "source_id": source_id},
+            )
+            row = result.fetchone()
+            if row:
+                indexed_source_id = str(row[0])
+            else:
+                logger.error("indexed_source_id not provided and record not found")
+                return {"status": "error", "error": "indexed_source record not found"}
+
+        claimed_attempts = _claim_indexed_source(indexed_source_id, task_id)
+        if claimed_attempts is None:
+            # A sibling already claimed this row, or it's terminal. This is a
+            # redundant duplicate (redelivery / reconciler re-dispatch); exit before
+            # any destructive or externally-visible work so a task storm is a
+            # no-op, not data loss or an OOM.
+            logger.info(
+                "index_source: %s not claimable (superseded or terminal); skipping",
+                indexed_source_id,
+            )
+            return {"status": "skipped", "reason": "not_claimable",
+                    "indexed_source_id": indexed_source_id}
+
         if indexed_source_id:
             # Read old snapshot BEFORE overwriting to detect strategy changes
             old_snapshot = _get_indexed_source_snapshot(indexed_source_id)
@@ -1528,33 +1557,6 @@ def index_source(
                 old_strategy,
                 strategy,
             )
-        else:
-            # Get or create indexed_source record
-            result = db.session.execute(
-                text(f"""
-                    SELECT id FROM "{AI_SCHEMA}".indexed_sources
-                    WHERE knowledge_base_id = :kb_id AND source_id = :source_id
-                """),
-                {"kb_id": knowledge_base_id, "source_id": source_id},
-            )
-            row = result.fetchone()
-            if row:
-                indexed_source_id = str(row[0])
-            else:
-                logger.error("indexed_source_id not provided and record not found")
-                return {"status": "error", "error": "indexed_source record not found"}
-
-        claimed_attempts = _claim_indexed_source(indexed_source_id, task_id)
-        if claimed_attempts is None:
-            # A sibling already claimed this row, or it's terminal. This is a
-            # redundant duplicate (redelivery / reconciler re-dispatch); exit before
-            # loading the document so a task storm is a no-op, not an OOM.
-            logger.info(
-                "index_source: %s not claimable (superseded or terminal); skipping",
-                indexed_source_id,
-            )
-            return {"status": "skipped", "reason": "not_claimable",
-                    "indexed_source_id": indexed_source_id}
 
         storage = get_storage()
         content = get_text_derivative_content(storage, source)
