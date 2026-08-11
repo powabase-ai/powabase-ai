@@ -7,6 +7,7 @@ by chunking, embedding, and storing in pgvector.
 import asyncio
 import json
 import logging
+import os
 import traceback
 
 from ..celery import celery_app
@@ -15,7 +16,7 @@ from sqlalchemy import text
 
 from agentic.llm.cost_accumulator import init_accumulator, install
 
-from ..db import db, AI_SCHEMA
+from ..db import db, AI_SCHEMA, commit_scoped_write
 from ..services import billing_port as billing
 from ..services.llm_call import (
     cached_byok_resolver,
@@ -35,6 +36,15 @@ from ..services.sparse_retrieval import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The ONE bound on how many times a single indexed_source may be executed.
+# ``indexed_sources.attempts`` is incremented by the atomic claim, so every
+# execution -- a fresh dispatch, a reconciler re-dispatch after a worker death,
+# or the storage-error re-dispatch below -- consumes exactly one unit of the
+# same budget. Celery's own ``max_retries`` deliberately plays no part: a second
+# counter running alongside this one multiplies the ceiling instead of sharing
+# it.
+MAX_ATTEMPTS = int(os.getenv("INDEXING_MAX_ATTEMPTS", "3"))
 
 # Indexing strategy -> billing action, per the credits catalog seeded in
 # migration 0006_credit_ledger. ``full_document`` is not in the catalog as a
@@ -253,6 +263,33 @@ def update_indexed_source_status(
     db.session.commit()
 
 
+def _claim_indexed_source(indexed_source_id: str, task_id: str) -> int | None:
+    """Atomically claim a pending indexed_source for execution.
+
+    Compare-and-swap: only a row currently in 'pending' can be claimed, so at
+    most one concurrent task wins; the rest see 0 rows. On success the row flips
+    to 'indexing', records this task as owner, increments attempts, and
+    refreshes last_dispatched_at (the reconciler's staleness buffer).
+
+    Returns the new attempts count if claimed, or None if the row was not
+    'pending' (already claimed by a sibling, or already terminal).
+    """
+    row = db.session.execute(
+        text(f"""
+            UPDATE "{AI_SCHEMA}".indexed_sources
+            SET index_status = 'indexing',
+                celery_task_id = :task_id,
+                attempts = attempts + 1,
+                last_dispatched_at = NOW()
+            WHERE id = :id AND index_status = 'pending'
+            RETURNING attempts
+        """),
+        {"id": indexed_source_id, "task_id": task_id},
+    ).fetchone()
+    db.session.commit()
+    return row.attempts if row else None
+
+
 def _get_indexed_source_snapshot(indexed_source_id: str) -> dict | None:
     """Fetch the current indexing_config_snapshot for an indexed source."""
     result = db.session.execute(
@@ -306,6 +343,128 @@ def update_indexed_source_result(
         },
     )
     db.session.commit()
+
+
+def _fenced_mark_indexed(indexed_source_id: str, task_id: str, stats: dict) -> int:
+    """Write the terminal 'indexed' result ONLY if this task still owns the row.
+
+    Does NOT commit — the caller commits the whole fenced transaction (chunk
+    inserts + this write) so a superseded task's chunks roll back with its
+    status write. Returns the number of rows matched (1 = owner, 0 = superseded).
+    """
+    result = db.session.execute(
+        text(f"""
+            UPDATE "{AI_SCHEMA}".indexed_sources
+            SET index_status = 'indexed',
+                indexed_at = NOW(),
+                stats = CAST(:stats AS jsonb),
+                error_message = NULL
+            WHERE id = :id AND celery_task_id = :task_id
+        """),
+        {"id": indexed_source_id, "task_id": task_id, "stats": json.dumps(stats)},
+    )
+    return result.rowcount
+
+
+def _fenced_mark_failed(indexed_source_id: str, task_id: str, message: str) -> int:
+    """Write a terminal 'failed' ONLY if this task still owns the row.
+
+    Mirrors _fenced_mark_indexed. Without the ownership predicate a superseded
+    task's failure write would both overwrite the owner's result AND stamp
+    itself as celery_task_id -- after which the owner's _fenced_mark_indexed
+    matches 0 rows and rolls back work that had already succeeded.
+
+    CALLER CONTRACT: only call this when the claim SUCCEEDED. A task that raises
+    before claiming never owned the row and must not write to it -- see the
+    ``claimed`` guard in index_source's handlers.
+
+    Commits. Returns rows matched (1 = owner, 0 = superseded/no-op).
+    """
+    result = db.session.execute(
+        text(f"""
+            UPDATE "{AI_SCHEMA}".indexed_sources
+            SET index_status = 'failed', error_message = :msg
+            WHERE id = :id AND celery_task_id = :task_id
+        """),
+        {"id": indexed_source_id, "task_id": task_id, "msg": message},
+    )
+    db.session.commit()
+    return result.rowcount
+
+
+def _log_unclaimed_failure(indexed_source_id: str) -> None:
+    """Record that a task failed BEFORE it claimed the row, and wrote nothing.
+
+    ``claimed`` is set True immediately after a successful
+    _claim_indexed_source. A raise before that means this task never owned the
+    row -- writing a fenced 'failed' would match 0 rows silently, and writing an
+    UNFENCED one would steal a row another task may legitimately own now. So
+    neither: leave the row alone and say so.
+
+    The row therefore stays as it was -- typically 'pending', which the orphan
+    reconciler does not sweep (it only looks at 'indexing'). A manual re-index
+    recovers it. Call from inside the except block so exc_info has a traceback.
+    """
+    logger.warning(
+        "index_source: raised before claiming %s; leaving row untouched "
+        "(a manual re-index recovers it)",
+        indexed_source_id,
+        exc_info=True,
+    )
+
+
+def _handle_storage_error(
+    *,
+    knowledge_base_id: str,
+    source_id: str,
+    indexed_source_id: str,
+    task_id: str,
+    provider_keys: dict[str, str] | None,
+    idempotency_action: str | None = None,
+    idempotency_parts: list | None = None,
+) -> None:
+    """Transient StorageError recovery, folded into the single attempts bound.
+
+    Under the bound: reset to 'pending' and re-dispatch (the re-dispatch
+    re-claims, incrementing attempts). At/over the bound: mark 'failed'. No
+    Celery self.retry -- that would run a second, uncomposed counter.
+    """
+    db.session.rollback()  # discard partial indexing data
+    row = db.session.execute(
+        text(f'SELECT attempts FROM "{AI_SCHEMA}".indexed_sources WHERE id = :id'),
+        {"id": indexed_source_id},
+    ).fetchone()
+    attempts = row.attempts if row else MAX_ATTEMPTS
+
+    if attempts < MAX_ATTEMPTS:
+        result = db.session.execute(
+            text(f"""UPDATE "{AI_SCHEMA}".indexed_sources
+                     SET index_status = 'pending', celery_task_id = NULL,
+                         error_message = NULL
+                     WHERE id = :id AND celery_task_id = :task_id"""),
+            {"id": indexed_source_id, "task_id": task_id},
+        )
+        db.session.commit()
+        # Only re-dispatch if we still owned the row (fence). A superseded task
+        # matched 0 rows and must NOT spawn a spurious duplicate.
+        if result.rowcount:
+            index_source.delay(
+                knowledge_base_id,
+                source_id,
+                indexed_source_id=indexed_source_id,
+                provider_keys=provider_keys,
+                idempotency_action=idempotency_action,
+                idempotency_parts=idempotency_parts,
+            )
+    else:
+        # Cause is known here (a persistent storage error), so name it -- unlike
+        # the reconciler path where the cause is not observable. FENCED: a
+        # superseded task must not write this row's terminal state.
+        _fenced_mark_failed(
+            indexed_source_id,
+            task_id,
+            f"Indexing failed after {attempts} attempts (persistent storage error).",
+        )
 
 
 def get_page_texts_from_derivative(
@@ -472,8 +631,22 @@ async def run_indexing(
     page_texts: list[str] | None = None,
     extraction_method: str | None = None,
     provider_keys: dict[str, str] | None = None,  # unused after #437
+    side_out: dict | None = None,
 ) -> dict:
-    """Run the actual indexing process asynchronously."""
+    """Run the actual indexing process asynchronously.
+
+    ``side_out`` is an optional caller-owned dict that collects the inputs the
+    caller needs for its POST-COMMIT side effects: the embedding dimension, the
+    new chunk ids, and the chunk texts for the sparse index. It is a second
+    channel on purpose -- none of it may ride in the returned ``stats``, which
+    is persisted verbatim into a jsonb column and read by clients. The chunk
+    texts alone are the whole document, so merging the two would write a second
+    copy of every source into the database.
+
+    It is left empty when there is nothing to do (no chunks), so a caller that
+    always passes a fresh dict gets "no side effects" by default rather than by
+    remembering to handle an early return.
+    """
     import time
 
     from agentic.knowledge.chunking import MarkdownHeaderChunking
@@ -582,39 +755,19 @@ async def run_indexing(
     )
     _store_secs = time.monotonic() - _t_store
 
-    # Build/update BM25s sparse index for fast keyword search
-    from ..services.sparse_retrieval import SparseIndexStore
-
-    _t_bm25 = time.monotonic()
-    if _should_build_bm25_now(kb_id):
-        sparse_store = SparseIndexStore(knowledge_base_id=kb_id)
-        sparse_store.add_and_save(
-            documents=[c["text"] for c in chunk_dicts],
-            item_ids=chunk_ids,
-            item_table="chunks",
-        )
-        _bm25_secs = time.monotonic() - _t_bm25
-        logger.info(f"Updated BM25s sparse index: {len(chunk_ids)} chunks added")
-    else:
-        _bm25_secs = 0.0
-        logger.info("Skipped BM25 update (KB does not require BM25 or auto-indexing is off)")
-
     _run_indexing_total = time.monotonic() - _run_indexing_t0
     logger.info(
-        "run_indexing_timing aindex=%.2f store_chunks=%.2f bm25=%.2f total=%.2f chunks=%d",
+        "run_indexing_timing aindex=%.2f store_chunks=%.2f total=%.2f chunks=%d",
         _aindex_secs,
         _store_secs,
-        _bm25_secs,
         _run_indexing_total,
         len(chunk_ids),
     )
 
-    # Ensure hnsw index exists for this embedding dimension
+    # No index creation here: the chunk/embedding inserts above are still
+    # uncommitted, and CREATE INDEX takes a ShareLock that conflicts with the
+    # RowExclusiveLock those INSERTs hold in the same transaction.
     embedding_dim = len(result.chunks[0].embedding) if result.chunks[0].embedding else 0
-    if embedding_dim:
-        from ..services.base_vector_store import ensure_embedding_index
-
-        ensure_embedding_index(db.session, AI_SCHEMA, embedding_dim)
 
     stats = {
         "artifact_count": stored_count,
@@ -623,6 +776,13 @@ async def run_indexing(
         "embedding_dim": embedding_dim,
         "embedding_model": embedding_model,
     }
+
+    # Second channel: the caller runs these AFTER it commits, so the sparse
+    # index can never end up holding ids for chunks that got rolled back.
+    if side_out is not None:
+        side_out["embedding_dim"] = embedding_dim
+        side_out["chunk_ids"] = chunk_ids
+        side_out["bm25_documents"] = [c["text"] for c in chunk_dicts]
 
     return stats
 
@@ -1308,7 +1468,423 @@ async def run_doc2json_indexing(
     return stats
 
 
-@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def _run_index_body(
+    *,
+    knowledge_base_id: str,
+    source_id: str,
+    indexed_source_id: str,
+    task_id: str,
+    provider_keys: dict[str, str] | None,
+    idempotency_action: str | None = None,
+    idempotency_parts: list | None = None,
+) -> dict:
+    """Run an indexing pass for a row this task has already claimed.
+
+    Split out of ``index_source`` at the post-claim boundary so the whole
+    "clear old artifacts -> load content -> index -> commit" span is callable
+    on its own. The caller must have won the claim first: this body always
+    performs the artifact writes, and it is the ownership fence at the end --
+    not the claim -- that decides whether they become durable.
+
+    Raises whatever the indexing strategies raise; ``index_source`` owns the
+    rollback-and-mark-failed handling.
+    """
+    import time as _time
+
+    _body_t0 = _time.monotonic()
+
+    kb = get_knowledge_base(knowledge_base_id)
+    indexing_config = kb["indexing_config"]
+    source = get_source(source_id)
+    strategy = indexing_config.get("strategy", "chunk_embed")
+    strategy_changed = False
+    # Sparse-index ids superseded by this run. Collected before the deletes
+    # below, applied only after the fenced commit -- see the side-effect block.
+    chunk_ids_to_remove: list[str] = []
+    fd_ids_to_remove: list[str] = []
+    gi_ids_to_remove: list[str] = []
+    # Side-effect inputs from the strategy run, kept out of `stats`.
+    side: dict = {}
+
+    if indexed_source_id:
+        # Read old snapshot BEFORE overwriting to detect strategy changes
+        old_snapshot = _get_indexed_source_snapshot(indexed_source_id)
+        old_strategy = (old_snapshot or {}).get("strategy", "chunk_embed")
+        strategy_changed = old_strategy != strategy
+
+        update_indexed_source_config_snapshot(indexed_source_id, indexing_config)
+
+        # Clean up all embeddings for this indexed source FIRST
+        # (prevents search queries from finding embeddings with missing content)
+        #
+        # This DELETE does NOT ride the fenced transaction below, despite
+        # carrying no commit of its own: the ToC store's
+        # delete_by_indexed_source further down commits unconditionally, and
+        # that commit flushes this statement and delete_chunks along with it.
+        # So the destructive half of a re-index is durable well before the
+        # fence decides anything -- only the INSERT side is fenced. A task that
+        # then loses the fence rolls back what it wrote but not what it
+        # deleted. Deliberate residual: losing the fence means a sibling
+        # re-claimed the row and is re-indexing the same source, so the
+        # artifacts are on their way back.
+        db.session.execute(
+            text(f"""
+                DELETE FROM "{AI_SCHEMA}".embeddings
+                WHERE indexed_source_id = :indexed_source_id
+            """),
+            {"indexed_source_id": indexed_source_id},
+        )
+
+        # Delete artifacts from ALL strategy tables unconditionally.
+        # Each call is a no-op (0 rows deleted) if no artifacts exist for that type.
+
+        # First, query IDs before deletion for sparse index cleanup
+        chunk_ids_to_remove = [
+            str(r[0])
+            for r in db.session.execute(
+                text(f'SELECT id FROM "{AI_SCHEMA}".chunks WHERE indexed_source_id = :is_id'),
+                {"is_id": indexed_source_id},
+            ).fetchall()
+        ]
+        fd_ids_to_remove = [
+            str(r[0])
+            for r in db.session.execute(
+                text(
+                    f'SELECT id FROM "{AI_SCHEMA}".full_documents WHERE indexed_source_id = :is_id'
+                ),
+                {"is_id": indexed_source_id},
+            ).fetchall()
+        ]
+        gi_ids_to_remove = [
+            str(r[0])
+            for r in db.session.execute(
+                text(
+                    f'SELECT id FROM "{AI_SCHEMA}".graph_index_nodes WHERE indexed_source_id = :is_id'
+                ),
+                {"is_id": indexed_source_id},
+            ).fetchall()
+        ]
+
+        store = PgVectorKnowledgeStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+        )
+        asyncio.run(store.delete_chunks(indexed_source_id))
+
+        pi_store = PageIndexStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+        )
+        pi_store.delete_by_indexed_source(indexed_source_id)
+
+        fd_store = FullDocumentStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+            storage=get_storage(),
+        )
+        fd_store.delete_by_indexed_source(indexed_source_id)
+
+        gi_store = GraphIndexStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+        )
+        gi_store.delete_by_indexed_source(indexed_source_id)
+
+        d2j_store = Doc2JSONStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+        )
+        d2j_store.delete_by_indexed_source(indexed_source_id)
+        # The matching sparse-index removals are deliberately NOT done here:
+        # they would mutate a shared on-disk index before this run has proved
+        # it owns the row, so a superseded task would strip the live index and
+        # then roll its own DB writes back. They run after the fenced commit.
+
+        logger.info(
+            "Cleared all artifact tables for re-indexing (old_strategy=%s, new_strategy=%s)",
+            old_strategy,
+            strategy,
+        )
+
+    storage = get_storage()
+    content = get_text_derivative_content(storage, source)
+
+    use_images = strategy == "doc2json" and indexing_config.get("use_images", False)
+
+    if not content:
+        if use_images:
+            logger.info(
+                "No text derivative found — proceeding in image-only mode "
+                "for doc2json strategy (source_id=%s)",
+                source_id,
+            )
+            content = ""
+        else:
+            error_msg = "No text derivative found for source"
+            logger.error(error_msg)
+            # FENCED: this body only runs post-claim, but the row can still have
+            # been re-claimed by a sibling since. An unfenced write here would
+            # both bury that sibling's result and (via
+            # update_indexed_source_status's celery_task_id column) hand
+            # ownership to whatever value this task passed.
+            _fenced_mark_failed(indexed_source_id, task_id, error_msg)
+            return {"status": "error", "error": error_msg}
+
+    if content:
+        logger.info(f"Loaded text content: {len(content)} chars")
+
+    # Extract page_texts from derivative metadata (available for PDF sources)
+    page_texts = get_page_texts_from_derivative(source, storage=storage)
+
+    # Set the cost accumulator on this thread's context BEFORE the
+    # strategy dispatch so each asyncio.run() snapshot below inherits
+    # the same accumulator object.
+    acc = init_accumulator()
+
+    if strategy == "page_index":
+        stats = asyncio.run(
+            run_page_index_indexing(
+                kb_id=knowledge_base_id,
+                indexed_source_id=indexed_source_id,
+                source_id=source_id,
+                content=content,
+                indexing_config=indexing_config,
+                source_name=source["name"],
+                page_texts=page_texts,
+            )
+        )
+    elif strategy == "full_document":
+        stats = asyncio.run(
+            run_full_document_indexing(
+                kb_id=knowledge_base_id,
+                indexed_source_id=indexed_source_id,
+                source_id=source_id,
+                content=content,
+                indexing_config=indexing_config,
+                provider_keys=provider_keys,
+            )
+        )
+    elif strategy == "graph_index":
+        stats = asyncio.run(
+            run_graph_index_indexing(
+                kb_id=knowledge_base_id,
+                indexed_source_id=indexed_source_id,
+                source_id=source_id,
+                content=content,
+                indexing_config=indexing_config,
+                source_name=source["name"],
+                page_texts=page_texts,
+                source=source,
+                provider_keys=provider_keys,
+            )
+        )
+    elif strategy == "doc2json":
+        # Fetch page images if use_images mode is enabled
+        page_images = None
+        use_images = indexing_config.get("use_images", False)
+        if use_images:
+            page_images = get_page_images_from_derivative(source, storage=storage)
+            if not page_images:
+                logger.warning(
+                    "use_images=True but no page images found for source %s, "
+                    "falling back to text mode",
+                    source_id,
+                )
+
+        stats = asyncio.run(
+            run_doc2json_indexing(
+                kb_id=knowledge_base_id,
+                indexed_source_id=indexed_source_id,
+                source_id=source_id,
+                content=content,
+                indexing_config=indexing_config,
+                page_images=page_images,
+            )
+        )
+    else:  # chunk_embed (default)
+        auto_meta = source.get("auto_metadata", {})
+        extraction_method = auto_meta.get("extraction_method")
+        # For -via-pdf wrappers (txt, docx), use the underlying PDF
+        # extraction method so the separator matches what was used to
+        # join pages during extraction.
+        if extraction_method and extraction_method.endswith("-via-pdf"):
+            extraction_method = auto_meta.get("pdf_extraction_method", extraction_method)
+        stats = asyncio.run(
+            run_indexing(
+                kb_id=knowledge_base_id,
+                indexed_source_id=indexed_source_id,
+                source_id=source_id,
+                content=content,
+                indexing_config=indexing_config,
+                page_texts=page_texts,
+                extraction_method=extraction_method,
+                provider_keys=provider_keys,
+                side_out=side,
+            )
+        )
+
+    # Fenced commit: chunk/embedding inserts (uncommitted inside run_indexing)
+    # + this status write are one transaction. If we lost ownership (a
+    # spurious reconciler reset let a sibling re-claim), match 0 rows, roll
+    # the whole transaction back, and exit WITHOUT any side effects.
+    stats["llm_costs"] = acc.to_dict()
+    matched = _fenced_mark_indexed(indexed_source_id, task_id, stats)
+    if matched == 0:
+        db.session.rollback()
+        logger.info(
+            "index_source: %s superseded before commit; this task's still-uncommitted "
+            "writes were rolled back and no post-commit side effect ran -- the "
+            "sparse-index removals, the chunk_embed sparse append, billing and "
+            "enrichment are all gated on the fenced commit. The rollback covers "
+            "chunk_embed only: page_index/graph_index/full_document/doc2json commit "
+            "their artifact rows inside their own run functions, ahead of the fence, "
+            "and graph_index/full_document write their sparse entries there too",
+            indexed_source_id,
+        )
+        return {"status": "skipped", "reason": "superseded",
+                "indexed_source_id": indexed_source_id}
+    db.session.commit()
+
+    # --- side effects: owner only, and only once a result is durably committed.
+    # The status row is ALREADY committed as 'indexed', so an exception escaping
+    # here would reach index_source's `except Exception` and relabel a
+    # durably-correct row as 'failed'. Log and carry on instead, the way the
+    # auto-enrichment block below already does.
+    try:
+        from ..services.base_vector_store import ensure_embedding_index
+        from ..services.sparse_retrieval import SparseIndexStore
+
+        # (1) hnsw index for this embedding dimension. It cannot live in the
+        #     insert path: CREATE INDEX takes a ShareLock that conflicts with
+        #     the RowExclusiveLock the uncommitted INSERTs hold.
+        embedding_dim = side.get("embedding_dim")
+        if embedding_dim:
+            ensure_embedding_index(db.session, AI_SCHEMA, embedding_dim)
+            db.session.commit()
+
+        # (2) sparse index: the removals deferred out of the clear-and-reindex
+        #     branch above, then the incremental append for the chunks this run
+        #     just committed. Removals go first so the superseded ids are gone
+        #     before the new ones land. Both now happen only for the owner and
+        #     only after the commit, so no sparse entry can point at a chunk
+        #     that was rolled back.
+        if _should_build_bm25_now(knowledge_base_id):
+            sparse_store = SparseIndexStore(knowledge_base_id=knowledge_base_id)
+            if chunk_ids_to_remove:
+                sparse_store.remove_and_save(chunk_ids_to_remove, item_table="chunks")
+            if fd_ids_to_remove:
+                sparse_store.remove_and_save(fd_ids_to_remove, item_table="full_documents")
+            if gi_ids_to_remove:
+                sparse_store.remove_and_save(gi_ids_to_remove, item_table="graph_index_nodes")
+            if side.get("bm25_documents"):
+                sparse_store.add_and_save(
+                    documents=side["bm25_documents"],
+                    item_ids=side["chunk_ids"],
+                    item_table="chunks",
+                )
+    except Exception:
+        # Roll back so a failed ensure_embedding_index does not leave the
+        # session unusable for the rest of the task. Hygiene only: nothing
+        # below this point touches the session before its own try.
+        db.session.rollback()
+        logger.error(
+            "index_source: post-commit side effect failed for %s; the indexed result "
+            "stands (the sparse index may be stale until the next reindex)",
+            indexed_source_id,
+            exc_info=True,
+        )
+
+    # Bill the indexing action with the actual 1k-token quantity. The
+    # billing-configured check now lives in the adapter (no-op when
+    # unconfigured), so this is unconditional. The BILLED action is the
+    # strategy-resolved indexing_<strategy>; the KEY action is whatever the
+    # caller threaded (== billed action for single-index, literal "indexing"
+    # for reindex/batch/watchdog — the split), reproducing the pre-port key.
+    indexing_action = _resolve_indexing_action(strategy)
+    actual_quantity = _quantity_from_stats(stats)
+    # billing.charge never raises; ChargeOutcome reports outcome. A
+    # post-success 402 is bounded over-serve.
+    billing.charge(
+        action=indexing_action,
+        idempotency_action=idempotency_action,
+        idempotency_parts=tuple(idempotency_parts or ()),
+        ref_type="indexing",
+        ref_id=str(indexed_source_id),
+        quantity=actual_quantity,
+        metadata={"strategy": strategy, "source_id": source_id},
+    )
+
+    # Auto-enrich if KB has an enrichment config
+    try:
+        from .enrichment import enrich_knowledge_base as _enrich_kb
+
+        _enrich_config = db.session.execute(
+            text(
+                f'SELECT id FROM "{AI_SCHEMA}".enrichment_configs '
+                f"WHERE knowledge_base_id = :kb_id AND status != 'enriching'"
+            ),
+            {"kb_id": knowledge_base_id},
+        ).fetchone()
+        if _enrich_config:
+            # Full enrichment when strategy changed — TRUNCATEs stale metadata rows.
+            # Incremental otherwise — only enriches newly created items.
+            use_incremental = not strategy_changed
+            # No idempotency key threaded: enrichment's per-batch charging is
+            # gated by the billing port's ctx (per_batch_callback enabled by
+            # default, ctx-gated when billing is off) — the old
+            # child_enrich_idem sentinel was only a proxy for "billing
+            # active", which the adapter now checks directly.
+            _enrich_kb.delay(
+                knowledge_base_id,
+                incremental=use_incremental,
+            )
+            logger.info(
+                "Triggered %s enrichment for KB %s",
+                "incremental" if use_incremental else "full",
+                knowledge_base_id,
+            )
+    except Exception:
+        logger.warning(
+            "Failed to trigger auto-enrichment for KB %s",
+            knowledge_base_id,
+            exc_info=True,
+        )
+
+    if strategy == "page_index":
+        artifact_desc = (
+            f"{stats.get('node_count', 0)} nodes, {stats.get('section_count', 0)} sections"
+        )
+    elif strategy == "graph_index":
+        artifact_desc = (
+            f"{stats.get('node_count', 0)} nodes, {stats.get('section_count', 0)} sections"
+        )
+    elif strategy == "full_document":
+        artifact_desc = f"1 full document ({stats.get('summary_tokens', 0)} summary tokens)"
+    elif strategy == "doc2json":
+        artifact_desc = f"1 doc2json ({stats.get('window_count', 0)} windows, {stats.get('summary_tokens', 0)} summary tokens)"
+    else:
+        artifact_desc = f"{stats['artifact_count']} chunks"
+    _body_total = _time.monotonic() - _body_t0
+    logger.info(
+        "index_source_timing task_id=%s total=%.2f strategy=%s",
+        task_id,
+        _body_total,
+        strategy,
+    )
+    logger.info(f"Indexing complete for source {source_id}: {artifact_desc} created")
+
+    return {
+        "status": "success",
+        "indexed_source_id": indexed_source_id,
+        "source_id": source_id,
+        "knowledge_base_id": knowledge_base_id,
+        "stats": stats,
+    }
+
+
+# No max_retries/default_retry_delay: this task never calls self.retry. Its
+# only retry budget is MAX_ATTEMPTS, spent through the claim's attempts counter.
+@celery_app.task(bind=True)
 @billing.task_context
 def index_source(
     self,
@@ -1351,13 +1927,13 @@ def index_source(
     Returns:
         Dict with indexing results or error info
     """
-    import time as _time
-
     task_id = self.request.id
-    _task_t0 = _time.monotonic()
     logger.info(
         f"Starting indexing task {task_id} for source {source_id} into KB {knowledge_base_id}"
     )
+    # Did THIS task win the claim? Gates every terminal write in the handlers
+    # below: a raise from before the claim means we never owned the row.
+    claimed = False
 
     try:
         kb = get_knowledge_base(knowledge_base_id)
@@ -1367,8 +1943,6 @@ def index_source(
             if indexed_source_id:
                 _mark_indexed_source_failed(indexed_source_id, error_msg)
             return {"status": "error", "error": error_msg}
-
-        indexing_config = kb["indexing_config"]
 
         source = get_source(source_id)
         if not source:
@@ -1392,9 +1966,6 @@ def index_source(
                 "error": error_msg,
             }
 
-        strategy = indexing_config.get("strategy", "chunk_embed")
-        strategy_changed = False
-
         # Early exit if already cancelled (handles race where cancel arrives before task starts)
         if indexed_source_id:
             current_status = db.session.execute(
@@ -1405,107 +1976,7 @@ def index_source(
                 logger.info(f"Indexed source {indexed_source_id} already cancelled, skipping")
                 return {"status": "cancelled", "source_id": source_id}
 
-        if indexed_source_id:
-            # Read old snapshot BEFORE overwriting to detect strategy changes
-            old_snapshot = _get_indexed_source_snapshot(indexed_source_id)
-            old_strategy = (old_snapshot or {}).get("strategy", "chunk_embed")
-            strategy_changed = old_strategy != strategy
-
-            update_indexed_source_config_snapshot(indexed_source_id, indexing_config)
-
-            # Mark as indexing BEFORE deleting old artifacts so the UI
-            # doesn't show "indexed" while content is being cleared.
-            update_indexed_source_status(indexed_source_id, "indexing", celery_task_id=task_id)
-
-            # Clean up all embeddings for this indexed source FIRST
-            # (prevents search queries from finding embeddings with missing content)
-            db.session.execute(
-                text(f"""
-                    DELETE FROM "{AI_SCHEMA}".embeddings
-                    WHERE indexed_source_id = :indexed_source_id
-                """),
-                {"indexed_source_id": indexed_source_id},
-            )
-            db.session.commit()
-
-            # Delete artifacts from ALL strategy tables unconditionally.
-            # Each call is a no-op (0 rows deleted) if no artifacts exist for that type.
-
-            # First, query IDs before deletion for sparse index cleanup
-            from ..services.sparse_retrieval import SparseIndexStore
-
-            chunk_ids_to_remove = [
-                str(r[0])
-                for r in db.session.execute(
-                    text(f'SELECT id FROM "{AI_SCHEMA}".chunks WHERE indexed_source_id = :is_id'),
-                    {"is_id": indexed_source_id},
-                ).fetchall()
-            ]
-            fd_ids_to_remove = [
-                str(r[0])
-                for r in db.session.execute(
-                    text(
-                        f'SELECT id FROM "{AI_SCHEMA}".full_documents WHERE indexed_source_id = :is_id'
-                    ),
-                    {"is_id": indexed_source_id},
-                ).fetchall()
-            ]
-            gi_ids_to_remove = [
-                str(r[0])
-                for r in db.session.execute(
-                    text(
-                        f'SELECT id FROM "{AI_SCHEMA}".graph_index_nodes WHERE indexed_source_id = :is_id'
-                    ),
-                    {"is_id": indexed_source_id},
-                ).fetchall()
-            ]
-
-            store = PgVectorKnowledgeStore(
-                db_session=db.session,
-                knowledge_base_id=knowledge_base_id,
-            )
-            asyncio.run(store.delete_chunks(indexed_source_id))
-
-            pi_store = PageIndexStore(
-                db_session=db.session,
-                knowledge_base_id=knowledge_base_id,
-            )
-            pi_store.delete_by_indexed_source(indexed_source_id)
-
-            fd_store = FullDocumentStore(
-                db_session=db.session,
-                knowledge_base_id=knowledge_base_id,
-                storage=get_storage(),
-            )
-            fd_store.delete_by_indexed_source(indexed_source_id)
-
-            gi_store = GraphIndexStore(
-                db_session=db.session,
-                knowledge_base_id=knowledge_base_id,
-            )
-            gi_store.delete_by_indexed_source(indexed_source_id)
-
-            d2j_store = Doc2JSONStore(
-                db_session=db.session,
-                knowledge_base_id=knowledge_base_id,
-            )
-            d2j_store.delete_by_indexed_source(indexed_source_id)
-            # Remove deleted items from sparse indexes
-            if _should_build_bm25_now(knowledge_base_id):
-                sparse_store = SparseIndexStore(knowledge_base_id=knowledge_base_id)
-                if chunk_ids_to_remove:
-                    sparse_store.remove_and_save(chunk_ids_to_remove, item_table="chunks")
-                if fd_ids_to_remove:
-                    sparse_store.remove_and_save(fd_ids_to_remove, item_table="full_documents")
-                if gi_ids_to_remove:
-                    sparse_store.remove_and_save(gi_ids_to_remove, item_table="graph_index_nodes")
-
-            logger.info(
-                "Cleared all artifact tables for re-indexing (old_strategy=%s, new_strategy=%s)",
-                old_strategy,
-                strategy,
-            )
-        else:
+        if indexed_source_id is None:
             # Get or create indexed_source record
             result = db.session.execute(
                 text(f"""
@@ -1521,208 +1992,29 @@ def index_source(
                 logger.error("indexed_source_id not provided and record not found")
                 return {"status": "error", "error": "indexed_source record not found"}
 
-        update_indexed_source_status(indexed_source_id, "indexing", celery_task_id=task_id)
-
-        storage = get_storage()
-        content = get_text_derivative_content(storage, source)
-
-        use_images = strategy == "doc2json" and indexing_config.get("use_images", False)
-
-        if not content:
-            if use_images:
-                logger.info(
-                    "No text derivative found — proceeding in image-only mode "
-                    "for doc2json strategy (source_id=%s)",
-                    source_id,
-                )
-                content = ""
-            else:
-                error_msg = "No text derivative found for source"
-                logger.error(error_msg)
-                update_indexed_source_status(indexed_source_id, "failed", error_msg)
-                return {"status": "error", "error": error_msg}
-
-        if content:
-            logger.info(f"Loaded text content: {len(content)} chars")
-
-        # Extract page_texts from derivative metadata (available for PDF sources)
-        page_texts = get_page_texts_from_derivative(source, storage=storage)
-
-        # Set the cost accumulator on this thread's context BEFORE the
-        # strategy dispatch so each asyncio.run() snapshot below inherits
-        # the same accumulator object.
-        acc = init_accumulator()
-
-        if strategy == "page_index":
-            stats = asyncio.run(
-                run_page_index_indexing(
-                    kb_id=knowledge_base_id,
-                    indexed_source_id=indexed_source_id,
-                    source_id=source_id,
-                    content=content,
-                    indexing_config=indexing_config,
-                    source_name=source["name"],
-                    page_texts=page_texts,
-                )
+        claimed_attempts = _claim_indexed_source(indexed_source_id, task_id)
+        if claimed_attempts is None:
+            # A sibling already claimed this row, or it's terminal. This is a
+            # redundant duplicate (redelivery / reconciler re-dispatch); exit before
+            # any destructive or externally-visible work so a task storm is a
+            # no-op, not data loss or an OOM.
+            logger.info(
+                "index_source: %s not claimable (superseded or terminal); skipping",
+                indexed_source_id,
             )
-        elif strategy == "full_document":
-            stats = asyncio.run(
-                run_full_document_indexing(
-                    kb_id=knowledge_base_id,
-                    indexed_source_id=indexed_source_id,
-                    source_id=source_id,
-                    content=content,
-                    indexing_config=indexing_config,
-                    provider_keys=provider_keys,
-                )
-            )
-        elif strategy == "graph_index":
-            stats = asyncio.run(
-                run_graph_index_indexing(
-                    kb_id=knowledge_base_id,
-                    indexed_source_id=indexed_source_id,
-                    source_id=source_id,
-                    content=content,
-                    indexing_config=indexing_config,
-                    source_name=source["name"],
-                    page_texts=page_texts,
-                    source=source,
-                    provider_keys=provider_keys,
-                )
-            )
-        elif strategy == "doc2json":
-            # Fetch page images if use_images mode is enabled
-            page_images = None
-            use_images = indexing_config.get("use_images", False)
-            if use_images:
-                page_images = get_page_images_from_derivative(source, storage=storage)
-                if not page_images:
-                    logger.warning(
-                        "use_images=True but no page images found for source %s, "
-                        "falling back to text mode",
-                        source_id,
-                    )
+            return {"status": "skipped", "reason": "not_claimable",
+                    "indexed_source_id": indexed_source_id}
+        claimed = True
 
-            stats = asyncio.run(
-                run_doc2json_indexing(
-                    kb_id=knowledge_base_id,
-                    indexed_source_id=indexed_source_id,
-                    source_id=source_id,
-                    content=content,
-                    indexing_config=indexing_config,
-                    page_images=page_images,
-                )
-            )
-        else:  # chunk_embed (default)
-            auto_meta = source.get("auto_metadata", {})
-            extraction_method = auto_meta.get("extraction_method")
-            # For -via-pdf wrappers (txt, docx), use the underlying PDF
-            # extraction method so the separator matches what was used to
-            # join pages during extraction.
-            if extraction_method and extraction_method.endswith("-via-pdf"):
-                extraction_method = auto_meta.get("pdf_extraction_method", extraction_method)
-            stats = asyncio.run(
-                run_indexing(
-                    kb_id=knowledge_base_id,
-                    indexed_source_id=indexed_source_id,
-                    source_id=source_id,
-                    content=content,
-                    indexing_config=indexing_config,
-                    page_texts=page_texts,
-                    extraction_method=extraction_method,
-                    provider_keys=provider_keys,
-                )
-            )
-
-        stats["llm_costs"] = acc.to_dict()
-        update_indexed_source_result(indexed_source_id, stats)
-
-        # Bill the indexing action with the actual 1k-token quantity. The
-        # billing-configured check now lives in the adapter (no-op when
-        # unconfigured), so this is unconditional. The BILLED action is the
-        # strategy-resolved indexing_<strategy>; the KEY action is whatever the
-        # caller threaded (== billed action for single-index, literal "indexing"
-        # for reindex/batch/watchdog — the split), reproducing the pre-port key.
-        indexing_action = _resolve_indexing_action(strategy)
-        actual_quantity = _quantity_from_stats(stats)
-        # billing.charge never raises; ChargeOutcome reports outcome. A
-        # post-success 402 is bounded over-serve per spec line 54.
-        billing.charge(
-            action=indexing_action,
+        return _run_index_body(
+            knowledge_base_id=knowledge_base_id,
+            source_id=source_id,
+            indexed_source_id=indexed_source_id,
+            task_id=task_id,
+            provider_keys=provider_keys,
             idempotency_action=idempotency_action,
-            idempotency_parts=tuple(idempotency_parts or ()),
-            ref_type="indexing",
-            ref_id=str(indexed_source_id),
-            quantity=actual_quantity,
-            metadata={"strategy": strategy, "source_id": source_id},
+            idempotency_parts=idempotency_parts,
         )
-
-        # Auto-enrich if KB has an enrichment config
-        try:
-            from .enrichment import enrich_knowledge_base as _enrich_kb
-
-            _enrich_config = db.session.execute(
-                text(
-                    f'SELECT id FROM "{AI_SCHEMA}".enrichment_configs '
-                    f"WHERE knowledge_base_id = :kb_id AND status != 'enriching'"
-                ),
-                {"kb_id": knowledge_base_id},
-            ).fetchone()
-            if _enrich_config:
-                # Full enrichment when strategy changed — TRUNCATEs stale metadata rows.
-                # Incremental otherwise — only enriches newly created items.
-                use_incremental = not strategy_changed
-                # No idempotency key threaded: enrichment's per-batch charging is
-                # gated by the billing port's ctx (per_batch_callback enabled by
-                # default, ctx-gated when billing is off) — the old
-                # child_enrich_idem sentinel was only a proxy for "billing
-                # active", which the adapter now checks directly.
-                _enrich_kb.delay(
-                    knowledge_base_id,
-                    incremental=use_incremental,
-                )
-                logger.info(
-                    "Triggered %s enrichment for KB %s",
-                    "incremental" if use_incremental else "full",
-                    knowledge_base_id,
-                )
-        except Exception:
-            logger.warning(
-                "Failed to trigger auto-enrichment for KB %s",
-                knowledge_base_id,
-                exc_info=True,
-            )
-
-        if strategy == "page_index":
-            artifact_desc = (
-                f"{stats.get('node_count', 0)} nodes, {stats.get('section_count', 0)} sections"
-            )
-        elif strategy == "graph_index":
-            artifact_desc = (
-                f"{stats.get('node_count', 0)} nodes, {stats.get('section_count', 0)} sections"
-            )
-        elif strategy == "full_document":
-            artifact_desc = f"1 full document ({stats.get('summary_tokens', 0)} summary tokens)"
-        elif strategy == "doc2json":
-            artifact_desc = f"1 doc2json ({stats.get('window_count', 0)} windows, {stats.get('summary_tokens', 0)} summary tokens)"
-        else:
-            artifact_desc = f"{stats['artifact_count']} chunks"
-        _task_total = _time.monotonic() - _task_t0
-        logger.info(
-            "index_source_timing task_id=%s total=%.2f strategy=%s",
-            task_id,
-            _task_total,
-            strategy,
-        )
-        logger.info(f"Indexing complete for source {source_id}: {artifact_desc} created")
-
-        return {
-            "status": "success",
-            "indexed_source_id": indexed_source_id,
-            "source_id": source_id,
-            "knowledge_base_id": knowledge_base_id,
-            "stats": stats,
-        }
 
     except SoftTimeLimitExceeded:
         logger.warning(
@@ -1737,7 +2029,10 @@ def index_source(
             ).scalar()
             if current == "cancelled":
                 return {"status": "cancelled", "source_id": source_id}
-            update_indexed_source_status(indexed_source_id, "failed", "Indexing timed out", task_id)
+            if claimed:
+                _fenced_mark_failed(indexed_source_id, task_id, "Indexing timed out")
+            else:
+                _log_unclaimed_failure(indexed_source_id)
         return {
             "status": "error",
             "source_id": source_id,
@@ -1745,22 +2040,31 @@ def index_source(
             "error": "Indexing timed out",
         }
 
-    except StorageError as e:
-        logger.error(f"Storage error during indexing: {e}")
-        db.session.rollback()  # Discard partial indexing data
-        if indexed_source_id:
-            update_indexed_source_status(
-                indexed_source_id, "failed", traceback.format_exc(), task_id
-            )
-        raise self.retry(exc=e) from e
+    except StorageError:
+        # No `claimed` guard and no `if indexed_source_id`: every storage call
+        # lives inside _run_index_body, which only runs post-claim with a
+        # resolved id. The checks above it are pure DB reads. Both writes inside
+        # the handler are fenced anyway, so a pre-claim raise would be a no-op.
+        logger.error("Storage error during indexing of %s", source_id, exc_info=True)
+        _handle_storage_error(
+            knowledge_base_id=knowledge_base_id,
+            source_id=source_id,
+            indexed_source_id=indexed_source_id,
+            task_id=task_id,
+            provider_keys=provider_keys,
+            idempotency_action=idempotency_action,
+            idempotency_parts=idempotency_parts,
+        )
+        return {"status": "retrying_or_failed", "source_id": source_id}
 
     except Exception:
         logger.error(f"Indexing failed for source {source_id}", exc_info=True)
         db.session.rollback()  # Discard partial indexing data
         if indexed_source_id:
-            update_indexed_source_status(
-                indexed_source_id, "failed", traceback.format_exc(), task_id
-            )
+            if claimed:
+                _fenced_mark_failed(indexed_source_id, task_id, traceback.format_exc())
+            else:
+                _log_unclaimed_failure(indexed_source_id)
 
         return {
             "status": "error",
@@ -1844,20 +2148,35 @@ def reindex_knowledge_base(
         }
 
 
-def _restore_indexed_status(knowledge_base_id: str, indexed_source_id: str | None) -> None:
-    """Restore index_status to 'indexed' for sources set to 'indexing'."""
+def _restore_indexed_status(
+    knowledge_base_id: str, indexed_source_id: str | None, task_id: str
+) -> None:
+    """Restore 'indexed' on the rows THIS reenrich marked, and only those.
+
+    Fenced on ``celery_task_id``. Scoping on ``index_status = 'indexing'``
+    alone is not enough: that also matches rows a concurrent index_source task
+    legitimately owns, and restoring those would declare a run finished that is
+    still in flight -- or, on the KB-wide path, declare a source indexed that
+    was only ever queued.
+
+    The mark writes this task's id, so the fence is exact both ways: rows we did
+    not mark are left alone, and a row since taken over by someone else no
+    longer matches.
+    """
+    sql = f"""
+        UPDATE "{AI_SCHEMA}".indexed_sources
+        SET index_status = 'indexed', celery_task_id = NULL
+        WHERE knowledge_base_id = :kb_id
+          AND index_status = 'indexing'
+          AND celery_task_id = :tid
+    """ + (" AND id = :id" if indexed_source_id else "")
+    params = {"kb_id": knowledge_base_id, "tid": task_id}
     if indexed_source_id:
-        update_indexed_source_status(indexed_source_id, "indexed")
-    else:
-        db.session.execute(
-            text(f"""
-                UPDATE "{AI_SCHEMA}".indexed_sources
-                SET index_status = 'indexed', celery_task_id = NULL
-                WHERE knowledge_base_id = :kb_id AND index_status = 'indexing'
-            """),
-            {"kb_id": knowledge_base_id},
-        )
-        db.session.commit()
+        params["id"] = indexed_source_id
+    # Through the helper: every caller is an early-exit path inside the task's
+    # own error handling, where a raise here would replace the real failure
+    # with this one.
+    commit_scoped_write(sql, params, what="reenrich early-exit restore")
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=120)
@@ -1899,13 +2218,13 @@ def reenrich_graph_references(
     try:
         kb = get_knowledge_base(knowledge_base_id)
         if not kb:
-            _restore_indexed_status(knowledge_base_id, indexed_source_id)
+            _restore_indexed_status(knowledge_base_id, indexed_source_id, self.request.id)
             return {"status": "error", "error": "Knowledge base not found"}
 
         indexing_config = kb["indexing_config"]
         strategy = indexing_config.get("strategy", "chunk_embed")
         if strategy != "graph_index":
-            _restore_indexed_status(knowledge_base_id, indexed_source_id)
+            _restore_indexed_status(knowledge_base_id, indexed_source_id, self.request.id)
             return {
                 "status": "error",
                 "error": f"Re-enrichment is only supported for graph_index strategy, got '{strategy}'",
@@ -1930,7 +2249,7 @@ def reenrich_graph_references(
 
         tocs = store.get_tocs()
         if not tocs:
-            _restore_indexed_status(knowledge_base_id, indexed_source_id)
+            _restore_indexed_status(knowledge_base_id, indexed_source_id, self.request.id)
             return {
                 "status": "success",
                 "toc_count": 0,
@@ -2074,21 +2393,56 @@ def reenrich_graph_references(
 
         db.session.commit()
 
-        # Update config snapshot and restore status to "indexed"
-        if indexed_source_id:
-            update_indexed_source_config_snapshot(indexed_source_id, indexing_config)
-            update_indexed_source_status(indexed_source_id, "indexed")
-        else:
-            # All sources were re-enriched — update all indexed_sources for this KB
-            source_rows = db.session.execute(
-                text(
-                    f'SELECT id FROM "{AI_SCHEMA}".indexed_sources WHERE knowledge_base_id = :kb_id'
-                ),
-                {"kb_id": knowledge_base_id},
-            ).fetchall()
-            for row in source_rows:
-                update_indexed_source_config_snapshot(str(row[0]), indexing_config)
-                update_indexed_source_status(str(row[0]), "indexed")
+        # Update config snapshot and restore status to "indexed" -- on the rows
+        # THIS reenrich marked, and only those.
+        #
+        # Selecting every row in the KB was the write that turned an over-broad
+        # mark into silent corruption: a source merely queued, or one a live
+        # index_source task was still working on, got stamped 'indexed' here
+        # regardless of whether it had ever been indexed.
+        #
+        # ONE fenced UPDATE, not a fenced SELECT feeding unfenced writes. The
+        # first version of this fix read the owned ids and then drove
+        # update_indexed_source_*() per row -- and those helpers are unfenced
+        # and commit. The predicate was therefore evaluated once, at SELECT
+        # time, and the writes landed unconditionally afterwards: anything that
+        # took the row in between got its status and config overwritten by us.
+        # A fence that is only consulted before the write is not a fence.
+        #
+        # Doing it as a single statement makes the predicate and the write
+        # atomic, and collapses N commits into one.
+        restored = commit_scoped_write(
+            f"""
+                UPDATE "{AI_SCHEMA}".indexed_sources
+                SET index_status = 'indexed',
+                    indexing_config_snapshot = CAST(:cfg AS jsonb),
+                    error_message = NULL,
+                    celery_task_id = NULL
+                WHERE knowledge_base_id = :kb_id
+                  AND index_status = 'indexing'
+                  AND celery_task_id = :tid
+            """ + (" AND id = :id" if indexed_source_id else ""),
+            (
+                {
+                    "kb_id": knowledge_base_id,
+                    "tid": self.request.id,
+                    "cfg": json.dumps(indexing_config),
+                    "id": indexed_source_id,
+                }
+                if indexed_source_id
+                else {
+                    "kb_id": knowledge_base_id,
+                    "tid": self.request.id,
+                    "cfg": json.dumps(indexing_config),
+                }
+            ),
+            what="reenrich completion restore",
+        )
+        logger.info(
+            "Graph re-enrichment restored 'indexed' on %d row(s) it owned for KB %s",
+            restored,
+            knowledge_base_id,
+        )
 
         logger.info(
             "Graph re-enrichment complete for KB %s: %d tocs, %d refs, %d embedded, %d errors",
@@ -2126,7 +2480,7 @@ def reenrich_graph_references(
         db.session.rollback()
         # Restore status so sources don't stay stuck at "indexing"
         try:
-            _restore_indexed_status(knowledge_base_id, indexed_source_id)
+            _restore_indexed_status(knowledge_base_id, indexed_source_id, self.request.id)
         except Exception:
             logger.warning(
                 "Failed to restore index_status after re-enrichment error for KB %s",

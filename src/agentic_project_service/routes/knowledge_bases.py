@@ -761,6 +761,8 @@ def index_source_into_kb(kb_id: str, source_id: str) -> dict:
                 index_status = 'pending',
                 indexing_config_snapshot = CAST(:config AS jsonb),
                 error_message = NULL,
+                attempts = 0,
+                celery_task_id = NULL,
                 last_dispatched_at = NOW()
             RETURNING id
         """),
@@ -998,6 +1000,8 @@ def reindex_kb(kb_id: str):
                 UPDATE "{AI_SCHEMA}".indexed_sources
                 SET index_status = 'pending',
                     error_message = NULL,
+                    attempts = 0,
+                    celery_task_id = NULL,
                     last_dispatched_at = NOW()
                 WHERE id = ANY(:ids)
             """),
@@ -1058,6 +1062,8 @@ def reindex_kb(kb_id: str):
                 UPDATE "{AI_SCHEMA}".indexed_sources
                 SET index_status = 'pending',
                     error_message = NULL,
+                    attempts = 0,
+                    celery_task_id = NULL,
                     last_dispatched_at = NOW()
                 WHERE id = ANY(:ids)
             """),
@@ -1109,6 +1115,8 @@ def reindex_kb(kb_id: str):
             UPDATE "{AI_SCHEMA}".indexed_sources
             SET index_status = 'pending',
                 error_message = NULL,
+                attempts = 0,
+                celery_task_id = NULL,
                 last_dispatched_at = NOW()
             WHERE knowledge_base_id = :kb_id
         """),
@@ -1133,6 +1141,77 @@ def reindex_kb(kb_id: str):
             "scope": "all",
         }
     )
+
+
+def _mark_reenriching(kb_id: str, indexed_source_id: str | None, task_id: str) -> None:
+    """Mark reenrich target(s) 'indexing', stamped with this task's id and a
+    fresh last_dispatched_at.
+
+    The fresh timestamp is what defers the reconciler: its orphan predicate
+    only selects rows whose last_dispatched_at is older than the staleness
+    window (see ORPHAN_QUERY), so a just-marked row is out of scope until that
+    window expires. The stamped id does NOT help there -- the reconciler builds
+    its alive set from index_source tasks only, so a reenrich id never matches
+    it and that clause stays true throughout. The id is what makes
+    _unmark_reenriching reversible against our own mark and nothing else.
+
+    A reenrichment still running when the window expires is therefore back in
+    scope, and can be hijacked into a full re-index.
+
+    SCOPED TO 'indexed' ROWS, and that predicate is load-bearing twice over.
+    Reenrichment runs over already-indexed sources, so it is the correct scope
+    semantically -- but without it this UPDATE takes ownership of rows it has no
+    business touching, and the claim/fence machinery turns that into silent
+    data loss:
+
+      - a 'pending' row (queued, not yet claimed) flipped to 'indexing' can no
+        longer be claimed -- _claim_indexed_source requires 'pending' -- so
+        index_source exits 'skipped' WITHOUT re-dispatching, and the completion
+        then stamps the row 'indexed'. Never indexed, reads green.
+      - an 'indexing' row owned by a LIVE task has its celery_task_id
+        overwritten, so that task's ownership fence matches nothing and its
+        inserts roll back. Its DELETEs already committed (the ToC store commits
+        unconditionally), so the source is left stripped -- and again stamped
+        'indexed' by the completion.
+
+    The second case also invalidates the reasoning that makes the unfenced
+    deletes acceptable elsewhere: that argument assumes losing the fence means a
+    CLAIMER took the row and is re-indexing it. This writer is not a claimer.
+    """
+    sql = f"""
+        UPDATE "{AI_SCHEMA}".indexed_sources
+        SET index_status = 'indexing', error_message = NULL,
+            celery_task_id = :tid, last_dispatched_at = NOW()
+        WHERE knowledge_base_id = :kb_id AND index_status = 'indexed'
+    """ + (" AND id = :id" if indexed_source_id else "")
+    params = {"kb_id": kb_id, "tid": task_id}
+    if indexed_source_id:
+        params["id"] = indexed_source_id
+    db.session.execute(text(sql), params)
+    db.session.commit()
+
+
+def _unmark_reenriching(kb_id: str, indexed_source_id: str | None, task_id: str) -> None:
+    """Undo _mark_reenriching after a dispatch that never reached the broker.
+
+    Fenced on the id we stamped AND on the row still being 'indexing', so it
+    reverses only our own mark and yields to anything that has since moved the
+    row on. The id alone does not deliver that second half: a row that still
+    carries our id but has been written terminal by someone else would be
+    flipped back to 'indexed' by an id-only predicate -- which is precisely
+    what this docstring promised and did not do."""
+    sql = f"""
+        UPDATE "{AI_SCHEMA}".indexed_sources
+        SET index_status = 'indexed', celery_task_id = NULL
+        WHERE knowledge_base_id = :kb_id
+          AND celery_task_id = :tid
+          AND index_status = 'indexing'
+    """ + (" AND id = :id" if indexed_source_id else "")
+    params = {"kb_id": kb_id, "tid": task_id}
+    if indexed_source_id:
+        params["id"] = indexed_source_id
+    db.session.execute(text(sql), params)
+    db.session.commit()
 
 
 @knowledge_bases_bp.route("/<kb_id>/graph-enrichment/run", methods=["POST"])
@@ -1172,57 +1251,45 @@ def run_graph_reenrichment(kb_id: str):
     # default in the billing port (ctx-gated by the adapter), so no billing key
     # inputs are threaded here.
 
-    # Mark affected sources as "indexing" so frontend polling kicks in
-    if indexed_source_id:
-        db.session.execute(
-            text(f"""
-                UPDATE "{AI_SCHEMA}".indexed_sources
-                SET index_status = 'indexing', error_message = NULL
-                WHERE id = :id AND knowledge_base_id = :kb_id
-            """),
-            {"id": indexed_source_id, "kb_id": kb_id},
-        )
-    else:
-        db.session.execute(
-            text(f"""
-                UPDATE "{AI_SCHEMA}".indexed_sources
-                SET index_status = 'indexing', error_message = NULL
-                WHERE knowledge_base_id = :kb_id
-            """),
-            {"kb_id": kb_id},
-        )
-    db.session.commit()
+    # Mark before dispatch, under an id minted here.
+    #
+    # Reenrichment runs over ALREADY-indexed sources, so a row marked without
+    # touching its dispatch bookkeeping (the original order did exactly that)
+    # kept the completed index run's celery_task_id AND its long-past
+    # last_dispatched_at -- satisfying every clause of the reconciler's orphan
+    # predicate immediately, which hijacked it into a full index_source
+    # re-index. The fresh last_dispatched_at is what stops that; see
+    # _mark_reenriching for what the stamped id does and does not buy.
+    #
+    # Mint the id here rather than reading it back off .delay(): taking it from
+    # the dispatch forces mark-AFTER-dispatch, and the task can finish first.
+    # Its fast exits restore 'indexed' with a NULL celery_task_id, and a mark
+    # landing after that puts the row back to 'indexing' behind an already-dead
+    # task id with a fresh last_dispatched_at -- the orphan shape again, two
+    # minutes later. Marking first and dispatching under that id has no such
+    # window.
+    tid = str(uuid.uuid4())
+    _mark_reenriching(kb_id, indexed_source_id, tid)
 
     try:
-        task = reenrich_graph_references.delay(
-            kb_id,
-            retry_failed=retry_failed,
-            indexed_source_id=indexed_source_id,
+        reenrich_graph_references.apply_async(
+            args=[kb_id],
+            kwargs={
+                "retry_failed": retry_failed,
+                "indexed_source_id": indexed_source_id,
+            },
+            task_id=tid,
         )
     except Exception:
-        # Restore status if task dispatch fails (e.g. Redis down)
-        if indexed_source_id:
-            db.session.execute(
-                text(
-                    f"UPDATE \"{AI_SCHEMA}\".indexed_sources SET index_status = 'indexed' WHERE id = :id"
-                ),
-                {"id": indexed_source_id},
-            )
-        else:
-            db.session.execute(
-                text(
-                    f"UPDATE \"{AI_SCHEMA}\".indexed_sources SET index_status = 'indexed' WHERE knowledge_base_id = :kb_id"
-                ),
-                {"kb_id": kb_id},
-            )
-        db.session.commit()
+        # The mark is committed and nothing was queued to clear it, so undo it.
         logger.exception("Failed to dispatch re-enrichment task for KB %s", kb_id)
+        _unmark_reenriching(kb_id, indexed_source_id, tid)
         return jsonify({"error": "Failed to start re-enrichment task"}), 500
 
     return jsonify(
         {
             "status": "started",
-            "task_id": task.id,
+            "task_id": tid,
             "knowledge_base_id": kb_id,
             "retry_failed": retry_failed,
         }

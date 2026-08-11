@@ -156,7 +156,7 @@ def _run_one_tick() -> None:
 
 
 ORPHAN_QUERY = f"""
-    SELECT id, source_id, knowledge_base_id, celery_task_id
+    SELECT id, source_id, knowledge_base_id, celery_task_id, attempts
     FROM "{AI_SCHEMA}".indexed_sources
     WHERE index_status = 'indexing'
       AND last_dispatched_at < NOW() - INTERVAL '2 minutes'
@@ -175,10 +175,15 @@ ORPHAN_QUERY = f"""
 
 
 def _find_and_recover_orphans(alive_ids: set[str]) -> int:
-    """Find orphans + re-dispatch each. Returns number recovered."""
+    """Find orphans; fail those at the attempts bound, re-dispatch the rest.
+
+    Returns the number re-dispatched. Rows at/over ``MAX_ATTEMPTS`` are written
+    terminal instead and counted separately -- this is what stops a source whose
+    worker dies every time from being re-dispatched forever.
+    """
     # Import locally to avoid circular import (indexing imports from celery, which
     # imports tasks at startup).
-    from .indexing import index_source
+    from .indexing import MAX_ATTEMPTS, index_source
 
     rows = db.session.execute(
         text(ORPHAN_QUERY),
@@ -189,7 +194,56 @@ def _find_and_recover_orphans(alive_ids: set[str]) -> int:
         logger.debug("Watchdog: no orphans detected")
         return 0
 
-    orphan_ids = [row.id for row in rows]
+    exhausted = [row for row in rows if row.attempts >= MAX_ATTEMPTS]
+    recoverable = [row for row in rows if row.attempts < MAX_ATTEMPTS]
+
+    # ORDER IS LOAD-BEARING: this terminal write MUST be issued and committed
+    # BEFORE the bulk reset below, while these rows are still 'indexing'. The
+    # reset flips its targets to 'pending'; run afterwards, this UPDATE's
+    # predicate would match zero rows and the row would sit at 'pending' with
+    # attempts already spent -- invisible to ORPHAN_QUERY (which only selects
+    # 'indexing') and never re-dispatched, i.e. stuck non-terminal forever.
+    #
+    # Fenced on index_status, NOT on celery_task_id. Everywhere else a terminal
+    # write is made by the task that claimed the row and is fenced on owning it;
+    # here the owner is a dead task and the reconciler holds no task id of its
+    # own, so an ownership predicate could never match. The status predicate is
+    # the equivalent guard: it yields to whatever moved the row on.
+    #
+    # The message names no cause. At this layer a worker that hit a resource
+    # ceiling, one reclaimed by the scheduler and one rolled by a redeploy are
+    # the same observation -- the task stopped existing -- so naming any of them
+    # would be a guess presented to the user as a diagnosis.
+    for row in exhausted:
+        db.session.execute(
+            text(f"""
+                UPDATE "{AI_SCHEMA}".indexed_sources
+                SET index_status = 'failed',
+                    error_message = :msg
+                WHERE id = :id
+                  AND index_status = 'indexing'
+            """),
+            {
+                "id": row.id,
+                "msg": (
+                    f"Indexing did not complete after {row.attempts} attempts "
+                    "(worker terminated before finishing)."
+                ),
+            },
+        )
+    if exhausted:
+        db.session.commit()
+        logger.warning(
+            "Watchdog: %d orphaned indexed_sources rows reached the attempts "
+            "bound of %d; wrote terminal 'failed' (no re-dispatch)",
+            len(exhausted),
+            MAX_ATTEMPTS,
+        )
+
+    if not recoverable:
+        return 0
+
+    orphan_ids = [row.id for row in recoverable]
     db.session.execute(
         text(f"""
             UPDATE "{AI_SCHEMA}".indexed_sources
@@ -216,7 +270,7 @@ def _find_and_recover_orphans(alive_ids: set[str]) -> int:
     # reached its charge (which only fires AFTER index_status is flipped to
     # 'indexed'), so dedupe here is the correct outcome.
     recovered = 0
-    for row in rows:
+    for row in recoverable:
         try:
             indexed_source_id_str = str(row.id)
             # str() coercion matches the four other dispatch sites
@@ -235,6 +289,19 @@ def _find_and_recover_orphans(alive_ids: set[str]) -> int:
             )
             recovered += 1
         except Exception:
+            # The reset above is already committed, so a publish that never
+            # reached the broker leaves a 'pending' row with nobody coming for
+            # it -- and ORPHAN_QUERY only ever selects 'indexing', so nothing
+            # would find it again. Logging alone strands the row, and strands it
+            # in the one component whose whole job is to un-strand rows: a
+            # broker outage would do this to every orphan in a single tick.
+            #
+            # Make it terminal instead, the way the storage-error retry does.
+            # Fenced on index_status, not ownership: the reset left this row
+            # 'pending' still carrying the DEAD task's id, and the reconciler
+            # holds no id of its own, so status is the only predicate that means
+            # anything here. It yields correctly too -- a task that has since
+            # claimed the row flipped it to 'indexing', and this matches nothing.
             logger.error(
                 "Watchdog: failed to .delay() recovery for indexed_source_id=%s",
                 row.id,
@@ -244,7 +311,7 @@ def _find_and_recover_orphans(alive_ids: set[str]) -> int:
     logger.info(
         "Watchdog: recovered %d/%d orphaned indexed_sources rows",
         recovered,
-        len(rows),
+        len(recoverable),
     )
     return recovered
 

@@ -193,6 +193,9 @@ class IndexedSource(db.Model):
     last_dispatched_at: Mapped[datetime | None] = mapped_column(
         db.DateTime(timezone=True), server_default=sa_text("now()")
     )
+    attempts: Mapped[int] = mapped_column(
+        db.Integer, nullable=False, server_default="0"
+    )
 
 
 class Chunk(db.Model):

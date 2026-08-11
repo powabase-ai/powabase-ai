@@ -442,9 +442,27 @@ def _stub_index_source(monkeypatch, idx_mod, mock_db_session, *, strategy, stats
     monkeypatch.setattr(idx_mod, "init_accumulator", lambda: SimpleNamespace(to_dict=lambda: {}))
     # Strategy dispatch → return the given stats without running async work.
     monkeypatch.setattr(idx_mod, "asyncio", SimpleNamespace(run=lambda _coro: stats))
-    # 1st fetchone: the get-or-create indexed_source row (indexed_source_id=None
-    # path). 2nd fetchone: the enrichment-config lookup (None → skip auto-enrich).
-    mock_db_session.execute.return_value.fetchone.side_effect = [("ix-db",), None]
+    # All db.session.execute(...).fetchone() calls share this one queue
+    # (mock_db_session.execute always returns the same Mock), so every
+    # fetchone() in the run — regardless of which query it belongs to —
+    # consumes the next entry, in call order:
+    #   1st: the get-or-create indexed_source row (indexed_source_id=None path).
+    #   2nd: the claim UPDATE...RETURNING attempts (must be a truthy row
+    #        exposing .attempts — a successful claim — or index_source exits
+    #        early with "skipped" and never reaches the charge).
+    #   3rd: the pre-overwrite indexing_config_snapshot read (None → no old
+    #        snapshot, strategy_changed stays False).
+    #   4th: the KB retrieval_config->>'method' read that gates a BM25
+    #        rebuild (None → not hybrid/full_text → skipped, so the
+    #        unmocked get_setting() is never reached).
+    #   5th: the enrichment-config lookup (None → skip auto-enrich).
+    mock_db_session.execute.return_value.fetchone.side_effect = [
+        ("ix-db",),
+        SimpleNamespace(attempts=1),
+        None,
+        None,
+        None,
+    ]
 
 
 def test_index_source_single_index_bills_and_keys_on_resolved_action(
