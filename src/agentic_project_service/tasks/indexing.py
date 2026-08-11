@@ -1603,7 +1603,9 @@ def _run_index_body(
     if matched == 0:
         db.session.rollback()
         logger.info(
-            "index_source: %s superseded before commit; rolled back, no side effects",
+            "index_source: %s superseded before commit; DB writes rolled back, but the "
+            "BM25 sparse-index write that ran before the fence is not undone and may "
+            "leave entries for rolled-back chunk ids",
             indexed_source_id,
         )
         return {"status": "skipped", "reason": "superseded",
