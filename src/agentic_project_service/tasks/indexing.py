@@ -253,6 +253,33 @@ def update_indexed_source_status(
     db.session.commit()
 
 
+def _claim_indexed_source(indexed_source_id: str, task_id: str) -> int | None:
+    """Atomically claim a pending indexed_source for execution.
+
+    Compare-and-swap: only a row currently in 'pending' can be claimed, so at
+    most one concurrent task wins; the rest see 0 rows. On success the row flips
+    to 'indexing', records this task as owner, increments attempts, and
+    refreshes last_dispatched_at (the reconciler's staleness buffer).
+
+    Returns the new attempts count if claimed, or None if the row was not
+    'pending' (already claimed by a sibling, or already terminal).
+    """
+    row = db.session.execute(
+        text(f"""
+            UPDATE "{AI_SCHEMA}".indexed_sources
+            SET index_status = 'indexing',
+                celery_task_id = :task_id,
+                attempts = attempts + 1,
+                last_dispatched_at = NOW()
+            WHERE id = :id AND index_status = 'pending'
+            RETURNING attempts
+        """),
+        {"id": indexed_source_id, "task_id": task_id},
+    ).fetchone()
+    db.session.commit()
+    return row.attempts if row else None
+
+
 def _get_indexed_source_snapshot(indexed_source_id: str) -> dict | None:
     """Fetch the current indexing_config_snapshot for an indexed source."""
     result = db.session.execute(
@@ -1413,10 +1440,6 @@ def index_source(
 
             update_indexed_source_config_snapshot(indexed_source_id, indexing_config)
 
-            # Mark as indexing BEFORE deleting old artifacts so the UI
-            # doesn't show "indexed" while content is being cleared.
-            update_indexed_source_status(indexed_source_id, "indexing", celery_task_id=task_id)
-
             # Clean up all embeddings for this indexed source FIRST
             # (prevents search queries from finding embeddings with missing content)
             db.session.execute(
@@ -1521,7 +1544,17 @@ def index_source(
                 logger.error("indexed_source_id not provided and record not found")
                 return {"status": "error", "error": "indexed_source record not found"}
 
-        update_indexed_source_status(indexed_source_id, "indexing", celery_task_id=task_id)
+        claimed_attempts = _claim_indexed_source(indexed_source_id, task_id)
+        if claimed_attempts is None:
+            # A sibling already claimed this row, or it's terminal. This is a
+            # redundant duplicate (redelivery / reconciler re-dispatch); exit before
+            # loading the document so a task storm is a no-op, not an OOM.
+            logger.info(
+                "index_source: %s not claimable (superseded or terminal); skipping",
+                indexed_source_id,
+            )
+            return {"status": "skipped", "reason": "not_claimable",
+                    "indexed_source_id": indexed_source_id}
 
         storage = get_storage()
         content = get_text_derivative_content(storage, source)
