@@ -187,9 +187,12 @@ def test_find_and_recover_orphans_dispatches_for_each_orphan():
     from agentic_project_service.tasks import watchdog
 
     # Mock db.session.execute to return 2 orphan rows, then accept the UPDATE.
+    # ``attempts`` is part of the orphan SELECT and decides recover-vs-fail;
+    # 0 keeps these rows under the bound whatever INDEXING_MAX_ATTEMPTS is set to,
+    # so this test stays about dispatch. The bound itself is covered separately.
     orphan_rows = [
-        MagicMock(id="row-1", source_id="src-1", knowledge_base_id="kb-1"),
-        MagicMock(id="row-2", source_id="src-2", knowledge_base_id="kb-2"),
+        MagicMock(id="row-1", source_id="src-1", knowledge_base_id="kb-1", attempts=0),
+        MagicMock(id="row-2", source_id="src-2", knowledge_base_id="kb-2", attempts=0),
     ]
     mock_session = MagicMock()
     select_result = MagicMock()
@@ -251,8 +254,8 @@ def test_find_and_recover_orphans_dispatches_str_args_even_when_row_columns_are_
     isid_uuid_2 = uuid.uuid4()
 
     orphan_rows = [
-        MagicMock(id=isid_uuid_1, source_id=src_uuid_1, knowledge_base_id=kb_uuid),
-        MagicMock(id=isid_uuid_2, source_id=src_uuid_2, knowledge_base_id=kb_uuid),
+        MagicMock(id=isid_uuid_1, source_id=src_uuid_1, knowledge_base_id=kb_uuid, attempts=0),
+        MagicMock(id=isid_uuid_2, source_id=src_uuid_2, knowledge_base_id=kb_uuid, attempts=0),
     ]
     mock_session = MagicMock()
     select_result = MagicMock()
@@ -401,6 +404,7 @@ def test_find_and_recover_orphans_redispatches_with_indexing_key_inputs(monkeypa
         id="00000000-0000-0000-0000-000000000001",
         source_id="00000000-0000-0000-0000-000000000002",
         knowledge_base_id="00000000-0000-0000-0000-000000000003",
+        attempts=0,  # under the bound -> recoverable, so a re-dispatch happens
     )
     mock_session = MagicMock()
     select_result = MagicMock()
@@ -445,6 +449,7 @@ def test_find_and_recover_orphans_threads_key_inputs_even_without_billing_env(mo
         id="row-1",
         source_id="src-1",
         knowledge_base_id="kb-1",
+        attempts=0,  # under the bound -> recoverable, so a re-dispatch happens
     )
     mock_session = MagicMock()
     select_result = MagicMock()
@@ -481,7 +486,7 @@ def test_find_and_recover_orphans_skips_rows_that_finished_between_select_and_up
     mock_session = MagicMock()
     select_result = MagicMock()
     select_result.fetchall.return_value = [
-        MagicMock(id="row-1", source_id="src-1", knowledge_base_id="kb-1"),
+        MagicMock(id="row-1", source_id="src-1", knowledge_base_id="kb-1", attempts=0),
     ]
 
     def capture_execute(sql, params=None):
