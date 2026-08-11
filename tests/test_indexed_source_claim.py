@@ -80,3 +80,78 @@ def test_index_source_noops_when_not_claimable(app, test_knowledge_base, mocker)
         )
     assert result["status"] == "skipped"
     load_spy.assert_not_called()
+
+
+def _seed_indexed_with_content(app, kb_id):
+    """Like _seed_pending, but also attaches a chunk + embedding to the
+    indexed_source, standing in for a row a prior run already indexed.
+    Returns (src_id, is_id); the row starts 'pending' same as _seed_pending.
+    """
+    src_id, is_id = _seed_pending(app, kb_id)
+    chunk_id = str(uuid.uuid4())
+    with app.app_context():
+        db.session.execute(
+            text("""
+                INSERT INTO ai.chunks (id, indexed_source_id, knowledge_base_id, source_id, text)
+                VALUES (:id, :is_id, :kb_id, :src_id, 'pre-existing chunk')
+            """),
+            {"id": chunk_id, "is_id": is_id, "kb_id": kb_id, "src_id": src_id},
+        )
+        db.session.execute(
+            text("""
+                INSERT INTO ai.embeddings (
+                    item_id, item_table, indexed_source_id, knowledge_base_id,
+                    source_id, embedding_model, dims, embedding
+                )
+                VALUES (
+                    :item_id, 'chunks', :is_id, :kb_id, :src_id,
+                    'test-model', 3, CAST(:embedding AS vector)
+                )
+            """),
+            {
+                "item_id": chunk_id,
+                "is_id": is_id,
+                "kb_id": kb_id,
+                "src_id": src_id,
+                "embedding": "[0,0,0]",
+            },
+        )
+        db.session.commit()
+    return src_id, is_id
+
+
+def test_claim_before_reindex_cleanup_prevents_loser_deleting_content(app, test_knowledge_base):
+    """Regression guard for claim-before-cleanup ordering.
+
+    If the claim is moved back to run AFTER the reindex branch's embedding/chunk
+    deletion — the ordering this shipped with before it was corrected — this test
+    fails: the loser deletes and commits the winner's already-indexed chunk and
+    embedding before discovering it lost the claim. Against the current ordering
+    (claim runs before any reindex cleanup) it passes: the loser exits on the
+    claim check before touching either row.
+    """
+    from agentic_project_service.tasks import indexing
+
+    src_id, is_id = _seed_indexed_with_content(app, test_knowledge_base["id"])
+    with app.app_context():
+        # Pre-claim as the winner so this task's own claim will lose.
+        indexing._claim_indexed_source(is_id, "winner")
+
+    with app.app_context():
+        result = indexing.index_source.run(
+            test_knowledge_base["id"], src_id,
+            indexed_source_id=is_id, provider_keys={},
+        )
+    assert result["status"] == "skipped"
+
+    with app.app_context():
+        chunk_count = db.session.execute(
+            text("SELECT COUNT(*) FROM ai.chunks WHERE indexed_source_id = :id"),
+            {"id": is_id},
+        ).scalar()
+        embedding_count = db.session.execute(
+            text("SELECT COUNT(*) FROM ai.embeddings WHERE indexed_source_id = :id"),
+            {"id": is_id},
+        ).scalar()
+    assert chunk_count == 1
+    assert embedding_count == 1
