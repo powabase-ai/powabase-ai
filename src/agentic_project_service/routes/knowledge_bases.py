@@ -1152,12 +1152,33 @@ def _mark_reenriching(kb_id: str, indexed_source_id: str | None, task_id: str) -
     _unmark_reenriching reversible against our own mark and nothing else.
 
     A reenrichment still running when the window expires is therefore back in
-    scope, and can be hijacked into a full re-index."""
+    scope, and can be hijacked into a full re-index.
+
+    SCOPED TO 'indexed' ROWS, and that predicate is load-bearing twice over.
+    Reenrichment runs over already-indexed sources, so it is the correct scope
+    semantically -- but without it this UPDATE takes ownership of rows it has no
+    business touching, and the claim/fence machinery turns that into silent
+    data loss:
+
+      - a 'pending' row (queued, not yet claimed) flipped to 'indexing' can no
+        longer be claimed -- _claim_indexed_source requires 'pending' -- so
+        index_source exits 'skipped' WITHOUT re-dispatching, and the completion
+        then stamps the row 'indexed'. Never indexed, reads green.
+      - an 'indexing' row owned by a LIVE task has its celery_task_id
+        overwritten, so that task's ownership fence matches nothing and its
+        inserts roll back. Its DELETEs already committed (the ToC store commits
+        unconditionally), so the source is left stripped -- and again stamped
+        'indexed' by the completion.
+
+    The second case also invalidates the reasoning that makes the unfenced
+    deletes acceptable elsewhere: that argument assumes losing the fence means a
+    CLAIMER took the row and is re-indexing it. This writer is not a claimer.
+    """
     sql = f"""
         UPDATE "{AI_SCHEMA}".indexed_sources
         SET index_status = 'indexing', error_message = NULL,
             celery_task_id = :tid, last_dispatched_at = NOW()
-        WHERE knowledge_base_id = :kb_id
+        WHERE knowledge_base_id = :kb_id AND index_status = 'indexed'
     """ + (" AND id = :id" if indexed_source_id else "")
     params = {"kb_id": kb_id, "tid": task_id}
     if indexed_source_id:

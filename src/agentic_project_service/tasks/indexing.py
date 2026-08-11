@@ -2179,20 +2179,33 @@ def reindex_knowledge_base(
         }
 
 
-def _restore_indexed_status(knowledge_base_id: str, indexed_source_id: str | None) -> None:
-    """Restore index_status to 'indexed' for sources set to 'indexing'."""
+def _restore_indexed_status(
+    knowledge_base_id: str, indexed_source_id: str | None, task_id: str
+) -> None:
+    """Restore 'indexed' on the rows THIS reenrich marked, and only those.
+
+    Fenced on ``celery_task_id``. Scoping on ``index_status = 'indexing'``
+    alone is not enough: that also matches rows a concurrent index_source task
+    legitimately owns, and restoring those would declare a run finished that is
+    still in flight -- or, on the KB-wide path, declare a source indexed that
+    was only ever queued.
+
+    The mark writes this task's id, so the fence is exact both ways: rows we did
+    not mark are left alone, and a row since taken over by someone else no
+    longer matches.
+    """
+    sql = f"""
+        UPDATE "{AI_SCHEMA}".indexed_sources
+        SET index_status = 'indexed', celery_task_id = NULL
+        WHERE knowledge_base_id = :kb_id
+          AND index_status = 'indexing'
+          AND celery_task_id = :tid
+    """ + (" AND id = :id" if indexed_source_id else "")
+    params = {"kb_id": knowledge_base_id, "tid": task_id}
     if indexed_source_id:
-        update_indexed_source_status(indexed_source_id, "indexed")
-    else:
-        db.session.execute(
-            text(f"""
-                UPDATE "{AI_SCHEMA}".indexed_sources
-                SET index_status = 'indexed', celery_task_id = NULL
-                WHERE knowledge_base_id = :kb_id AND index_status = 'indexing'
-            """),
-            {"kb_id": knowledge_base_id},
-        )
-        db.session.commit()
+        params["id"] = indexed_source_id
+    db.session.execute(text(sql), params)
+    db.session.commit()
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=120)
@@ -2234,13 +2247,13 @@ def reenrich_graph_references(
     try:
         kb = get_knowledge_base(knowledge_base_id)
         if not kb:
-            _restore_indexed_status(knowledge_base_id, indexed_source_id)
+            _restore_indexed_status(knowledge_base_id, indexed_source_id, self.request.id)
             return {"status": "error", "error": "Knowledge base not found"}
 
         indexing_config = kb["indexing_config"]
         strategy = indexing_config.get("strategy", "chunk_embed")
         if strategy != "graph_index":
-            _restore_indexed_status(knowledge_base_id, indexed_source_id)
+            _restore_indexed_status(knowledge_base_id, indexed_source_id, self.request.id)
             return {
                 "status": "error",
                 "error": f"Re-enrichment is only supported for graph_index strategy, got '{strategy}'",
@@ -2265,7 +2278,7 @@ def reenrich_graph_references(
 
         tocs = store.get_tocs()
         if not tocs:
-            _restore_indexed_status(knowledge_base_id, indexed_source_id)
+            _restore_indexed_status(knowledge_base_id, indexed_source_id, self.request.id)
             return {
                 "status": "success",
                 "toc_count": 0,
@@ -2409,21 +2422,27 @@ def reenrich_graph_references(
 
         db.session.commit()
 
-        # Update config snapshot and restore status to "indexed"
+        # Update config snapshot and restore status to "indexed" -- on the rows
+        # THIS reenrich marked, and only those.
+        #
+        # Selecting every row in the KB was the write that turned an over-broad
+        # mark into silent corruption: a source merely queued, or one a live
+        # index_source task was still working on, got stamped 'indexed' here
+        # regardless of whether it had ever been indexed. The mark is scoped
+        # now, but this end is fenced too -- a guard at one end only is a guard
+        # until the next caller.
+        sql = f"""
+            SELECT id FROM "{AI_SCHEMA}".indexed_sources
+            WHERE knowledge_base_id = :kb_id
+              AND index_status = 'indexing'
+              AND celery_task_id = :tid
+        """ + (" AND id = :id" if indexed_source_id else "")
+        params = {"kb_id": knowledge_base_id, "tid": self.request.id}
         if indexed_source_id:
-            update_indexed_source_config_snapshot(indexed_source_id, indexing_config)
-            update_indexed_source_status(indexed_source_id, "indexed")
-        else:
-            # All sources were re-enriched — update all indexed_sources for this KB
-            source_rows = db.session.execute(
-                text(
-                    f'SELECT id FROM "{AI_SCHEMA}".indexed_sources WHERE knowledge_base_id = :kb_id'
-                ),
-                {"kb_id": knowledge_base_id},
-            ).fetchall()
-            for row in source_rows:
-                update_indexed_source_config_snapshot(str(row[0]), indexing_config)
-                update_indexed_source_status(str(row[0]), "indexed")
+            params["id"] = indexed_source_id
+        for row in db.session.execute(text(sql), params).fetchall():
+            update_indexed_source_config_snapshot(str(row[0]), indexing_config)
+            update_indexed_source_status(str(row[0]), "indexed")
 
         logger.info(
             "Graph re-enrichment complete for KB %s: %d tocs, %d refs, %d embedded, %d errors",
@@ -2461,7 +2480,7 @@ def reenrich_graph_references(
         db.session.rollback()
         # Restore status so sources don't stay stuck at "indexing"
         try:
-            _restore_indexed_status(knowledge_base_id, indexed_source_id)
+            _restore_indexed_status(knowledge_base_id, indexed_source_id, self.request.id)
         except Exception:
             logger.warning(
                 "Failed to restore index_status after re-enrichment error for KB %s",
