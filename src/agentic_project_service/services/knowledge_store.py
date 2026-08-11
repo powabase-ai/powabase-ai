@@ -39,13 +39,17 @@ class PgVectorKnowledgeStore(BasePgVectorStore):
         chunks: list[dict],
         embedding_model: str | None = None,
     ) -> tuple[int, list[str]]:
-        """Store chunks and their embeddings (in ai.embeddings table)."""
+        """Store chunks and their embeddings (in ai.embeddings table).
+
+        Does NOT commit: the inserts stay open so the caller can commit them
+        together with the terminal status write, and roll both back as one if
+        the run turns out to have been superseded.
+        """
         if not chunks:
             return 0, []
 
         inserted = 0
         chunk_ids: list[str] = []
-        dims_seen: int | None = None
         for chunk in chunks:
             chunk_id = str(uuid4())
             chunk_ids.append(chunk_id)
@@ -79,7 +83,6 @@ class PgVectorKnowledgeStore(BasePgVectorStore):
             if embedding and embedding_model:
                 embedding_str = f"[{','.join(str(x) for x in embedding)}]"
                 dims = len(embedding)
-                dims_seen = dims
                 self.session.execute(
                     text(f"""
                         INSERT INTO "{self.schema}".embeddings (
@@ -105,14 +108,13 @@ class PgVectorKnowledgeStore(BasePgVectorStore):
 
             inserted += 1
 
-        if dims_seen is not None:
-            self._ensure_embedding_index(dims_seen)
-
-        self.session.commit()
         return inserted, chunk_ids
 
     async def delete_chunks(self, indexed_source_id: str) -> int:
-        """Delete all chunks for an indexed source."""
+        """Delete all chunks for an indexed source.
+
+        Does NOT commit — see ``store_chunks``.
+        """
         result = self.session.execute(
             text(f"""
                 DELETE FROM "{self.schema}".chunks
@@ -120,7 +122,6 @@ class PgVectorKnowledgeStore(BasePgVectorStore):
             """),
             {"indexed_source_id": indexed_source_id},
         )
-        self.session.commit()
         return result.rowcount
 
     async def count_chunks(self, indexed_source_id: str | None = None) -> int:

@@ -335,6 +335,27 @@ def update_indexed_source_result(
     db.session.commit()
 
 
+def _fenced_mark_indexed(indexed_source_id: str, task_id: str, stats: dict) -> int:
+    """Write the terminal 'indexed' result ONLY if this task still owns the row.
+
+    Does NOT commit — the caller commits the whole fenced transaction (chunk
+    inserts + this write) so a superseded task's chunks roll back with its
+    status write. Returns the number of rows matched (1 = owner, 0 = superseded).
+    """
+    result = db.session.execute(
+        text(f"""
+            UPDATE "{AI_SCHEMA}".indexed_sources
+            SET index_status = 'indexed',
+                indexed_at = NOW(),
+                stats = CAST(:stats AS jsonb),
+                error_message = NULL
+            WHERE id = :id AND celery_task_id = :task_id
+        """),
+        {"id": indexed_source_id, "task_id": task_id, "stats": json.dumps(stats)},
+    )
+    return result.rowcount
+
+
 def get_page_texts_from_derivative(
     source: dict,
     storage: SupabaseStorage | None = None,
@@ -636,12 +657,10 @@ async def run_indexing(
         len(chunk_ids),
     )
 
-    # Ensure hnsw index exists for this embedding dimension
+    # No index creation here: the chunk/embedding inserts above are still
+    # uncommitted, and CREATE INDEX takes a ShareLock that conflicts with the
+    # RowExclusiveLock those INSERTs hold in the same transaction.
     embedding_dim = len(result.chunks[0].embedding) if result.chunks[0].embedding else 0
-    if embedding_dim:
-        from ..services.base_vector_store import ensure_embedding_index
-
-        ensure_embedding_index(db.session, AI_SCHEMA, embedding_dim)
 
     stats = {
         "artifact_count": stored_count,
@@ -1335,6 +1354,350 @@ async def run_doc2json_indexing(
     return stats
 
 
+def _run_index_body(
+    *,
+    knowledge_base_id: str,
+    source_id: str,
+    indexed_source_id: str,
+    task_id: str,
+    provider_keys: dict[str, str] | None,
+    idempotency_action: str | None = None,
+    idempotency_parts: list | None = None,
+) -> dict:
+    """Run an indexing pass for a row this task has already claimed.
+
+    Split out of ``index_source`` at the post-claim boundary so the whole
+    "clear old artifacts -> load content -> index -> commit" span is callable
+    on its own. The caller must have won the claim first: this body always
+    performs the artifact writes, and it is the ownership fence at the end --
+    not the claim -- that decides whether they become durable.
+
+    Raises whatever the indexing strategies raise; ``index_source`` owns the
+    rollback-and-mark-failed handling.
+    """
+    import time as _time
+
+    _body_t0 = _time.monotonic()
+
+    kb = get_knowledge_base(knowledge_base_id)
+    indexing_config = kb["indexing_config"]
+    source = get_source(source_id)
+    strategy = indexing_config.get("strategy", "chunk_embed")
+    strategy_changed = False
+
+    if indexed_source_id:
+        # Read old snapshot BEFORE overwriting to detect strategy changes
+        old_snapshot = _get_indexed_source_snapshot(indexed_source_id)
+        old_strategy = (old_snapshot or {}).get("strategy", "chunk_embed")
+        strategy_changed = old_strategy != strategy
+
+        update_indexed_source_config_snapshot(indexed_source_id, indexing_config)
+
+        # Clean up all embeddings for this indexed source FIRST
+        # (prevents search queries from finding embeddings with missing content)
+        # Left uncommitted on purpose so it can ride the fenced transaction
+        # below rather than becoming durable ahead of the result it belongs to.
+        db.session.execute(
+            text(f"""
+                DELETE FROM "{AI_SCHEMA}".embeddings
+                WHERE indexed_source_id = :indexed_source_id
+            """),
+            {"indexed_source_id": indexed_source_id},
+        )
+
+        # Delete artifacts from ALL strategy tables unconditionally.
+        # Each call is a no-op (0 rows deleted) if no artifacts exist for that type.
+
+        # First, query IDs before deletion for sparse index cleanup
+        from ..services.sparse_retrieval import SparseIndexStore
+
+        chunk_ids_to_remove = [
+            str(r[0])
+            for r in db.session.execute(
+                text(f'SELECT id FROM "{AI_SCHEMA}".chunks WHERE indexed_source_id = :is_id'),
+                {"is_id": indexed_source_id},
+            ).fetchall()
+        ]
+        fd_ids_to_remove = [
+            str(r[0])
+            for r in db.session.execute(
+                text(
+                    f'SELECT id FROM "{AI_SCHEMA}".full_documents WHERE indexed_source_id = :is_id'
+                ),
+                {"is_id": indexed_source_id},
+            ).fetchall()
+        ]
+        gi_ids_to_remove = [
+            str(r[0])
+            for r in db.session.execute(
+                text(
+                    f'SELECT id FROM "{AI_SCHEMA}".graph_index_nodes WHERE indexed_source_id = :is_id'
+                ),
+                {"is_id": indexed_source_id},
+            ).fetchall()
+        ]
+
+        store = PgVectorKnowledgeStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+        )
+        asyncio.run(store.delete_chunks(indexed_source_id))
+
+        pi_store = PageIndexStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+        )
+        pi_store.delete_by_indexed_source(indexed_source_id)
+
+        fd_store = FullDocumentStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+            storage=get_storage(),
+        )
+        fd_store.delete_by_indexed_source(indexed_source_id)
+
+        gi_store = GraphIndexStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+        )
+        gi_store.delete_by_indexed_source(indexed_source_id)
+
+        d2j_store = Doc2JSONStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+        )
+        d2j_store.delete_by_indexed_source(indexed_source_id)
+        # Remove deleted items from sparse indexes
+        if _should_build_bm25_now(knowledge_base_id):
+            sparse_store = SparseIndexStore(knowledge_base_id=knowledge_base_id)
+            if chunk_ids_to_remove:
+                sparse_store.remove_and_save(chunk_ids_to_remove, item_table="chunks")
+            if fd_ids_to_remove:
+                sparse_store.remove_and_save(fd_ids_to_remove, item_table="full_documents")
+            if gi_ids_to_remove:
+                sparse_store.remove_and_save(gi_ids_to_remove, item_table="graph_index_nodes")
+
+        logger.info(
+            "Cleared all artifact tables for re-indexing (old_strategy=%s, new_strategy=%s)",
+            old_strategy,
+            strategy,
+        )
+
+    storage = get_storage()
+    content = get_text_derivative_content(storage, source)
+
+    use_images = strategy == "doc2json" and indexing_config.get("use_images", False)
+
+    if not content:
+        if use_images:
+            logger.info(
+                "No text derivative found — proceeding in image-only mode "
+                "for doc2json strategy (source_id=%s)",
+                source_id,
+            )
+            content = ""
+        else:
+            error_msg = "No text derivative found for source"
+            logger.error(error_msg)
+            update_indexed_source_status(indexed_source_id, "failed", error_msg)
+            return {"status": "error", "error": error_msg}
+
+    if content:
+        logger.info(f"Loaded text content: {len(content)} chars")
+
+    # Extract page_texts from derivative metadata (available for PDF sources)
+    page_texts = get_page_texts_from_derivative(source, storage=storage)
+
+    # Set the cost accumulator on this thread's context BEFORE the
+    # strategy dispatch so each asyncio.run() snapshot below inherits
+    # the same accumulator object.
+    acc = init_accumulator()
+
+    if strategy == "page_index":
+        stats = asyncio.run(
+            run_page_index_indexing(
+                kb_id=knowledge_base_id,
+                indexed_source_id=indexed_source_id,
+                source_id=source_id,
+                content=content,
+                indexing_config=indexing_config,
+                source_name=source["name"],
+                page_texts=page_texts,
+            )
+        )
+    elif strategy == "full_document":
+        stats = asyncio.run(
+            run_full_document_indexing(
+                kb_id=knowledge_base_id,
+                indexed_source_id=indexed_source_id,
+                source_id=source_id,
+                content=content,
+                indexing_config=indexing_config,
+                provider_keys=provider_keys,
+            )
+        )
+    elif strategy == "graph_index":
+        stats = asyncio.run(
+            run_graph_index_indexing(
+                kb_id=knowledge_base_id,
+                indexed_source_id=indexed_source_id,
+                source_id=source_id,
+                content=content,
+                indexing_config=indexing_config,
+                source_name=source["name"],
+                page_texts=page_texts,
+                source=source,
+                provider_keys=provider_keys,
+            )
+        )
+    elif strategy == "doc2json":
+        # Fetch page images if use_images mode is enabled
+        page_images = None
+        use_images = indexing_config.get("use_images", False)
+        if use_images:
+            page_images = get_page_images_from_derivative(source, storage=storage)
+            if not page_images:
+                logger.warning(
+                    "use_images=True but no page images found for source %s, "
+                    "falling back to text mode",
+                    source_id,
+                )
+
+        stats = asyncio.run(
+            run_doc2json_indexing(
+                kb_id=knowledge_base_id,
+                indexed_source_id=indexed_source_id,
+                source_id=source_id,
+                content=content,
+                indexing_config=indexing_config,
+                page_images=page_images,
+            )
+        )
+    else:  # chunk_embed (default)
+        auto_meta = source.get("auto_metadata", {})
+        extraction_method = auto_meta.get("extraction_method")
+        # For -via-pdf wrappers (txt, docx), use the underlying PDF
+        # extraction method so the separator matches what was used to
+        # join pages during extraction.
+        if extraction_method and extraction_method.endswith("-via-pdf"):
+            extraction_method = auto_meta.get("pdf_extraction_method", extraction_method)
+        stats = asyncio.run(
+            run_indexing(
+                kb_id=knowledge_base_id,
+                indexed_source_id=indexed_source_id,
+                source_id=source_id,
+                content=content,
+                indexing_config=indexing_config,
+                page_texts=page_texts,
+                extraction_method=extraction_method,
+                provider_keys=provider_keys,
+            )
+        )
+
+    # Fenced commit: chunk/embedding inserts (uncommitted inside run_indexing)
+    # + this status write are one transaction. If we lost ownership (a
+    # spurious reconciler reset let a sibling re-claim), match 0 rows, roll
+    # the whole transaction back, and exit WITHOUT any side effects.
+    stats["llm_costs"] = acc.to_dict()
+    matched = _fenced_mark_indexed(indexed_source_id, task_id, stats)
+    if matched == 0:
+        db.session.rollback()
+        logger.info(
+            "index_source: %s superseded before commit; rolled back, no side effects",
+            indexed_source_id,
+        )
+        return {"status": "skipped", "reason": "superseded",
+                "indexed_source_id": indexed_source_id}
+    db.session.commit()
+
+    # Bill the indexing action with the actual 1k-token quantity. The
+    # billing-configured check now lives in the adapter (no-op when
+    # unconfigured), so this is unconditional. The BILLED action is the
+    # strategy-resolved indexing_<strategy>; the KEY action is whatever the
+    # caller threaded (== billed action for single-index, literal "indexing"
+    # for reindex/batch/watchdog — the split), reproducing the pre-port key.
+    indexing_action = _resolve_indexing_action(strategy)
+    actual_quantity = _quantity_from_stats(stats)
+    # billing.charge never raises; ChargeOutcome reports outcome. A
+    # post-success 402 is bounded over-serve per spec line 54.
+    billing.charge(
+        action=indexing_action,
+        idempotency_action=idempotency_action,
+        idempotency_parts=tuple(idempotency_parts or ()),
+        ref_type="indexing",
+        ref_id=str(indexed_source_id),
+        quantity=actual_quantity,
+        metadata={"strategy": strategy, "source_id": source_id},
+    )
+
+    # Auto-enrich if KB has an enrichment config
+    try:
+        from .enrichment import enrich_knowledge_base as _enrich_kb
+
+        _enrich_config = db.session.execute(
+            text(
+                f'SELECT id FROM "{AI_SCHEMA}".enrichment_configs '
+                f"WHERE knowledge_base_id = :kb_id AND status != 'enriching'"
+            ),
+            {"kb_id": knowledge_base_id},
+        ).fetchone()
+        if _enrich_config:
+            # Full enrichment when strategy changed — TRUNCATEs stale metadata rows.
+            # Incremental otherwise — only enriches newly created items.
+            use_incremental = not strategy_changed
+            # No idempotency key threaded: enrichment's per-batch charging is
+            # gated by the billing port's ctx (per_batch_callback enabled by
+            # default, ctx-gated when billing is off) — the old
+            # child_enrich_idem sentinel was only a proxy for "billing
+            # active", which the adapter now checks directly.
+            _enrich_kb.delay(
+                knowledge_base_id,
+                incremental=use_incremental,
+            )
+            logger.info(
+                "Triggered %s enrichment for KB %s",
+                "incremental" if use_incremental else "full",
+                knowledge_base_id,
+            )
+    except Exception:
+        logger.warning(
+            "Failed to trigger auto-enrichment for KB %s",
+            knowledge_base_id,
+            exc_info=True,
+        )
+
+    if strategy == "page_index":
+        artifact_desc = (
+            f"{stats.get('node_count', 0)} nodes, {stats.get('section_count', 0)} sections"
+        )
+    elif strategy == "graph_index":
+        artifact_desc = (
+            f"{stats.get('node_count', 0)} nodes, {stats.get('section_count', 0)} sections"
+        )
+    elif strategy == "full_document":
+        artifact_desc = f"1 full document ({stats.get('summary_tokens', 0)} summary tokens)"
+    elif strategy == "doc2json":
+        artifact_desc = f"1 doc2json ({stats.get('window_count', 0)} windows, {stats.get('summary_tokens', 0)} summary tokens)"
+    else:
+        artifact_desc = f"{stats['artifact_count']} chunks"
+    _body_total = _time.monotonic() - _body_t0
+    logger.info(
+        "index_source_timing task_id=%s total=%.2f strategy=%s",
+        task_id,
+        _body_total,
+        strategy,
+    )
+    logger.info(f"Indexing complete for source {source_id}: {artifact_desc} created")
+
+    return {
+        "status": "success",
+        "indexed_source_id": indexed_source_id,
+        "source_id": source_id,
+        "knowledge_base_id": knowledge_base_id,
+        "stats": stats,
+    }
+
+
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 @billing.task_context
 def index_source(
@@ -1378,10 +1741,7 @@ def index_source(
     Returns:
         Dict with indexing results or error info
     """
-    import time as _time
-
     task_id = self.request.id
-    _task_t0 = _time.monotonic()
     logger.info(
         f"Starting indexing task {task_id} for source {source_id} into KB {knowledge_base_id}"
     )
@@ -1394,8 +1754,6 @@ def index_source(
             if indexed_source_id:
                 _mark_indexed_source_failed(indexed_source_id, error_msg)
             return {"status": "error", "error": error_msg}
-
-        indexing_config = kb["indexing_config"]
 
         source = get_source(source_id)
         if not source:
@@ -1418,9 +1776,6 @@ def index_source(
                 "status": "error",
                 "error": error_msg,
             }
-
-        strategy = indexing_config.get("strategy", "chunk_embed")
-        strategy_changed = False
 
         # Early exit if already cancelled (handles race where cancel arrives before task starts)
         if indexed_source_id:
@@ -1461,303 +1816,15 @@ def index_source(
             return {"status": "skipped", "reason": "not_claimable",
                     "indexed_source_id": indexed_source_id}
 
-        if indexed_source_id:
-            # Read old snapshot BEFORE overwriting to detect strategy changes
-            old_snapshot = _get_indexed_source_snapshot(indexed_source_id)
-            old_strategy = (old_snapshot or {}).get("strategy", "chunk_embed")
-            strategy_changed = old_strategy != strategy
-
-            update_indexed_source_config_snapshot(indexed_source_id, indexing_config)
-
-            # Clean up all embeddings for this indexed source FIRST
-            # (prevents search queries from finding embeddings with missing content)
-            db.session.execute(
-                text(f"""
-                    DELETE FROM "{AI_SCHEMA}".embeddings
-                    WHERE indexed_source_id = :indexed_source_id
-                """),
-                {"indexed_source_id": indexed_source_id},
-            )
-            db.session.commit()
-
-            # Delete artifacts from ALL strategy tables unconditionally.
-            # Each call is a no-op (0 rows deleted) if no artifacts exist for that type.
-
-            # First, query IDs before deletion for sparse index cleanup
-            from ..services.sparse_retrieval import SparseIndexStore
-
-            chunk_ids_to_remove = [
-                str(r[0])
-                for r in db.session.execute(
-                    text(f'SELECT id FROM "{AI_SCHEMA}".chunks WHERE indexed_source_id = :is_id'),
-                    {"is_id": indexed_source_id},
-                ).fetchall()
-            ]
-            fd_ids_to_remove = [
-                str(r[0])
-                for r in db.session.execute(
-                    text(
-                        f'SELECT id FROM "{AI_SCHEMA}".full_documents WHERE indexed_source_id = :is_id'
-                    ),
-                    {"is_id": indexed_source_id},
-                ).fetchall()
-            ]
-            gi_ids_to_remove = [
-                str(r[0])
-                for r in db.session.execute(
-                    text(
-                        f'SELECT id FROM "{AI_SCHEMA}".graph_index_nodes WHERE indexed_source_id = :is_id'
-                    ),
-                    {"is_id": indexed_source_id},
-                ).fetchall()
-            ]
-
-            store = PgVectorKnowledgeStore(
-                db_session=db.session,
-                knowledge_base_id=knowledge_base_id,
-            )
-            asyncio.run(store.delete_chunks(indexed_source_id))
-
-            pi_store = PageIndexStore(
-                db_session=db.session,
-                knowledge_base_id=knowledge_base_id,
-            )
-            pi_store.delete_by_indexed_source(indexed_source_id)
-
-            fd_store = FullDocumentStore(
-                db_session=db.session,
-                knowledge_base_id=knowledge_base_id,
-                storage=get_storage(),
-            )
-            fd_store.delete_by_indexed_source(indexed_source_id)
-
-            gi_store = GraphIndexStore(
-                db_session=db.session,
-                knowledge_base_id=knowledge_base_id,
-            )
-            gi_store.delete_by_indexed_source(indexed_source_id)
-
-            d2j_store = Doc2JSONStore(
-                db_session=db.session,
-                knowledge_base_id=knowledge_base_id,
-            )
-            d2j_store.delete_by_indexed_source(indexed_source_id)
-            # Remove deleted items from sparse indexes
-            if _should_build_bm25_now(knowledge_base_id):
-                sparse_store = SparseIndexStore(knowledge_base_id=knowledge_base_id)
-                if chunk_ids_to_remove:
-                    sparse_store.remove_and_save(chunk_ids_to_remove, item_table="chunks")
-                if fd_ids_to_remove:
-                    sparse_store.remove_and_save(fd_ids_to_remove, item_table="full_documents")
-                if gi_ids_to_remove:
-                    sparse_store.remove_and_save(gi_ids_to_remove, item_table="graph_index_nodes")
-
-            logger.info(
-                "Cleared all artifact tables for re-indexing (old_strategy=%s, new_strategy=%s)",
-                old_strategy,
-                strategy,
-            )
-
-        storage = get_storage()
-        content = get_text_derivative_content(storage, source)
-
-        use_images = strategy == "doc2json" and indexing_config.get("use_images", False)
-
-        if not content:
-            if use_images:
-                logger.info(
-                    "No text derivative found — proceeding in image-only mode "
-                    "for doc2json strategy (source_id=%s)",
-                    source_id,
-                )
-                content = ""
-            else:
-                error_msg = "No text derivative found for source"
-                logger.error(error_msg)
-                update_indexed_source_status(indexed_source_id, "failed", error_msg)
-                return {"status": "error", "error": error_msg}
-
-        if content:
-            logger.info(f"Loaded text content: {len(content)} chars")
-
-        # Extract page_texts from derivative metadata (available for PDF sources)
-        page_texts = get_page_texts_from_derivative(source, storage=storage)
-
-        # Set the cost accumulator on this thread's context BEFORE the
-        # strategy dispatch so each asyncio.run() snapshot below inherits
-        # the same accumulator object.
-        acc = init_accumulator()
-
-        if strategy == "page_index":
-            stats = asyncio.run(
-                run_page_index_indexing(
-                    kb_id=knowledge_base_id,
-                    indexed_source_id=indexed_source_id,
-                    source_id=source_id,
-                    content=content,
-                    indexing_config=indexing_config,
-                    source_name=source["name"],
-                    page_texts=page_texts,
-                )
-            )
-        elif strategy == "full_document":
-            stats = asyncio.run(
-                run_full_document_indexing(
-                    kb_id=knowledge_base_id,
-                    indexed_source_id=indexed_source_id,
-                    source_id=source_id,
-                    content=content,
-                    indexing_config=indexing_config,
-                    provider_keys=provider_keys,
-                )
-            )
-        elif strategy == "graph_index":
-            stats = asyncio.run(
-                run_graph_index_indexing(
-                    kb_id=knowledge_base_id,
-                    indexed_source_id=indexed_source_id,
-                    source_id=source_id,
-                    content=content,
-                    indexing_config=indexing_config,
-                    source_name=source["name"],
-                    page_texts=page_texts,
-                    source=source,
-                    provider_keys=provider_keys,
-                )
-            )
-        elif strategy == "doc2json":
-            # Fetch page images if use_images mode is enabled
-            page_images = None
-            use_images = indexing_config.get("use_images", False)
-            if use_images:
-                page_images = get_page_images_from_derivative(source, storage=storage)
-                if not page_images:
-                    logger.warning(
-                        "use_images=True but no page images found for source %s, "
-                        "falling back to text mode",
-                        source_id,
-                    )
-
-            stats = asyncio.run(
-                run_doc2json_indexing(
-                    kb_id=knowledge_base_id,
-                    indexed_source_id=indexed_source_id,
-                    source_id=source_id,
-                    content=content,
-                    indexing_config=indexing_config,
-                    page_images=page_images,
-                )
-            )
-        else:  # chunk_embed (default)
-            auto_meta = source.get("auto_metadata", {})
-            extraction_method = auto_meta.get("extraction_method")
-            # For -via-pdf wrappers (txt, docx), use the underlying PDF
-            # extraction method so the separator matches what was used to
-            # join pages during extraction.
-            if extraction_method and extraction_method.endswith("-via-pdf"):
-                extraction_method = auto_meta.get("pdf_extraction_method", extraction_method)
-            stats = asyncio.run(
-                run_indexing(
-                    kb_id=knowledge_base_id,
-                    indexed_source_id=indexed_source_id,
-                    source_id=source_id,
-                    content=content,
-                    indexing_config=indexing_config,
-                    page_texts=page_texts,
-                    extraction_method=extraction_method,
-                    provider_keys=provider_keys,
-                )
-            )
-
-        stats["llm_costs"] = acc.to_dict()
-        update_indexed_source_result(indexed_source_id, stats)
-
-        # Bill the indexing action with the actual 1k-token quantity. The
-        # billing-configured check now lives in the adapter (no-op when
-        # unconfigured), so this is unconditional. The BILLED action is the
-        # strategy-resolved indexing_<strategy>; the KEY action is whatever the
-        # caller threaded (== billed action for single-index, literal "indexing"
-        # for reindex/batch/watchdog — the split), reproducing the pre-port key.
-        indexing_action = _resolve_indexing_action(strategy)
-        actual_quantity = _quantity_from_stats(stats)
-        # billing.charge never raises; ChargeOutcome reports outcome. A
-        # post-success 402 is bounded over-serve per spec line 54.
-        billing.charge(
-            action=indexing_action,
+        return _run_index_body(
+            knowledge_base_id=knowledge_base_id,
+            source_id=source_id,
+            indexed_source_id=indexed_source_id,
+            task_id=task_id,
+            provider_keys=provider_keys,
             idempotency_action=idempotency_action,
-            idempotency_parts=tuple(idempotency_parts or ()),
-            ref_type="indexing",
-            ref_id=str(indexed_source_id),
-            quantity=actual_quantity,
-            metadata={"strategy": strategy, "source_id": source_id},
+            idempotency_parts=idempotency_parts,
         )
-
-        # Auto-enrich if KB has an enrichment config
-        try:
-            from .enrichment import enrich_knowledge_base as _enrich_kb
-
-            _enrich_config = db.session.execute(
-                text(
-                    f'SELECT id FROM "{AI_SCHEMA}".enrichment_configs '
-                    f"WHERE knowledge_base_id = :kb_id AND status != 'enriching'"
-                ),
-                {"kb_id": knowledge_base_id},
-            ).fetchone()
-            if _enrich_config:
-                # Full enrichment when strategy changed — TRUNCATEs stale metadata rows.
-                # Incremental otherwise — only enriches newly created items.
-                use_incremental = not strategy_changed
-                # No idempotency key threaded: enrichment's per-batch charging is
-                # gated by the billing port's ctx (per_batch_callback enabled by
-                # default, ctx-gated when billing is off) — the old
-                # child_enrich_idem sentinel was only a proxy for "billing
-                # active", which the adapter now checks directly.
-                _enrich_kb.delay(
-                    knowledge_base_id,
-                    incremental=use_incremental,
-                )
-                logger.info(
-                    "Triggered %s enrichment for KB %s",
-                    "incremental" if use_incremental else "full",
-                    knowledge_base_id,
-                )
-        except Exception:
-            logger.warning(
-                "Failed to trigger auto-enrichment for KB %s",
-                knowledge_base_id,
-                exc_info=True,
-            )
-
-        if strategy == "page_index":
-            artifact_desc = (
-                f"{stats.get('node_count', 0)} nodes, {stats.get('section_count', 0)} sections"
-            )
-        elif strategy == "graph_index":
-            artifact_desc = (
-                f"{stats.get('node_count', 0)} nodes, {stats.get('section_count', 0)} sections"
-            )
-        elif strategy == "full_document":
-            artifact_desc = f"1 full document ({stats.get('summary_tokens', 0)} summary tokens)"
-        elif strategy == "doc2json":
-            artifact_desc = f"1 doc2json ({stats.get('window_count', 0)} windows, {stats.get('summary_tokens', 0)} summary tokens)"
-        else:
-            artifact_desc = f"{stats['artifact_count']} chunks"
-        _task_total = _time.monotonic() - _task_t0
-        logger.info(
-            "index_source_timing task_id=%s total=%.2f strategy=%s",
-            task_id,
-            _task_total,
-            strategy,
-        )
-        logger.info(f"Indexing complete for source {source_id}: {artifact_desc} created")
-
-        return {
-            "status": "success",
-            "indexed_source_id": indexed_source_id,
-            "source_id": source_id,
-            "knowledge_base_id": knowledge_base_id,
-            "stats": stats,
-        }
 
     except SoftTimeLimitExceeded:
         logger.warning(
