@@ -74,18 +74,19 @@ def test_indexing_initializes_accumulator_before_strategy_dispatch():
 
 def test_indexing_merges_costs_into_stats_before_persist():
     """The accumulator's to_dict() output must be merged into stats before
-    update_indexed_source_result(...) writes to the DB, so the cost data
-    lands on the same row."""
+    _fenced_mark_indexed(...) writes to the DB, so the cost data lands on the
+    same row. (The terminal write is the ownership-fenced one — the stats it
+    persists are the stats it is handed, so the merge has to happen first.)"""
     src = _source()
     # Pattern: stats["llm_costs"] = <something with to_dict>
     pattern = re.compile(r'stats\[["\']llm_costs["\']\]\s*=\s*[^\n]*\.to_dict\(\)')
     assignment = pattern.search(src)
     assert assignment, (
         'tasks/indexing.py must assign stats["llm_costs"] = <acc>.to_dict() '
-        "before calling update_indexed_source_result(...)."
+        "before calling _fenced_mark_indexed(...)."
     )
-    persist_pos = src.find("update_indexed_source_result(indexed_source_id, stats)")
-    assert persist_pos != -1, "update_indexed_source_result call not found"
+    persist_pos = src.find("_fenced_mark_indexed(indexed_source_id, task_id, stats)")
+    assert persist_pos != -1, "_fenced_mark_indexed call not found"
     assert assignment.start() < persist_pos, (
-        'stats["llm_costs"] = ... must come BEFORE update_indexed_source_result.'
+        'stats["llm_costs"] = ... must come BEFORE _fenced_mark_indexed.'
     )
