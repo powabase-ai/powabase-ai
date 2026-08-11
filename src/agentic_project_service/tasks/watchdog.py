@@ -289,11 +289,41 @@ def _find_and_recover_orphans(alive_ids: set[str]) -> int:
             )
             recovered += 1
         except Exception:
+            # The reset above is already committed, so a publish that never
+            # reached the broker leaves a 'pending' row with nobody coming for
+            # it -- and ORPHAN_QUERY only ever selects 'indexing', so nothing
+            # would find it again. Logging alone strands the row, and strands it
+            # in the one component whose whole job is to un-strand rows: a
+            # broker outage would do this to every orphan in a single tick.
+            #
+            # Make it terminal instead, the way the storage-error retry does.
+            # Fenced on index_status, not ownership: the reset left this row
+            # 'pending' still carrying the DEAD task's id, and the reconciler
+            # holds no id of its own, so status is the only predicate that means
+            # anything here. It yields correctly too -- a task that has since
+            # claimed the row flipped it to 'indexing', and this matches nothing.
             logger.error(
                 "Watchdog: failed to .delay() recovery for indexed_source_id=%s",
                 row.id,
                 exc_info=True,
             )
+            db.session.execute(
+                text(f"""
+                    UPDATE "{AI_SCHEMA}".indexed_sources
+                    SET index_status = 'failed',
+                        error_message = :msg
+                    WHERE id = :id
+                      AND index_status = 'pending'
+                """),
+                {
+                    "id": row.id,
+                    # Names only what is known here: the retry could not be
+                    # queued. Why the broker refused is not observable at this
+                    # layer, so it is not guessed at.
+                    "msg": "Indexing could not be re-queued after the worker stopped.",
+                },
+            )
+            db.session.commit()
 
     logger.info(
         "Watchdog: recovered %d/%d orphaned indexed_sources rows",
