@@ -7,6 +7,7 @@ by chunking, embedding, and storing in pgvector.
 import asyncio
 import json
 import logging
+import os
 import traceback
 
 from ..celery import celery_app
@@ -35,6 +36,15 @@ from ..services.sparse_retrieval import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The ONE bound on how many times a single indexed_source may be executed.
+# ``indexed_sources.attempts`` is incremented by the atomic claim, so every
+# execution -- a fresh dispatch, a reconciler re-dispatch after a worker death,
+# or the storage-error re-dispatch below -- consumes exactly one unit of the
+# same budget. Celery's own ``max_retries`` deliberately plays no part: a second
+# counter running alongside this one multiplies the ceiling instead of sharing
+# it.
+MAX_ATTEMPTS = int(os.getenv("INDEXING_MAX_ATTEMPTS", "3"))
 
 # Indexing strategy -> billing action, per the credits catalog seeded in
 # migration 0006_credit_ledger. ``full_document`` is not in the catalog as a
@@ -354,6 +364,107 @@ def _fenced_mark_indexed(indexed_source_id: str, task_id: str, stats: dict) -> i
         {"id": indexed_source_id, "task_id": task_id, "stats": json.dumps(stats)},
     )
     return result.rowcount
+
+
+def _fenced_mark_failed(indexed_source_id: str, task_id: str, message: str) -> int:
+    """Write a terminal 'failed' ONLY if this task still owns the row.
+
+    Mirrors _fenced_mark_indexed. Without the ownership predicate a superseded
+    task's failure write would both overwrite the owner's result AND stamp
+    itself as celery_task_id -- after which the owner's _fenced_mark_indexed
+    matches 0 rows and rolls back work that had already succeeded.
+
+    CALLER CONTRACT: only call this when the claim SUCCEEDED. A task that raises
+    before claiming never owned the row and must not write to it -- see the
+    ``claimed`` guard in index_source's handlers.
+
+    Commits. Returns rows matched (1 = owner, 0 = superseded/no-op).
+    """
+    result = db.session.execute(
+        text(f"""
+            UPDATE "{AI_SCHEMA}".indexed_sources
+            SET index_status = 'failed', error_message = :msg
+            WHERE id = :id AND celery_task_id = :task_id
+        """),
+        {"id": indexed_source_id, "task_id": task_id, "msg": message},
+    )
+    db.session.commit()
+    return result.rowcount
+
+
+def _log_unclaimed_failure(indexed_source_id: str) -> None:
+    """Record that a task failed BEFORE it claimed the row, and wrote nothing.
+
+    ``claimed`` is set True immediately after a successful
+    _claim_indexed_source. A raise before that means this task never owned the
+    row -- writing a fenced 'failed' would match 0 rows silently, and writing an
+    UNFENCED one would steal a row another task may legitimately own now. So
+    neither: leave the row alone and say so.
+
+    The row therefore stays as it was -- typically 'pending', which the orphan
+    reconciler does not sweep (it only looks at 'indexing'). A manual re-index
+    recovers it. Call from inside the except block so exc_info has a traceback.
+    """
+    logger.warning(
+        "index_source: raised before claiming %s; leaving row untouched "
+        "(a manual re-index recovers it)",
+        indexed_source_id,
+        exc_info=True,
+    )
+
+
+def _handle_storage_error(
+    *,
+    knowledge_base_id: str,
+    source_id: str,
+    indexed_source_id: str,
+    task_id: str,
+    provider_keys: dict[str, str] | None,
+    idempotency_action: str | None = None,
+    idempotency_parts: list | None = None,
+) -> None:
+    """Transient StorageError recovery, folded into the single attempts bound.
+
+    Under the bound: reset to 'pending' and re-dispatch (the re-dispatch
+    re-claims, incrementing attempts). At/over the bound: mark 'failed'. No
+    Celery self.retry -- that would run a second, uncomposed counter.
+    """
+    db.session.rollback()  # discard partial indexing data
+    row = db.session.execute(
+        text(f'SELECT attempts FROM "{AI_SCHEMA}".indexed_sources WHERE id = :id'),
+        {"id": indexed_source_id},
+    ).fetchone()
+    attempts = row.attempts if row else MAX_ATTEMPTS
+
+    if attempts < MAX_ATTEMPTS:
+        result = db.session.execute(
+            text(f"""UPDATE "{AI_SCHEMA}".indexed_sources
+                     SET index_status = 'pending', celery_task_id = NULL,
+                         error_message = NULL
+                     WHERE id = :id AND celery_task_id = :task_id"""),
+            {"id": indexed_source_id, "task_id": task_id},
+        )
+        db.session.commit()
+        # Only re-dispatch if we still owned the row (fence). A superseded task
+        # matched 0 rows and must NOT spawn a spurious duplicate.
+        if result.rowcount:
+            index_source.delay(
+                knowledge_base_id,
+                source_id,
+                indexed_source_id=indexed_source_id,
+                provider_keys=provider_keys,
+                idempotency_action=idempotency_action,
+                idempotency_parts=idempotency_parts,
+            )
+    else:
+        # Cause is known here (a persistent storage error), so name it -- unlike
+        # the reconciler path where the cause is not observable. FENCED: a
+        # superseded task must not write this row's terminal state.
+        _fenced_mark_failed(
+            indexed_source_id,
+            task_id,
+            f"Indexing failed after {attempts} attempts (persistent storage error).",
+        )
 
 
 def get_page_texts_from_derivative(
@@ -1502,7 +1613,12 @@ def _run_index_body(
         else:
             error_msg = "No text derivative found for source"
             logger.error(error_msg)
-            update_indexed_source_status(indexed_source_id, "failed", error_msg)
+            # FENCED: this body only runs post-claim, but the row can still have
+            # been re-claimed by a sibling since. An unfenced write here would
+            # both bury that sibling's result and (via
+            # update_indexed_source_status's celery_task_id column) hand
+            # ownership to whatever value this task passed.
+            _fenced_mark_failed(indexed_source_id, task_id, error_msg)
             return {"status": "error", "error": error_msg}
 
     if content:
@@ -1755,7 +1871,9 @@ def _run_index_body(
     }
 
 
-@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+# No max_retries/default_retry_delay: this task never calls self.retry. Its
+# only retry budget is MAX_ATTEMPTS, spent through the claim's attempts counter.
+@celery_app.task(bind=True)
 @billing.task_context
 def index_source(
     self,
@@ -1802,6 +1920,9 @@ def index_source(
     logger.info(
         f"Starting indexing task {task_id} for source {source_id} into KB {knowledge_base_id}"
     )
+    # Did THIS task win the claim? Gates every terminal write in the handlers
+    # below: a raise from before the claim means we never owned the row.
+    claimed = False
 
     try:
         kb = get_knowledge_base(knowledge_base_id)
@@ -1872,6 +1993,7 @@ def index_source(
             )
             return {"status": "skipped", "reason": "not_claimable",
                     "indexed_source_id": indexed_source_id}
+        claimed = True
 
         return _run_index_body(
             knowledge_base_id=knowledge_base_id,
@@ -1896,7 +2018,10 @@ def index_source(
             ).scalar()
             if current == "cancelled":
                 return {"status": "cancelled", "source_id": source_id}
-            update_indexed_source_status(indexed_source_id, "failed", "Indexing timed out", task_id)
+            if claimed:
+                _fenced_mark_failed(indexed_source_id, task_id, "Indexing timed out")
+            else:
+                _log_unclaimed_failure(indexed_source_id)
         return {
             "status": "error",
             "source_id": source_id,
@@ -1904,22 +2029,31 @@ def index_source(
             "error": "Indexing timed out",
         }
 
-    except StorageError as e:
-        logger.error(f"Storage error during indexing: {e}")
-        db.session.rollback()  # Discard partial indexing data
-        if indexed_source_id:
-            update_indexed_source_status(
-                indexed_source_id, "failed", traceback.format_exc(), task_id
-            )
-        raise self.retry(exc=e) from e
+    except StorageError:
+        # No `claimed` guard and no `if indexed_source_id`: every storage call
+        # lives inside _run_index_body, which only runs post-claim with a
+        # resolved id. The checks above it are pure DB reads. Both writes inside
+        # the handler are fenced anyway, so a pre-claim raise would be a no-op.
+        logger.error("Storage error during indexing of %s", source_id, exc_info=True)
+        _handle_storage_error(
+            knowledge_base_id=knowledge_base_id,
+            source_id=source_id,
+            indexed_source_id=indexed_source_id,
+            task_id=task_id,
+            provider_keys=provider_keys,
+            idempotency_action=idempotency_action,
+            idempotency_parts=idempotency_parts,
+        )
+        return {"status": "retrying_or_failed", "source_id": source_id}
 
     except Exception:
         logger.error(f"Indexing failed for source {source_id}", exc_info=True)
         db.session.rollback()  # Discard partial indexing data
         if indexed_source_id:
-            update_indexed_source_status(
-                indexed_source_id, "failed", traceback.format_exc(), task_id
-            )
+            if claimed:
+                _fenced_mark_failed(indexed_source_id, task_id, traceback.format_exc())
+            else:
+                _log_unclaimed_failure(indexed_source_id)
 
         return {
             "status": "error",
