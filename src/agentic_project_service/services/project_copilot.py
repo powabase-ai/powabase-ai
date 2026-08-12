@@ -608,11 +608,19 @@ def _repair_launch_claim(
     """Run the bounded corrective retry; return the content to deliver.
 
     Outcomes (one structured log line each):
-      launched            — retry called play_guide; its reply is delivered
-      rewrote             — retry dropped the claim without launching
-      still_claiming      — retry claimed again; delivered WITH correction
-      retry_failed        — retry errored; original delivered WITH correction
-      skipped_time_budget — turn too old to retry; original WITH correction
+      launched              — retry called play_guide; its reply is delivered
+      launched_retry_failed — play_guide ran, then a LATER retry step failed;
+                              the original reply is delivered UNCORRECTED (the
+                              guide id is set, so trigger_guide fires and the
+                              original claim is now true — a correction here
+                              would contradict a walkthrough visibly launching)
+      rewrote               — retry dropped the claim without launching
+      still_claiming        — retry claimed again; delivered WITH correction
+      retry_failed          — retry errored; original delivered WITH correction
+      retry_raised          — retry raised; original delivered WITH correction
+                              (never destroy a billed, successful answer into a
+                              generic error)
+      skipped_time_budget   — turn too old to retry; original WITH correction
     """
     elapsed = time.monotonic() - started_at
     if elapsed > _REPAIR_TIME_BUDGET_SECONDS:
@@ -629,23 +637,42 @@ def _repair_launch_claim(
                 if event.get("type") != "reasoning_delta":
                     on_event(event)
 
-        retry = agent.run(
-            input=input_messages
-            + [
-                {"role": "assistant", "content": content},
-                {"role": "user", "content": _LAUNCH_CLAIM_NUDGE},
-            ],
-            tools=tools,
-            max_steps=_REPAIR_MAX_STEPS,
-            context=ExecutionContext(on_event=retry_on_event),
-        )
-        if retry.is_failed():
+        try:
+            retry = agent.run(
+                input=input_messages
+                + [
+                    {"role": "assistant", "content": content},
+                    {"role": "user", "content": _LAUNCH_CLAIM_NUDGE},
+                ],
+                tools=tools,
+                max_steps=_REPAIR_MAX_STEPS,
+                context=ExecutionContext(on_event=retry_on_event),
+            )
+        except Exception:
+            # The repair is best-effort on top of an already-billed, successful
+            # answer — a raising retry must never convert that into the route's
+            # generic error path.
+            logger.warning("Launch-claim repair retry raised", exc_info=True)
+            retry = None
+
+        # Check the accumulator BEFORE the failure state: play_guide may have
+        # run before a later retry step failed/raised, and once the guide id is
+        # set trigger_guide fires regardless — correcting the text would show
+        # the user a walkthrough launching under a message insisting it wasn't.
+        if guide_accumulator[0] is not None:
+            if retry is None or retry.is_failed():
+                # Deliver the ORIGINAL reply: the launch it claims is now real,
+                # and the failed retry produced no usable replacement text.
+                outcome = "launched_retry_failed"
+            else:
+                outcome, content = "launched", retry.content or ""
+        elif retry is None:
+            outcome, content = "retry_raised", content + _CLAIM_CORRECTION_SUFFIX
+        elif retry.is_failed():
             # Keep the answer we already have rather than failing the turn —
             # but never deliver the claim unmarked: at this point the backend
             # knows it is false.
             outcome, content = "retry_failed", content + _CLAIM_CORRECTION_SUFFIX
-        elif guide_accumulator[0] is not None:
-            outcome, content = "launched", retry.content or ""
         elif looks_like_guide_launch_assertion(retry.content or ""):
             outcome, content = "still_claiming", (retry.content or "") + _CLAIM_CORRECTION_SUFFIX
         else:

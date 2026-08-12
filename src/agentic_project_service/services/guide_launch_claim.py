@@ -11,30 +11,37 @@ the walkthrough?") would convert the clarifying question the system prompt
 solicits into an unrequested launch — a UI action plus an extra billed LLM
 call. Precision over recall: anything this predicate misses is still observed
 client-side by the telemetry detector; anything it wrongly matches becomes an
-unwanted action.
+unwanted action. Known deliberate misses under that policy: third-person
+reported speech, and exotic phrasings no assertion pattern covers.
 
 Semantics, per sentence (questions never match):
 
-- first-person indicative assertions — "I've launched…", "I'm opening…",
-  "I'll launch the walkthrough now."
-- subjectless progressives — "Launching the connect walkthrough…"
-- state assertions — "The walkthrough is now on screen."
+- completed/progressive first-person claims — "I've launched…", "I launched…",
+  "I'm opening…" — plus subjectless progressives ("Launching the connect
+  walkthrough…", markdown-prefixed forms included) and walkthrough-state
+  claims ("The walkthrough is now on screen."). For these, offer/permission
+  markers veto only when they appear BEFORE the claim: a trailing offer
+  ("I've launched X — let me know if you'd like Y too") doesn't unmake a
+  completed claim, and models love the trailing-offer dash.
+- future first-person claims — "I'll launch the walkthrough now." For these,
+  offer/conditional markers anywhere in the sentence veto: "I'll launch the
+  walkthrough if you'd like" is an offer, because the condition governs
+  whether the action happens at all.
 
-Excluded outright: interrogative sentences; offer/ability/conditional phrasing
-("I can/could…", "if you'd like", "let me know", "want me to"); negations and
-denials ("can't", "won't", "haven't", "no walkthrough").
+Negations and denials ("can't", "won't", "haven't", "no walkthrough") veto the
+whole sentence in either form — the safe direction for a repair guard.
 """
 
 import re
 
 _SENTENCE_SPLIT = re.compile(r"[.!?\n]")
 
-# A sentence containing any of these is an offer, a request for permission, or
-# an ability/conditional statement — not an assertion that a launch happened.
+# Offer, permission, ability, or conditional phrasing. Scope of application
+# depends on the claim's tense — see module docstring.
 _OFFER_OR_CONDITIONAL = re.compile(
     r"\b(?:would you|do you want|want me to|shall i|should i|can i|may i|"
-    r"i can\b|i could\b|i would\b|i might\b|if you(?:'d| would)? like|"
-    r"let me know|say the word|just ask)",
+    r"i can\b|i could\b|i would\b|i might\b|if you(?:'d| would)? (?:like|want|prefer)|"
+    r"let me know|say the word|just ask|when(?:ever)? you'?re ready)",
     re.IGNORECASE,
 )
 
@@ -47,23 +54,21 @@ _NEGATION = re.compile(
 
 _LAUNCH_VERB = r"(?:launch|start|open|show|pull up|bring up|play)"
 
-_ASSERTIONS = [
-    # First-person indicative: I've launched / I have started / I'm opening /
-    # I'll launch / I just launched … (offers like "I can launch" are excluded
-    # above, so bare "I launch" is not needed and not matched).
+# Completed / in-progress claims: a trailing offer can't unmake these.
+_COMPLETED_ASSERTIONS = [
+    # "I've launched…", "I have started…", "I'm opening…", "I (just) launched…"
     re.compile(
-        rf"\bi(?:'ve| have|'m| am|'ll| will| just)\s+(?:just\s+|now\s+)?{_LAUNCH_VERB}(?:ed|ing)?\b"
+        rf"\bi(?:'ve| have|'m| am)?\s+(?:just\s+|now\s+)?{_LAUNCH_VERB}(?:ed|ing)\b"
         rf"[^.!?\n]{{0,60}}\bwalkthrough\b",
         re.IGNORECASE,
     ),
-    # Subjectless progressive at the start of a sentence: "Launching the
-    # connect walkthrough now…"
+    # Subjectless progressive opening the sentence — allow markdown prefixes
+    # (**Launching…**, > Launching…, - Launching…).
     re.compile(
-        rf"^\s*{_LAUNCH_VERB}ing\b[^.!?\n]{{0,60}}\bwalkthrough\b",
+        rf"^[\s*_>#•-]*{_LAUNCH_VERB}ing\b[^.!?\n]{{0,60}}\bwalkthrough\b",
         re.IGNORECASE,
     ),
-    # State assertion about the walkthrough itself: "the walkthrough is now on
-    # screen", "the walkthrough is launching / has started".
+    # State claim about the walkthrough itself.
     re.compile(
         rf"\bwalkthrough (?:is|has been|has|was) (?:now )?"
         rf"(?:on (?:your )?screen|live|running|{_LAUNCH_VERB}(?:ed|ing))\b",
@@ -71,6 +76,15 @@ _ASSERTIONS = [
     ),
     # Past-tense first person with an implied object: "I've launched it for you."
     re.compile(r"\bi'?ve (?:just )?launched\b", re.IGNORECASE),
+]
+
+# Future claims: a conditional anywhere in the sentence makes these offers.
+_FUTURE_ASSERTIONS = [
+    re.compile(
+        rf"\bi(?:'ll| will)\s+(?:just\s+|now\s+)?{_LAUNCH_VERB}\b"
+        rf"[^.!?\n]{{0,60}}\bwalkthrough\b",
+        re.IGNORECASE,
+    ),
 ]
 
 
@@ -92,6 +106,13 @@ def looks_like_guide_launch_assertion(text: str | None) -> bool:
 def _sentence_asserts_launch(sentence: str) -> bool:
     if not sentence.strip():
         return False
-    if _OFFER_OR_CONDITIONAL.search(sentence) or _NEGATION.search(sentence):
+    if _NEGATION.search(sentence):
         return False
-    return any(p.search(sentence) for p in _ASSERTIONS)
+    for pattern in _COMPLETED_ASSERTIONS:
+        m = pattern.search(sentence)
+        if m and not _OFFER_OR_CONDITIONAL.search(sentence[: m.start()]):
+            return True
+    for pattern in _FUTURE_ASSERTIONS:
+        if pattern.search(sentence) and not _OFFER_OR_CONDITIONAL.search(sentence):
+            return True
+    return False

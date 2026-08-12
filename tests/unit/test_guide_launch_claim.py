@@ -87,6 +87,39 @@ def test_never_matches_descriptions_without_an_assertion():
     )
 
 
+def test_trailing_offer_does_not_veto_a_completed_claim():
+    """The offer-veto must depend on meaning, not punctuation: models love the
+    trailing-offer dash, and 'I've launched X — let me know if you'd like Y'
+    is a real (false) claim about X regardless of the offer about Y."""
+    assert looks_like_guide_launch_assertion(
+        "I've launched the create-table walkthrough — let me know if you'd like "
+        "the connect one too."
+    )
+    assert looks_like_guide_launch_assertion(
+        "Launching the connect walkthrough now — say the word if you want the "
+        "create-table one after."
+    )
+
+
+def test_trailing_conditional_still_vetoes_a_future_claim():
+    """A FUTURE-tense 'launch' with a trailing conditional is an offer, not an
+    assertion — unlike the completed claims above, the condition governs
+    whether the action happens at all."""
+    assert not looks_like_guide_launch_assertion(
+        "I'll launch the walkthrough if you'd like — just say the word."
+    )
+    assert not looks_like_guide_launch_assertion(
+        "If you'd like, I'll launch the connect walkthrough."
+    )
+    # Unconditional future stays an assertion.
+    assert looks_like_guide_launch_assertion("I'll launch the walkthrough now.")
+
+
+def test_matches_bare_simple_past_and_markdown_leading_claims():
+    assert looks_like_guide_launch_assertion("I launched the connect walkthrough for you.")
+    assert looks_like_guide_launch_assertion("**Launching the create-table walkthrough now**")
+
+
 def test_assertion_must_be_contained_in_one_sentence():
     # Assertion verb in one sentence, "walkthrough" in the next — not a claim.
     assert not looks_like_guide_launch_assertion(
@@ -224,6 +257,66 @@ def test_still_claiming_retry_gets_correction_and_no_third_attempt(mocker):
     assert guide_id is None
     assert content.startswith("I've launched the connect walkthrough, take a look!")
     assert "not actually launched" in content
+
+
+def test_retry_that_launches_then_fails_delivers_original_without_correction(mocker, caplog):
+    """N1 regression: play_guide runs, then a LATER retry step fails. The guide
+    id is set, so trigger_guide WILL fire — appending the correction suffix
+    would show the user a walkthrough launching under a message insisting it
+    wasn't launched, persisted forever. The accumulator must win over
+    is_failed(): deliver the original reply (now true) unmarked."""
+    import logging
+
+    def side_effect(*args, **kwargs):
+        if run_mock.call_count == 1:
+            return _agent_output("I've launched the connect walkthrough.")
+        kwargs["tools"]["play_guide"].handler({"sequence_id": "connect"}, None)
+        return _agent_output(None, failed=True)  # failed AFTER the tool ran
+
+    mocker.patch.object(pc, "resolve_api_key_or_raise_for_drop", return_value="key")
+    agent_cls = mocker.patch.object(pc, "Agent")
+    run_mock = agent_cls.return_value.run
+    run_mock.side_effect = side_effect
+
+    with caplog.at_level(logging.WARNING):
+        content, guide_id, _ = pc.run_project_copilot_chat(
+            [{"role": "user", "content": "help me connect"}]
+        )
+
+    assert guide_id == "connect"
+    assert content == "I've launched the connect walkthrough."
+    assert "not actually launched" not in content
+    assert any(
+        "launch_claim_repair" in r.message and "outcome=launched_retry_failed" in r.message
+        for r in caplog.records
+    )
+
+
+def test_retry_that_raises_keeps_the_original_answer_with_correction(mocker, caplog):
+    """N2: a retry that RAISES (vs returning a failed output) must not destroy
+    a billed, successful answer into a generic error — catch it, deliver the
+    original with the correction suffix, and log outcome=retry_raised."""
+    import logging
+
+    def side_effect(*args, **kwargs):
+        if run_mock.call_count == 1:
+            return _agent_output("I've launched the connect walkthrough.")
+        raise RuntimeError("provider exploded")
+
+    mocker.patch.object(pc, "resolve_api_key_or_raise_for_drop", return_value="key")
+    agent_cls = mocker.patch.object(pc, "Agent")
+    run_mock = agent_cls.return_value.run
+    run_mock.side_effect = side_effect
+
+    with caplog.at_level(logging.WARNING):
+        content, guide_id, _ = pc.run_project_copilot_chat(
+            [{"role": "user", "content": "help me connect"}]
+        )
+
+    assert guide_id is None
+    assert content.startswith("I've launched the connect walkthrough.")
+    assert "not actually launched" in content
+    assert any("outcome=retry_raised" in r.message for r in caplog.records)
 
 
 def test_repair_skipped_when_turn_already_ate_the_time_budget(mocker):
