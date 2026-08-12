@@ -1232,6 +1232,42 @@ def create_session_for_agent(agent_id: str):
     return jsonify({"session_id": session_id}), 201
 
 
+@agents_bp.route("/<agent_id>/sessions/<session_id>", methods=["DELETE"])
+@require_auth
+def delete_session_for_agent(agent_id: str, session_id: str):
+    """Delete a session and its runs.
+
+    Ownership check mirrors `run_agent`'s (`get_session_owner`,
+    service-role bypass), except here "not found" and "owned by someone
+    else" both 404 for a user-scoped caller, to avoid leaking session
+    existence.
+    """
+    is_service_role = (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False)
+    if not is_service_role:
+        owner = get_session_owner(db.session, session_id)
+        if owner is None or owner != get_current_user_id():
+            return jsonify({"error": "Session not found"}), 404
+
+    row = db.session.execute(
+        text(f'SELECT id FROM "{AI_SCHEMA}".agent_sessions WHERE session_id = :session_id'),
+        {"session_id": session_id},
+    ).fetchone()
+    if not row:
+        return jsonify({"error": "Session not found"}), 404
+
+    db_session_uuid = str(row[0])
+    db.session.execute(
+        text(f'DELETE FROM "{AI_SCHEMA}".agent_runs WHERE session_id = :id'),
+        {"id": db_session_uuid},
+    )
+    db.session.execute(
+        text(f'DELETE FROM "{AI_SCHEMA}".agent_sessions WHERE id = :id'),
+        {"id": db_session_uuid},
+    )
+    db.session.commit()
+    return "", 204
+
+
 # =============================================================================
 # Agent Run Endpoint (Non-Streaming Mode)
 # =============================================================================
