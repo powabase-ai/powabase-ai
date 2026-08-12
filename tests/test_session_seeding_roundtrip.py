@@ -292,7 +292,12 @@ class TestSeedRoundTrip:
         self, client, mock_auth, auth_headers, test_agent, app
     ):
         """`agent_runs.session_id` is `ON DELETE CASCADE`, so deleting the
-        session is enough — the route does not delete runs itself."""
+        session is enough — the route does not delete runs itself.
+
+        The cascade proved here is the ORM-declared one: the conftest bootstraps
+        with `db.metadata.create_all`, so this says nothing about whether the
+        migration-applied schema declares the same FK.
+        """
         messages = [
             {"role": "user", "content": "Q1"},
             {"role": "assistant", "content": "A1"},

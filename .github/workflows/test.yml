@@ -15,10 +15,12 @@ jobs:
   # sets no env of its own — anything declared here would be dead config that
   # drifts from the conftest.
   #
-  # The database-backed tier (tests/ minus tests/unit/) is NOT run here yet: its
-  # schema/role bootstrap is still being finished. Adding it as a permanently-red
-  # continue-on-error job would train readers to ignore this workflow, so it is
-  # left out until it can run green and gate.
+  # Most of the database-backed tier (tests/ minus tests/unit/) is still NOT run
+  # here: it expects the deployment's base schema, which this repo does not
+  # carry. The `roundtrip` job below runs the files that need nothing but a
+  # plain Postgres. Adding the rest as a permanently-red continue-on-error job
+  # would train readers to ignore this workflow, so it stays out until it can
+  # run green and gate.
   unit:
     name: pytest tests/unit (Python 3.13)
     runs-on: ubuntu-latest
@@ -40,3 +42,69 @@ jobs:
       # this stops uv re-resolving mid-suite.
       - name: Run unit tests
         run: uv run --no-sync pytest tests/unit -q
+
+  # The unit tier above is deliberately over-mocked: it stubs `db.session`
+  # wholesale, so uuid casting, foreign keys, ON DELETE CASCADE and the
+  # `created_at ASC` reconstruction are all delegated to the round-trip suite.
+  # Delegating them to a suite no gate runs means nothing protects them, so the
+  # round-trip suite gets a job of its own against a real Postgres.
+  #
+  # `tests/conftest.py` bootstraps with `db.metadata.create_all`, so this needs
+  # no migration chain and no base schema — only the roles and the database the
+  # conftest's DATABASE_URL default names. It does need the database to be
+  # *empty*: `create_app` skips migrations only while the ai schema has no
+  # tables, and the service container is created fresh for each job, so it is.
+  roundtrip:
+    name: pytest session round-trip (Postgres)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        # pgvector, not plain postgres: the conftest creates the `vector`
+        # extension while bootstrapping the ai schema.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      # The conftest defaults DATABASE_URL to
+      # supabase_admin:$POSTGRES_PASSWORD@localhost:5432/postgres_test, so the
+      # role, its password and the database all have to match that default —
+      # declaring DATABASE_URL here instead would be config that silently drifts
+      # from the conftest. supabase_admin is SUPERUSER because the bootstrap
+      # creates an extension. service_role / authenticated / anon are the grant
+      # targets the deployment's schema uses; they are created NOLOGIN so any
+      # GRANT that runs resolves instead of erroring.
+      #
+      # Separate -c flags: psql wraps one multi-statement -c in a transaction,
+      # and CREATE DATABASE cannot run inside one.
+      - name: Create roles and the test database
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d postgres \
+            -c "CREATE ROLE supabase_admin LOGIN SUPERUSER PASSWORD 'postgres'" \
+            -c "CREATE ROLE service_role NOLOGIN" \
+            -c "CREATE ROLE authenticated NOLOGIN" \
+            -c "CREATE ROLE anon NOLOGIN"
+          psql -h localhost -U postgres -d postgres \
+            -c "CREATE DATABASE postgres_test OWNER supabase_admin"
+
+      - name: Run the session round-trip suite
+        run: uv run --no-sync pytest tests/test_session_seeding_roundtrip.py -v
