@@ -1249,10 +1249,12 @@ def delete_session_for_agent(agent_id: str, session_id: str):
             return jsonify({"error": "Session not found"}), 404
 
     row = db.session.execute(
-        text(f'SELECT id FROM "{AI_SCHEMA}".agent_sessions WHERE session_id = :session_id'),
+        text(
+            f'SELECT id, agent_id FROM "{AI_SCHEMA}".agent_sessions WHERE session_id = :session_id'
+        ),
         {"session_id": session_id},
     ).fetchone()
-    if not row:
+    if not row or str(row[1]) != agent_id:
         return jsonify({"error": "Session not found"}), 404
 
     db_session_uuid = str(row[0])

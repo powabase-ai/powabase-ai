@@ -44,7 +44,7 @@ class TestDeleteSessionRoute:
     def test_delete_own_session_returns_204_and_deletes_runs_then_session(self):
         app = _make_test_app()
         fake_db_session = MagicMock()
-        fake_db_session.execute.return_value.fetchone.return_value = ("db-uuid-1",)
+        fake_db_session.execute.return_value.fetchone.return_value = ("db-uuid-1", AGENT_ID)
 
         manager = MagicMock()
         with (
@@ -131,3 +131,32 @@ class TestDeleteSessionRoute:
         with app.test_client() as client:
             resp = client.delete(f"/api/agents/{AGENT_ID}/sessions/{SESSION_ID}")
         assert resp.status_code == 401
+
+    def test_session_of_different_agent_returns_404(self):
+        """A session owned by the caller but belonging to a different agent
+        than the one in the path 404s — mirrors remove_agent_tool's and
+        delete_agent_hook's `str(row.agent_id) != agent_id` scoping for the
+        same `/<agent_id>/<resource>/<resource_id>` DELETE shape."""
+        app = _make_test_app()
+        fake_db_session = MagicMock()
+        fake_db_session.execute.return_value.fetchone.return_value = (
+            "db-uuid-1",
+            "some-other-agent",
+        )
+
+        with (
+            patch.object(agents_route, "get_session_owner", return_value=USER_ID),
+            patch.object(agents_route.db, "session", fake_db_session),
+        ):
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.delete(
+                        f"/api/agents/{AGENT_ID}/sessions/{SESSION_ID}",
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 404
+        assert resp.get_json() == {"error": "Session not found"}
+        # Only the lookup SELECT ran — no DELETE, no commit.
+        fake_db_session.execute.assert_called_once()
+        fake_db_session.commit.assert_not_called()
