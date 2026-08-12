@@ -76,13 +76,28 @@ class TestSeedRoundTrip:
             messages.append({"role": "assistant", "content": f"A{i}"})
 
         session_id = self._seed(client, auth_headers, test_agent["id"], messages)
+        db_uuid = self._db_uuid(app, session_id)
 
         with app.app_context():
-            history = load_session_history(db.session, self._db_uuid(app, session_id))
+            history = load_session_history(db.session, db_uuid)
+            stamps = [
+                row[0]
+                for row in db.session.execute(
+                    text(
+                        """
+                        SELECT created_at FROM "ai".agent_runs
+                        WHERE session_id = :sid ORDER BY created_at ASC
+                        """
+                    ),
+                    {"sid": db_uuid},
+                ).fetchall()
+            ]
 
         assert [(m.role, m.content) for m in history] == [
             (m["role"], m["content"]) for m in messages
         ]
+        # No two runs may share the sort key the reconstruction above depends on.
+        assert len(set(stamps)) == 10
 
     def test_citation_markers_are_stripped_from_seeded_assistant_content(
         self, client, mock_auth, auth_headers, test_agent, app

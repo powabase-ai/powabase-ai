@@ -10,7 +10,7 @@ import json
 import logging
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import litellm
@@ -524,6 +524,7 @@ def persist_agent_run(
     error: str | None = None,
     started_at: datetime | None = None,
     completed_at: datetime | None = None,
+    created_at: datetime | None = None,
     context_handler_id: str | None = None,
     steps: int | None = None,
     events: list[dict] | None = None,
@@ -542,6 +543,10 @@ def persist_agent_run(
 
     When db_session_uuid is None (delegated / block runs), the row is written with
     session_id NULL and no session timestamp update is performed.
+
+    `created_at` defaults to now. Callers writing several runs in one loop pass
+    it explicitly: history is reconstructed by ordering on this column, and it
+    has no tie-break.
 
     Returns the run's UUID.
     """
@@ -594,7 +599,7 @@ def persist_agent_run(
             "error": error,
             "started_at": started_at or now,
             "completed_at": completed_at,
-            "created_at": now,
+            "created_at": created_at or now,
             "steps": steps,
             "events": _safe_json_dumps(events, "[]") if events else None,
             "reasoning_steps": _safe_json_dumps(reasoning_steps, "[]") if reasoning_steps else None,
@@ -642,10 +647,16 @@ def seed_session_runs(
     e.g. an import, a handoff from another surface, or a compacted
     summary standing in for older turns. Caller validates shape (strict
     user/assistant alternation, even count).
+
+    The ordering the reconstruction relies on is `created_at ASC`, which
+    has no tie-break — so each pair is stamped one microsecond after the
+    last rather than left to a fresh `datetime.now(UTC)` per run, which
+    ties whenever two runs land inside the same microsecond.
     """
-    now = datetime.now(UTC)
-    for i in range(0, len(initial_messages), 2):
+    base = datetime.now(UTC)
+    for pair_index, i in enumerate(range(0, len(initial_messages), 2)):
         user_msg, assistant_msg = initial_messages[i], initial_messages[i + 1]
+        stamp = base + timedelta(microseconds=pair_index)
         persist_agent_run(
             db_session=db_session,
             run_id=f"seed_{uuid.uuid4().hex[:12]}",
@@ -654,8 +665,9 @@ def seed_session_runs(
             db_session_uuid=db_session_uuid,
             output_messages=[{"role": "assistant", "content": assistant_msg["content"]}],
             content=assistant_msg["content"],
-            started_at=now,
-            completed_at=now,
+            started_at=stamp,
+            completed_at=stamp,
+            created_at=stamp,
         )
 
 

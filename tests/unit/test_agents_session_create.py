@@ -545,3 +545,41 @@ class TestSeedSessionRuns:
             seed_session_runs(fake_db_session, "db-uuid-1", [])
 
         mock_persist.assert_not_called()
+
+    def test_each_pair_gets_a_strictly_increasing_created_at(self):
+        """load_session_history orders by created_at ASC with no tie-break, so
+        the seeding loop must stamp each pair itself. Leaving created_at to a
+        fresh datetime.now(UTC) inside persist_agent_run makes correct ordering
+        a matter of how long the loop happens to take: pairs written in the
+        same microsecond tie, and the sort may interleave them — exactly the
+        corruption one-run-per-pair exists to prevent."""
+        msgs = []
+        for i in range(20):
+            msgs.append({"role": "user", "content": f"Q{i}"})
+            msgs.append({"role": "assistant", "content": f"A{i}"})
+        fake_db_session = MagicMock()
+
+        with patch("agentic_project_service.services.session.persist_agent_run") as mock_persist:
+            seed_session_runs(fake_db_session, "db-uuid-1", msgs)
+
+        stamps = [c.kwargs["created_at"] for c in mock_persist.call_args_list]
+        assert len(stamps) == 20
+        assert all(a < b for a, b in zip(stamps, stamps[1:], strict=False))
+
+    def test_run_timestamps_match_the_pair_stamp(self):
+        """started_at / completed_at track created_at so all three columns
+        agree on the pair's position in the imported conversation."""
+        msgs = [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "user", "content": "Q2"},
+            {"role": "assistant", "content": "A2"},
+        ]
+        fake_db_session = MagicMock()
+
+        with patch("agentic_project_service.services.session.persist_agent_run") as mock_persist:
+            seed_session_runs(fake_db_session, "db-uuid-1", msgs)
+
+        for call in mock_persist.call_args_list:
+            assert call.kwargs["started_at"] == call.kwargs["created_at"]
+            assert call.kwargs["completed_at"] == call.kwargs["created_at"]
