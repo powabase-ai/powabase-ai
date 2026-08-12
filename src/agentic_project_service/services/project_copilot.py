@@ -26,6 +26,7 @@ from agentic.agent.tools import BuiltinTool
 from agentic.execution.context import ExecutionContext
 
 from .ai_provider_keys_resolver import resolve_api_key_or_raise_for_drop
+from .guide_launch_claim import looks_like_guide_launch_claim
 from . import billing_port as billing
 
 # Reuse the workflow copilot's read-only project-introspection resolvers and
@@ -214,7 +215,15 @@ _DOCS_UNAVAILABLE = "Documentation search is temporarily unavailable."
 # sentinel, a fresh deploy (or a silently-failed indexing run) would answer from
 # parametric knowledge with no signal that grounding was ever unavailable.
 _DOCS_NOT_READY = "The documentation index is not ready yet."
-_DEGRADED_DOCS_RESULTS = frozenset({_DOCS_NOT_CONFIGURED, _DOCS_UNAVAILABLE, _DOCS_NOT_READY})
+# Sentinel → wire notice kind. Kept distinct on the wire so the Studio can say
+# "configure docs search" vs "the docs endpoint is down" vs "still indexing" —
+# an operator can't act on a collapsed "couldn't be reached" (see PR feedback:
+# on an unconfigured self-host stack that copy is simply wrong).
+_DEGRADED_DOCS_NOTICE_KINDS = {
+    _DOCS_NOT_CONFIGURED: "docs_not_configured",
+    _DOCS_UNAVAILABLE: "docs_unreachable",
+    _DOCS_NOT_READY: "docs_not_ready",
+}
 
 
 def search_docs(query: str, top_k: int = 8) -> str:
@@ -320,10 +329,12 @@ def build_project_copilot_tools(
     ``guide_accumulator`` is a single-element list [str|None] that ``play_guide``
     writes the chosen sequence id into; the route reads it after Agent.run() and
     emits the SSE ``trigger_guide`` event. ``notice_accumulator`` is the same
-    shape: ``search_docs`` writes ``'docs_unavailable'`` into it when the docs
-    endpoint is unreachable/unconfigured, so the route can warn the user the
-    answer wasn't grounded. It defaults to a throwaway list so callers that don't
-    care about notices (e.g. unit tests of the tools) can omit it.
+    shape: ``search_docs`` writes a degraded-docs kind into it
+    (``'docs_not_configured'`` / ``'docs_unreachable'`` / ``'docs_not_ready'``,
+    see ``_DEGRADED_DOCS_NOTICE_KINDS``) so the route can warn the user the
+    answer wasn't grounded — and the Studio can say what to do about it. It
+    defaults to a throwaway list so callers that don't care about notices
+    (e.g. unit tests of the tools) can omit it.
     """
     if notice_accumulator is None:
         notice_accumulator = [None]
@@ -332,8 +343,8 @@ def build_project_copilot_tools(
 
     def _handle_search_docs(arguments: dict[str, Any], context) -> str:
         result = search_docs(arguments.get("query", ""))
-        if result in _DEGRADED_DOCS_RESULTS:
-            notice_accumulator[0] = "docs_unavailable"
+        if result in _DEGRADED_DOCS_NOTICE_KINDS:
+            notice_accumulator[0] = _DEGRADED_DOCS_NOTICE_KINDS[result]
         return result
 
     def _handle_play_guide(arguments: dict[str, Any], context) -> str:
@@ -466,6 +477,21 @@ def _build_input_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]
     return out
 
 
+# Fed back to the model (as a user turn, unpersisted) when its reply claimed a
+# walkthrough launch but never called play_guide. The system prompt already
+# orders "call play_guide first" twice; observed live, the model still
+# occasionally narrates a launch without the tool round-trip — a prompt can
+# reduce that, only this guard can repair it.
+_LAUNCH_CLAIM_NUDGE = (
+    "Correction: your previous reply told the user a walkthrough was being "
+    "launched, started, shown, or highlighted, but you never called the "
+    "`play_guide` tool, so NOTHING appeared on their screen. If a walkthrough "
+    "in your list fits the user's goal, call `play_guide` with its sequence_id "
+    "NOW and then restate your reply briefly. If none fits, rewrite the reply "
+    "without claiming a launch. Do not apologise for or mention this correction."
+)
+
+
 def run_project_copilot_chat(
     messages: list[dict[str, Any]],
     on_event: Callable[[dict], None] | None = None,
@@ -473,8 +499,15 @@ def run_project_copilot_chat(
     """Run the Project Copilot ReAct loop.
 
     Returns ``(assistant_content, guide_sequence_id_or_None, notice_or_None)``.
-    ``notice`` is ``'docs_unavailable'`` when a ``search_docs`` call degraded, so
-    the caller can warn the user the answer wasn't grounded in the docs.
+    ``notice`` is a degraded-docs kind (``_DEGRADED_DOCS_NOTICE_KINDS``) when a
+    ``search_docs`` call degraded, so the caller can warn the user the answer
+    wasn't grounded in the docs.
+
+    If the reply *claims* a walkthrough launch while ``play_guide`` was never
+    called (the "show, don't tell" failure observed in smoke testing), the turn
+    is re-run once with a corrective nudge — the retry's reply and tool calls
+    replace the original. A failed retry falls back to the original reply; the
+    Studio's ``guide_launch_missing`` telemetry still observes that case.
     """
     guide_accumulator: list[str | None] = [None]
     notice_accumulator: list[str | None] = [None]
@@ -511,6 +544,36 @@ def run_project_copilot_chat(
             max_steps=PROJECT_COPILOT_MAX_STEPS,
             context=ctx,
         )
+
+        # Launch-claim guard: the reply says a walkthrough is launching but
+        # play_guide never ran → nothing will appear on screen. Re-run the turn
+        # once with the offending reply + a corrective nudge appended (neither
+        # is persisted; the retry's reply replaces the original everywhere).
+        if (
+            not output.is_failed()
+            and guide_accumulator[0] is None
+            and looks_like_guide_launch_claim(output.content)
+        ):
+            logger.warning(
+                "Project copilot claimed a walkthrough launch without calling "
+                "play_guide; retrying the turn with a corrective nudge"
+            )
+            retry = agent.run(
+                input=input_messages
+                + [
+                    {"role": "assistant", "content": output.content or ""},
+                    {"role": "user", "content": _LAUNCH_CLAIM_NUDGE},
+                ],
+                tools=tools,
+                max_steps=PROJECT_COPILOT_MAX_STEPS,
+                context=ctx,
+            )
+            if retry.is_failed():
+                # Keep the answer we already have rather than failing the turn;
+                # the claim-without-launch stays observable client-side.
+                logger.error("Launch-claim corrective retry failed: %s", retry.error)
+            else:
+                output = retry
 
     if output.is_failed():
         logger.error("Project copilot agent failed: %s", output.error)

@@ -80,7 +80,7 @@ def test_search_docs_maps_kb_not_ready_to_degraded_sentinel(monkeypatch, mocker)
     mocker.patch.object(pc.httpx, "post", return_value=_Resp())
     out = pc.search_docs("x")
     assert out == pc._DOCS_NOT_READY
-    assert pc._DOCS_NOT_READY in pc._DEGRADED_DOCS_RESULTS
+    assert pc._DOCS_NOT_READY in pc._DEGRADED_DOCS_NOTICE_KINDS
 
 
 def test_search_docs_genuine_no_match_stays_non_degraded(monkeypatch, mocker):
@@ -99,7 +99,7 @@ def test_search_docs_genuine_no_match_stays_non_degraded(monkeypatch, mocker):
     mocker.patch.object(pc.httpx, "post", return_value=_Resp())
     out = pc.search_docs("x")
     assert out == "No relevant documentation was found for that query."
-    assert out not in pc._DEGRADED_DOCS_RESULTS
+    assert out not in pc._DEGRADED_DOCS_NOTICE_KINDS
 
 
 def test_play_guide_sets_accumulator():
@@ -134,13 +134,20 @@ def test_search_docs_tool_delegates(monkeypatch, mocker):
 
 def test_search_docs_tool_flags_notice_when_degraded(mocker):
     """A degraded search_docs result sets the notice accumulator so the route can
-    warn the user the answer wasn't grounded; a healthy result leaves it None."""
+    warn the user the answer wasn't grounded; a healthy result leaves it None.
+    The kind distinguishes unreachable from unconfigured — the Studio renders
+    different copy for "fix your docs endpoint" vs "configure docs search"."""
     guide_acc, notice_acc = [None], [None]
     tools = pc.build_project_copilot_tools(guide_acc, notice_acc)
 
     mocker.patch.object(pc, "search_docs", return_value=pc._DOCS_UNAVAILABLE)
     tools["search_docs"].handler({"query": "x"}, None)
-    assert notice_acc[0] == "docs_unavailable"
+    assert notice_acc[0] == "docs_unreachable"
+
+    notice_acc[0] = None
+    mocker.patch.object(pc, "search_docs", return_value=pc._DOCS_NOT_CONFIGURED)
+    tools["search_docs"].handler({"query": "x"}, None)
+    assert notice_acc[0] == "docs_not_configured"
 
     notice_acc[0] = None
     mocker.patch.object(pc, "search_docs", return_value="# Real doc\nbody")
@@ -201,13 +208,15 @@ def test_build_input_messages_names_guide_in_placeholder():
 
 def test_search_docs_tool_flags_notice_when_kb_not_ready(mocker):
     """The _DOCS_NOT_READY sentinel (empty/not-yet-indexed KB) must also flag the
-    notice accumulator — same treatment as _DOCS_UNAVAILABLE/_DOCS_NOT_CONFIGURED."""
+    notice accumulator — same treatment as _DOCS_UNAVAILABLE/_DOCS_NOT_CONFIGURED,
+    but with its own kind so the Studio can say "still indexing" rather than
+    "couldn't be reached"."""
     guide_acc, notice_acc = [None], [None]
     tools = pc.build_project_copilot_tools(guide_acc, notice_acc)
 
     mocker.patch.object(pc, "search_docs", return_value=pc._DOCS_NOT_READY)
     tools["search_docs"].handler({"query": "x"}, None)
-    assert notice_acc[0] == "docs_unavailable"
+    assert notice_acc[0] == "docs_not_ready"
 
 
 # ---------------------------------------------------------------------------

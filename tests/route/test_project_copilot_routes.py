@@ -322,7 +322,7 @@ def test_chat_emits_notice_when_docs_degraded(client, mock_auth, auth_headers, m
     sid = client.post("/api/project-copilot/sessions", headers=auth_headers).get_json()["id"]
     mocker.patch(
         "agentic_project_service.routes.project_copilot.run_project_copilot_chat",
-        return_value=("Answered from general knowledge.", None, "docs_unavailable"),
+        return_value=("Answered from general knowledge.", None, "docs_unreachable"),
     )
     resp = client.post(
         f"/api/project-copilot/sessions/{sid}/chat",
@@ -332,5 +332,5 @@ def test_chat_emits_notice_when_docs_degraded(client, mock_auth, auth_headers, m
     assert resp.status_code == 200
     events = _events(resp)
     notice = next(e for e in events if e.get("event") == "notice")
-    assert notice["kind"] == "docs_unavailable"
+    assert notice["kind"] == "docs_unreachable"
     assert "complete" in [e.get("event") for e in events]
