@@ -37,7 +37,12 @@ FROM python:3.13-slim
 WORKDIR /app
 ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:$PATH" \
     FLASK_APP=agentic_project_service.main:create_app
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+# git: the docs-KB refresh (tasks/docs_refresh.py) shallow-clones its two
+# GitHub sources at runtime — without the binary those legs fail on every
+# cycle ("[Errno 2] No such file or directory: 'git'") and the KB serves
+# stale provisioning-day content forever, while the task still reports
+# "complete" (found live: sources_ok=1/3, only llms-full.txt refreshing).
+RUN apt-get update && apt-get install -y --no-install-recommends curl git \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /opt/venv /opt/venv
 # No `COPY src/ src/` here: `--no-editable` installs the package INTO /opt/venv,
