@@ -2,13 +2,15 @@
 
 Mirrors the DB-free harness in test_agents_session_create.py: a minimal Flask
 app registering only agents_bp, auth mocked via `auth.decode_jwt`, and the DB
-layer stubbed rather than exercised for real (this repo's `tests/unit` tier
-is deliberately Postgres-free — see .github/workflows/test.yml).
+layer stubbed rather than exercised for real (this repo's `tests/unit` tier is
+deliberately Postgres-free). The properties that need a real database — the
+ON DELETE CASCADE this route relies on to remove the session's runs — are
+covered in tests/test_session_seeding_roundtrip.py.
 
-Ownership check mirrors `run_agent`'s (`get_session_owner`, service-role
-bypass), except "session not found" and "owned by someone else" both 404
-here (there is no request body that could be valid regardless of ownership,
-unlike run_agent's optional session_id).
+"Not found", "owned by someone else" and "belongs to a different agent" all
+answer 404 with the same body, so the endpoint cannot be used to enumerate
+sessions. Service role bypasses the ownership half of that; agent scoping
+still applies to it.
 """
 
 from unittest.mock import MagicMock, patch
@@ -49,17 +51,22 @@ def _authed_as_service_role():
     )
 
 
+def _db_session_returning(row):
+    fake = MagicMock()
+    fake.execute.return_value.fetchone.return_value = row
+    return fake
+
+
 class TestDeleteSessionRoute:
-    def test_delete_own_session_returns_204_and_deletes_runs_then_session(self):
+    def test_delete_own_session_returns_204(self):
+        """One SELECT answers both checks — ownership and agent scoping — and
+        one DELETE removes the session; its runs go with it via the
+        `agent_runs.session_id` ON DELETE CASCADE."""
         app = _make_test_app()
-        fake_db_session = MagicMock()
-        fake_db_session.execute.return_value.fetchone.return_value = ("db-uuid-1", AGENT_ID)
+        fake_db_session = _db_session_returning(("db-uuid-1", AGENT_ID, USER_ID))
 
         manager = MagicMock()
-        with (
-            patch.object(agents_route, "get_session_owner", return_value=USER_ID) as mock_owner,
-            patch.object(agents_route.db, "session", fake_db_session),
-        ):
+        with patch.object(agents_route.db, "session", fake_db_session):
             manager.attach_mock(fake_db_session.execute, "execute")
             manager.attach_mock(fake_db_session.commit, "commit")
 
@@ -73,36 +80,26 @@ class TestDeleteSessionRoute:
         assert resp.status_code == 204
         assert resp.get_data() == b""
 
-        mock_owner.assert_called_once_with(fake_db_session, SESSION_ID)
-
-        # SELECT the internal id, then DELETE agent_runs, then DELETE
-        # agent_sessions, then commit — in that order.
         execute_calls = [c for c in manager.mock_calls if c[0] == "execute"]
-        assert len(execute_calls) == 3
+        assert len(execute_calls) == 2
 
         select_sql = str(execute_calls[0].args[0])
         assert "SELECT" in select_sql and "agent_sessions" in select_sql
+        assert execute_calls[0].args[1] == {"session_id": SESSION_ID}
 
-        runs_delete_sql = str(execute_calls[1].args[0])
-        assert "DELETE" in runs_delete_sql and "agent_runs" in runs_delete_sql
+        delete_sql = str(execute_calls[1].args[0])
+        assert "DELETE" in delete_sql and "agent_sessions" in delete_sql
         assert execute_calls[1].args[1] == {"id": "db-uuid-1"}
-
-        session_delete_sql = str(execute_calls[2].args[0])
-        assert "DELETE" in session_delete_sql and "agent_sessions" in session_delete_sql
-        assert execute_calls[2].args[1] == {"id": "db-uuid-1"}
 
         # Top-level calls (excluding the chained `.fetchone()`), in order.
         top_level_calls = [c[0] for c in manager.mock_calls if "." not in c[0]]
-        assert top_level_calls == ["execute", "execute", "execute", "commit"]
+        assert top_level_calls == ["execute", "execute", "commit"]
 
     def test_delete_nonexistent_session_returns_404(self):
         app = _make_test_app()
-        fake_db_session = MagicMock()
+        fake_db_session = _db_session_returning(None)
 
-        with (
-            patch.object(agents_route, "get_session_owner", return_value=None),
-            patch.object(agents_route.db, "session", fake_db_session),
-        ):
+        with patch.object(agents_route.db, "session", fake_db_session):
             with _authed_as():
                 with app.test_client() as client:
                     resp = client.delete(
@@ -112,17 +109,14 @@ class TestDeleteSessionRoute:
 
         assert resp.status_code == 404
         assert resp.get_json() == {"error": "Session not found"}
-        fake_db_session.execute.assert_not_called()
+        fake_db_session.execute.assert_called_once()
         fake_db_session.commit.assert_not_called()
 
     def test_delete_other_users_session_returns_404(self):
         app = _make_test_app()
-        fake_db_session = MagicMock()
+        fake_db_session = _db_session_returning(("db-uuid-1", AGENT_ID, "other-user"))
 
-        with (
-            patch.object(agents_route, "get_session_owner", return_value="other-user"),
-            patch.object(agents_route.db, "session", fake_db_session),
-        ):
+        with patch.object(agents_route.db, "session", fake_db_session):
             with _authed_as(user_id=USER_ID):
                 with app.test_client() as client:
                     resp = client.delete(
@@ -132,7 +126,25 @@ class TestDeleteSessionRoute:
 
         assert resp.status_code == 404
         assert resp.get_json() == {"error": "Session not found"}
-        fake_db_session.execute.assert_not_called()
+        fake_db_session.execute.assert_called_once()
+        fake_db_session.commit.assert_not_called()
+
+    def test_delete_unowned_session_returns_404(self):
+        """A session with a NULL user_id belongs to nobody, so no user-scoped
+        caller may delete it."""
+        app = _make_test_app()
+        fake_db_session = _db_session_returning(("db-uuid-1", AGENT_ID, None))
+
+        with patch.object(agents_route.db, "session", fake_db_session):
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.delete(
+                        f"/api/agents/{AGENT_ID}/sessions/{SESSION_ID}",
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 404
+        assert resp.get_json() == {"error": "Session not found"}
         fake_db_session.commit.assert_not_called()
 
     def test_delete_session_requires_auth(self):
@@ -141,21 +153,53 @@ class TestDeleteSessionRoute:
             resp = client.delete(f"/api/agents/{AGENT_ID}/sessions/{SESSION_ID}")
         assert resp.status_code == 401
 
-    def test_service_role_deletes_a_session_it_does_not_own(self):
-        """The bypass exists so an operator/service caller can clean up any
-        session; ownership is not consulted at all for it."""
+    def test_session_of_different_agent_returns_404(self):
+        """A session owned by the caller but belonging to a different agent
+        than the one in the path 404s — mirrors remove_agent_tool's and
+        delete_agent_hook's `str(row.agent_id) != agent_id` scoping for the
+        same `/<agent_id>/<resource>/<resource_id>` DELETE shape."""
         app = _make_test_app()
-        fake_db_session = MagicMock()
-        fake_db_session.execute.return_value.fetchone.return_value = (
-            "db-uuid-1",
-            AGENT_ID,
-            "someone-else",
-        )
+        fake_db_session = _db_session_returning(("db-uuid-1", "some-other-agent", USER_ID))
 
-        with (
-            patch.object(agents_route, "get_session_owner") as mock_owner,
-            patch.object(agents_route.db, "session", fake_db_session),
-        ):
+        with patch.object(agents_route.db, "session", fake_db_session):
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.delete(
+                        f"/api/agents/{AGENT_ID}/sessions/{SESSION_ID}",
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 404
+        assert resp.get_json() == {"error": "Session not found"}
+        # Only the lookup SELECT ran — no DELETE, no commit.
+        fake_db_session.execute.assert_called_once()
+        fake_db_session.commit.assert_not_called()
+
+    def test_orphaned_session_is_not_deletable_here(self):
+        """`agent_sessions.agent_id` is ON DELETE SET NULL, so a session whose
+        agent was deleted can never match the agent in the path. It stays
+        deletable through DELETE /api/sessions/<session_id>."""
+        app = _make_test_app()
+        fake_db_session = _db_session_returning(("db-uuid-1", None, USER_ID))
+
+        with patch.object(agents_route.db, "session", fake_db_session):
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.delete(
+                        f"/api/agents/{AGENT_ID}/sessions/{SESSION_ID}",
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 404
+        fake_db_session.commit.assert_not_called()
+
+    def test_service_role_deletes_a_session_it_does_not_own(self):
+        """The bypass exists so a service caller can clean up any session;
+        ownership is not consulted for it."""
+        app = _make_test_app()
+        fake_db_session = _db_session_returning(("db-uuid-1", AGENT_ID, "someone-else"))
+
+        with patch.object(agents_route.db, "session", fake_db_session):
             with _authed_as_service_role():
                 with app.test_client() as client:
                     resp = client.delete(
@@ -164,18 +208,12 @@ class TestDeleteSessionRoute:
                     )
 
         assert resp.status_code == 204
-        mock_owner.assert_not_called()
         fake_db_session.commit.assert_called_once()
 
     def test_service_role_still_gets_404_for_a_session_of_another_agent(self):
         """The bypass is about ownership only — agent scoping still applies."""
         app = _make_test_app()
-        fake_db_session = MagicMock()
-        fake_db_session.execute.return_value.fetchone.return_value = (
-            "db-uuid-1",
-            "some-other-agent",
-            "someone-else",
-        )
+        fake_db_session = _db_session_returning(("db-uuid-1", "some-other-agent", "someone-else"))
 
         with patch.object(agents_route.db, "session", fake_db_session):
             with _authed_as_service_role():
@@ -191,8 +229,7 @@ class TestDeleteSessionRoute:
 
     def test_service_role_gets_404_for_a_nonexistent_session(self):
         app = _make_test_app()
-        fake_db_session = MagicMock()
-        fake_db_session.execute.return_value.fetchone.return_value = None
+        fake_db_session = _db_session_returning(None)
 
         with patch.object(agents_route.db, "session", fake_db_session):
             with _authed_as_service_role():
@@ -204,33 +241,4 @@ class TestDeleteSessionRoute:
 
         assert resp.status_code == 404
         assert resp.get_json() == {"error": "Session not found"}
-        fake_db_session.commit.assert_not_called()
-
-    def test_session_of_different_agent_returns_404(self):
-        """A session owned by the caller but belonging to a different agent
-        than the one in the path 404s — mirrors remove_agent_tool's and
-        delete_agent_hook's `str(row.agent_id) != agent_id` scoping for the
-        same `/<agent_id>/<resource>/<resource_id>` DELETE shape."""
-        app = _make_test_app()
-        fake_db_session = MagicMock()
-        fake_db_session.execute.return_value.fetchone.return_value = (
-            "db-uuid-1",
-            "some-other-agent",
-        )
-
-        with (
-            patch.object(agents_route, "get_session_owner", return_value=USER_ID),
-            patch.object(agents_route.db, "session", fake_db_session),
-        ):
-            with _authed_as():
-                with app.test_client() as client:
-                    resp = client.delete(
-                        f"/api/agents/{AGENT_ID}/sessions/{SESSION_ID}",
-                        headers=_auth_headers(),
-                    )
-
-        assert resp.status_code == 404
-        assert resp.get_json() == {"error": "Session not found"}
-        # Only the lookup SELECT ran — no DELETE, no commit.
-        fake_db_session.execute.assert_called_once()
         fake_db_session.commit.assert_not_called()

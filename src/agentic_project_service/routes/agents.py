@@ -1332,31 +1332,37 @@ def create_session_for_agent(agent_id: str):
 def delete_session_for_agent(agent_id: str, session_id: str):
     """Delete a session and its runs.
 
-    Ownership check mirrors `run_agent`'s (`get_session_owner`,
-    service-role bypass), except here "not found" and "owned by someone
-    else" both 404 for a user-scoped caller, to avoid leaking session
-    existence.
-    """
-    is_service_role = (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False)
-    if not is_service_role:
-        owner = get_session_owner(db.session, session_id)
-        if owner is None or owner != get_current_user_id():
-            return jsonify({"error": "Session not found"}), 404
+    "Not found", "owned by someone else" and "belongs to a different agent"
+    all answer 404 with the same body, so this endpoint cannot be used to
+    enumerate sessions. Service role bypasses the ownership half of that
+    (mirroring `run_agent`); agent scoping still applies to it.
 
+    A session whose agent has been deleted is orphaned by the ON DELETE SET
+    NULL on `agent_sessions.agent_id`: it can never match the agent in the
+    path, so it stays deletable only through DELETE /api/sessions/<id>.
+
+    Runs in flight are not checked. Deleting a session mid-stream leaves the
+    worker's final persist_agent_run to fail its foreign key, and that run's
+    output is lost.
+    """
     row = db.session.execute(
         text(
-            f'SELECT id, agent_id FROM "{AI_SCHEMA}".agent_sessions WHERE session_id = :session_id'
+            f"""
+            SELECT id, agent_id, user_id FROM "{AI_SCHEMA}".agent_sessions
+            WHERE session_id = :session_id
+            """
         ),
         {"session_id": session_id},
     ).fetchone()
     if not row or str(row[1]) != agent_id:
         return jsonify({"error": "Session not found"}), 404
 
+    is_service_role = (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False)
+    if not is_service_role and (row[2] is None or str(row[2]) != get_current_user_id()):
+        return jsonify({"error": "Session not found"}), 404
+
     db_session_uuid = str(row[0])
-    db.session.execute(
-        text(f'DELETE FROM "{AI_SCHEMA}".agent_runs WHERE session_id = :id'),
-        {"id": db_session_uuid},
-    )
+    # The session's runs go with it: agent_runs.session_id is ON DELETE CASCADE.
     db.session.execute(
         text(f'DELETE FROM "{AI_SCHEMA}".agent_sessions WHERE id = :id'),
         {"id": db_session_uuid},

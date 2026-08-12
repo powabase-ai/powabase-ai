@@ -3,17 +3,23 @@ optional conversation seeding.
 
 Mirrors the DB-free harness in test_agents_route_billing.py: a minimal Flask
 app registering only agents_bp, auth mocked via `auth.decode_jwt`, and the DB
-layer stubbed rather than exercised for real (this repo's `tests/unit` tier
-is deliberately Postgres-free — see .github/workflows/test.yml).
+layer stubbed rather than exercised for real (this repo's `tests/unit` tier is
+deliberately Postgres-free).
 
-Two levels of coverage:
-  * TestCreateSessionRoute — validation (alternation/shape) and wiring
-    (get_or_create_session / seed_session_runs / commit called correctly),
-    with those two service calls mocked out.
+Three levels of coverage:
+  * TestCreateSessionRoute — validation (body shape, alternation, cap) and
+    wiring (get_or_create_session / seed_session_runs / commit called
+    correctly), with those two service calls mocked out.
+  * TestCreateSessionOnBehalfOfAUser — who ends up owning the session.
   * TestSeedSessionRuns — the seeding helper in isolation, mocking
     persist_agent_run to prove one synthetic COMPLETED run is written per
-    user/assistant pair, in order — the property that keeps
-    load_session_history's reconstruction from interleaving pairs.
+    user/assistant pair, in order, each with its own timestamp — the
+    properties that keep load_session_history's reconstruction from
+    interleaving pairs.
+
+What only a real database decides — uuid casting, foreign keys, the cascade,
+and the reconstruction itself — is covered in
+tests/test_session_seeding_roundtrip.py.
 """
 
 from unittest.mock import MagicMock, patch
