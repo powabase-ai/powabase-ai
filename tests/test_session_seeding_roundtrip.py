@@ -45,6 +45,36 @@ class TestAgentIdHandling:
             count = db.session.execute(text('SELECT COUNT(*) FROM "ai".agent_sessions')).scalar()
         assert count == 0
 
+    def test_a_session_is_deletable_under_the_spelling_it_was_created_with(
+        self, client, mock_auth, auth_headers, test_agent
+    ):
+        """Create accepts any uuid spelling Python parses; delete compares
+        against `str(row.agent_id)`, which is canonical. Unless both routes
+        normalize, a session created under an uppercase or braced agent id can
+        never be deleted under that same id. `urn:uuid:` is here too: Python
+        parses it and Postgres's uuid cast does not, so passing it through raw
+        is a 22P02 — a 500, not a 404."""
+        canonical = test_agent["id"]
+        for spelling in (
+            canonical.upper(),
+            "{" + canonical + "}",
+            f"urn:uuid:{canonical}",
+            canonical.replace("-", ""),
+        ):
+            created = client.post(
+                f"/api/agents/{spelling}/sessions",
+                json={},
+                headers=auth_headers,
+            )
+            assert created.status_code == 201, (spelling, created.get_data(as_text=True))
+            session_id = created.get_json()["session_id"]
+
+            deleted = client.delete(
+                f"/api/agents/{spelling}/sessions/{session_id}",
+                headers=auth_headers,
+            )
+            assert deleted.status_code == 204, (spelling, deleted.get_data(as_text=True))
+
 
 class TestSeedingOnBehalfOfAUser:
     def test_service_role_seeded_session_belongs_to_the_named_user(

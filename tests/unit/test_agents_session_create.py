@@ -466,6 +466,49 @@ class TestCreateSessionRoute:
         fake_db_session.execute.assert_not_called()
         mock_get_or_create.assert_not_called()
 
+    def test_agent_id_is_normalized_before_it_is_bound(self):
+        """`uuid.UUID` accepts spellings the create route must not pass through
+        raw: `urn:uuid:` forms fail Postgres's uuid cast (22P02 → 500), and
+        uppercase/braced/hyphenless forms cast fine but would then be compared
+        against `str(row.agent_id)` by the delete route, which is canonical —
+        making a session creatable under a spelling it can never be deleted
+        under. Everything downstream sees the canonical form."""
+        app = _make_test_app()
+
+        for spelling in (
+            AGENT_ID.upper(),
+            "{" + AGENT_ID + "}",
+            f"urn:uuid:{AGENT_ID}",
+            AGENT_ID.replace("-", ""),
+        ):
+            fake_db_session = MagicMock()
+            fake_db_session.execute.return_value.fetchone.return_value = ("gpt-4o-mini",)
+
+            with (
+                patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+                patch.object(agents_route, "seed_session_runs") as mock_seed,
+                patch.object(agents_route.db, "session", fake_db_session),
+            ):
+                mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+                with _authed_as():
+                    with app.test_client() as client:
+                        resp = client.post(
+                            f"/api/agents/{spelling}/sessions",
+                            json={
+                                "initial_messages": [
+                                    {"role": "user", "content": "Q1"},
+                                    {"role": "assistant", "content": "A1"},
+                                ]
+                            },
+                            headers=_auth_headers(),
+                        )
+
+            assert resp.status_code == 201, spelling
+            assert fake_db_session.execute.call_args.args[1] == {"id": AGENT_ID}, spelling
+            assert mock_get_or_create.call_args.kwargs["agent_id"] == AGENT_ID, spelling
+            assert mock_seed.call_args.kwargs["agent_id"] == AGENT_ID, spelling
+
     def test_agent_deleted_between_check_and_commit_returns_404(self):
         """The existence pre-check is not a lock: an agent deleted between it
         and the commit surfaces as an IntegrityError on the session insert,

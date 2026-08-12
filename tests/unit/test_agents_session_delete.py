@@ -17,7 +17,8 @@ from unittest.mock import MagicMock, patch
 
 from agentic_project_service.routes import agents as agents_route
 
-AGENT_ID = "agent-1"
+AGENT_ID = "3f9a1c2e-5b7d-4e11-9a3c-8d2f6b4e1a70"
+OTHER_AGENT_ID = "9c1e7d40-2a55-4f8b-b0d3-6e5a1c9f8b22"
 SESSION_ID = "sess_abc123"
 USER_ID = "user-1"
 
@@ -147,6 +148,53 @@ class TestDeleteSessionRoute:
         assert resp.get_json() == {"error": "Session not found"}
         fake_db_session.commit.assert_not_called()
 
+    def test_agent_id_spelling_does_not_change_the_comparison(self):
+        """The scoping check compares against `str(row.agent_id)`, which is
+        always canonical lowercase-hyphenated. Uppercase, braced and `urn:uuid:`
+        spellings all name the same agent and all cast in Postgres's uuid input
+        (or, for `urn:uuid:`, would not cast at all), so the path segment is
+        normalized before it is compared — otherwise a session created under
+        one spelling could never be deleted under it."""
+        app = _make_test_app()
+
+        for spelling in (
+            AGENT_ID.upper(),
+            "{" + AGENT_ID + "}",
+            f"urn:uuid:{AGENT_ID}",
+            AGENT_ID.replace("-", ""),
+        ):
+            fake_db_session = _db_session_returning(("db-uuid-1", AGENT_ID, USER_ID))
+
+            with patch.object(agents_route.db, "session", fake_db_session):
+                with _authed_as():
+                    with app.test_client() as client:
+                        resp = client.delete(
+                            f"/api/agents/{spelling}/sessions/{SESSION_ID}",
+                            headers=_auth_headers(),
+                        )
+
+            assert resp.status_code == 204, spelling
+            fake_db_session.commit.assert_called_once()
+
+    def test_malformed_agent_id_returns_404_without_querying(self):
+        """A non-uuid path segment cannot name any agent, so it 404s before the
+        lookup rather than being compared as a string."""
+        app = _make_test_app()
+        fake_db_session = _db_session_returning(("db-uuid-1", AGENT_ID, USER_ID))
+
+        with patch.object(agents_route.db, "session", fake_db_session):
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.delete(
+                        f"/api/agents/does-not-exist/sessions/{SESSION_ID}",
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 404
+        assert resp.get_json() == {"error": "Session not found"}
+        fake_db_session.execute.assert_not_called()
+        fake_db_session.commit.assert_not_called()
+
     def test_delete_session_requires_auth(self):
         app = _make_test_app()
         with app.test_client() as client:
@@ -159,7 +207,7 @@ class TestDeleteSessionRoute:
         delete_agent_hook's `str(row.agent_id) != agent_id` scoping for the
         same `/<agent_id>/<resource>/<resource_id>` DELETE shape."""
         app = _make_test_app()
-        fake_db_session = _db_session_returning(("db-uuid-1", "some-other-agent", USER_ID))
+        fake_db_session = _db_session_returning(("db-uuid-1", OTHER_AGENT_ID, USER_ID))
 
         with patch.object(agents_route.db, "session", fake_db_session):
             with _authed_as():
@@ -213,7 +261,7 @@ class TestDeleteSessionRoute:
     def test_service_role_still_gets_404_for_a_session_of_another_agent(self):
         """The bypass is about ownership only — agent scoping still applies."""
         app = _make_test_app()
-        fake_db_session = _db_session_returning(("db-uuid-1", "some-other-agent", "someone-else"))
+        fake_db_session = _db_session_returning(("db-uuid-1", OTHER_AGENT_ID, "someone-else"))
 
         with patch.object(agents_route.db, "session", fake_db_session):
             with _authed_as_service_role():

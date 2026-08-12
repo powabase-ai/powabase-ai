@@ -1245,8 +1245,16 @@ def create_session_for_agent(agent_id: str):
     # agents.id is a uuid column: a non-uuid path segment would make the
     # existence check itself raise 22P02 and poison the transaction, so parse
     # it here and answer with the 404 an unknown agent already gets.
+    #
+    # Normalized, not merely validated. Python's parser and Postgres's uuid
+    # input accept overlapping but different spellings, and the delete route
+    # compares the path segment against `str(row.agent_id)`, which is always
+    # canonical. Binding the raw segment would (a) let a session be created
+    # under an uppercase, braced or hyphenless id that its own DELETE can never
+    # match, and (b) push `urn:uuid:` forms — which Python parses and Postgres
+    # rejects — into the query as a 22P02, i.e. a 500 in place of the 404.
     try:
-        uuid.UUID(agent_id)
+        agent_id = str(uuid.UUID(agent_id))
     except ValueError:
         return jsonify({"error": "Agent not found"}), 404
 
@@ -1365,6 +1373,16 @@ def delete_session_for_agent(agent_id: str, session_id: str):
     worker's final persist_agent_run to fail its foreign key, and that run's
     output is lost.
     """
+    # The scoping check below compares against `str(row.agent_id)`, which is
+    # canonical lowercase-hyphenated. Normalize the path segment to the same
+    # form — as the create route does — so a session is deletable under every
+    # spelling it was creatable under, and a non-uuid segment (which can name
+    # no agent) 404s here rather than being compared as a string.
+    try:
+        agent_id = str(uuid.UUID(agent_id))
+    except ValueError:
+        return jsonify({"error": "Session not found"}), 404
+
     row = db.session.execute(
         text(
             f"""
