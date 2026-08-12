@@ -40,6 +40,15 @@ def _authed_as(user_id=USER_ID):
     )
 
 
+def _authed_as_service_role():
+    """auth.decode_jwt marks the payload is_service_role=True when the token
+    matches SERVICE_ROLE_KEY; patch that branch directly."""
+    return patch(
+        "agentic_project_service.auth.decode_jwt",
+        return_value={"sub": "service", "role": "service_role", "is_service_role": True},
+    )
+
+
 class TestDeleteSessionRoute:
     def test_delete_own_session_returns_204_and_deletes_runs_then_session(self):
         app = _make_test_app()
@@ -131,6 +140,71 @@ class TestDeleteSessionRoute:
         with app.test_client() as client:
             resp = client.delete(f"/api/agents/{AGENT_ID}/sessions/{SESSION_ID}")
         assert resp.status_code == 401
+
+    def test_service_role_deletes_a_session_it_does_not_own(self):
+        """The bypass exists so an operator/service caller can clean up any
+        session; ownership is not consulted at all for it."""
+        app = _make_test_app()
+        fake_db_session = MagicMock()
+        fake_db_session.execute.return_value.fetchone.return_value = (
+            "db-uuid-1",
+            AGENT_ID,
+            "someone-else",
+        )
+
+        with (
+            patch.object(agents_route, "get_session_owner") as mock_owner,
+            patch.object(agents_route.db, "session", fake_db_session),
+        ):
+            with _authed_as_service_role():
+                with app.test_client() as client:
+                    resp = client.delete(
+                        f"/api/agents/{AGENT_ID}/sessions/{SESSION_ID}",
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 204
+        mock_owner.assert_not_called()
+        fake_db_session.commit.assert_called_once()
+
+    def test_service_role_still_gets_404_for_a_session_of_another_agent(self):
+        """The bypass is about ownership only — agent scoping still applies."""
+        app = _make_test_app()
+        fake_db_session = MagicMock()
+        fake_db_session.execute.return_value.fetchone.return_value = (
+            "db-uuid-1",
+            "some-other-agent",
+            "someone-else",
+        )
+
+        with patch.object(agents_route.db, "session", fake_db_session):
+            with _authed_as_service_role():
+                with app.test_client() as client:
+                    resp = client.delete(
+                        f"/api/agents/{AGENT_ID}/sessions/{SESSION_ID}",
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 404
+        assert resp.get_json() == {"error": "Session not found"}
+        fake_db_session.commit.assert_not_called()
+
+    def test_service_role_gets_404_for_a_nonexistent_session(self):
+        app = _make_test_app()
+        fake_db_session = MagicMock()
+        fake_db_session.execute.return_value.fetchone.return_value = None
+
+        with patch.object(agents_route.db, "session", fake_db_session):
+            with _authed_as_service_role():
+                with app.test_client() as client:
+                    resp = client.delete(
+                        f"/api/agents/{AGENT_ID}/sessions/does-not-exist",
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 404
+        assert resp.get_json() == {"error": "Session not found"}
+        fake_db_session.commit.assert_not_called()
 
     def test_session_of_different_agent_returns_404(self):
         """A session owned by the caller but belonging to a different agent

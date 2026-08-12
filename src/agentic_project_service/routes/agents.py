@@ -1231,7 +1231,23 @@ def create_session_for_agent(agent_id: str):
             {"error": "initial_messages must alternate user/assistant, starting with user"}
         ), 400
 
+    # An import or handoff is performed *for* a user by a service-role caller
+    # whose own JWT `sub` is not that user. Without an explicit owner the
+    # session lands with user_id NULL: absent from list_sessions and, since
+    # get_session_owner then returns None, undeletable through this blueprint.
+    # Only service role may name an owner, and a user-scoped caller that tries
+    # is refused rather than silently ignored — ignoring it would return 201
+    # for a session belonging to someone other than the one asked for.
     user_id = get_current_user_id()
+    requested_user_id = data.get("user_id")
+    if requested_user_id is not None:
+        if not (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False):
+            return jsonify({"error": "Service role required to set user_id"}), 403
+        try:
+            uuid.UUID(str(requested_user_id))
+        except ValueError:
+            return jsonify({"error": "user_id must be a uuid"}), 400
+        user_id = str(requested_user_id)
 
     # agent_id is a foreign key on agent_sessions — check existence before
     # writing so a bad id is a clean 404, not an integrity error.

@@ -46,6 +46,55 @@ class TestAgentIdHandling:
         assert count == 0
 
 
+class TestSeedingOnBehalfOfAUser:
+    def test_service_role_seeded_session_belongs_to_the_named_user(
+        self, client, mock_auth, auth_headers, test_agent, app, mocker
+    ):
+        """The import use case: a service-role caller seeds a conversation for
+        an end user, who must then see it. Falling back to the caller's own
+        JWT `sub` leaves user_id NULL, and the session is invisible to
+        list_sessions and undeletable through the agent-scoped route."""
+        target_user = str(uuid.uuid4())
+        mocker.patch(
+            "agentic_project_service.auth.decode_jwt",
+            return_value={"sub": "service", "role": "service_role", "is_service_role": True},
+        )
+        resp = client.post(
+            f"/api/agents/{test_agent['id']}/sessions",
+            json={
+                "user_id": target_user,
+                "initial_messages": [
+                    {"role": "user", "content": "Q1"},
+                    {"role": "assistant", "content": "A1"},
+                ],
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 201
+        session_id = resp.get_json()["session_id"]
+
+        with app.app_context():
+            owner = db.session.execute(
+                text('SELECT user_id FROM "ai".agent_sessions WHERE session_id = :sid'),
+                {"sid": session_id},
+            ).scalar()
+        assert str(owner) == target_user
+
+        # The named user can now list it, and delete it through this blueprint.
+        mocker.patch(
+            "agentic_project_service.auth.decode_jwt",
+            return_value={"sub": target_user, "role": "authenticated"},
+        )
+        listed = client.get(f"/api/agents/{test_agent['id']}/sessions", headers=auth_headers)
+        assert listed.status_code == 200
+        assert session_id in {s["session_id"] for s in listed.get_json()["sessions"]}
+
+        deleted = client.delete(
+            f"/api/agents/{test_agent['id']}/sessions/{session_id}", headers=auth_headers
+        )
+        assert deleted.status_code == 204
+
+
 class TestSeedRoundTrip:
     def _seed(self, client, auth_headers, agent_id, messages):
         resp = client.post(
