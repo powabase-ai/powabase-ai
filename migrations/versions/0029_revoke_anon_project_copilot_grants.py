@@ -1,6 +1,6 @@
 """Revoke the inert anon SELECT grants on the project_copilot tables.
 
-Migration 0027 granted ``SELECT ... TO anon`` on ai.project_copilot_sessions
+Migration 0028 granted ``SELECT ... TO anon`` on ai.project_copilot_sessions
 and ai.project_copilot_messages alongside the authenticated/service_role
 grants. Nothing uses them: the copilot routes go through the project-service
 (service-role connection), and no RLS policy on either table targets anon —
@@ -10,18 +10,18 @@ copilot chat history to unauthenticated PostgREST callers. Drop the grants
 so any future anon access has to be added deliberately.
 
 Defensive — REVOKE is naturally idempotent (revoking an absent privilege is
-a no-op), and 0027 guarantees both tables exist. The downgrade restores the
-grants, returning to 0027's exact final state.
+a no-op), and 0028 guarantees both tables exist. The downgrade restores the
+grants, returning to 0028's exact final state.
 
-Revision ID: 0028
-Revises: 0027
+Revision ID: 0029
+Revises: 0028
 Create Date: 2026-07-16
 """
 
 from alembic import op
 
-revision = "0028"
-down_revision = "0027"
+revision = "0029"
+down_revision = "0028"
 branch_labels = None
 depends_on = None
 
