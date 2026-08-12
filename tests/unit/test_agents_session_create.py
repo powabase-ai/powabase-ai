@@ -22,7 +22,7 @@ from agentic_project_service.models.tenant import AgentRunStatus
 from agentic_project_service.routes import agents as agents_route
 from agentic_project_service.services.session import seed_session_runs
 
-AGENT_ID = "agent-1"
+AGENT_ID = "3f9a1c2e-5b7d-4e11-9a3c-8d2f6b4e1a70"
 USER_ID = "user-1"
 
 
@@ -281,12 +281,41 @@ class TestCreateSessionRoute:
         app = _make_test_app()
         fake_db_session = MagicMock()
         fake_db_session.execute.return_value.fetchone.return_value = None
+        unknown_but_valid = "9c1e7d40-2a55-4f8b-b0d3-6e5a1c9f8b22"
 
         with (
             patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
             patch.object(agents_route, "seed_session_runs") as mock_seed,
             patch.object(agents_route.db, "session", fake_db_session),
         ):
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{unknown_but_valid}/sessions",
+                        json={},
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 404
+        assert resp.get_json() == {"error": "Agent not found"}
+        mock_get_or_create.assert_not_called()
+        mock_seed.assert_not_called()
+        fake_db_session.commit.assert_not_called()
+
+    def test_malformed_agent_id_returns_404_without_querying(self):
+        """`agents.id` is a uuid column, so a non-uuid path segment must be
+        rejected before it reaches SQL — passing it through makes Postgres
+        raise `invalid input syntax for type uuid` and poisons the
+        transaction, turning the intended 404 into a 500."""
+        app = _make_test_app()
+        fake_db_session = MagicMock()
+
+        with (
+            patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+            patch.object(agents_route.db, "session", fake_db_session),
+        ):
+            mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
             with _authed_as():
                 with app.test_client() as client:
                     resp = client.post(
@@ -297,9 +326,155 @@ class TestCreateSessionRoute:
 
         assert resp.status_code == 404
         assert resp.get_json() == {"error": "Agent not found"}
+        fake_db_session.execute.assert_not_called()
         mock_get_or_create.assert_not_called()
+
+    def test_agent_deleted_between_check_and_commit_returns_404(self):
+        """The existence pre-check is not a lock: an agent deleted between it
+        and the commit surfaces as an IntegrityError on the session insert,
+        which must roll back to a 404 rather than a 500."""
+        from sqlalchemy.exc import IntegrityError
+
+        app = _make_test_app()
+        fake_db_session = MagicMock()
+        fake_db_session.execute.return_value.fetchone.return_value = ("gpt-4o-mini",)
+        fake_db_session.commit.side_effect = IntegrityError("stmt", {}, Exception("fk"))
+
+        with (
+            patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+            patch.object(agents_route.db, "session", fake_db_session),
+        ):
+            mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{AGENT_ID}/sessions",
+                        json={},
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 404
+        assert resp.get_json() == {"error": "Agent not found"}
+        fake_db_session.rollback.assert_called_once()
+
+    def test_malformed_json_body_rejected(self):
+        """A body that fails to parse must 400. Silently treating it as "no
+        seed" would discard an imported conversation and report 201."""
+        app = _make_test_app()
+
+        with (
+            patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+            patch.object(agents_route.db, "session", MagicMock()),
+        ):
+            mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{AGENT_ID}/sessions",
+                        data='{"initial_messages": [{"role": "user", "content": "Q1"',
+                        content_type="application/json",
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 400
+        assert resp.get_json() == {"error": "Request body must be valid JSON"}
+        mock_get_or_create.assert_not_called()
+
+    def test_body_without_json_content_type_rejected(self):
+        """Valid JSON sent without `application/json` does not parse either —
+        same silent-discard hazard, same 400."""
+        app = _make_test_app()
+
+        with (
+            patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+            patch.object(agents_route.db, "session", MagicMock()),
+        ):
+            mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{AGENT_ID}/sessions",
+                        data='{"initial_messages": []}',
+                        content_type="text/plain",
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 400
+        assert resp.get_json() == {"error": "Request body must be valid JSON"}
+        mock_get_or_create.assert_not_called()
+
+    def test_non_object_json_body_rejected(self):
+        """A top-level array or string is valid JSON but has no `.get` —
+        it must 400, not raise AttributeError into a 500."""
+        app = _make_test_app()
+
+        for body in ([1, 2], "x"):
+            with (
+                patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+                patch.object(agents_route.db, "session", MagicMock()),
+            ):
+                mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+                with _authed_as():
+                    with app.test_client() as client:
+                        resp = client.post(
+                            f"/api/agents/{AGENT_ID}/sessions",
+                            json=body,
+                            headers=_auth_headers(),
+                        )
+
+            assert resp.status_code == 400, body
+            assert resp.get_json() == {"error": "Request body must be a JSON object"}
+            mock_get_or_create.assert_not_called()
+
+    def test_falsy_non_list_initial_messages_rejected(self):
+        """`{}`, `""`, `0` and `false` are not lists either — they must be
+        rejected like any other wrong type, not coerced to "no seed"."""
+        app = _make_test_app()
+
+        for value in ({}, "", 0, False):
+            with (
+                patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+                patch.object(agents_route.db, "session", MagicMock()),
+            ):
+                mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+                with _authed_as():
+                    with app.test_client() as client:
+                        resp = client.post(
+                            f"/api/agents/{AGENT_ID}/sessions",
+                            json={"initial_messages": value},
+                            headers=_auth_headers(),
+                        )
+
+            assert resp.status_code == 400, value
+            assert resp.get_json() == {"error": "initial_messages must be a list"}
+            mock_get_or_create.assert_not_called()
+
+    def test_null_initial_messages_creates_bare_session(self):
+        """Explicit `null` means "no seed" — only absence, not a wrong type."""
+        app = _make_test_app()
+
+        with (
+            patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+            patch.object(agents_route, "seed_session_runs") as mock_seed,
+            patch.object(agents_route.db, "session", MagicMock()),
+        ):
+            mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{AGENT_ID}/sessions",
+                        json={"initial_messages": None},
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 201
         mock_seed.assert_not_called()
-        fake_db_session.commit.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -1196,9 +1196,30 @@ def create_session_for_agent(agent_id: str):
     compaction. Seeds become synthetic completed runs so history
     reconstruction needs no special cases.
     """
-    data = request.get_json(silent=True) or {}
-    initial = data.get("initial_messages") or []
-    if not isinstance(initial, list):
+    # agents.id is a uuid column: a non-uuid path segment would make the
+    # existence check itself raise 22P02 and poison the transaction, so parse
+    # it here and answer with the 404 an unknown agent already gets.
+    try:
+        uuid.UUID(agent_id)
+    except ValueError:
+        return jsonify({"error": "Agent not found"}), 404
+
+    data = request.get_json(silent=True)
+    if data is None:
+        # Only a genuinely empty request means "no seed". A body that failed to
+        # parse (invalid JSON, or no application/json content type) must not be
+        # downgraded to a bare session — that discards the imported
+        # conversation and reports it as a success.
+        if request.get_data():
+            return jsonify({"error": "Request body must be valid JSON"}), 400
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+
+    initial = data.get("initial_messages")
+    if initial is None:
+        initial = []
+    elif not isinstance(initial, list):
         return jsonify({"error": "initial_messages must be a list"}), 400
     if len(initial) % 2 != 0 or any(
         not isinstance(m, dict)
@@ -1212,8 +1233,8 @@ def create_session_for_agent(agent_id: str):
 
     user_id = get_current_user_id()
 
-    # agent_id is a foreign key on agent_sessions (ON DELETE SET NULL) — check
-    # existence before writing so a bad id is a clean 404, not an integrity error.
+    # agent_id is a foreign key on agent_sessions — check existence before
+    # writing so a bad id is a clean 404, not an integrity error.
     agent_row = db.session.execute(
         text(f'SELECT 1 FROM "{AI_SCHEMA}".agents WHERE id = :id'),
         {"id": agent_id},
@@ -1228,7 +1249,13 @@ def create_session_for_agent(agent_id: str):
     )
     if initial:
         seed_session_runs(db.session, db_session_uuid, initial)
-    db.session.commit()
+    # The check above is not a lock: the agent can be deleted before this
+    # commit, and the foreign key then rejects the insert. Same 404, no 500.
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"error": "Agent not found"}), 404
     return jsonify({"session_id": session_id}), 201
 
 
