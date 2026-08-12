@@ -272,6 +272,35 @@ class TestCreateSessionRoute:
             resp = client.post(f"/api/agents/{AGENT_ID}/sessions", json={})
         assert resp.status_code == 401
 
+    def test_unknown_agent_id_returns_404(self):
+        """A well-formed but nonexistent agent_id must be rejected with a
+        clean 404 before any session-creating write is attempted — agent_id
+        is a foreign key on the sessions table, so reaching
+        get_or_create_session with a bad id would otherwise surface as an
+        unhandled integrity error instead of a normal 404."""
+        app = _make_test_app()
+        fake_db_session = MagicMock()
+        fake_db_session.execute.return_value.fetchone.return_value = None
+
+        with (
+            patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+            patch.object(agents_route, "seed_session_runs") as mock_seed,
+            patch.object(agents_route.db, "session", fake_db_session),
+        ):
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        "/api/agents/does-not-exist/sessions",
+                        json={},
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 404
+        assert resp.get_json() == {"error": "Agent not found"}
+        mock_get_or_create.assert_not_called()
+        mock_seed.assert_not_called()
+        fake_db_session.commit.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # seed_session_runs — the seeding helper in isolation

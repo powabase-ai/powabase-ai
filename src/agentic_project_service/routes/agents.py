@@ -1211,6 +1211,16 @@ def create_session_for_agent(agent_id: str):
         ), 400
 
     user_id = get_current_user_id()
+
+    # agent_id is a foreign key on agent_sessions (ON DELETE SET NULL) — check
+    # existence before writing so a bad id is a clean 404, not an integrity error.
+    agent_row = db.session.execute(
+        text(f'SELECT 1 FROM "{AI_SCHEMA}".agents WHERE id = :id'),
+        {"id": agent_id},
+    ).fetchone()
+    if not agent_row:
+        return jsonify({"error": "Agent not found"}), 404
+
     db_session_uuid, session_id, _ = get_or_create_session(
         db_session=db.session,
         agent_id=agent_id,
