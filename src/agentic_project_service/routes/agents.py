@@ -72,6 +72,7 @@ from ..services.session import (
     get_session_owner,
     load_session_history,
     persist_agent_run,
+    seed_session_runs,
     update_agent_run,
 )
 from ..services.run_registry import get_active_run_context, register_run, unregister_run
@@ -1184,6 +1185,41 @@ def list_sessions(agent_id: str):
             "offset": offset,
         }
     )
+
+
+@agents_bp.route("/<agent_id>/sessions", methods=["POST"])
+@require_auth
+def create_session_for_agent(agent_id: str):
+    """Create a session, optionally seeded with an initial conversation.
+
+    Generic conversation seeding: import, human-agent handoff, memory
+    compaction. Seeds become synthetic completed runs so history
+    reconstruction needs no special cases.
+    """
+    data = request.get_json(silent=True) or {}
+    initial = data.get("initial_messages") or []
+    if not isinstance(initial, list):
+        return jsonify({"error": "initial_messages must be a list"}), 400
+    if len(initial) % 2 != 0 or any(
+        not isinstance(m, dict)
+        or m.get("role") != ("user" if i % 2 == 0 else "assistant")
+        or not isinstance(m.get("content"), str)
+        for i, m in enumerate(initial)
+    ):
+        return jsonify(
+            {"error": "initial_messages must alternate user/assistant, starting with user"}
+        ), 400
+
+    user_id = get_current_user_id()
+    db_session_uuid, session_id, _ = get_or_create_session(
+        db_session=db.session,
+        agent_id=agent_id,
+        user_id=user_id,
+    )
+    if initial:
+        seed_session_runs(db.session, db_session_uuid, initial)
+    db.session.commit()
+    return jsonify({"session_id": session_id}), 201
 
 
 # =============================================================================

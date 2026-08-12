@@ -629,6 +629,36 @@ def persist_agent_run(
     return run_uuid
 
 
+def seed_session_runs(
+    db_session: Session,
+    db_session_uuid: str,
+    initial_messages: list[dict],
+) -> None:
+    """Persist seed messages as synthetic completed runs, one per
+    user/assistant pair, so load_session_history reconstructs them in
+    order with no changes to context assembly.
+
+    Used to seed a freshly created session with a prior conversation —
+    e.g. an import, a handoff from another surface, or a compacted
+    summary standing in for older turns. Caller validates shape (strict
+    user/assistant alternation, even count).
+    """
+    now = datetime.now(UTC)
+    for i in range(0, len(initial_messages), 2):
+        user_msg, assistant_msg = initial_messages[i], initial_messages[i + 1]
+        persist_agent_run(
+            db_session=db_session,
+            run_id=f"seed_{uuid.uuid4().hex[:12]}",
+            status=AgentRunStatus.COMPLETED,
+            input_messages=[{"role": "user", "content": user_msg["content"]}],
+            db_session_uuid=db_session_uuid,
+            output_messages=[{"role": "assistant", "content": assistant_msg["content"]}],
+            content=assistant_msg["content"],
+            started_at=now,
+            completed_at=now,
+        )
+
+
 def _insert_tool_call_events(
     db_session: Session,
     *,
