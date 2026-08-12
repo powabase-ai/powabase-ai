@@ -118,7 +118,12 @@ class TestCreateSessionRoute:
                     )
 
         assert resp.status_code == 400
-        assert "error" in resp.get_json()
+        assert resp.get_json() == {
+            "error": (
+                "initial_messages[0] must have role 'user' — initial_messages must "
+                "alternate user/assistant, starting with user"
+            )
+        }
         mock_get_or_create.assert_not_called()
 
     def test_odd_count_rejected(self):
@@ -135,6 +140,12 @@ class TestCreateSessionRoute:
                     )
 
         assert resp.status_code == 400
+        assert resp.get_json() == {
+            "error": (
+                "initial_messages must contain an even number of messages "
+                "(user/assistant pairs); got 1"
+            )
+        }
         mock_get_or_create.assert_not_called()
 
     def test_role_mismatch_mid_sequence_rejected(self):
@@ -157,6 +168,12 @@ class TestCreateSessionRoute:
                     )
 
         assert resp.status_code == 400
+        assert resp.get_json() == {
+            "error": (
+                "initial_messages[1] must have role 'assistant' — initial_messages must "
+                "alternate user/assistant, starting with user"
+            )
+        }
         mock_get_or_create.assert_not_called()
 
     def test_non_string_content_rejected(self):
@@ -173,6 +190,7 @@ class TestCreateSessionRoute:
                     )
 
         assert resp.status_code == 400
+        assert resp.get_json() == {"error": "initial_messages[0] content must be a string"}
         mock_get_or_create.assert_not_called()
 
     def test_non_list_initial_messages_rejected(self):
@@ -188,6 +206,7 @@ class TestCreateSessionRoute:
                     )
 
         assert resp.status_code == 400
+        assert resp.get_json() == {"error": "initial_messages must be a list"}
         mock_get_or_create.assert_not_called()
 
     def test_non_dict_message_item_rejected(self):
@@ -203,7 +222,105 @@ class TestCreateSessionRoute:
                     )
 
         assert resp.status_code == 400
+        assert resp.get_json() == {"error": "initial_messages[0] must be an object"}
         mock_get_or_create.assert_not_called()
+
+    def test_validation_error_names_the_offending_index(self):
+        """A 200-message import with one bad entry at position 137 must say
+        which entry and why — not a blanket alternation message that
+        misdiagnoses every shape failure as an ordering failure."""
+        app = _make_test_app()
+        msgs = []
+        for i in range(100):
+            msgs.append({"role": "user", "content": f"Q{i}"})
+            msgs.append({"role": "assistant", "content": f"A{i}"})
+        msgs[137]["content"] = None
+
+        with patch.object(agents_route, "get_or_create_session") as mock_get_or_create:
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{AGENT_ID}/sessions",
+                        json={"initial_messages": msgs},
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 400
+        assert resp.get_json() == {"error": "initial_messages[137] content must be a string"}
+        mock_get_or_create.assert_not_called()
+
+    def test_empty_content_rejected(self):
+        """Empty content renders inconsistently downstream — get_chat_messages
+        drops empty assistant turns while load_session_history hands them to
+        the model, so the UI and the LLM see different conversations."""
+        app = _make_test_app()
+        msgs = [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "   "},
+        ]
+
+        with patch.object(agents_route, "get_or_create_session") as mock_get_or_create:
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{AGENT_ID}/sessions",
+                        json={"initial_messages": msgs},
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 400
+        assert resp.get_json() == {"error": "initial_messages[1] content must not be empty"}
+        mock_get_or_create.assert_not_called()
+
+    def test_seed_length_is_capped(self):
+        """Each pair costs an INSERT plus a session-timestamp UPDATE in one
+        open write transaction; unbounded input is an unbounded transaction.
+        Capped at the 200 this codebase already clamps list limits to."""
+        app = _make_test_app()
+        msgs = []
+        for i in range(101):
+            msgs.append({"role": "user", "content": f"Q{i}"})
+            msgs.append({"role": "assistant", "content": f"A{i}"})
+
+        with patch.object(agents_route, "get_or_create_session") as mock_get_or_create:
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{AGENT_ID}/sessions",
+                        json={"initial_messages": msgs},
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 400
+        assert resp.get_json() == {"error": "initial_messages is limited to 200 messages; got 202"}
+        mock_get_or_create.assert_not_called()
+
+    def test_seed_at_the_cap_is_accepted(self):
+        app = _make_test_app()
+        msgs = []
+        for i in range(100):
+            msgs.append({"role": "user", "content": f"Q{i}"})
+            msgs.append({"role": "assistant", "content": f"A{i}"})
+        fake_db_session = MagicMock()
+        fake_db_session.execute.return_value.fetchone.return_value = ("gpt-4o-mini",)
+
+        with (
+            patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+            patch.object(agents_route, "seed_session_runs") as mock_seed,
+            patch.object(agents_route.db, "session", fake_db_session),
+        ):
+            mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{AGENT_ID}/sessions",
+                        json={"initial_messages": msgs},
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 201
+        mock_seed.assert_called_once()
 
     def test_valid_messages_seeded_and_session_committed(self):
         """Valid alternating messages: get_or_create_session then
@@ -217,6 +334,9 @@ class TestCreateSessionRoute:
             {"role": "assistant", "content": "A2"},
         ]
         fake_db_session = MagicMock()
+        # The agent-existence check returns the agent's model, which is handed
+        # to the seeding helper so it need not resolve identity per run.
+        fake_db_session.execute.return_value.fetchone.return_value = ("gpt-4o-mini",)
 
         manager = MagicMock()
         with (
@@ -243,7 +363,9 @@ class TestCreateSessionRoute:
         mock_get_or_create.assert_called_once_with(
             db_session=fake_db_session, agent_id=AGENT_ID, user_id=USER_ID
         )
-        mock_seed.assert_called_once_with(fake_db_session, "db-uuid-1", msgs)
+        mock_seed.assert_called_once_with(
+            fake_db_session, "db-uuid-1", msgs, agent_id=AGENT_ID, model="gpt-4o-mini"
+        )
 
         # get_or_create_session, then seed_session_runs, then commit — in order.
         assert [c[0] for c in manager.mock_calls] == [
@@ -654,6 +776,30 @@ class TestSeedSessionRuns:
             seed_session_runs(fake_db_session, "db-uuid-1", [])
 
         mock_persist.assert_not_called()
+
+    def test_agent_identity_is_passed_through_to_every_run(self):
+        """persist_agent_run resolves (agent_id, model) from the session with a
+        SELECT when the caller supplies neither — once per pair. The caller
+        knows both, so it hands them over and the loop stays write-only."""
+        msgs = [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "A1"},
+            {"role": "user", "content": "Q2"},
+            {"role": "assistant", "content": "A2"},
+        ]
+        fake_db_session = MagicMock()
+
+        with patch("agentic_project_service.services.session.persist_agent_run") as mock_persist:
+            seed_session_runs(
+                fake_db_session, "db-uuid-1", msgs, agent_id="agent-uuid", model="gpt-4o-mini"
+            )
+
+        assert mock_persist.call_count == 2
+        for call in mock_persist.call_args_list:
+            assert call.kwargs["agent_id"] == "agent-uuid"
+            assert call.kwargs["model"] == "gpt-4o-mini"
+        # Nothing was read from the database on the way through.
+        fake_db_session.execute.assert_not_called()
 
     def test_each_pair_gets_a_strictly_increasing_created_at(self):
         """load_session_history orders by created_at ASC with no tie-break, so

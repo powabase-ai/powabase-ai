@@ -638,6 +638,8 @@ def seed_session_runs(
     db_session: Session,
     db_session_uuid: str,
     initial_messages: list[dict],
+    agent_id: str | None = None,
+    model: str | None = None,
 ) -> None:
     """Persist seed messages as synthetic completed runs, one per
     user/assistant pair, so load_session_history reconstructs them in
@@ -652,6 +654,10 @@ def seed_session_runs(
     has no tie-break — so each pair is stamped one microsecond after the
     last rather than left to a fresh `datetime.now(UTC)` per run, which
     ties whenever two runs land inside the same microsecond.
+
+    `agent_id` / `model` are passed straight through: the caller already
+    knows both, and supplying them keeps persist_agent_run from
+    re-resolving the same pair from the session once per run.
     """
     base = datetime.now(UTC)
     for pair_index, i in enumerate(range(0, len(initial_messages), 2)):
@@ -668,6 +674,8 @@ def seed_session_runs(
             started_at=stamp,
             completed_at=stamp,
             created_at=stamp,
+            agent_id=agent_id,
+            model=model,
         )
 
 

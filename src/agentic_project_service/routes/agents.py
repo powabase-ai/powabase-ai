@@ -1187,6 +1187,47 @@ def list_sessions(agent_id: str):
     )
 
 
+# Seeding writes one INSERT plus a session-timestamp UPDATE per pair inside a
+# single open write transaction, so the input has to be bounded. 200 is the
+# clamp this codebase already applies to list limits.
+_MAX_SEED_MESSAGES = 200
+
+
+def _validate_seed_messages(messages: list) -> str | None:
+    """Return the first problem with a seed conversation, or None.
+
+    One message per failure, naming the offending index and the actual reason:
+    a 200-message import with a null content at position 137 should not be
+    diagnosed as an ordering problem.
+    """
+    if len(messages) % 2 != 0:
+        return (
+            "initial_messages must contain an even number of messages "
+            f"(user/assistant pairs); got {len(messages)}"
+        )
+    for i, message in enumerate(messages):
+        if not isinstance(message, dict):
+            return f"initial_messages[{i}] must be an object"
+        expected_role = "user" if i % 2 == 0 else "assistant"
+        if message.get("role") != expected_role:
+            # A leading system message lands here too: only strict
+            # user/assistant alternation is supported.
+            return (
+                f"initial_messages[{i}] must have role '{expected_role}' — "
+                "initial_messages must alternate user/assistant, starting with user"
+            )
+        content = message.get("content")
+        if not isinstance(content, str):
+            # As do structured content blocks — seeds are plain text.
+            return f"initial_messages[{i}] content must be a string"
+        if not content.strip():
+            # get_chat_messages drops empty assistant turns while
+            # load_session_history hands them to the model, so an empty seed
+            # would show the UI and the LLM different conversations.
+            return f"initial_messages[{i}] content must not be empty"
+    return None
+
+
 @agents_bp.route("/<agent_id>/sessions", methods=["POST"])
 @require_auth
 def create_session_for_agent(agent_id: str):
@@ -1195,6 +1236,11 @@ def create_session_for_agent(agent_id: str):
     Generic conversation seeding: import, human-agent handoff, memory
     compaction. Seeds become synthetic completed runs so history
     reconstruction needs no special cases.
+
+    Seed messages keep `role` and `content` only — anything else on a message
+    (timestamps, name, tool_calls) is dropped, and every run is re-stamped with
+    a fresh id and import-time timestamps. Top-level `session_id` and
+    `metadata` are not accepted: this endpoint always creates.
     """
     # agents.id is a uuid column: a non-uuid path segment would make the
     # existence check itself raise 22P02 and poison the transaction, so parse
@@ -1221,15 +1267,18 @@ def create_session_for_agent(agent_id: str):
         initial = []
     elif not isinstance(initial, list):
         return jsonify({"error": "initial_messages must be a list"}), 400
-    if len(initial) % 2 != 0 or any(
-        not isinstance(m, dict)
-        or m.get("role") != ("user" if i % 2 == 0 else "assistant")
-        or not isinstance(m.get("content"), str)
-        for i, m in enumerate(initial)
-    ):
+    if len(initial) > _MAX_SEED_MESSAGES:
         return jsonify(
-            {"error": "initial_messages must alternate user/assistant, starting with user"}
+            {
+                "error": (
+                    f"initial_messages is limited to {_MAX_SEED_MESSAGES} messages; "
+                    f"got {len(initial)}"
+                )
+            }
         ), 400
+    invalid = _validate_seed_messages(initial)
+    if invalid:
+        return jsonify({"error": invalid}), 400
 
     # An import or handoff is performed *for* a user by a service-role caller
     # whose own JWT `sub` is not that user. Without an explicit owner the
@@ -1250,9 +1299,10 @@ def create_session_for_agent(agent_id: str):
         user_id = str(requested_user_id)
 
     # agent_id is a foreign key on agent_sessions — check existence before
-    # writing so a bad id is a clean 404, not an integrity error.
+    # writing so a bad id is a clean 404, not an integrity error. The model
+    # comes back with it so seeding does not re-resolve the pair per run.
     agent_row = db.session.execute(
-        text(f'SELECT 1 FROM "{AI_SCHEMA}".agents WHERE id = :id'),
+        text(f'SELECT model FROM "{AI_SCHEMA}".agents WHERE id = :id'),
         {"id": agent_id},
     ).fetchone()
     if not agent_row:
@@ -1264,7 +1314,9 @@ def create_session_for_agent(agent_id: str):
         user_id=user_id,
     )
     if initial:
-        seed_session_runs(db.session, db_session_uuid, initial)
+        seed_session_runs(
+            db.session, db_session_uuid, initial, agent_id=agent_id, model=agent_row[0]
+        )
     # The check above is not a lock: the agent can be deleted before this
     # commit, and the foreign key then rejects the insert. Same 404, no 500.
     try:
