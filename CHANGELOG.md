@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/powabase-ai/powabase-ai/compare/v0.5.0...v0.6.0) (2026-08-12)
+
+
+### Features
+
+* session creation with seeding + session delete ([#54](https://github.com/powabase-ai/powabase-ai/issues/54)) ([1ae64c7](https://github.com/powabase-ai/powabase-ai/commit/1ae64c7ad953e7a507ee9e30f90f1dab9e1b912d))
+
 ## [0.5.0](https://github.com/powabase-ai/powabase-ai/compare/v0.4.0...v0.5.0) (2026-08-11)
 
 
