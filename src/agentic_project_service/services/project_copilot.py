@@ -16,6 +16,7 @@ bespoke per-turn charge — that would double-charge the same turn.
 import json
 import logging
 import os
+import time
 from typing import Any, Callable
 
 import httpx
@@ -26,7 +27,7 @@ from agentic.agent.tools import BuiltinTool
 from agentic.execution.context import ExecutionContext
 
 from .ai_provider_keys_resolver import resolve_api_key_or_raise_for_drop
-from .guide_launch_claim import looks_like_guide_launch_claim
+from .guide_launch_claim import looks_like_guide_launch_assertion
 from . import billing_port as billing
 
 # Reuse the workflow copilot's read-only project-introspection resolvers and
@@ -477,18 +478,41 @@ def _build_input_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]
     return out
 
 
-# Fed back to the model (as a user turn, unpersisted) when its reply claimed a
+# Fed back to the model (as a user turn, unpersisted) when its reply ASSERTED a
 # walkthrough launch but never called play_guide. The system prompt already
 # orders "call play_guide first" twice; observed live, the model still
 # occasionally narrates a launch without the tool round-trip — a prompt can
-# reduce that, only this guard can repair it.
+# reduce that, only this guard can repair it. The nudge asks for the SAME reply
+# back (the original already carries the docs grounding from run 1's tool
+# calls) — a from-scratch shorter answer would trade a grounded reply for a
+# terse one, and run 1's docs notice would then mis-describe run 2's content.
 _LAUNCH_CLAIM_NUDGE = (
-    "Correction: your previous reply told the user a walkthrough was being "
-    "launched, started, shown, or highlighted, but you never called the "
-    "`play_guide` tool, so NOTHING appeared on their screen. If a walkthrough "
-    "in your list fits the user's goal, call `play_guide` with its sequence_id "
-    "NOW and then restate your reply briefly. If none fits, rewrite the reply "
-    "without claiming a launch. Do not apologise for or mention this correction."
+    "Correction: your previous reply told the user a walkthrough was launching "
+    "or launched, but you never called the `play_guide` tool, so NOTHING "
+    "appeared on their screen. If a walkthrough in your list matches what you "
+    "claimed, call `play_guide` with its sequence_id now, then repeat your "
+    "previous reply essentially unchanged — do not re-research or shorten it. "
+    "If none matches, repeat the reply with the launch claim removed. Do not "
+    "apologise for or mention this correction."
+)
+
+# Bounds on the repair. The retry exists to make one tool call and echo the
+# reply back — not to run a fresh research loop — and the route streams for at
+# most 300s with a 360s turn-lock TTL behind it: an unbounded repair on top of
+# an already-long turn streams the user an error while the worker finishes
+# (stream/DB divergence, plus the documented double-charge race) and can
+# outlive the lock. Past the time budget the repair is skipped and the false
+# claim corrected textually instead.
+_REPAIR_MAX_STEPS = 4
+_REPAIR_TIME_BUDGET_SECONDS = 150
+
+# Appended whenever a false launch claim would otherwise reach the user
+# verbatim (repair skipped for time, retry failed, or retry still claiming):
+# at that point the backend KNOWS no walkthrough launched, and silence would
+# deliver a claim it can prove false.
+_CLAIM_CORRECTION_SUFFIX = (
+    "\n\n*(Correction: the walkthrough was not actually launched — say the "
+    "word and I'll launch it.)*"
 )
 
 
@@ -503,12 +527,19 @@ def run_project_copilot_chat(
     ``search_docs`` call degraded, so the caller can warn the user the answer
     wasn't grounded in the docs.
 
-    If the reply *claims* a walkthrough launch while ``play_guide`` was never
+    If the reply *asserts* a walkthrough launch while ``play_guide`` was never
     called (the "show, don't tell" failure observed in smoke testing), the turn
-    is re-run once with a corrective nudge — the retry's reply and tool calls
-    replace the original. A failed retry falls back to the original reply; the
-    Studio's ``guide_launch_missing`` telemetry still observes that case.
+    is re-run once with a corrective nudge — bounded by ``_REPAIR_MAX_STEPS``
+    and skipped entirely past ``_REPAIR_TIME_BUDGET_SECONDS`` — and the retry's
+    reply and tool calls replace the original. Whenever the false claim would
+    still reach the user (repair skipped, retry failed, or retry claiming
+    again), ``_CLAIM_CORRECTION_SUFFIX`` is appended so the backend never
+    delivers a claim it can prove false. Every repair attempt logs one
+    ``project_copilot_launch_claim_repair outcome=…`` line — successful repairs
+    mask the Studio's ``guide_launch_missing`` telemetry, so this log line IS
+    the measurement of the underlying prompt defect's rate.
     """
+    started_at = time.monotonic()
     guide_accumulator: list[str | None] = [None]
     notice_accumulator: list[str | None] = [None]
     tools = build_project_copilot_tools(guide_accumulator, notice_accumulator)
@@ -544,39 +575,86 @@ def run_project_copilot_chat(
             max_steps=PROJECT_COPILOT_MAX_STEPS,
             context=ctx,
         )
+        if output.is_failed():
+            logger.error("Project copilot agent failed: %s", output.error)
+            raise RuntimeError(output.error or "Project copilot agent failed")
 
-        # Launch-claim guard: the reply says a walkthrough is launching but
+        content = output.content or ""
+
+        # Launch-claim repair: the reply ASSERTS a walkthrough is launching but
         # play_guide never ran → nothing will appear on screen. Re-run the turn
         # once with the offending reply + a corrective nudge appended (neither
         # is persisted; the retry's reply replaces the original everywhere).
-        if (
-            not output.is_failed()
-            and guide_accumulator[0] is None
-            and looks_like_guide_launch_claim(output.content)
-        ):
-            logger.warning(
-                "Project copilot claimed a walkthrough launch without calling "
-                "play_guide; retrying the turn with a corrective nudge"
+        # looks_like_guide_launch_assertion is strict on purpose — a false
+        # positive here converts a permission question into an unrequested
+        # launch (see guide_launch_claim.py).
+        if guide_accumulator[0] is None and looks_like_guide_launch_assertion(content):
+            content = _repair_launch_claim(
+                agent, input_messages, content, tools, guide_accumulator, on_event, started_at
             )
-            retry = agent.run(
-                input=input_messages
-                + [
-                    {"role": "assistant", "content": output.content or ""},
-                    {"role": "user", "content": _LAUNCH_CLAIM_NUDGE},
-                ],
-                tools=tools,
-                max_steps=PROJECT_COPILOT_MAX_STEPS,
-                context=ctx,
-            )
-            if retry.is_failed():
-                # Keep the answer we already have rather than failing the turn;
-                # the claim-without-launch stays observable client-side.
-                logger.error("Launch-claim corrective retry failed: %s", retry.error)
-            else:
-                output = retry
 
-    if output.is_failed():
-        logger.error("Project copilot agent failed: %s", output.error)
-        raise RuntimeError(output.error or "Project copilot agent failed")
+    return (content, guide_accumulator[0], notice_accumulator[0])
 
-    return (output.content or "", guide_accumulator[0], notice_accumulator[0])
+
+def _repair_launch_claim(
+    agent,
+    input_messages: list[dict[str, str]],
+    content: str,
+    tools: dict[str, BuiltinTool],
+    guide_accumulator: list,
+    on_event: Callable[[dict], None] | None,
+    started_at: float,
+) -> str:
+    """Run the bounded corrective retry; return the content to deliver.
+
+    Outcomes (one structured log line each):
+      launched            — retry called play_guide; its reply is delivered
+      rewrote             — retry dropped the claim without launching
+      still_claiming      — retry claimed again; delivered WITH correction
+      retry_failed        — retry errored; original delivered WITH correction
+      skipped_time_budget — turn too old to retry; original WITH correction
+    """
+    elapsed = time.monotonic() - started_at
+    if elapsed > _REPAIR_TIME_BUDGET_SECONDS:
+        outcome, content = "skipped_time_budget", content + _CLAIM_CORRECTION_SUFFIX
+    else:
+        # The panel renders reasoning deltas into one live buffer per turn —
+        # streaming the retry's reasoning would show the model thinking about
+        # its own false claim. Keep tool_call events (the "Using play_guide…"
+        # status line is honest and useful); drop reasoning only.
+        retry_on_event = None
+        if on_event is not None:
+
+            def retry_on_event(event: dict) -> None:
+                if event.get("type") != "reasoning_delta":
+                    on_event(event)
+
+        retry = agent.run(
+            input=input_messages
+            + [
+                {"role": "assistant", "content": content},
+                {"role": "user", "content": _LAUNCH_CLAIM_NUDGE},
+            ],
+            tools=tools,
+            max_steps=_REPAIR_MAX_STEPS,
+            context=ExecutionContext(on_event=retry_on_event),
+        )
+        if retry.is_failed():
+            # Keep the answer we already have rather than failing the turn —
+            # but never deliver the claim unmarked: at this point the backend
+            # knows it is false.
+            outcome, content = "retry_failed", content + _CLAIM_CORRECTION_SUFFIX
+        elif guide_accumulator[0] is not None:
+            outcome, content = "launched", retry.content or ""
+        elif looks_like_guide_launch_assertion(retry.content or ""):
+            outcome, content = "still_claiming", (retry.content or "") + _CLAIM_CORRECTION_SUFFIX
+        else:
+            outcome, content = "rewrote", retry.content or ""
+
+    logger.warning(
+        "project_copilot_launch_claim_repair outcome=%s elapsed_s=%.1f guide=%s",
+        outcome,
+        elapsed,
+        guide_accumulator[0],
+    )
+    return content
