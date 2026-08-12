@@ -51,9 +51,9 @@ class TestSeedingOnBehalfOfAUser:
         self, client, mock_auth, auth_headers, test_agent, app, mocker
     ):
         """The import use case: a service-role caller seeds a conversation for
-        an end user, who must then see it. Falling back to the caller's own
-        JWT `sub` leaves user_id NULL, and the session is invisible to
-        list_sessions and undeletable through the agent-scoped route."""
+        an end user, who must then see it. Naming the owner is the only way a
+        service-role create can produce a session that shows up in
+        list_sessions and is deletable through the agent-scoped route."""
         target_user = str(uuid.uuid4())
         mocker.patch(
             "agentic_project_service.auth.decode_jwt",
@@ -93,6 +93,64 @@ class TestSeedingOnBehalfOfAUser:
             f"/api/agents/{test_agent['id']}/sessions/{session_id}", headers=auth_headers
         )
         assert deleted.status_code == 204
+
+    def test_service_role_bare_session_is_written_with_a_null_owner(
+        self, client, mock_auth, auth_headers, test_agent, app, mocker
+    ):
+        """A service token's `sub` is not a project user and is not a uuid, so
+        it is never forwarded as the owner — the column really goes to NULL.
+        Forwarding it would fail the INSERT with 22P02 rather than write this
+        row at all."""
+        mocker.patch(
+            "agentic_project_service.auth.decode_jwt",
+            return_value={"sub": "service", "role": "service_role", "is_service_role": True},
+        )
+        resp = client.post(
+            f"/api/agents/{test_agent['id']}/sessions",
+            json={},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 201, resp.get_data(as_text=True)
+        session_id = resp.get_json()["session_id"]
+
+        with app.app_context():
+            owner = db.session.execute(
+                text('SELECT user_id FROM "ai".agent_sessions WHERE session_id = :sid'),
+                {"sid": session_id},
+            ).scalar()
+        assert owner is None
+
+    def test_service_role_cannot_seed_a_session_it_names_no_owner_for(
+        self, client, mock_auth, auth_headers, test_agent, app, mocker
+    ):
+        """A NULL-owner session passes the `owner is not None` run/stream
+        ownership checks for every authenticated user, so an ownerless session
+        carrying an imported conversation hands that conversation to anyone who
+        learns its id. Rejected before anything is written."""
+        mocker.patch(
+            "agentic_project_service.auth.decode_jwt",
+            return_value={"sub": "service", "role": "service_role", "is_service_role": True},
+        )
+        resp = client.post(
+            f"/api/agents/{test_agent['id']}/sessions",
+            json={
+                "initial_messages": [
+                    {"role": "user", "content": "Q1"},
+                    {"role": "assistant", "content": "A1"},
+                ]
+            },
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400
+        assert resp.get_json() == {
+            "error": "user_id is required to seed initial_messages as service role"
+        }
+
+        with app.app_context():
+            sessions = db.session.execute(text('SELECT COUNT(*) FROM "ai".agent_sessions')).scalar()
+            runs = db.session.execute(text('SELECT COUNT(*) FROM "ai".agent_runs')).scalar()
+        assert sessions == 0
+        assert runs == 0
 
 
 class TestSeedRoundTrip:

@@ -1281,22 +1281,42 @@ def create_session_for_agent(agent_id: str):
         return jsonify({"error": invalid}), 400
 
     # An import or handoff is performed *for* a user by a service-role caller
-    # whose own JWT `sub` is not that user. Without an explicit owner the
-    # session lands with user_id NULL: absent from list_sessions and, since
-    # get_session_owner then returns None, undeletable through this blueprint.
+    # whose own JWT `sub` is not that user — and, for a service token, is not a
+    # uuid at all, so it can never stand in as the owner of a column that is
+    # one. A service-role create therefore owns the session to the `user_id`
+    # the body names, or to nobody.
+    #
+    # Owning it to nobody is not merely an invisibility problem. list_sessions
+    # skips a NULL-owner session and the agent-scoped DELETE below 404s for
+    # every user-scoped caller, but run_agent and the streaming path gate on
+    # `owner is not None and owner != user_id` — which a NULL owner passes for
+    # *every* authenticated user of the project. Anyone who learns the `sess_`
+    # id can attach to it and have the model replay what is in it. A bare
+    # ownerless session exposes nothing; one pre-loaded with an imported
+    # conversation exposes that conversation, so the combination is refused.
+    #
     # Only service role may name an owner, and a user-scoped caller that tries
     # is refused rather than silently ignored — ignoring it would return 201
     # for a session belonging to someone other than the one asked for.
-    user_id = get_current_user_id()
+    is_service_role = (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False)
     requested_user_id = data.get("user_id")
-    if requested_user_id is not None:
-        if not (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False):
+    if requested_user_id is None:
+        if is_service_role and initial:
+            return jsonify(
+                {"error": "user_id is required to seed initial_messages as service role"}
+            ), 400
+        user_id = None if is_service_role else get_current_user_id()
+    else:
+        if not is_service_role:
             return jsonify({"error": "Service role required to set user_id"}), 403
         try:
-            uuid.UUID(str(requested_user_id))
+            # Normalized, not merely validated: Python's parser accepts braced
+            # and `urn:uuid:` spellings that Postgres's uuid cast rejects, so
+            # binding the raw body string would fail the INSERT with 22P02 —
+            # a 500, since that is not an IntegrityError.
+            user_id = str(uuid.UUID(str(requested_user_id)))
         except ValueError:
             return jsonify({"error": "user_id must be a uuid"}), 400
-        user_id = str(requested_user_id)
 
     # agent_id is a foreign key on agent_sessions — check existence before
     # writing so a bad id is a clean 404, not an integrity error. The model

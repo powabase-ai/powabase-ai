@@ -616,9 +616,15 @@ class TestCreateSessionRoute:
 
 class TestCreateSessionOnBehalfOfAUser:
     """A service-role caller imports a conversation *for* an end user. Its JWT
-    `sub` is not that user, so without an explicit owner the session is written
-    with user_id NULL: invisible in list_sessions, and undeletable through the
-    agent-scoped route."""
+    `sub` is not that user — and is usually not a uuid at all — so the owner is
+    the `user_id` the body names, or NULL.
+
+    A NULL owner is not merely invisible. list_sessions skips it and the
+    agent-scoped DELETE 404s for every user-scoped caller, but run_agent and
+    the streaming path gate on `owner is not None and owner != user_id`, so an
+    ownerless session is attachable by *every* authenticated user of the
+    project. A bare ownerless session exposes nothing; one pre-loaded with an
+    imported conversation exposes that conversation."""
 
     def test_service_role_can_set_the_session_owner(self):
         app = _make_test_app()
@@ -666,8 +672,14 @@ class TestCreateSessionOnBehalfOfAUser:
         assert resp.get_json() == {"error": "Service role required to set user_id"}
         mock_get_or_create.assert_not_called()
 
-    def test_service_role_without_user_id_still_creates_a_session(self):
-        """Omitting user_id keeps the existing behaviour — the JWT `sub`."""
+    def test_service_role_without_user_id_creates_an_ownerless_session(self):
+        """A bare service-role create is allowed and lands with NULL owner.
+
+        The token's `sub` is never forwarded: a service token's subject is not
+        a project user, and `agent_sessions.user_id` is a uuid column — a
+        non-uuid `sub` would fail the INSERT with 22P02 (an uncaught 500) and
+        an absent one would produce this same NULL by accident.
+        """
         app = _make_test_app()
         fake_db_session = MagicMock()
         fake_db_session.execute.return_value.fetchone.return_value = ("gpt-4o-mini",)
@@ -687,7 +699,108 @@ class TestCreateSessionOnBehalfOfAUser:
                     )
 
         assert resp.status_code == 201
-        assert mock_get_or_create.call_args.kwargs["user_id"] == "service"
+        assert mock_get_or_create.call_args.kwargs["user_id"] is None
+
+    def test_service_role_seeding_without_user_id_is_rejected(self):
+        """An ownerless session pre-loaded with a conversation is readable by
+        every authenticated user of the project — the run/stream ownership
+        checks pass when the owner is NULL. Refuse the combination rather than
+        write it."""
+        app = _make_test_app()
+        fake_db_session = MagicMock()
+        fake_db_session.execute.return_value.fetchone.return_value = ("gpt-4o-mini",)
+
+        with (
+            patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+            patch.object(agents_route, "seed_session_runs") as mock_seed,
+            patch.object(agents_route.db, "session", fake_db_session),
+        ):
+            mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+            with _authed_as_service_role():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{AGENT_ID}/sessions",
+                        json={
+                            "initial_messages": [
+                                {"role": "user", "content": "Q1"},
+                                {"role": "assistant", "content": "A1"},
+                            ]
+                        },
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 400
+        assert resp.get_json() == {
+            "error": "user_id is required to seed initial_messages as service role"
+        }
+        mock_get_or_create.assert_not_called()
+        mock_seed.assert_not_called()
+        fake_db_session.commit.assert_not_called()
+
+    def test_user_scoped_caller_may_seed_without_naming_an_owner(self):
+        """The refusal above is about ownerless sessions, not about seeding: a
+        user-scoped caller owns what it creates, so its seed needs no user_id."""
+        app = _make_test_app()
+        fake_db_session = MagicMock()
+        fake_db_session.execute.return_value.fetchone.return_value = ("gpt-4o-mini",)
+
+        with (
+            patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+            patch.object(agents_route, "seed_session_runs") as mock_seed,
+            patch.object(agents_route.db, "session", fake_db_session),
+        ):
+            mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{AGENT_ID}/sessions",
+                        json={
+                            "initial_messages": [
+                                {"role": "user", "content": "Q1"},
+                                {"role": "assistant", "content": "A1"},
+                            ]
+                        },
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 201
+        assert mock_get_or_create.call_args.kwargs["user_id"] == USER_ID
+        mock_seed.assert_called_once()
+
+    def test_owner_uuid_is_normalized_before_it_is_written(self):
+        """`uuid.UUID` accepts braced and `urn:uuid:` spellings that Postgres's
+        uuid cast rejects, so the parsed value — not the raw body string — is
+        what gets bound."""
+        app = _make_test_app()
+        fake_db_session = MagicMock()
+        fake_db_session.execute.return_value.fetchone.return_value = ("gpt-4o-mini",)
+
+        for spelling in (
+            "6B8F0C11-4D2A-4F5E-9B7C-1E3A5D7F9021",
+            "{6b8f0c11-4d2a-4f5e-9b7c-1e3a5d7f9021}",
+            "urn:uuid:6b8f0c11-4d2a-4f5e-9b7c-1e3a5d7f9021",
+        ):
+            with (
+                patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+                patch.object(agents_route.db, "session", fake_db_session),
+            ):
+                mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+                with _authed_as_service_role():
+                    with app.test_client() as client:
+                        resp = client.post(
+                            f"/api/agents/{AGENT_ID}/sessions",
+                            json={"user_id": spelling},
+                            headers=_auth_headers(),
+                        )
+
+            assert resp.status_code == 201, spelling
+            assert (
+                mock_get_or_create.call_args.kwargs["user_id"]
+                == "6b8f0c11-4d2a-4f5e-9b7c-1e3a5d7f9021"
+            ), spelling
 
     def test_malformed_user_id_rejected(self):
         """agent_sessions.user_id is a uuid column — a non-uuid owner would
