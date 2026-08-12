@@ -256,9 +256,10 @@ class TestCreateSessionRoute:
         mock_get_or_create.assert_not_called()
 
     def test_empty_content_rejected(self):
-        """Empty content renders inconsistently downstream — get_chat_messages
-        drops empty assistant turns while load_session_history hands them to
-        the model, so the UI and the LLM see different conversations."""
+        """Nothing downstream drops an empty turn: get_chat_messages falls to
+        its output_messages branch and emits `content: ""`, and
+        load_session_history hands the same blank message to the model. A blank
+        turn would land in both the transcript and the model's context."""
         app = _make_test_app()
         msgs = [
             {"role": "user", "content": "Q1"},
@@ -300,6 +301,66 @@ class TestCreateSessionRoute:
         assert resp.status_code == 400
         assert resp.get_json() == {"error": "initial_messages is limited to 200 messages; got 202"}
         mock_get_or_create.assert_not_called()
+
+    def test_oversized_message_content_rejected(self):
+        """The 200-message cap bounds the number of INSERTs, not their size —
+        200 arbitrarily large strings are still the unbounded write transaction
+        the cap exists to prevent. Each message is bounded too."""
+        app = _make_test_app()
+        msgs = [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "x" * 20_001},
+        ]
+        fake_db_session = MagicMock()
+        fake_db_session.execute.return_value.fetchone.return_value = ("gpt-4o-mini",)
+
+        with (
+            patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+            patch.object(agents_route, "seed_session_runs"),
+            patch.object(agents_route.db, "session", fake_db_session),
+        ):
+            mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{AGENT_ID}/sessions",
+                        json={"initial_messages": msgs},
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 400
+        assert resp.get_json() == {
+            "error": "initial_messages[1] content is limited to 20000 characters; got 20001"
+        }
+        mock_get_or_create.assert_not_called()
+
+    def test_message_content_at_the_size_cap_is_accepted(self):
+        app = _make_test_app()
+        msgs = [
+            {"role": "user", "content": "x" * 20_000},
+            {"role": "assistant", "content": "y" * 20_000},
+        ]
+        fake_db_session = MagicMock()
+        fake_db_session.execute.return_value.fetchone.return_value = ("gpt-4o-mini",)
+
+        with (
+            patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+            patch.object(agents_route, "seed_session_runs") as mock_seed,
+            patch.object(agents_route.db, "session", fake_db_session),
+        ):
+            mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{AGENT_ID}/sessions",
+                        json={"initial_messages": msgs},
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 201
+        mock_seed.assert_called_once()
 
     def test_seed_at_the_cap_is_accepted(self):
         app = _make_test_app()
@@ -584,6 +645,31 @@ class TestCreateSessionRoute:
 
         assert resp.status_code == 400
         assert resp.get_json() == {"error": "Request body must be valid JSON"}
+        mock_get_or_create.assert_not_called()
+
+    def test_literal_null_body_is_diagnosed_as_a_non_object(self):
+        """A body of `null` parses fine — it is just not an object. Telling the
+        client its JSON is invalid sends it looking for a syntax error it does
+        not have."""
+        app = _make_test_app()
+
+        with (
+            patch.object(agents_route, "get_or_create_session") as mock_get_or_create,
+            patch.object(agents_route.db, "session", MagicMock()),
+        ):
+            mock_get_or_create.return_value = ("db-uuid-1", "sess_abc123", True)
+
+            with _authed_as():
+                with app.test_client() as client:
+                    resp = client.post(
+                        f"/api/agents/{AGENT_ID}/sessions",
+                        data="null",
+                        content_type="application/json",
+                        headers=_auth_headers(),
+                    )
+
+        assert resp.status_code == 400
+        assert resp.get_json() == {"error": "Request body must be a JSON object"}
         mock_get_or_create.assert_not_called()
 
     def test_non_object_json_body_rejected(self):

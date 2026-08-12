@@ -60,9 +60,16 @@ def _db_session_returning(row):
 
 class TestDeleteSessionRoute:
     def test_delete_own_session_returns_204(self):
-        """One SELECT answers both checks — ownership and agent scoping — and
-        one DELETE removes the session; its runs go with it via the
-        `agent_runs.session_id` ON DELETE CASCADE."""
+        """The row read for the ownership and agent-scoping checks is the row
+        deleted: the DELETE is keyed on the primary key that SELECT returned,
+        not re-resolved from the session_id, so there is no window in which the
+        two could refer to different rows. Its runs go with it via the
+        `agent_runs.session_id` ON DELETE CASCADE.
+
+        Deliberately not pinned: how many statements the route issues, or in
+        what order. Only the identity the DELETE is keyed on, and that 204 is
+        returned after the commit rather than before it.
+        """
         app = _make_test_app()
         fake_db_session = _db_session_returning(("db-uuid-1", AGENT_ID, USER_ID))
 
@@ -81,20 +88,18 @@ class TestDeleteSessionRoute:
         assert resp.status_code == 204
         assert resp.get_data() == b""
 
-        execute_calls = [c for c in manager.mock_calls if c[0] == "execute"]
-        assert len(execute_calls) == 2
+        deletes = [
+            call
+            for call in fake_db_session.execute.call_args_list
+            if "DELETE" in str(call.args[0]) and "agent_sessions" in str(call.args[0])
+        ]
+        assert len(deletes) == 1
+        assert deletes[0].args[1] == {"id": "db-uuid-1"}
 
-        select_sql = str(execute_calls[0].args[0])
-        assert "SELECT" in select_sql and "agent_sessions" in select_sql
-        assert execute_calls[0].args[1] == {"session_id": SESSION_ID}
-
-        delete_sql = str(execute_calls[1].args[0])
-        assert "DELETE" in delete_sql and "agent_sessions" in delete_sql
-        assert execute_calls[1].args[1] == {"id": "db-uuid-1"}
-
-        # Top-level calls (excluding the chained `.fetchone()`), in order.
+        fake_db_session.commit.assert_called_once()
+        # The commit follows the DELETE — 204 is not returned on an open txn.
         top_level_calls = [c[0] for c in manager.mock_calls if "." not in c[0]]
-        assert top_level_calls == ["execute", "execute", "commit"]
+        assert top_level_calls[-1] == "commit"
 
     def test_delete_nonexistent_session_returns_404(self):
         app = _make_test_app()

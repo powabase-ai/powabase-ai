@@ -1192,6 +1192,13 @@ def list_sessions(agent_id: str):
 # clamp this codebase already applies to list limits.
 _MAX_SEED_MESSAGES = 200
 
+# A message count bounds the number of statements, not the bytes they carry —
+# 200 arbitrarily large strings are still the unbounded transaction the cap
+# above exists to prevent. 20k characters is generous for a conversation turn
+# (a seed is a transcript, not a document store) and puts the worst-case import
+# at roughly 4 MB of message text.
+_MAX_SEED_MESSAGE_CHARS = 20_000
+
 
 def _validate_seed_messages(messages: list) -> str | None:
     """Return the first problem with a seed conversation, or None.
@@ -1221,10 +1228,16 @@ def _validate_seed_messages(messages: list) -> str | None:
             # As do structured content blocks — seeds are plain text.
             return f"initial_messages[{i}] content must be a string"
         if not content.strip():
-            # get_chat_messages drops empty assistant turns while
-            # load_session_history hands them to the model, so an empty seed
-            # would show the UI and the LLM different conversations.
+            # Nothing downstream drops an empty turn: get_chat_messages falls
+            # to its output_messages branch and emits `content: ""`, and
+            # load_session_history hands the same blank message to the model.
+            # A blank turn would sit in both the transcript and the context.
             return f"initial_messages[{i}] content must not be empty"
+        if len(content) > _MAX_SEED_MESSAGE_CHARS:
+            return (
+                f"initial_messages[{i}] content is limited to "
+                f"{_MAX_SEED_MESSAGE_CHARS} characters; got {len(content)}"
+            )
     return None
 
 
@@ -1264,7 +1277,13 @@ def create_session_for_agent(agent_id: str):
         # parse (invalid JSON, or no application/json content type) must not be
         # downgraded to a bare session — that discards the imported
         # conversation and reports it as a success.
-        if request.get_data():
+        raw = request.get_data()
+        if raw.strip() == b"null" and request.is_json:
+            # A literal `null` is valid JSON that get_json() also reports as
+            # None. Answering "must be valid JSON" would send the client
+            # looking for a syntax error it does not have.
+            return jsonify({"error": "Request body must be a JSON object"}), 400
+        if raw:
             return jsonify({"error": "Request body must be valid JSON"}), 400
         data = {}
     if not isinstance(data, dict):
@@ -1347,6 +1366,11 @@ def create_session_for_agent(agent_id: str):
         )
     # The check above is not a lock: the agent can be deleted before this
     # commit, and the foreign key then rejects the insert. Same 404, no 500.
+    #
+    # Reporting *every* IntegrityError as a missing agent is truthful only
+    # because the agent foreign key is the one constraint these two inserts can
+    # realistically violate. Any new constraint on agent_sessions or agent_runs
+    # needs this branch to distinguish them, or it will be misreported here.
     try:
         db.session.commit()
     except IntegrityError:
