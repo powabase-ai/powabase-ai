@@ -107,46 +107,61 @@ def mock_auth(mocker):
 # ---------------------------------------------------------------------------
 
 
+# Tables the cleanup below empties, most-dependent first. Not all of them exist
+# in every database this suite runs against: the `app` fixture bootstraps with
+# `db.metadata.create_all`, which builds the ORM-declared tables only, while a
+# few of these are declared in the deployment's base schema instead
+# (`workflow_block_logs` is the current example). TRUNCATE names every table in
+# one statement, so a single missing one would fail the whole teardown; the
+# list is intersected with what the database actually has.
+_CLEANUP_TABLES = (
+    "workflow_block_logs",
+    "workflow_executions",
+    "hooks",
+    "orchestration_runs",
+    "orchestration_sessions",
+    "orchestration_entities",
+    "orchestrations",
+    "agent_runs",
+    "agent_sessions",
+    "agent_mcp_servers",
+    "agent_tools",
+    "agent_knowledge_bases",
+    "context_handlers",
+    "enrichment_configs",
+    "embeddings",
+    "chunks",
+    "full_documents",
+    "page_index_nodes",
+    "page_index_toc",
+    "graph_index_nodes",
+    "graph_index_toc",
+    "doc2json_documents",
+    "indexed_sources",
+    "sources",
+    "knowledge_bases",
+    "agents",
+    "tools",
+    "ai_provider_keys",
+    "project_copilot_sessions",
+    "project_copilot_messages",
+)
+
+
 @pytest.fixture(autouse=True)
 def db_cleanup(app):
     """Truncate all ai-schema tables between tests."""
     yield
     with app.app_context():
-        db.session.execute(
-            text(
-                "TRUNCATE "
-                '"ai".workflow_block_logs, '
-                '"ai".workflow_executions, '
-                '"ai".hooks, '
-                '"ai".orchestration_runs, '
-                '"ai".orchestration_sessions, '
-                '"ai".orchestration_entities, '
-                '"ai".orchestrations, '
-                '"ai".agent_runs, '
-                '"ai".agent_sessions, '
-                '"ai".agent_mcp_servers, '
-                '"ai".agent_tools, '
-                '"ai".agent_knowledge_bases, '
-                '"ai".context_handlers, '
-                '"ai".enrichment_configs, '
-                '"ai".embeddings, '
-                '"ai".chunks, '
-                '"ai".full_documents, '
-                '"ai".page_index_nodes, '
-                '"ai".page_index_toc, '
-                '"ai".graph_index_nodes, '
-                '"ai".graph_index_toc, '
-                '"ai".doc2json_documents, '
-                '"ai".indexed_sources, '
-                '"ai".sources, '
-                '"ai".knowledge_bases, '
-                '"ai".agents, '
-                '"ai".tools, '
-                '"ai".ai_provider_keys, '
-                '"ai".project_copilot_messages, '
-                '"ai".project_copilot_sessions '
-                "CASCADE"
+        present = {
+            row[0]
+            for row in db.session.execute(
+                text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'ai'")
             )
+        }
+        targets = [name for name in _CLEANUP_TABLES if name in present]
+        db.session.execute(
+            text("TRUNCATE " + ", ".join(f'"ai".{name}' for name in targets) + " CASCADE")
         )
         db.session.commit()
 

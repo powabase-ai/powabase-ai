@@ -12,7 +12,7 @@ resolution-markers = [
 
 [[package]]
 name = "agentic-project-service"
-version = "0.5.0"
+version = "0.6.1"
 source = { editable = "." }
 dependencies = [
     { name = "anyascii" },
@@ -73,7 +73,7 @@ requires-dist = [
     { name = "flask-sqlalchemy", specifier = ">=3.1.0" },
     { name = "gunicorn", specifier = ">=26.0.0" },
     { name = "httpx", specifier = ">=0.27.0" },
-    { name = "litellm", specifier = ">=1.90.1" },
+    { name = "litellm", specifier = ">=1.90.1,!=1.92.0,!=1.92.1" },
     { name = "markdown", specifier = ">=3.5.0" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "openai", specifier = ">=1.0.0" },
@@ -2311,7 +2311,7 @@ wheels = [
 
 [[package]]
 name = "powabase-agentic"
-version = "0.3.0"
+version = "0.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -2336,9 +2336,9 @@ dependencies = [
     { name = "seaborn" },
     { name = "tiktoken" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ca/75/716af1db94465d6401445579e721773287c1249f4393f68f690da05df8aa/powabase_agentic-0.3.0.tar.gz", hash = "sha256:68805897cbf304c31c564c691db445b9a3068777ec51d7356029ffa4a46928d8", size = 499767, upload-time = "2026-08-06T08:47:34.661Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e0/be/bae20c52ad0fd6fe743aca1a9786b18a0bddf9d1874ba0212825ffd5dc12/powabase_agentic-0.3.1.tar.gz", hash = "sha256:7d3af12f30198139b3fa540f87dd372923848d0d7c2f16bc2442193f07c2c4a0", size = 500747, upload-time = "2026-08-12T23:55:44.172Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/15/1a/140278963579e58772ea48a621ef5b8167eb8ee2997142e03ba7593ef5bb/powabase_agentic-0.3.0-py3-none-any.whl", hash = "sha256:9c3f1cf822d77303f08a8930c261236097d53ac0a5ffdacc036451d7fa940966", size = 257194, upload-time = "2026-08-06T08:47:33.31Z" },
+    { url = "https://files.pythonhosted.org/packages/73/4f/1661a21b4b1707abfca6edb91de790fae52c80a11d08b68febb4fc843e9c/powabase_agentic-0.3.1-py3-none-any.whl", hash = "sha256:67660657e3f3df33ac460fe4bcbec019211c99f08744c859d6bb0104c36b9fe6", size = 257621, upload-time = "2026-08-12T23:55:42.545Z" },
 ]
 
 [package.optional-dependencies]

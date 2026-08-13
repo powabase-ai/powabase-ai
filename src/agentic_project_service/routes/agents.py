@@ -72,6 +72,7 @@ from ..services.session import (
     get_session_owner,
     load_session_history,
     persist_agent_run,
+    seed_session_runs,
     update_agent_run,
 )
 from ..services.run_registry import get_active_run_context, register_run, unregister_run
@@ -1184,6 +1185,252 @@ def list_sessions(agent_id: str):
             "offset": offset,
         }
     )
+
+
+# Seeding writes one INSERT plus a session-timestamp UPDATE per pair inside a
+# single open write transaction, so the input has to be bounded. 200 is the
+# clamp this codebase already applies to list limits.
+_MAX_SEED_MESSAGES = 200
+
+# A message count bounds the number of statements, not the bytes they carry —
+# 200 arbitrarily large strings are still the unbounded transaction the cap
+# above exists to prevent. 20k characters is generous for a conversation turn
+# (a seed is a transcript, not a document store) and puts the worst-case import
+# at roughly 4 MB of message text.
+_MAX_SEED_MESSAGE_CHARS = 20_000
+
+
+def _validate_seed_messages(messages: list) -> str | None:
+    """Return the first problem with a seed conversation, or None.
+
+    One message per failure, naming the offending index and the actual reason:
+    a 200-message import with a null content at position 137 should not be
+    diagnosed as an ordering problem.
+    """
+    if len(messages) % 2 != 0:
+        return (
+            "initial_messages must contain an even number of messages "
+            f"(user/assistant pairs); got {len(messages)}"
+        )
+    for i, message in enumerate(messages):
+        if not isinstance(message, dict):
+            return f"initial_messages[{i}] must be an object"
+        expected_role = "user" if i % 2 == 0 else "assistant"
+        if message.get("role") != expected_role:
+            # A leading system message lands here too: only strict
+            # user/assistant alternation is supported.
+            return (
+                f"initial_messages[{i}] must have role '{expected_role}' — "
+                "initial_messages must alternate user/assistant, starting with user"
+            )
+        content = message.get("content")
+        if not isinstance(content, str):
+            # As do structured content blocks — seeds are plain text.
+            return f"initial_messages[{i}] content must be a string"
+        if not content.strip():
+            # Nothing downstream drops an empty turn: get_chat_messages falls
+            # to its output_messages branch and emits `content: ""`, and
+            # load_session_history hands the same blank message to the model.
+            # A blank turn would sit in both the transcript and the context.
+            return f"initial_messages[{i}] content must not be empty"
+        if len(content) > _MAX_SEED_MESSAGE_CHARS:
+            return (
+                f"initial_messages[{i}] content is limited to "
+                f"{_MAX_SEED_MESSAGE_CHARS} characters; got {len(content)}"
+            )
+    return None
+
+
+@agents_bp.route("/<agent_id>/sessions", methods=["POST"])
+@require_auth
+def create_session_for_agent(agent_id: str):
+    """Create a session, optionally seeded with an initial conversation.
+
+    Generic conversation seeding: import, human-agent handoff, memory
+    compaction. Seeds become synthetic completed runs so history
+    reconstruction needs no special cases.
+
+    Seed messages keep `role` and `content` only — anything else on a message
+    (timestamps, name, tool_calls) is dropped, and every run is re-stamped with
+    a fresh id and import-time timestamps. Top-level `session_id` and
+    `metadata` are not accepted: this endpoint always creates.
+    """
+    # agents.id is a uuid column: a non-uuid path segment would make the
+    # existence check itself raise 22P02 and poison the transaction, so parse
+    # it here and answer with the 404 an unknown agent already gets.
+    #
+    # Normalized, not merely validated. Python's parser and Postgres's uuid
+    # input accept overlapping but different spellings, and the delete route
+    # compares the path segment against `str(row.agent_id)`, which is always
+    # canonical. Binding the raw segment would (a) let a session be created
+    # under an uppercase, braced or hyphenless id that its own DELETE can never
+    # match, and (b) push `urn:uuid:` forms — which Python parses and Postgres
+    # rejects — into the query as a 22P02, i.e. a 500 in place of the 404.
+    try:
+        agent_id = str(uuid.UUID(agent_id))
+    except ValueError:
+        return jsonify({"error": "Agent not found"}), 404
+
+    data = request.get_json(silent=True)
+    if data is None:
+        # Only a genuinely empty request means "no seed". A body that failed to
+        # parse (invalid JSON, or no application/json content type) must not be
+        # downgraded to a bare session — that discards the imported
+        # conversation and reports it as a success.
+        raw = request.get_data()
+        if raw.strip() == b"null" and request.is_json:
+            # A literal `null` is valid JSON that get_json() also reports as
+            # None. Answering "must be valid JSON" would send the client
+            # looking for a syntax error it does not have.
+            return jsonify({"error": "Request body must be a JSON object"}), 400
+        if raw:
+            return jsonify({"error": "Request body must be valid JSON"}), 400
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+
+    initial = data.get("initial_messages")
+    if initial is None:
+        initial = []
+    elif not isinstance(initial, list):
+        return jsonify({"error": "initial_messages must be a list"}), 400
+    if len(initial) > _MAX_SEED_MESSAGES:
+        return jsonify(
+            {
+                "error": (
+                    f"initial_messages is limited to {_MAX_SEED_MESSAGES} messages; "
+                    f"got {len(initial)}"
+                )
+            }
+        ), 400
+    invalid = _validate_seed_messages(initial)
+    if invalid:
+        return jsonify({"error": invalid}), 400
+
+    # An import or handoff is performed *for* a user by a service-role caller
+    # whose own JWT `sub` is not that user — and, for a service token, is not a
+    # uuid at all, so it can never stand in as the owner of a column that is
+    # one. A service-role create therefore owns the session to the `user_id`
+    # the body names, or to nobody.
+    #
+    # Owning it to nobody is not merely an invisibility problem. list_sessions
+    # skips a NULL-owner session and the agent-scoped DELETE below 404s for
+    # every user-scoped caller, but run_agent and the streaming path gate on
+    # `owner is not None and owner != user_id` — which a NULL owner passes for
+    # *every* authenticated user of the project. Anyone who learns the `sess_`
+    # id can attach to it and have the model replay what is in it. A bare
+    # ownerless session exposes nothing; one pre-loaded with an imported
+    # conversation exposes that conversation, so the combination is refused.
+    #
+    # Only service role may name an owner, and a user-scoped caller that tries
+    # is refused rather than silently ignored — ignoring it would return 201
+    # for a session belonging to someone other than the one asked for.
+    is_service_role = (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False)
+    requested_user_id = data.get("user_id")
+    if requested_user_id is None:
+        if is_service_role and initial:
+            return jsonify(
+                {"error": "user_id is required to seed initial_messages as service role"}
+            ), 400
+        user_id = None if is_service_role else get_current_user_id()
+    else:
+        if not is_service_role:
+            return jsonify({"error": "Service role required to set user_id"}), 403
+        try:
+            # Normalized, not merely validated: Python's parser accepts braced
+            # and `urn:uuid:` spellings that Postgres's uuid cast rejects, so
+            # binding the raw body string would fail the INSERT with 22P02 —
+            # a 500, since that is not an IntegrityError.
+            user_id = str(uuid.UUID(str(requested_user_id)))
+        except ValueError:
+            return jsonify({"error": "user_id must be a uuid"}), 400
+
+    # agent_id is a foreign key on agent_sessions — check existence before
+    # writing so a bad id is a clean 404, not an integrity error. The model
+    # comes back with it so seeding does not re-resolve the pair per run.
+    agent_row = db.session.execute(
+        text(f'SELECT model FROM "{AI_SCHEMA}".agents WHERE id = :id'),
+        {"id": agent_id},
+    ).fetchone()
+    if not agent_row:
+        return jsonify({"error": "Agent not found"}), 404
+
+    db_session_uuid, session_id, _ = get_or_create_session(
+        db_session=db.session,
+        agent_id=agent_id,
+        user_id=user_id,
+    )
+    if initial:
+        seed_session_runs(
+            db.session, db_session_uuid, initial, agent_id=agent_id, model=agent_row[0]
+        )
+    # The check above is not a lock: the agent can be deleted before this
+    # commit, and the foreign key then rejects the insert. Same 404, no 500.
+    #
+    # Reporting *every* IntegrityError as a missing agent is truthful only
+    # because the agent foreign key is the one constraint these two inserts can
+    # realistically violate. Any new constraint on agent_sessions or agent_runs
+    # needs this branch to distinguish them, or it will be misreported here.
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"error": "Agent not found"}), 404
+    return jsonify({"session_id": session_id}), 201
+
+
+@agents_bp.route("/<agent_id>/sessions/<session_id>", methods=["DELETE"])
+@require_auth
+def delete_session_for_agent(agent_id: str, session_id: str):
+    """Delete a session and its runs.
+
+    "Not found", "owned by someone else" and "belongs to a different agent"
+    all answer 404 with the same body, so this endpoint cannot be used to
+    enumerate sessions. Service role bypasses the ownership half of that
+    (mirroring `run_agent`); agent scoping still applies to it.
+
+    A session whose agent has been deleted is orphaned by the ON DELETE SET
+    NULL on `agent_sessions.agent_id`: it can never match the agent in the
+    path, so it stays deletable only through DELETE /api/sessions/<id>.
+
+    Runs in flight are not checked. Deleting a session mid-stream leaves the
+    worker's final persist_agent_run to fail its foreign key, and that run's
+    output is lost.
+    """
+    # The scoping check below compares against `str(row.agent_id)`, which is
+    # canonical lowercase-hyphenated. Normalize the path segment to the same
+    # form — as the create route does — so a session is deletable under every
+    # spelling it was creatable under, and a non-uuid segment (which can name
+    # no agent) 404s here rather than being compared as a string.
+    try:
+        agent_id = str(uuid.UUID(agent_id))
+    except ValueError:
+        return jsonify({"error": "Session not found"}), 404
+
+    row = db.session.execute(
+        text(
+            f"""
+            SELECT id, agent_id, user_id FROM "{AI_SCHEMA}".agent_sessions
+            WHERE session_id = :session_id
+            """
+        ),
+        {"session_id": session_id},
+    ).fetchone()
+    if not row or str(row[1]) != agent_id:
+        return jsonify({"error": "Session not found"}), 404
+
+    is_service_role = (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False)
+    if not is_service_role and (row[2] is None or str(row[2]) != get_current_user_id()):
+        return jsonify({"error": "Session not found"}), 404
+
+    db_session_uuid = str(row[0])
+    # The session's runs go with it: agent_runs.session_id is ON DELETE CASCADE.
+    db.session.execute(
+        text(f'DELETE FROM "{AI_SCHEMA}".agent_sessions WHERE id = :id'),
+        {"id": db_session_uuid},
+    )
+    db.session.commit()
+    return "", 204
 
 
 # =============================================================================
