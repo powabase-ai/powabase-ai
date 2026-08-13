@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.0](https://github.com/powabase-ai/powabase-ai/compare/v0.6.1...v0.7.0) (2026-08-13)
+
+
+### Features
+
+* **copilot:** project copilot + docs-RAG grounding ([#46](https://github.com/powabase-ai/powabase-ai/issues/46)) ([e27ed12](https://github.com/powabase-ai/powabase-ai/commit/e27ed12b59507c4522d0ec6c7ab9b05762e36ef7))
+
+
+### Bug Fixes
+
+* **copilot:** turn lock, persist-failure alternation, credit gate ([#44](https://github.com/powabase-ai/powabase-ai/issues/44)) ([180d359](https://github.com/powabase-ai/powabase-ai/commit/180d35924bcc3d2919fd966fe7e0b3e4499dcffb))
+* **deps:** exclude litellm 1.92.0 and 1.92.1 ([#43](https://github.com/powabase-ai/powabase-ai/issues/43)) ([2e7ee0b](https://github.com/powabase-ai/powabase-ai/commit/2e7ee0b0d9af22313e081ea4d1ecf6820671c548))
+
 ## [0.6.1](https://github.com/powabase-ai/powabase-ai/compare/v0.6.0...v0.6.1) (2026-08-12)
 
 
