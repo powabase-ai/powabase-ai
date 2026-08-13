@@ -40,6 +40,18 @@ from agentic.knowledge.retrieval import TreeSearchAlgorithm, apply_source_limits
 
 logger = logging.getLogger(__name__)
 
+
+class EmptyKnowledgeBaseError(ValueError):
+    """A search hit a KB that has no indexed documents yet.
+
+    Subclasses ValueError so existing ``except ValueError`` callers keep working,
+    while callers that need to tell "empty KB" apart from a genuine retrieval /
+    config error (bad retrieval_config, embedding-dim mismatch, pgvector parse
+    failure — which also raise ValueError) can catch this specifically instead of
+    masking a broken index as "no results". See routes/internal_docs.py.
+    """
+
+
 # When per-source limits are active we must fetch a candidate pool larger than
 # top_k so there's a surplus to diversify over. Multiply top_k by this factor,
 # capped so a pathological top_k can't trigger a huge scan. Factor 5 gives ample
@@ -861,7 +873,7 @@ async def search_knowledge_base_async(
             toc_records = [t for t in toc_records if t["source_id"] in source_ids_set]
 
         if not toc_records:
-            raise ValueError(
+            raise EmptyKnowledgeBaseError(
                 "No indexed documents in this knowledge base. Add and index sources first."
             )
 
@@ -960,7 +972,7 @@ async def search_knowledge_base_async(
             or 0
         )
         if gi_node_count == 0:
-            raise ValueError(
+            raise EmptyKnowledgeBaseError(
                 "No nodes indexed in this knowledge base. Add and index sources first."
             )
 
@@ -1005,7 +1017,7 @@ async def search_knowledge_base_async(
             or 0
         )
         if ft_count == 0:
-            raise ValueError(
+            raise EmptyKnowledgeBaseError(
                 "No documents indexed in this knowledge base. Add and index sources first."
             )
         store = FullDocumentStore(
@@ -1024,7 +1036,7 @@ async def search_knowledge_base_async(
             or 0
         )
         if d2j_count == 0:
-            raise ValueError(
+            raise EmptyKnowledgeBaseError(
                 "No documents indexed in this knowledge base. Add and index sources first."
             )
         store = Doc2JSONStore(
@@ -1040,7 +1052,7 @@ async def search_knowledge_base_async(
             or 0
         )
         if chunk_count == 0:
-            raise ValueError(
+            raise EmptyKnowledgeBaseError(
                 "No chunks indexed in this knowledge base. Add and index sources first."
             )
         store = PgVectorKnowledgeStore(db_session=db_session, knowledge_base_id=knowledge_base_id)
@@ -1583,7 +1595,7 @@ def search_knowledge_base(
             toc_records = [t for t in toc_records if t["source_id"] in source_ids_set]
 
         if not toc_records:
-            raise ValueError(
+            raise EmptyKnowledgeBaseError(
                 "No indexed documents in this knowledge base. Add and index sources first."
             )
 
@@ -1691,7 +1703,7 @@ def search_knowledge_base(
             or 0
         )
         if gi_node_count == 0:
-            raise ValueError(
+            raise EmptyKnowledgeBaseError(
                 "No nodes indexed in this knowledge base. Add and index sources first."
             )
 
@@ -1740,7 +1752,7 @@ def search_knowledge_base(
             or 0
         )
         if ft_count == 0:
-            raise ValueError(
+            raise EmptyKnowledgeBaseError(
                 "No documents indexed in this knowledge base. Add and index sources first."
             )
         store = FullDocumentStore(
@@ -1760,7 +1772,7 @@ def search_knowledge_base(
             or 0
         )
         if d2j_count == 0:
-            raise ValueError(
+            raise EmptyKnowledgeBaseError(
                 "No documents indexed in this knowledge base. Add and index sources first."
             )
         store = Doc2JSONStore(
@@ -1778,7 +1790,7 @@ def search_knowledge_base(
         )
         chunk_count = chunk_count_result.scalar() or 0
         if chunk_count == 0:
-            raise ValueError(
+            raise EmptyKnowledgeBaseError(
                 "No chunks indexed in this knowledge base. Add and index sources first."
             )
         store = PgVectorKnowledgeStore(db_session=db_session, knowledge_base_id=knowledge_base_id)

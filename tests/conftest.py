@@ -143,6 +143,8 @@ _CLEANUP_TABLES = (
     "agents",
     "tools",
     "ai_provider_keys",
+    "project_copilot_sessions",
+    "project_copilot_messages",
 )
 
 

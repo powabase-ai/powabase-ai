@@ -30,12 +30,14 @@ from .routes.webhooks import webhooks_bp
 from .routes.database import database_bp
 from .routes.config import config_bp
 from .routes.copilot import copilot_bp
+from .routes.project_copilot import project_copilot_bp
 from .routes.tools import tools_bp
 from .routes.orchestrations import orchestrations_bp
 from .routes.settings import settings_bp
 from .routes.ai_provider_keys import ai_provider_keys_bp
 from .routes.observability import observability_bp
 from .routes.internal import internal_bp
+from .routes.internal_docs import internal_docs_bp
 
 # Import ORM models so they register with SQLAlchemy metadata
 from .models import tenant  # noqa: F401
@@ -133,8 +135,11 @@ def create_app(testing: bool = False):
     try:
         import litellm
         from .services.copilot_config import COPILOT_MODEL_OPTIONS
+        from .services.project_copilot import PROJECT_COPILOT_MODEL
 
-        for _label, model_id in COPILOT_MODEL_OPTIONS:
+        # Workflow-copilot picker models + the pinned Project Copilot model.
+        _models_to_check = [m for _label, m in COPILOT_MODEL_OPTIONS] + [PROJECT_COPILOT_MODEL]
+        for model_id in _models_to_check:
             try:
                 info = litellm.get_model_info(model_id)
             except Exception:
@@ -212,12 +217,19 @@ def create_app(testing: bool = False):
     app.register_blueprint(database_bp)
     app.register_blueprint(config_bp)
     app.register_blueprint(copilot_bp)
+    app.register_blueprint(project_copilot_bp)
     app.register_blueprint(tools_bp)
     app.register_blueprint(orchestrations_bp)
     app.register_blueprint(settings_bp)
     app.register_blueprint(ai_provider_keys_bp)
     app.register_blueprint(observability_bp)
     app.register_blueprint(internal_bp)
+    app.register_blueprint(internal_docs_bp)
+
+    # CLI commands (e.g. `flask docs refresh-kb`)
+    from .cli import register_cli
+
+    register_cli(app)
 
     # Bind Flask context to the existing Celery app (broker config
     # lives in celery.py — no second Celery instance created here)
