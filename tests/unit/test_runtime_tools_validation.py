@@ -106,3 +106,170 @@ def test_duplicate_builtin_names_rejected():
     }
     _, err = validate_runtime_tools(data, MagicMock())
     assert err is not None and "web_search" in err
+
+
+_TOOL_1 = "11111111-1111-1111-1111-111111111111"
+_TOOL_2 = "22222222-2222-2222-2222-222222222222"
+
+
+def _db_returning_tools(rows):
+    """A db_session whose execute() yields (id, name) rows from ai.tools."""
+    db = MagicMock()
+    db.execute.return_value = rows
+    return db
+
+
+def _definition(**overrides):
+    d = {
+        "name": "case_lookup",
+        "description": "Look up a case by docket number",
+        "input_schema": {"type": "object", "properties": {"docket": {"type": "string"}}},
+        "config": {"endpoint": "https://api.example.com/cases"},
+    }
+    d.update(overrides)
+    return d
+
+
+def test_custom_requires_exactly_one_of_tool_id_or_definition():
+    for entry in (
+        {"type": "custom"},
+        {"type": "custom", "tool_id": _TOOL_1, "definition": _definition()},
+    ):
+        _, err = validate_runtime_tools({"runtime_tools": [entry]}, MagicMock())
+        assert err is not None and "tool_id" in err and "definition" in err
+
+
+def test_custom_malformed_tool_id_rejected_without_db():
+    db = MagicMock()
+    _, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "tool_id": "not-a-uuid"}]}, db
+    )
+    assert err is not None and "not-a-uuid" in err
+    db.execute.assert_not_called()
+
+
+def test_custom_tool_id_normalized_and_resolved():
+    """Uppercase input still matches the DB row and passes through canonical."""
+    upper = _TOOL_1.upper()
+    configs, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "tool_id": upper}]},
+        _db_returning_tools([(_TOOL_1, "case_lookup")]),
+    )
+    assert err is None
+    assert configs[0]["tool_id"] == _TOOL_1
+    assert configs[0]["_resolved_name"] == "case_lookup"
+
+
+def test_custom_unknown_tool_id_rejected():
+    _, err = validate_runtime_tools(
+        {
+            "runtime_tools": [
+                {"type": "custom", "tool_id": _TOOL_1},
+                {"type": "custom", "tool_id": _TOOL_2},
+            ]
+        },
+        _db_returning_tools([(_TOOL_1, "case_lookup")]),
+    )
+    assert err is not None and _TOOL_2 in err
+
+
+def test_custom_duplicate_tool_ids_rejected_after_normalization():
+    _, err = validate_runtime_tools(
+        {
+            "runtime_tools": [
+                {"type": "custom", "tool_id": _TOOL_1},
+                {"type": "custom", "tool_id": _TOOL_1.upper()},
+            ]
+        },
+        MagicMock(),
+    )
+    assert err is not None and _TOOL_1 in err
+
+
+def test_definition_valid_passes():
+    configs, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "definition": _definition()}]}, MagicMock()
+    )
+    assert err is None and configs[0]["definition"]["name"] == "case_lookup"
+
+
+def test_definition_unknown_keys_rejected():
+    d = _definition()
+    d["is_concurrency_safe"] = True
+    _, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "definition": d}]}, MagicMock()
+    )
+    assert err is not None and "is_concurrency_safe" in err
+
+
+def test_definition_requires_name_description_schema_config():
+    for missing in ("name", "description", "input_schema", "config"):
+        d = _definition()
+        del d[missing]
+        _, err = validate_runtime_tools(
+            {"runtime_tools": [{"type": "custom", "definition": d}]}, MagicMock()
+        )
+        assert err is not None and missing in err
+
+
+def test_definition_name_shadowing_builtin_rejected():
+    d = _definition(name="web_search")
+    _, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "definition": d}]}, MagicMock()
+    )
+    assert err is not None and "web_search" in err
+
+
+def test_definition_input_schema_must_be_object_typed():
+    d = _definition(input_schema={"type": "string"})
+    _, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "definition": d}]}, MagicMock()
+    )
+    assert err is not None and "input_schema" in err
+
+
+def test_definition_endpoint_must_be_http_url():
+    for bad in ("ftp://x", "file:///etc/passwd", "api.example.com/cases", "", None):
+        d = _definition(config={"endpoint": bad})
+        _, err = validate_runtime_tools(
+            {"runtime_tools": [{"type": "custom", "definition": d}]}, MagicMock()
+        )
+        assert err is not None and "endpoint" in err
+
+
+def test_definition_unknown_config_keys_rejected():
+    d = _definition(config={"endpoint": "https://x.example.com", "retries": 3})
+    _, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "definition": d}]}, MagicMock()
+    )
+    assert err is not None and "retries" in err
+
+
+def test_definition_method_whitelisted():
+    d = _definition(config={"endpoint": "https://x.example.com", "method": "TRACE"})
+    _, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "definition": d}]}, MagicMock()
+    )
+    assert err is not None and "TRACE" in err
+
+
+def test_definition_timeout_bounds():
+    for bad in (0, 601, True, "30"):
+        d = _definition(config={"endpoint": "https://x.example.com", "timeout_seconds": bad})
+        _, err = validate_runtime_tools(
+            {"runtime_tools": [{"type": "custom", "definition": d}]}, MagicMock()
+        )
+        assert err is not None and "timeout_seconds" in err
+
+
+def test_definition_header_value_errors_do_not_echo_the_value():
+    """Headers carry secrets. A rejected header value must be named by KEY
+    only — the message must not contain the value itself."""
+    d = _definition(
+        config={"endpoint": "https://x.example.com", "headers": {"Authorization": ["sk-oops"]}}
+    )
+    _, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "definition": d}]}, MagicMock()
+    )
+    assert err is not None and "Authorization" in err
+    assert "sk-oops" not in err

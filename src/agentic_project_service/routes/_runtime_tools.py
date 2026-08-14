@@ -75,6 +75,88 @@ def _validate_builtin_entry(entry):
     return None
 
 
+def _validate_http_url(value, label):
+    if not value or not isinstance(value, str):
+        return f"{label} is required and must be an http(s) URL"
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return f"{label} must be an http(s) URL: {value!r}"
+    return None
+
+
+def _validate_headers(value, label):
+    """Headers may carry secrets: on rejection, name the key, never the value."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return f"{label} 'headers' must be an object"
+    for k, v in value.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            return f"{label} 'headers' entries must map string keys to string values (key: {k!r})"
+    return None
+
+
+def _validate_definition(definition):
+    if not isinstance(definition, dict):
+        return "'definition' must be an object"
+    unknown_keys = set(definition) - _ALLOWED_DEFINITION_KEYS
+    if unknown_keys:
+        return f"unknown key(s) in runtime tool definition: {sorted(unknown_keys)}"
+    name = definition.get("name")
+    if not name or not isinstance(name, str):
+        return "runtime tool definition requires a non-empty 'name'"
+    if name in _BUILTIN_DEFS:
+        return f"runtime tool definition name {name!r} shadows a builtin tool"
+    description = definition.get("description")
+    if not description or not isinstance(description, str):
+        return f"runtime tool definition {name!r} requires a non-empty 'description'"
+    input_schema = definition.get("input_schema")
+    if not isinstance(input_schema, dict) or input_schema.get("type") != "object":
+        return (
+            f"runtime tool definition {name!r} requires an 'input_schema' object "
+            'with "type": "object"'
+        )
+    config = definition.get("config")
+    if not isinstance(config, dict):
+        return f"runtime tool definition {name!r} requires a 'config' object"
+    unknown_keys = set(config) - _ALLOWED_DEFINITION_CONFIG_KEYS
+    if unknown_keys:
+        return f"unknown key(s) in runtime tool definition config: {sorted(unknown_keys)}"
+    err = _validate_http_url(config.get("endpoint"), f"definition {name!r} config 'endpoint'")
+    if err:
+        return err
+    method = config.get("method")
+    if method is not None and method not in _HTTP_METHODS:
+        return f"invalid method in runtime tool definition {name!r}: {method!r}"
+    err = _validate_headers(config.get("headers"), f"definition {name!r} config")
+    if err:
+        return err
+    # The offending value is deliberately omitted from the message — uniform
+    # no-echo habit for everything inside a definition config.
+    timeout = config.get("timeout_seconds")
+    if timeout is not None:
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or not (1 <= timeout <= 600):
+            return (
+                f"'timeout_seconds' in runtime tool definition {name!r} must be "
+                "an integer between 1 and 600"
+            )
+    return None
+
+
+def _validate_custom_entry(entry):
+    has_ref = entry.get("tool_id") is not None
+    has_def = entry.get("definition") is not None
+    if has_ref == has_def:
+        return "each custom runtime_tools entry must have exactly one of 'tool_id' or 'definition'"
+    if has_ref:
+        try:
+            entry["tool_id"] = _normalize_uuid(entry["tool_id"])
+        except (ValueError, AttributeError, TypeError):
+            return f"invalid tool id: {entry.get('tool_id')!r}"
+        return None
+    return _validate_definition(entry["definition"])
+
+
 def validate_runtime_tools(data, db_session, ai_schema: str = AI_SCHEMA):
     raw = data.get("runtime_tools")
     if raw is None:
@@ -100,10 +182,31 @@ def validate_runtime_tools(data, db_session, ai_schema: str = AI_SCHEMA):
         entry = dict(entry)  # normalized copy; never mutate the caller's object
         if entry_type == "builtin":
             err = _validate_builtin_entry(entry)
+        elif entry_type == "custom":
+            err = _validate_custom_entry(entry)
         else:
             err = f"runtime_tools type {entry_type!r} not yet supported"
         if err:
             return [], err
         normalized_entries.append(entry)
+
+    ref_entries = [e for e in normalized_entries if e["type"] == "custom" and "tool_id" in e]
+    seen_tool_ids: set[str] = set()
+    for e in ref_entries:
+        if e["tool_id"] in seen_tool_ids:
+            return [], f"duplicate tool id: {e['tool_id']}"
+        seen_tool_ids.add(e["tool_id"])
+    if ref_entries:
+        ids = [e["tool_id"] for e in ref_entries]
+        rows = db_session.execute(
+            text(f'SELECT id, name FROM "{ai_schema}".tools WHERE id = ANY(:ids)'),
+            {"ids": ids},
+        )
+        name_by_id = {str(row[0]): row[1] for row in rows}
+        missing = [i for i in ids if i not in name_by_id]
+        if missing:
+            return [], f"unknown tool id(s): {', '.join(missing)}"
+        for e in ref_entries:
+            e["_resolved_name"] = name_by_id[e["tool_id"]]
 
     return normalized_entries, None
