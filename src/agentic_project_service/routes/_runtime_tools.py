@@ -157,6 +157,22 @@ def _validate_custom_entry(entry):
     return _validate_definition(entry["definition"])
 
 
+def _validate_mcp_entry(entry):
+    name = entry.get("name")
+    if not isinstance(name, str) or not _MCP_NAME_RE.match(name):
+        return (
+            "mcp runtime_tools entry 'name' must be 1-64 characters of "
+            f"letters, digits, '_' or '-': {name!r}"
+        )
+    err = _validate_http_url(entry.get("url"), f"mcp server {name!r} 'url'")
+    if err:
+        return err
+    transport = entry.get("transport")
+    if transport is not None and transport not in ("http", "sse"):
+        return f"invalid transport for mcp server {name!r}: {transport!r}"
+    return _validate_headers(entry.get("headers"), f"mcp server {name!r}")
+
+
 def validate_runtime_tools(data, db_session, ai_schema: str = AI_SCHEMA):
     raw = data.get("runtime_tools")
     if raw is None:
@@ -185,7 +201,7 @@ def validate_runtime_tools(data, db_session, ai_schema: str = AI_SCHEMA):
         elif entry_type == "custom":
             err = _validate_custom_entry(entry)
         else:
-            err = f"runtime_tools type {entry_type!r} not yet supported"
+            err = _validate_mcp_entry(entry)
         if err:
             return [], err
         normalized_entries.append(entry)
@@ -208,5 +224,20 @@ def validate_runtime_tools(data, db_session, ai_schema: str = AI_SCHEMA):
             return [], f"unknown tool id(s): {', '.join(missing)}"
         for e in ref_entries:
             e["_resolved_name"] = name_by_id[e["tool_id"]]
+
+    # Final-name duplicate detection across the whole request. MCP entries
+    # participate with their server name (their discovered tool names are
+    # unknowable pre-discovery; the mcp__{name}__ prefix keeps them from
+    # colliding with the rest at run time). Collision with an *attached*
+    # tool's name is deliberately NOT an error — that is the override case.
+    seen_names: set[str] = set()
+    for e in normalized_entries:
+        if e["type"] == "builtin" or e["type"] == "mcp":
+            final = e["name"]
+        else:
+            final = e["definition"]["name"] if "definition" in e else e["_resolved_name"]
+        if final in seen_names:
+            return [], f"duplicate runtime tool name: {final!r}"
+        seen_names.add(final)
 
     return normalized_entries, None

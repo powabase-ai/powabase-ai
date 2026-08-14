@@ -96,7 +96,6 @@ def test_builtin_valid_config_override_passes():
     assert configs[0] is not data["runtime_tools"][0]  # copies, never the caller's objects
 
 
-@pytest.mark.xfail(reason="final-name dedup lands with the mcp task", strict=True)
 def test_duplicate_builtin_names_rejected():
     data = {
         "runtime_tools": [
@@ -273,3 +272,70 @@ def test_definition_header_value_errors_do_not_echo_the_value():
     )
     assert err is not None and "Authorization" in err
     assert "sk-oops" not in err
+
+
+def _mcp(**overrides):
+    e = {"type": "mcp", "name": "github", "url": "https://mcp.example.com/mcp"}
+    e.update(overrides)
+    return e
+
+
+def test_mcp_valid_entry_passes():
+    """Transport is optional; the builder ignores it (matching attached
+    servers, where only 'http' is honored today)."""
+    configs, err = validate_runtime_tools({"runtime_tools": [_mcp()]}, MagicMock())
+    assert err is None
+    assert configs[0]["name"] == "github"
+
+
+def test_mcp_name_regex_enforced():
+    for bad in ("", "has space", "a" * 65, "semi;colon", None, 7):
+        _, err = validate_runtime_tools({"runtime_tools": [_mcp(name=bad)]}, MagicMock())
+        assert err is not None and "name" in err
+
+
+def test_mcp_url_must_be_http():
+    _, err = validate_runtime_tools({"runtime_tools": [_mcp(url="ws://x")]}, MagicMock())
+    assert err is not None and "url" in err
+
+
+def test_mcp_transport_values():
+    _, err = validate_runtime_tools({"runtime_tools": [_mcp(transport="grpc")]}, MagicMock())
+    assert err is not None and "transport" in err
+    _, err = validate_runtime_tools({"runtime_tools": [_mcp(transport="http")]}, MagicMock())
+    assert err is None
+
+
+def test_mcp_header_value_errors_do_not_echo_the_value():
+    _, err = validate_runtime_tools(
+        {"runtime_tools": [_mcp(headers={"Authorization": 12345})]}, MagicMock()
+    )
+    assert err is not None and "Authorization" in err
+    assert "12345" not in err
+
+
+def test_duplicate_mcp_names_rejected():
+    _, err = validate_runtime_tools({"runtime_tools": [_mcp(), _mcp()]}, MagicMock())
+    assert err is not None and "github" in err
+
+
+def test_final_name_collision_across_shapes_rejected():
+    """An inline definition and a referenced ai.tools row resolving to the
+    same name is ambiguous — reject, mirroring dup-id rejection."""
+    entry_ref = {"type": "custom", "tool_id": _TOOL_1}
+    entry_inline = {"type": "custom", "definition": _definition(name="case_lookup")}
+    _, err = validate_runtime_tools(
+        {"runtime_tools": [entry_ref, entry_inline]},
+        _db_returning_tools([(_TOOL_1, "case_lookup")]),
+    )
+    assert err is not None and "case_lookup" in err
+
+
+def test_collision_with_attached_tools_is_not_checked_here():
+    """Validation has no attached-tool knowledge — a runtime tool named like
+    an ATTACHED tool is the documented override case and passes validation."""
+    configs, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "definition": _definition(name="anything")}]},
+        MagicMock(),
+    )
+    assert err is None
