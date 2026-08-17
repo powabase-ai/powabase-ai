@@ -152,3 +152,66 @@ def test_runtime_tool_overrides_attached_tool_with_same_name(monkeypatch):
         runtime_tool_configs=[{"type": "builtin", "name": "web_search"}],
     )
     assert tools["web_search"] is runtime_marker
+
+
+def _fake_discovered(name):
+    t = MagicMock()
+    t.name = name
+    t.description = "d"
+    t.input_schema = {"type": "object", "properties": {}}
+    t.read_only_hint = True
+    t.destructive_hint = False
+    return t
+
+
+def test_runtime_mcp_entry_discovers_and_namespaces_tools(registry_env, monkeypatch):
+    monkeypatch.setattr(
+        "agentic.mcp.client.discover_mcp_tools",
+        lambda url, headers: [_fake_discovered("list_issues")],
+    )
+    tools = tool_registry.build_runtime_tools(
+        "agent-1",
+        MagicMock(),
+        [
+            {
+                "type": "mcp",
+                "name": "github",
+                "url": "https://mcp.example.com/mcp",
+                "headers": {"Authorization": "Bearer sk-mcp-secret"},
+            }
+        ],
+    )
+    assert set(tools) == {"mcp__github__list_issues"}
+    assert tools["mcp__github__list_issues"].server_headers == {
+        "Authorization": "Bearer sk-mcp-secret"
+    }
+
+
+def test_runtime_mcp_discovery_failure_skips_and_never_logs_headers(
+    registry_env, monkeypatch, caplog
+):
+    """Soft-fail like attached servers — and the warning must not leak the
+    Authorization header value."""
+    import logging
+
+    def boom(url, headers):
+        raise ConnectionError("no route to host")
+
+    monkeypatch.setattr("agentic.mcp.client.discover_mcp_tools", boom)
+    with caplog.at_level(logging.WARNING, logger=tool_registry.__name__):
+        tools = tool_registry.build_runtime_tools(
+            "agent-1",
+            MagicMock(),
+            [
+                {
+                    "type": "mcp",
+                    "name": "github",
+                    "url": "https://mcp.example.com/mcp",
+                    "headers": {"Authorization": "Bearer sk-mcp-secret"},
+                }
+            ],
+        )
+    assert tools == {}
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "github" in joined
+    assert "sk-mcp-secret" not in joined

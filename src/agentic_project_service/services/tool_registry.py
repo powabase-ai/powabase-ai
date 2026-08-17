@@ -980,6 +980,16 @@ def build_runtime_tools(
                 max_tool_output_length,
                 default_max_result_chars,
             )
+        elif entry_type == "mcp":
+            tools.update(
+                _build_mcp_server_tools(
+                    entry["name"],
+                    entry["url"],
+                    entry.get("headers") or {},
+                    agent_id,
+                    default_max_result_chars,
+                )
+            )
 
     return tools
 
