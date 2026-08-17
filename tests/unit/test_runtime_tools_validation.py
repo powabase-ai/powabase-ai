@@ -146,10 +146,11 @@ def test_custom_requires_exactly_one_of_tool_id_or_definition():
         assert err is not None and "tool_id" in err and "definition" in err
 
 
-def test_custom_null_tool_id_with_valid_definition_rejected_not_raised():
-    """An explicit 'tool_id': null alongside a valid 'definition' must 400
-    (key present, value None isn't a real reference), not fall through to a
-    DB query with ids=[None]."""
+def test_custom_null_tool_id_with_valid_definition_is_accepted_as_definition_entry():
+    """An explicit 'tool_id': null alongside a valid 'definition' is treated
+    the same as an omitted 'tool_id' (key present, value None isn't a real
+    reference) — it must validate as a definition entry, not fall through to
+    a DB query with ids=[None]."""
     db = MagicMock()
     db.execute.return_value = []
     _, err = validate_runtime_tools(
@@ -324,6 +325,17 @@ def test_definition_method_whitelisted():
         {"runtime_tools": [{"type": "custom", "definition": d}]}, MagicMock()
     )
     assert err is not None and "TRACE" in err
+
+
+def test_definition_unhashable_method_rejected_not_raised():
+    """An unhashable 'method' (list/dict) must 400 like any other invalid
+    value, not raise TypeError from `method not in _HTTP_METHODS` (a set)."""
+    for bad in ([], {}, ["GET"]):
+        d = _definition(config={"endpoint": "https://x.example.com", "method": bad})
+        _, err = validate_runtime_tools(
+            {"runtime_tools": [{"type": "custom", "definition": d}]}, MagicMock()
+        )
+        assert err is not None and "method" in err
 
 
 def test_definition_timeout_bounds():

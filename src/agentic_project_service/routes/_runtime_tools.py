@@ -132,7 +132,10 @@ def _validate_definition(definition):
     if err:
         return err
     method = config.get("method")
-    if method is not None and method not in _HTTP_METHODS:
+    # isinstance(..., str) is checked before the set membership test — an
+    # unhashable method (a list or dict) would otherwise raise TypeError from
+    # `not in _HTTP_METHODS` instead of 400ing.
+    if method is not None and (not isinstance(method, str) or method not in _HTTP_METHODS):
         return f"invalid method in runtime tool definition {name!r}: {method!r}"
     err = _validate_headers(config.get("headers"), f"definition {name!r} config")
     if err:
