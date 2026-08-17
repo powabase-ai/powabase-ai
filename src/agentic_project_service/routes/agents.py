@@ -1451,7 +1451,8 @@ def run_agent(agent_id: str):
     - agentic.Agent class for LLM calls
 
     `runtime_knowledge_bases` is rejected with 400 here — this endpoint has
-    no tool loop; use POST .../run/stream instead.
+    no tool loop; use POST .../run/stream instead. `runtime_tools` is
+    rejected with 400 here for the same reason.
     """
     data = request.get_json() or {}
     message = data.get("message")

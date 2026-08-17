@@ -19,7 +19,17 @@ def registry_env(monkeypatch):
     )
 
 
-def test_runtime_builtin_builds_with_forced_args(registry_env):
+def test_runtime_builtin_builds_with_forced_args(registry_env, monkeypatch):
+    """config_override must actually reach the handler as a forced argument,
+    not just be accepted and ignored."""
+    seen_args = []
+
+    def stub_handler(arguments, context):
+        seen_args.append(dict(arguments))
+        return "ok"
+
+    monkeypatch.setitem(tool_registry.BUILTIN_HANDLERS, "web_search", stub_handler)
+
     tools = tool_registry.build_runtime_tools(
         "agent-1",
         MagicMock(),
@@ -27,6 +37,9 @@ def test_runtime_builtin_builds_with_forced_args(registry_env):
     )
     assert set(tools) == {"web_search"}
     assert tools["web_search"].input_schema  # real builtin schema came through
+
+    tools["web_search"].execute({"query": "test"}, None)
+    assert seen_args and seen_args[0]["search_type"] == "deep"
 
 
 def test_runtime_custom_by_reference_builds_from_db_row(registry_env):

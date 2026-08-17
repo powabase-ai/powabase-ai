@@ -937,6 +937,18 @@ def build_runtime_tools(
     the same helpers as attached tools so billing wrappers and truncation
     semantics are identical. A referenced custom tool deleted between
     validation and build (TOCTOU) is logged and skipped, not fatal.
+
+    A runtime ``mcp`` entry overrides an attached server ONLY by matching
+    discovered tool name, never by server name as a whole: if the attached
+    and runtime servers share a name but expose different tool sets, the
+    result is a mixed namespace — tools present on both resolve to the
+    runtime server, while a tool the attached server has and the runtime
+    server doesn't keeps pointing at the attached server. And because
+    discovery failure is soft (see _build_mcp_server_tools), a runtime
+    server that fails to discover contributes nothing, silently leaving
+    every one of that name's tools bound to the attached server while the
+    run proceeds as if the override had applied. This is accepted, not a
+    bug to fix here.
     """
     tools: dict[str, ToolDefinition] = {}
     app = _get_flask_app()

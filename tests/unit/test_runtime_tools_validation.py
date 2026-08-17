@@ -35,6 +35,14 @@ def test_unknown_type_rejected():
     assert err is not None and "type" in err
 
 
+def test_unhashable_type_rejected_not_raised():
+    """An object/array 'type' must 400, not raise TypeError from an unhashable
+    dict-key lookup."""
+    for bad_type in ([], {}):
+        _, err = validate_runtime_tools({"runtime_tools": [{"type": bad_type}]}, MagicMock())
+        assert err is not None and "type" in err
+
+
 def test_cap_enforced():
     """Uses VALID builtin entries so this pins the cap itself, not an earlier
     per-entry rejection."""
@@ -138,6 +146,30 @@ def test_custom_requires_exactly_one_of_tool_id_or_definition():
         assert err is not None and "tool_id" in err and "definition" in err
 
 
+def test_custom_null_tool_id_with_valid_definition_rejected_not_raised():
+    """An explicit 'tool_id': null alongside a valid 'definition' must 400
+    (key present, value None isn't a real reference), not fall through to a
+    DB query with ids=[None]."""
+    db = MagicMock()
+    db.execute.return_value = []
+    _, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "tool_id": None, "definition": _definition()}]},
+        db,
+    )
+    assert err is None
+
+
+def test_custom_null_definition_with_valid_tool_id_rejected_not_raised():
+    """An explicit 'definition': null alongside a valid 'tool_id' must not
+    raise when the final-name dedup pass looks up definition['name']."""
+    configs, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "definition": None, "tool_id": _TOOL_1}]},
+        _db_returning_tools([(_TOOL_1, "case_lookup")]),
+    )
+    assert err is None
+    assert configs[0]["_resolved_name"] == "case_lookup"
+
+
 def test_custom_malformed_tool_id_rejected_without_db():
     db = MagicMock()
     _, err = validate_runtime_tools(
@@ -157,6 +189,37 @@ def test_custom_tool_id_normalized_and_resolved():
     assert err is None
     assert configs[0]["tool_id"] == _TOOL_1
     assert configs[0]["_resolved_name"] == "case_lookup"
+
+
+def test_custom_tool_id_resolved_name_shadowing_builtin_rejected():
+    """An ai.tools row named like a builtin (e.g. web_search), referenced by
+    tool_id, must be held to the same shadow rule as an inline definition —
+    otherwise it silently replaces the attached builtin and its billing
+    action at build time."""
+    _, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "tool_id": _TOOL_1}]},
+        _db_returning_tools([(_TOOL_1, "web_search")]),
+    )
+    assert err is not None and "web_search" in err
+
+
+def test_custom_tool_id_resolved_name_shadowing_knowledge_search_rejected():
+    _, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "tool_id": _TOOL_1}]},
+        _db_returning_tools([(_TOOL_1, "knowledge_search")]),
+    )
+    assert err is not None and "knowledge_search" in err
+
+
+def test_custom_resolved_name_key_cannot_be_injected_by_caller():
+    """'_resolved_name' is set internally after DB resolution. A caller
+    supplying it is already rejected by the strict per-type key allowlist —
+    pin that."""
+    data = {
+        "runtime_tools": [{"type": "custom", "tool_id": _TOOL_1, "_resolved_name": "web_search"}]
+    }
+    _, err = validate_runtime_tools(data, _db_returning_tools([(_TOOL_1, "case_lookup")]))
+    assert err is not None and "_resolved_name" in err
 
 
 def test_custom_unknown_tool_id_rejected():
@@ -217,6 +280,17 @@ def test_definition_name_shadowing_builtin_rejected():
         {"runtime_tools": [{"type": "custom", "definition": d}]}, MagicMock()
     )
     assert err is not None and "web_search" in err
+
+
+def test_definition_name_shadowing_knowledge_search_rejected():
+    """knowledge_search is never touched by this feature — an inline
+    definition claiming that name must 400, not silently displace the real
+    KnowledgeSearchTool at build time."""
+    d = _definition(name="knowledge_search")
+    _, err = validate_runtime_tools(
+        {"runtime_tools": [{"type": "custom", "definition": d}]}, MagicMock()
+    )
+    assert err is not None and "knowledge_search" in err
 
 
 def test_definition_input_schema_must_be_object_typed():

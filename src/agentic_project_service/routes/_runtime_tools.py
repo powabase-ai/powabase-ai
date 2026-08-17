@@ -40,6 +40,12 @@ _ALLOWED_KEYS_BY_TYPE = {
 _ALLOWED_DEFINITION_KEYS = {"name", "description", "input_schema", "config"}
 _ALLOWED_DEFINITION_CONFIG_KEYS = {"endpoint", "method", "headers", "timeout_seconds"}
 
+# Names a runtime custom tool may never resolve to, whether inline or via
+# tool_id: real builtins, plus the generated knowledge_search tool. Either
+# one is built and then silently clobbered by ``tools.update(...)`` in
+# build_runtime_tools/load_all_tools_for_agent, with no signal to the caller.
+_RESERVED_TOOL_NAMES = set(_BUILTIN_DEFS) | {"knowledge_search"}
+
 
 def _normalize_uuid(value):
     """Parse a UUID and return its canonical (lowercase, dashed) string form.
@@ -105,7 +111,7 @@ def _validate_definition(definition):
     name = definition.get("name")
     if not name or not isinstance(name, str):
         return "runtime tool definition requires a non-empty 'name'"
-    if name in _BUILTIN_DEFS:
+    if name in _RESERVED_TOOL_NAMES:
         return f"runtime tool definition name {name!r} shadows a builtin tool"
     description = definition.get("description")
     if not description or not isinstance(description, str):
@@ -184,12 +190,15 @@ def validate_runtime_tools(data, db_session, ai_schema: str = AI_SCHEMA):
 
     normalized_entries = []
     for entry in raw:
-        if not isinstance(entry, dict) or entry.get("type") not in _ALLOWED_KEYS_BY_TYPE:
+        # isinstance(..., str) is checked before the dict-key lookup below —
+        # an unhashable 'type' (a list or dict) would otherwise raise
+        # TypeError from `not in _ALLOWED_KEYS_BY_TYPE` instead of 400ing.
+        entry_type = entry.get("type") if isinstance(entry, dict) else None
+        if not isinstance(entry_type, str) or entry_type not in _ALLOWED_KEYS_BY_TYPE:
             return [], (
                 "each 'runtime_tools' entry must be an object with a 'type' of "
                 "'builtin', 'custom', or 'mcp'"
             )
-        entry_type = entry["type"]
         unknown_keys = set(entry) - _ALLOWED_KEYS_BY_TYPE[entry_type]
         if unknown_keys:
             return [], (
@@ -206,7 +215,15 @@ def validate_runtime_tools(data, db_session, ai_schema: str = AI_SCHEMA):
             return [], err
         normalized_entries.append(entry)
 
-    ref_entries = [e for e in normalized_entries if e["type"] == "custom" and "tool_id" in e]
+    # Keyed off "value is not None" — the same notion _validate_custom_entry's
+    # xor check uses — not key presence. An entry can carry a "tool_id" (or
+    # "definition") key set to null alongside a valid value in the other
+    # field (the xor already treats that as "not provided"); selecting on
+    # key presence instead would catch that null and query the DB with
+    # ids=[None].
+    ref_entries = [
+        e for e in normalized_entries if e["type"] == "custom" and e.get("tool_id") is not None
+    ]
     seen_tool_ids: set[str] = set()
     for e in ref_entries:
         if e["tool_id"] in seen_tool_ids:
@@ -223,7 +240,13 @@ def validate_runtime_tools(data, db_session, ai_schema: str = AI_SCHEMA):
         if missing:
             return [], f"unknown tool id(s): {', '.join(missing)}"
         for e in ref_entries:
-            e["_resolved_name"] = name_by_id[e["tool_id"]]
+            resolved_name = name_by_id[e["tool_id"]]
+            if resolved_name in _RESERVED_TOOL_NAMES:
+                return [], (
+                    f"tool id {e['tool_id']} resolves to name {resolved_name!r}, "
+                    "which shadows a builtin tool"
+                )
+            e["_resolved_name"] = resolved_name
 
     # Final-name duplicate detection across the whole request. MCP entries
     # participate with their server name (their discovered tool names are
@@ -235,7 +258,12 @@ def validate_runtime_tools(data, db_session, ai_schema: str = AI_SCHEMA):
         if e["type"] == "builtin" or e["type"] == "mcp":
             final = e["name"]
         else:
-            final = e["definition"]["name"] if "definition" in e else e["_resolved_name"]
+            # Same not-None notion as the xor check and ref_entries above —
+            # a "definition" key present but null falls through to
+            # "_resolved_name" instead of subscripting None.
+            final = (
+                e["definition"]["name"] if e.get("definition") is not None else e["_resolved_name"]
+            )
         if final in seen_names:
             return [], f"duplicate runtime tool name: {final!r}"
         seen_names.add(final)
