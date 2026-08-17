@@ -231,3 +231,38 @@ def test_stream_and_db_writes_never_echo_runtime_tool_headers():
     for call in mock_session.execute.call_args_list:
         assert secret not in repr(call)
 
+
+def _make_orchestrations_test_app():
+    from flask import Flask
+
+    from agentic_project_service.routes import orchestrations as orch_route
+
+    app = Flask(__name__)
+    app.register_blueprint(orch_route.orchestrations_bp)
+    return app
+
+
+def test_orchestration_stream_400s_on_invalid_runtime_tools_before_streaming():
+    from agentic_project_service.routes import orchestrations as orch_route
+
+    app = _make_orchestrations_test_app()
+    with patch(
+        "agentic_project_service.auth.decode_jwt",
+        return_value={"sub": "user-1", "role": "authenticated"},
+    ):
+        with patch.object(
+            orch_route,
+            "validate_runtime_tools",
+            return_value=([], "unknown builtin tool: 'telepathy'"),
+        ):
+            with app.test_client() as client:
+                resp = client.post(
+                    "/api/orchestrations/orch-1/run/stream",
+                    json={
+                        "message": "hi",
+                        "runtime_tools": [{"type": "builtin", "name": "telepathy"}],
+                    },
+                    headers=_auth_headers(),
+                )
+    assert resp.status_code == 400
+    assert "telepathy" in resp.get_json()["error"]
