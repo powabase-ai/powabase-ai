@@ -783,6 +783,7 @@ def load_all_tools_for_agent(
     max_tool_output_length: int | None = None,
     default_max_result_chars: int | None = None,
     runtime_kb_configs: list[dict] | None = None,
+    runtime_tool_configs: list[dict] | None = None,
 ) -> dict[str, ToolDefinition]:
     """Load all tools assigned to an agent: built-in + custom.
 
@@ -791,6 +792,8 @@ def load_all_tools_for_agent(
         default_max_result_chars: Override for ToolDefinition.max_result_chars.
         runtime_kb_configs: Per-request KB configs merged into the agent's
             knowledge_search tool for this run only.
+        runtime_tool_configs: Per-request tool entries added for this run only;
+            a runtime tool overrides an attached tool with the same name.
     """
     tools: dict[str, ToolDefinition] = {}
     app = _get_flask_app()
@@ -905,6 +908,78 @@ def load_all_tools_for_agent(
         default_max_result_chars=default_max_result_chars,
     )
     tools.update(mcp_tools)
+
+    # 4. Runtime tools (per-request; override attached tools on name collision)
+    if runtime_tool_configs:
+        tools.update(
+            build_runtime_tools(
+                agent_id,
+                db_session,
+                runtime_tool_configs,
+                max_tool_output_length=max_tool_output_length,
+                default_max_result_chars=default_max_result_chars,
+            )
+        )
+
+    return tools
+
+
+def build_runtime_tools(
+    agent_id: str,
+    db_session,
+    runtime_tool_configs: list[dict],
+    max_tool_output_length: int | None = None,
+    default_max_result_chars: int | None = None,
+) -> dict[str, ToolDefinition]:
+    """Build per-request tools from validated ``runtime_tools`` entries.
+
+    Entries arrive validated by routes/_runtime_tools.py. Construction reuses
+    the same helpers as attached tools so billing wrappers and truncation
+    semantics are identical. A referenced custom tool deleted between
+    validation and build (TOCTOU) is logged and skipped, not fatal.
+    """
+    tools: dict[str, ToolDefinition] = {}
+    app = _get_flask_app()
+
+    for entry in runtime_tool_configs:
+        entry_type = entry.get("type")
+        if entry_type == "builtin":
+            name = entry["name"]
+            defn = _BUILTIN_DEFS.get(name)
+            handler = BUILTIN_HANDLERS.get(name)
+            if not defn or not handler:
+                logger.warning("Unknown built-in runtime tool: %s", name)
+                continue
+            tools[name] = _build_plain_builtin_tool(
+                defn, handler, entry.get("config_override"), app, default_max_result_chars
+            )
+        elif entry_type == "custom" and entry.get("tool_id"):
+            tool_row = db_session.get(Tool, entry["tool_id"])
+            if not tool_row:
+                logger.warning(
+                    "Runtime tool %s no longer exists — dropped from this run (agent %s)",
+                    entry["tool_id"],
+                    agent_id,
+                )
+                continue
+            tools[tool_row.name] = _build_custom_tool(
+                tool_row.name,
+                tool_row.description,
+                tool_row.input_schema,
+                tool_row.config or {},
+                max_tool_output_length,
+                default_max_result_chars,
+            )
+        elif entry_type == "custom":
+            definition = entry["definition"]
+            tools[definition["name"]] = _build_custom_tool(
+                definition["name"],
+                definition["description"],
+                definition["input_schema"],
+                definition["config"],
+                max_tool_output_length,
+                default_max_result_chars,
+            )
 
     return tools
 
