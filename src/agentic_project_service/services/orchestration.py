@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 def build_orchestration(
     orch_id: str,
     runtime_kb_configs: list[dict] | None = None,
+    runtime_tool_configs: list[dict] | None = None,
 ) -> tuple[OrchestrationModel, Orchestration]:
     """Build a core Orchestration object from DB models.
 
@@ -114,6 +115,7 @@ def build_orchestration(
                 max_tool_output_length=get_setting("MAX_TOOL_OUTPUT_LENGTH"),
                 default_max_result_chars=get_setting("DEFAULT_MAX_RESULT_CHARS"),
                 runtime_kb_configs=runtime_kb_configs,
+                runtime_tool_configs=runtime_tool_configs,
             )
 
             entity_config = entity.config or {}

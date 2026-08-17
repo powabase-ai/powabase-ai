@@ -667,12 +667,123 @@ def _introspect_table_metadata(db_session, schemas_config: dict[str, list[str]])
     return "\n".join(lines)
 
 
+def _build_plain_builtin_tool(defn, handler, config_override, app, default_max_result_chars):
+    """Build a non-database builtin with config-override forced arguments.
+
+    Only override keys declared in the tool's input_schema become forced
+    argument values (metadata keys like "rules" are filtered out). Order
+    matters: the override wrapper composes OUTSIDE the billing wrapper so a
+    price-affecting forced argument (e.g. web_search search_type = deep) is
+    present in `arguments` when the billing wrapper resolves the action.
+    Wrapping the other way bills the standard rate while running the pricier
+    deep search.
+    """
+    schema_props = (defn.get("input_schema") or {}).get("properties", {})
+    param_overrides = {k: v for k, v in (config_override or {}).items() if k in schema_props}
+
+    tool_handler = _wrap_handler_with_billing(_ensure_app_context(handler, app), defn["name"])
+
+    if param_overrides:
+
+        def make_overrides_handler(h, overrides):
+            def with_overrides(arguments, context):
+                arguments.update(overrides)
+                return h(arguments, context)
+
+            return with_overrides
+
+        tool_handler = make_overrides_handler(tool_handler, param_overrides)
+
+    builtin = BuiltinTool(
+        name=defn["name"],
+        description=defn["description"],
+        input_schema=defn["input_schema"],
+        handler=tool_handler,
+    )
+    if default_max_result_chars is not None:
+        builtin.max_result_chars = default_max_result_chars
+    return builtin
+
+
+def _build_custom_tool(
+    name, description, input_schema, config, max_tool_output_length, default_max_result_chars
+):
+    """Build a CustomTool from a tool row's (or inline definition's) config."""
+    custom_tool = CustomTool(
+        name=name,
+        description=description,
+        input_schema=input_schema,
+        endpoint=config.get("endpoint", ""),
+        method=config.get("method", "POST"),
+        headers=config.get("headers", {}),
+        timeout=config.get("timeout_seconds", get_setting("CUSTOM_TOOL_TIMEOUT")),
+    )
+    if max_tool_output_length is not None:
+        custom_tool.max_output_length = max_tool_output_length
+    if default_max_result_chars is not None:
+        custom_tool.max_result_chars = default_max_result_chars
+    _wrap_tool_execute_with_billing(custom_tool)
+    return custom_tool
+
+
+def _build_mcp_server_tools(
+    server_name, server_url, server_headers, agent_id, default_max_result_chars
+):
+    """Discover one MCP server's tools and build McpTool definitions.
+
+    Discovery failure is soft: logged and an empty dict returned, so the run
+    continues without this server. Server names are only unique per agent —
+    without the agent id the log cannot answer "whose server failed".
+    exc_info because the broad except will eventually catch a programming
+    error, and a one-line message is useless for that. Headers are never
+    logged — they carry secrets.
+    """
+    from agentic.agent.tools import McpTool
+    from agentic.mcp.client import discover_mcp_tools
+
+    tools: dict[str, ToolDefinition] = {}
+    try:
+        mcp_tools = discover_mcp_tools(server_url, server_headers or {})
+    except Exception as e:
+        logger.warning(
+            "Failed to discover tools from MCP server %s (%s) for agent %s: %s",
+            server_name,
+            server_url,
+            agent_id,
+            e,
+            exc_info=True,
+        )
+        return tools
+
+    for mcp_tool in mcp_tools:
+        tool_name = f"mcp__{server_name}__{mcp_tool.name}"
+        mcp_tool_def = McpTool(
+            name=tool_name,
+            description=mcp_tool.description,
+            input_schema=mcp_tool.input_schema,
+            server_name=server_name,
+            server_url=server_url,
+            server_headers=server_headers or {},
+            mcp_tool_name=mcp_tool.name,
+            is_concurrency_safe=mcp_tool.read_only_hint,
+            is_read_only=mcp_tool.read_only_hint,
+            is_destructive=mcp_tool.destructive_hint,
+        )
+        if default_max_result_chars is not None:
+            mcp_tool_def.max_result_chars = default_max_result_chars
+        _wrap_tool_execute_with_billing(mcp_tool_def)
+        tools[tool_name] = mcp_tool_def
+
+    return tools
+
+
 def load_all_tools_for_agent(
     agent_id: str,
     db_session,
     max_tool_output_length: int | None = None,
     default_max_result_chars: int | None = None,
     runtime_kb_configs: list[dict] | None = None,
+    runtime_tool_configs: list[dict] | None = None,
 ) -> dict[str, ToolDefinition]:
     """Load all tools assigned to an agent: built-in + custom.
 
@@ -681,6 +792,8 @@ def load_all_tools_for_agent(
         default_max_result_chars: Override for ToolDefinition.max_result_chars.
         runtime_kb_configs: Per-request KB configs merged into the agent's
             knowledge_search tool for this run only.
+        runtime_tool_configs: Per-request tool entries added for this run only;
+            a runtime tool overrides an attached tool with the same name.
     """
     tools: dict[str, ToolDefinition] = {}
     app = _get_flask_app()
@@ -767,62 +880,22 @@ def load_all_tools_for_agent(
                 continue
 
             # All other builtin tools — apply config overrides as forced
-            # argument values.  Only inject keys that are declared in the
-            # tool's input_schema to avoid leaking metadata (e.g. "rules")
-            # into the handler's arguments dict.
-            raw_overrides = assignment.config_override or {}
-            schema_props = (defn.get("input_schema") or {}).get("properties", {})
-            param_overrides = {k: v for k, v in raw_overrides.items() if k in schema_props}
-
-            # Order matters: the override must run OUTSIDE the billing wrapper
-            # so a price-affecting forced argument (e.g. web_search search_type
-            # = deep) is present in `arguments` when the billing wrapper
-            # resolves the action. Wrapping the other way bills the standard
-            # rate while running the pricier deep search.
-            tool_handler = _wrap_handler_with_billing(
-                _ensure_app_context(handler, app), defn["name"]
+            # argument values.
+            tools[tool_name] = _build_plain_builtin_tool(
+                defn, handler, assignment.config_override, app, default_max_result_chars
             )
-
-            if param_overrides:
-
-                def make_overrides_handler(h, overrides):
-                    def with_overrides(arguments, context):
-                        arguments.update(overrides)
-                        return h(arguments, context)
-
-                    return with_overrides
-
-                tool_handler = make_overrides_handler(tool_handler, param_overrides)
-
-            builtin = BuiltinTool(
-                name=defn["name"],
-                description=defn["description"],
-                input_schema=defn["input_schema"],
-                handler=tool_handler,
-            )
-            if default_max_result_chars is not None:
-                builtin.max_result_chars = default_max_result_chars
-            tools[tool_name] = builtin
 
         elif assignment.tool_type == "custom" and assignment.tool_id:
             tool_row = db_session.get(Tool, assignment.tool_id)
             if tool_row:
-                config = tool_row.config or {}
-                custom_tool = CustomTool(
-                    name=tool_row.name,
-                    description=tool_row.description,
-                    input_schema=tool_row.input_schema,
-                    endpoint=config.get("endpoint", ""),
-                    method=config.get("method", "POST"),
-                    headers=config.get("headers", {}),
-                    timeout=config.get("timeout_seconds", get_setting("CUSTOM_TOOL_TIMEOUT")),
+                tools[tool_row.name] = _build_custom_tool(
+                    tool_row.name,
+                    tool_row.description,
+                    tool_row.input_schema,
+                    tool_row.config or {},
+                    max_tool_output_length,
+                    default_max_result_chars,
                 )
-                if max_tool_output_length is not None:
-                    custom_tool.max_output_length = max_tool_output_length
-                if default_max_result_chars is not None:
-                    custom_tool.max_result_chars = default_max_result_chars
-                _wrap_tool_execute_with_billing(custom_tool)
-                tools[tool_row.name] = custom_tool
 
     # 2. Knowledge search tools (auto-generated from ai.agent_knowledge_bases)
     kb_tools = build_kb_tools_for_agent(agent_id, db_session, runtime_kb_configs=runtime_kb_configs)
@@ -836,6 +909,100 @@ def load_all_tools_for_agent(
     )
     tools.update(mcp_tools)
 
+    # 4. Runtime tools (per-request; override attached tools on name collision)
+    if runtime_tool_configs:
+        tools.update(
+            build_runtime_tools(
+                agent_id,
+                db_session,
+                runtime_tool_configs,
+                max_tool_output_length=max_tool_output_length,
+                default_max_result_chars=default_max_result_chars,
+            )
+        )
+
+    return tools
+
+
+def build_runtime_tools(
+    agent_id: str,
+    db_session,
+    runtime_tool_configs: list[dict],
+    max_tool_output_length: int | None = None,
+    default_max_result_chars: int | None = None,
+) -> dict[str, ToolDefinition]:
+    """Build per-request tools from validated ``runtime_tools`` entries.
+
+    Entries arrive validated by routes/_runtime_tools.py. Construction reuses
+    the same helpers as attached tools so billing wrappers and truncation
+    semantics are identical. A referenced custom tool deleted between
+    validation and build (TOCTOU) is logged and skipped, not fatal.
+
+    A runtime ``mcp`` entry overrides an attached server ONLY by matching
+    discovered tool name, never by server name as a whole: if the attached
+    and runtime servers share a name but expose different tool sets, the
+    result is a mixed namespace — tools present on both resolve to the
+    runtime server, while a tool the attached server has and the runtime
+    server doesn't keeps pointing at the attached server. And because
+    discovery failure is soft (see _build_mcp_server_tools), a runtime
+    server that fails to discover contributes nothing, silently leaving
+    every one of that name's tools bound to the attached server while the
+    run proceeds as if the override had applied. This is accepted, not a
+    bug to fix here.
+    """
+    tools: dict[str, ToolDefinition] = {}
+    app = _get_flask_app()
+
+    for entry in runtime_tool_configs:
+        entry_type = entry.get("type")
+        if entry_type == "builtin":
+            name = entry["name"]
+            defn = _BUILTIN_DEFS.get(name)
+            handler = BUILTIN_HANDLERS.get(name)
+            if not defn or not handler:
+                logger.warning("Unknown built-in runtime tool: %s", name)
+                continue
+            tools[name] = _build_plain_builtin_tool(
+                defn, handler, entry.get("config_override"), app, default_max_result_chars
+            )
+        elif entry_type == "custom" and entry.get("tool_id"):
+            tool_row = db_session.get(Tool, entry["tool_id"])
+            if not tool_row:
+                logger.warning(
+                    "Runtime tool %s no longer exists — dropped from this run (agent %s)",
+                    entry["tool_id"],
+                    agent_id,
+                )
+                continue
+            tools[tool_row.name] = _build_custom_tool(
+                tool_row.name,
+                tool_row.description,
+                tool_row.input_schema,
+                tool_row.config or {},
+                max_tool_output_length,
+                default_max_result_chars,
+            )
+        elif entry_type == "custom":
+            definition = entry["definition"]
+            tools[definition["name"]] = _build_custom_tool(
+                definition["name"],
+                definition["description"],
+                definition["input_schema"],
+                definition["config"],
+                max_tool_output_length,
+                default_max_result_chars,
+            )
+        elif entry_type == "mcp":
+            tools.update(
+                _build_mcp_server_tools(
+                    entry["name"],
+                    entry["url"],
+                    entry.get("headers") or {},
+                    agent_id,
+                    default_max_result_chars,
+                )
+            )
+
     return tools
 
 
@@ -845,47 +1012,14 @@ def build_mcp_tools_for_agent(
     default_max_result_chars: int | None = None,
 ) -> dict[str, "ToolDefinition"]:
     """Discover and build tools from MCP servers assigned to an agent."""
-    from agentic.agent.tools import McpTool
-    from agentic.mcp.client import discover_mcp_tools
-
     servers = AgentMcpServer.query.filter_by(agent_id=agent_id, enabled=True).all()
     tools: dict[str, ToolDefinition] = {}
 
     for server in servers:
-        try:
-            mcp_tools = discover_mcp_tools(server.url, server.headers or {})
-        except Exception as e:
-            # Server names are only unique per agent — without the agent id
-            # this log cannot answer "whose server failed". exc_info because
-            # the broad except will eventually catch a programming error, and
-            # a one-line message is useless for that.
-            logger.warning(
-                "Failed to discover tools from MCP server %s (%s) for agent %s: %s",
-                server.name,
-                server.url,
-                agent_id,
-                e,
-                exc_info=True,
+        tools.update(
+            _build_mcp_server_tools(
+                server.name, server.url, server.headers, agent_id, default_max_result_chars
             )
-            continue
-
-        for mcp_tool in mcp_tools:
-            tool_name = f"mcp__{server.name}__{mcp_tool.name}"
-            mcp_tool_def = McpTool(
-                name=tool_name,
-                description=mcp_tool.description,
-                input_schema=mcp_tool.input_schema,
-                server_name=server.name,
-                server_url=server.url,
-                server_headers=server.headers or {},
-                mcp_tool_name=mcp_tool.name,
-                is_concurrency_safe=mcp_tool.read_only_hint,
-                is_read_only=mcp_tool.read_only_hint,
-                is_destructive=mcp_tool.destructive_hint,
-            )
-            if default_max_result_chars is not None:
-                mcp_tool_def.max_result_chars = default_max_result_chars
-            _wrap_tool_execute_with_billing(mcp_tool_def)
-            tools[tool_name] = mcp_tool_def
+        )
 
     return tools
