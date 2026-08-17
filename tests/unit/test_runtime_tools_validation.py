@@ -2,7 +2,6 @@
 
 from unittest.mock import MagicMock
 
-import pytest
 
 from agentic_project_service.routes._runtime_tools import (
     RUNTIME_TOOLS_MAX_ENTRIES,
