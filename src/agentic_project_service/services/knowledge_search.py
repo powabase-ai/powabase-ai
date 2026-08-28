@@ -66,6 +66,15 @@ PER_SOURCE_CANDIDATE_CAP = 200
 # small sources can't blow up the candidate pool.
 PER_SOURCE_FLOOR_SOURCE_CAP = 50
 
+# graph_index expansion. Children of a referenced node are opt-in; when asked
+# for, at most this many per parent. The document outline that ships instead
+# names the sections left out, so the model can request one by node_id.
+GRAPH_DEFAULT_MAX_CHILDREN = 3
+
+# Outline lines per document. A 500-section contract is ~5k tokens of pure
+# structure otherwise; beyond this the outline truncates with a marker.
+GRAPH_TOC_MAX_NODES = 200
+
 
 def _read_source_limits(
     retrieval_config: dict | None,
@@ -997,7 +1006,7 @@ async def search_knowledge_base_async(
             request_id=rid,
         )
 
-        results = _expand_graph_neighbors(db_session, results, knowledge_base_id)
+        results = _expand_graph_neighbors(db_session, results, knowledge_base_id, retrieval_config)
 
         if source_ids:
             source_ids_set = set(source_ids)
@@ -1296,14 +1305,65 @@ def _execute_retrieval_pipeline(
     return results
 
 
+def _read_graph_expansion_config(retrieval_config: dict | None) -> tuple[bool, int, bool]:
+    """Extract (include_children, max_children_per_parent, include_doc_toc).
+
+    Children fan-out is opt-in: a referenced node's substructure is advertised
+    by the document outline rather than paid for in full section bodies.
+    """
+    cfg = (retrieval_config or {}).get("graph_expansion") or {}
+
+    raw_cap = cfg.get("max_children_per_parent", GRAPH_DEFAULT_MAX_CHILDREN)
+    try:
+        max_children = int(raw_cap)
+    except (TypeError, ValueError):
+        # Present but unparseable. Studio validates this field; API and agent
+        # callers bypass it — surface it rather than silently unbounding.
+        logger.warning("Ignoring non-integer max_children_per_parent: %r", raw_cap)
+        max_children = GRAPH_DEFAULT_MAX_CHILDREN
+
+    return (
+        bool(cfg.get("include_children", False)),
+        max(0, max_children),
+        bool(cfg.get("include_doc_toc", True)),
+    )
+
+
+def _render_toc_outline(nodes: list[dict]) -> str:
+    """Render a document outline: one indented ``[node_id] Title`` per line.
+
+    Same shape the indexing-time enricher shows the LLM, so a model reading
+    search results can name a section back in a follow-up query. Bounded by
+    ``GRAPH_TOC_MAX_NODES`` — a long document's full outline is otherwise
+    thousands of tokens nobody asked for.
+    """
+    lines = [
+        f"{'  ' * int(node.get('depth') or 0)}[{node['node_id']}] {node.get('title') or ''}".rstrip()
+        for node in nodes[:GRAPH_TOC_MAX_NODES]
+    ]
+    remaining = len(nodes) - GRAPH_TOC_MAX_NODES
+    if remaining > 0:
+        lines.append(f"... ({remaining} more sections)")
+    return "\n".join(lines)
+
+
 def _expand_graph_neighbors(
     db_session: Session,
     results: list[RetrievedItem],
     knowledge_base_id: str,
+    retrieval_config: dict | None = None,
 ) -> list[RetrievedItem]:
-    """Pull in first-degree referenced nodes for graph_index results."""
+    """Pull in first-degree referenced nodes for graph_index results.
+
+    Appends, in descending score order beneath the main pool: one outline per
+    document where a reference was actually followed, then the referenced
+    nodes, then — only when ``include_children`` is set — a capped number of
+    each referenced node's direct children.
+    """
     if not results:
         return results
+
+    include_children, max_children, include_doc_toc = _read_graph_expansion_config(retrieval_config)
 
     # Collect existing (toc_id, node_id) pairs for deduplication
     existing_keys: set[tuple[str, str]] = set()
@@ -1336,10 +1396,38 @@ def _expand_graph_neighbors(
     selections = [(tid, nid) for tid, nids in refs_to_fetch.items() for nid in nids]
     node_map = gi_store.get_nodes_by_ids(selections)
 
-    # Build RetrievedItems for referenced nodes
-    min_score = min(r.score for r in results) if results else 0.0
-    parent_score = max(0.0, min_score - 0.01)
+    # Score the expansion tiers as a band just below the main pool, ordered
+    # outline > referenced node > child. The step is proportional because the
+    # pool's scale depends on the retrieval method: hybrid fuses with RRF
+    # (~1/(60+rank), so ~0.008-0.016), an order of magnitude below cosine. A
+    # fixed decrement swallows the RRF scale whole and collapses the tiers.
+    pool_scores = [r.score for r in results if r.score is not None]
+    min_score = min(pool_scores) if pool_scores else 0.0
+    step = (abs(min_score) or 1.0) * 0.01
+    toc_score = min_score - step
+    parent_score = min_score - 2 * step
     all_keys = set(existing_keys)
+
+    # One outline per document that actually contributed a referenced node.
+    if include_doc_toc and node_map:
+        outlines = gi_store.get_toc_outline(sorted({tid for tid, _ in node_map}))
+        for toc_id, outline in outlines.items():
+            results.append(
+                RetrievedItem(
+                    item_id=toc_id,
+                    text=_render_toc_outline(outline.get("nodes") or []),
+                    score=toc_score,
+                    source_id=outline.get("source_id"),
+                    knowledge_base_id=knowledge_base_id,
+                    meta={
+                        "toc_id": toc_id,
+                        "doc_name": outline.get("doc_name", ""),
+                        "retrieval_method": "graph_toc",
+                        "score_type": "graph_doc_outline",
+                        "pages": [],
+                    },
+                )
+            )
 
     for (toc_id, node_id), node_row in node_map.items():
         all_keys.add((toc_id, node_id))
@@ -1368,17 +1456,27 @@ def _expand_graph_neighbors(
             )
         )
 
-    # Expand children of referenced parent nodes
-    children_map = gi_store.get_children_by_parent_ids(list(node_map.keys()))
-    child_score = max(0.0, parent_score - 0.01)
+    # Expand children of referenced parent nodes — opt-in, and capped per
+    # parent so one heavily-subdivided section can't flood the context.
+    children_map = (
+        gi_store.get_children_by_parent_ids(list(node_map.keys()))
+        if include_children and max_children
+        else {}
+    )
+    child_score = min_score - 3 * step
     children_added = 0
 
     for (toc_id, parent_node_id), child_rows in children_map.items():
-        for child_row in child_rows:
+        kept = 0
+        # node_id is zero-padded and sequential, so this is document order.
+        for child_row in sorted(child_rows, key=lambda row: row["node_id"]):
+            if kept >= max_children:
+                break
             child_key = (toc_id, child_row["node_id"])
             if child_key in all_keys:
                 continue
             all_keys.add(child_key)
+            kept += 1
 
             child_meta = child_row.get("meta") or {}
             start_page = child_meta.get("start_page")
@@ -1730,7 +1828,7 @@ def search_knowledge_base(
         )
 
         # Graph expansion: pull in first-degree referenced nodes
-        results = _expand_graph_neighbors(db_session, results, knowledge_base_id)
+        results = _expand_graph_neighbors(db_session, results, knowledge_base_id, retrieval_config)
 
         # Post-filter by source_ids — graph expansion may add nodes from
         # other sources that weren't in the original filter set.

@@ -209,6 +209,44 @@ class GraphIndexStore(BaseTocStore):
             },
         )
 
+    def get_toc_outline(self, toc_ids: list[str]) -> dict[str, dict]:
+        """Fetch title-only outlines for whole documents.
+
+        Deliberately not ``get_all_nodes_for_toc``, which selects every node's
+        full text — retrieval wants the structure, not the document.
+
+        Returns:
+            {toc_id: {"doc_name", "source_id", "nodes": [{node_id, title, depth}]}},
+            nodes in document order.
+        """
+        if not toc_ids:
+            return {}
+
+        result = self.session.execute(
+            text(f"""
+                SELECT n.toc_id, n.node_id, n.title, n.depth,
+                       t.doc_name, t.source_id
+                FROM "{AI_SCHEMA}".{self.NODES_TABLE} n
+                JOIN "{AI_SCHEMA}".{self.TOC_TABLE} t ON t.id = n.toc_id
+                WHERE n.toc_id = ANY(CAST(:toc_ids AS uuid[]))
+                ORDER BY n.toc_id, n.node_id ASC
+            """),
+            {"toc_ids": "{" + ",".join(toc_ids) + "}"},
+        )
+
+        outlines: dict[str, dict] = {}
+        for row in result:
+            toc_id = str(row[0])
+            outline = outlines.setdefault(
+                toc_id,
+                {"doc_name": row[4] or "", "source_id": str(row[5]), "nodes": []},
+            )
+            outline["nodes"].append(
+                {"node_id": row[1], "title": row[2] or "", "depth": row[3] or 0}
+            )
+
+        return outlines
+
     def count_nodes(self, indexed_source_id: str | None = None) -> int:
         """Total node count for this KB, optionally scoped to one source."""
         sql = f'SELECT COUNT(*) FROM "{AI_SCHEMA}".{self.NODES_TABLE} WHERE knowledge_base_id = :kb_id'

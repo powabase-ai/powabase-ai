@@ -111,6 +111,11 @@ STRATEGY_REGISTRY: dict[str, dict] = {
             "top_k": 5,
             "context_mode": "text",
             "ts_language": "english",
+            "graph_expansion": {
+                "include_children": False,
+                "max_children_per_parent": 3,
+                "include_doc_toc": True,
+            },
         },
     },
     "doc2json": {
