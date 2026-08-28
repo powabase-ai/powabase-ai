@@ -22,6 +22,7 @@ from ..db import AI_SCHEMA
 from .settings_registry import get_setting
 from ..models.tenant import ContextHandlerStatus
 from .knowledge_search import (
+    _is_structural_item,
     _pages_for_item,
     search_knowledge_base,
     search_knowledge_base_async,
@@ -180,6 +181,12 @@ def _resolve_page_images(
     for item in items:
         sid = item.source_id
         if not sid:
+            continue
+        if _is_structural_item(item):
+            # Structural items (e.g. a graph_index document outline) have no
+            # pages by construction. Counting them here would put their source
+            # in fetch_all_for, which wins over needed_pages — discarding the
+            # page filter for every other item from that same document.
             continue
         item_pages = _pages_for_item(item)
         if item_pages:

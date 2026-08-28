@@ -35,6 +35,10 @@ from .run_context import (
 from .storage import get_storage
 from ..db import AI_SCHEMA
 from ..strategies import get_default_retrieval_method, validate_retriever
+from ..strategies.graph_defaults import (
+    GRAPH_DEFAULT_MAX_CHILDREN,
+    GRAPH_MAX_CHILDREN_CEILING,
+)
 
 from agentic.knowledge.retrieval import TreeSearchAlgorithm, apply_source_limits
 
@@ -66,14 +70,13 @@ PER_SOURCE_CANDIDATE_CAP = 200
 # small sources can't blow up the candidate pool.
 PER_SOURCE_FLOOR_SOURCE_CAP = 50
 
-# graph_index expansion. Children of a referenced node are opt-in; when asked
-# for, at most this many per parent. The document outline that ships instead
-# names the sections left out, so the model can request one by node_id.
-GRAPH_DEFAULT_MAX_CHILDREN = 3
-
 # Outline lines per document. A 500-section contract is ~5k tokens of pure
 # structure otherwise; beyond this the outline truncates with a marker.
 GRAPH_TOC_MAX_NODES = 200
+
+# Retrieval methods whose items carry structure rather than source content.
+# They have no pages, and must be kept out of the image page-coverage scan.
+STRUCTURAL_RETRIEVAL_METHODS = frozenset({"graph_toc"})
 
 
 def _read_source_limits(
@@ -118,9 +121,10 @@ def _merge_floor_items(
     Without a reranker to re-score the merged pool uniformly, raw cosine values
     would sort floor items above genuine top matches and corrupt the ranking.
     When set, newly-added floor items are re-scored to sit just below the main
-    pool's minimum (preserving their relative order) — the same pool-relative
-    approach as ``_expand_graph_neighbors``. For pure ``vector_search`` the pool
-    is already cosine, so this is left off and true scores are preserved.
+    pool's minimum (preserving their relative order). Note this still uses a
+    fixed 0.01 step, where ``_expansion_tier_scores`` derives one from the
+    pool's own minimum; the two should converge. For pure ``vector_search``
+    the pool is already cosine, so this is left off and true scores kept.
     """
     seen = {it.item_id for it in main}
     new_items = [it for it in floor if it.item_id not in seen]
@@ -1305,43 +1309,124 @@ def _execute_retrieval_pipeline(
     return results
 
 
+def _read_graph_expansion_bool(cfg: dict, key: str, default: bool) -> bool:
+    """Read one boolean, rejecting rather than coercing non-booleans.
+
+    ``bool()`` would fail asymmetrically in the expensive direction: every
+    non-empty string is truthy, so ``"false"`` would switch children *on*.
+    The graph_index registry entry already stores string booleans elsewhere
+    (``"if_add_node_summary": "yes"``), so a caller writing ``"no"`` here by
+    analogy is a live possibility, and Studio reads these strictly too.
+    """
+    raw = cfg.get(key, default)
+    if isinstance(raw, bool):
+        return raw
+    if key in cfg:
+        logger.warning(
+            "graph_expansion.%s must be a boolean, got %s (%r) — using %s",
+            key,
+            type(raw).__name__,
+            raw,
+            default,
+        )
+    return default
+
+
 def _read_graph_expansion_config(retrieval_config: dict | None) -> tuple[bool, int, bool]:
     """Extract (include_children, max_children_per_parent, include_doc_toc).
 
     Children fan-out is opt-in: a referenced node's substructure is advertised
     by the document outline rather than paid for in full section bodies.
+
+    ``retrieval_config`` is unvalidated JSONB, and this runs on every
+    graph_index search that returns anything, ahead of the no-references
+    early-out. A malformed block therefore has to degrade to defaults:
+    raising here would be caught by the bare ``except`` in context_handler
+    and reported to the agent as an empty knowledge base, discarding a
+    search that had already succeeded.
     """
-    cfg = (retrieval_config or {}).get("graph_expansion") or {}
+    raw_cfg = (retrieval_config or {}).get("graph_expansion")
+    if raw_cfg is not None and not isinstance(raw_cfg, dict):
+        logger.warning(
+            "graph_expansion must be an object, got %s (%r) — using defaults",
+            type(raw_cfg).__name__,
+            raw_cfg,
+        )
+        raw_cfg = None
+    cfg = raw_cfg or {}
 
     raw_cap = cfg.get("max_children_per_parent", GRAPH_DEFAULT_MAX_CHILDREN)
-    try:
-        max_children = int(raw_cap)
-    except (TypeError, ValueError):
-        # Present but unparseable. Studio validates this field; API and agent
-        # callers bypass it — surface it rather than silently unbounding.
-        logger.warning("Ignoring non-integer max_children_per_parent: %r", raw_cap)
+    # bools are ints in Python, and a numeric string would disagree with how
+    # Studio reads the same value back, so accept only a real int.
+    if isinstance(raw_cap, int) and not isinstance(raw_cap, bool):
+        max_children = min(max(0, raw_cap), GRAPH_MAX_CHILDREN_CEILING)
+    else:
+        if "max_children_per_parent" in cfg:
+            logger.warning(
+                "Ignoring non-integer max_children_per_parent: %r",
+                raw_cap,
+            )
         max_children = GRAPH_DEFAULT_MAX_CHILDREN
 
     return (
-        bool(cfg.get("include_children", False)),
-        max(0, max_children),
-        bool(cfg.get("include_doc_toc", True)),
+        _read_graph_expansion_bool(cfg, "include_children", False),
+        max_children,
+        _read_graph_expansion_bool(cfg, "include_doc_toc", True),
     )
 
 
-def _render_toc_outline(nodes: list[dict]) -> str:
+def _expansion_tier_scores(min_score: float) -> tuple[float, float, float]:
+    """Score the expansion band beneath the pool: outline, node, child.
+
+    The step is proportional because a fixed decrement has to assume a score
+    scale, and this path has three: cosine on ``[0, 1]``, RRF (also ``[0, 1]``
+    — ``reciprocal_rank_fusion`` normalizes so the top hit is exactly 1.0),
+    and whatever a configured reranker emits. It is also floored, because
+    ``min_score`` of exactly 0.0 is reachable — ``bm25_score`` returns 0.0 for
+    an empty tsvector, and the vector store substitutes 0.0 for a NULL
+    similarity — and a purely multiplicative step would collapse all three
+    tiers onto 0.0 there.
+
+    Ordering holds within one knowledge base. ``search_multiple_knowledge_bases``
+    merges pools by raw score, so an expansion item from a high-scoring KB can
+    still outrank a genuine hit from a low-scoring one.
+    """
+    step = max(abs(min_score), 1e-6) * 0.01
+    return min_score - step, min_score - 2 * step, min_score - 3 * step
+
+
+def _is_structural_item(item: RetrievedItem) -> bool:
+    """True for items carrying document structure rather than source content.
+
+    These have no pages by construction, and an item with no page info makes
+    the image path fall back to fetching *every* image for its source
+    (``context_handler``'s ``fetch_all_for``, which wins over precise page
+    coverage). Graph references are intra-document, so an outline's source is
+    always one already represented by real hits — leaving it in that scan
+    would discard the page filter for all of them.
+    """
+    return (item.meta or {}).get("retrieval_method") in STRUCTURAL_RETRIEVAL_METHODS
+
+
+def _render_toc_outline(nodes: list[dict], total_nodes: int) -> str:
     """Render a document outline: one indented ``[node_id] Title`` per line.
 
-    Same shape the indexing-time enricher shows the LLM, so a model reading
-    search results can name a section back in a follow-up query. Bounded by
-    ``GRAPH_TOC_MAX_NODES`` — a long document's full outline is otherwise
-    thousands of tokens nobody asked for.
+    Same shape the indexing-time enricher builds (``graph_enricher``'s
+    ``_build_toc_context``), minus its optional ``— summary`` suffix and plus
+    a bound: a long document's full outline is thousands of tokens nobody
+    asked for. ``total_nodes`` is the document's real section count, which
+    the store knows even though it only returns the first page of rows.
+
+    Titles are searchable — the BM25 document for a node is ``title + text``
+    — so a model reading this can put a section's title in a follow-up query.
+    The bracketed ids are for a human or a downstream tool: no route or agent
+    tool takes a ``node_id``.
     """
     lines = [
         f"{'  ' * int(node.get('depth') or 0)}[{node['node_id']}] {node.get('title') or ''}".rstrip()
         for node in nodes[:GRAPH_TOC_MAX_NODES]
     ]
-    remaining = len(nodes) - GRAPH_TOC_MAX_NODES
+    remaining = total_nodes - len(lines)
     if remaining > 0:
         lines.append(f"... ({remaining} more sections)")
     return "\n".join(lines)
@@ -1396,38 +1481,45 @@ def _expand_graph_neighbors(
     selections = [(tid, nid) for tid, nids in refs_to_fetch.items() for nid in nids]
     node_map = gi_store.get_nodes_by_ids(selections)
 
-    # Score the expansion tiers as a band just below the main pool, ordered
-    # outline > referenced node > child. The step is proportional because the
-    # pool's scale depends on the retrieval method: hybrid fuses with RRF
-    # (~1/(60+rank), so ~0.008-0.016), an order of magnitude below cosine. A
-    # fixed decrement swallows the RRF scale whole and collapses the tiers.
     pool_scores = [r.score for r in results if r.score is not None]
     min_score = min(pool_scores) if pool_scores else 0.0
-    step = (abs(min_score) or 1.0) * 0.01
-    toc_score = min_score - step
-    parent_score = min_score - 2 * step
+    toc_score, parent_score, child_score = _expansion_tier_scores(min_score)
     all_keys = set(existing_keys)
 
     # One outline per document that actually contributed a referenced node.
+    # Best-effort: the outline decorates results that already exist, so a
+    # statement timeout here must not throw away a successful search — the
+    # same treatment the source floor gets above.
+    outlines: dict[str, dict] = {}
     if include_doc_toc and node_map:
-        outlines = gi_store.get_toc_outline(sorted({tid for tid, _ in node_map}))
-        for toc_id, outline in outlines.items():
-            results.append(
-                RetrievedItem(
-                    item_id=toc_id,
-                    text=_render_toc_outline(outline.get("nodes") or []),
-                    score=toc_score,
-                    source_id=outline.get("source_id"),
-                    knowledge_base_id=knowledge_base_id,
-                    meta={
-                        "toc_id": toc_id,
-                        "doc_name": outline.get("doc_name", ""),
-                        "retrieval_method": "graph_toc",
-                        "score_type": "graph_doc_outline",
-                        "pages": [],
-                    },
-                )
+        try:
+            outlines = gi_store.get_toc_outline(
+                sorted({tid for tid, _ in node_map}), GRAPH_TOC_MAX_NODES
             )
+        except Exception:
+            logger.warning("graph_expansion: outline fetch failed; continuing", exc_info=True)
+            outlines = {}
+
+    for toc_id, outline in outlines.items():
+        outline_nodes = outline.get("nodes") or []
+        if not outline_nodes:
+            continue
+        results.append(
+            RetrievedItem(
+                item_id=toc_id,
+                text=_render_toc_outline(outline_nodes, outline.get("total_nodes") or 0),
+                score=toc_score,
+                source_id=outline.get("source_id"),
+                knowledge_base_id=knowledge_base_id,
+                meta={
+                    "toc_id": toc_id,
+                    "doc_name": outline.get("doc_name", ""),
+                    "retrieval_method": "graph_toc",
+                    "score_type": "graph_doc_outline",
+                    "pages": [],
+                },
+            )
+        )
 
     for (toc_id, node_id), node_row in node_map.items():
         all_keys.add((toc_id, node_id))
@@ -1463,12 +1555,17 @@ def _expand_graph_neighbors(
         if include_children and max_children
         else {}
     )
-    child_score = min_score - 3 * step
     children_added = 0
 
     for (toc_id, parent_node_id), child_rows in children_map.items():
+        # The cap charges only newly-added children: one already in the pool
+        # is skipped without consuming budget, so a parent can contribute up
+        # to max_children *beyond* what the search already found.
         kept = 0
-        # node_id is zero-padded and sequential, so this is document order.
+        # node_id is zero-padded and sequential (write_node_id zfills to 4 in
+        # pre-order), so this is document order — and the children query has
+        # no ORDER BY of its own. Past 9999 nodes the padding stops and this
+        # sorts lexically, the same way the SQL would.
         for child_row in sorted(child_rows, key=lambda row: row["node_id"]):
             if kept >= max_children:
                 break
@@ -1508,10 +1605,15 @@ def _expand_graph_neighbors(
             children_added += 1
 
     logger.info(
-        "graph_expansion: fetched %d neighbors + %d children from %d refs",
+        "graph_expansion: fetched %d neighbors + %d children + %d outlines "
+        "from %d refs (children=%s cap=%d outline=%s)",
         len(node_map),
         children_added,
+        len(outlines),
         sum(len(nids) for nids in refs_to_fetch.values()),
+        include_children,
+        max_children,
+        include_doc_toc,
     )
 
     return results
@@ -2011,6 +2113,11 @@ def _format_chunk_annotation(item: RetrievedItem) -> str:
     parts: list[str] = []
     meta = item.meta or {}
 
+    if _is_structural_item(item):
+        # Structure, not source text. Without this it reaches the model as a
+        # bare citation marker with nothing saying it is an outline.
+        return "Document outline (section titles only)"
+
     title = meta.get("title")
     pages = meta.get("pages")
     if title:
@@ -2192,7 +2299,11 @@ def format_items_as_context(
                 for orig_idx, item in group_items:
                     kb_mode = (per_kb_context_mode or {}).get(item.knowledge_base_id, "text")
 
-                    if kb_mode == "image" and item.source_id in (source_image_map or {}):
+                    if (
+                        kb_mode == "image"
+                        and item.source_id in (source_image_map or {})
+                        and not _is_structural_item(item)
+                    ):
                         pages = _pages_for_item(item)
                         source_images = (source_image_map or {}).get(item.source_id, [])
                         matched_images = (
@@ -2312,7 +2423,11 @@ def format_items_as_context(
             for i, item in enumerate(items):
                 kb_mode = (per_kb_context_mode or {}).get(item.knowledge_base_id, "text")
 
-                if kb_mode == "image" and item.source_id in (source_image_map or {}):
+                if (
+                    kb_mode == "image"
+                    and item.source_id in (source_image_map or {})
+                    and not _is_structural_item(item)
+                ):
                     pages = _pages_for_item(item)
                     source_images = (source_image_map or {}).get(item.source_id, [])
                     matched_images = (

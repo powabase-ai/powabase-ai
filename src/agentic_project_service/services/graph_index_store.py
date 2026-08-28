@@ -209,29 +209,43 @@ class GraphIndexStore(BaseTocStore):
             },
         )
 
-    def get_toc_outline(self, toc_ids: list[str]) -> dict[str, dict]:
+    def get_toc_outline(self, toc_ids: list[str], limit: int) -> dict[str, dict]:
         """Fetch title-only outlines for whole documents.
 
         Deliberately not ``get_all_nodes_for_toc``, which selects every node's
         full text — retrieval wants the structure, not the document.
 
+        Paged in SQL rather than in Python: this runs on the search path, and
+        a 500-section document would otherwise ship 500 rows to render the
+        first ``limit`` of them. ``total_nodes`` still reports the real count
+        so the caller can say how many sections it left out.
+
         Returns:
-            {toc_id: {"doc_name", "source_id", "nodes": [{node_id, title, depth}]}},
-            nodes in document order.
+            {toc_id: {"doc_name", "source_id", "total_nodes", "nodes":
+            [{node_id, title, depth}]}}, nodes in document order.
         """
         if not toc_ids:
             return {}
 
         result = self.session.execute(
             text(f"""
-                SELECT n.toc_id, n.node_id, n.title, n.depth,
+                WITH ranked AS (
+                    SELECT n.toc_id, n.node_id, n.title, n.depth,
+                           row_number() OVER (
+                               PARTITION BY n.toc_id ORDER BY n.node_id ASC
+                           ) AS rn,
+                           count(*) OVER (PARTITION BY n.toc_id) AS total_nodes
+                    FROM "{AI_SCHEMA}".{self.NODES_TABLE} n
+                    WHERE n.toc_id = ANY(CAST(:toc_ids AS uuid[]))
+                )
+                SELECT r.toc_id, r.node_id, r.title, r.depth, r.total_nodes,
                        t.doc_name, t.source_id
-                FROM "{AI_SCHEMA}".{self.NODES_TABLE} n
-                JOIN "{AI_SCHEMA}".{self.TOC_TABLE} t ON t.id = n.toc_id
-                WHERE n.toc_id = ANY(CAST(:toc_ids AS uuid[]))
-                ORDER BY n.toc_id, n.node_id ASC
+                FROM ranked r
+                JOIN "{AI_SCHEMA}".{self.TOC_TABLE} t ON t.id = r.toc_id
+                WHERE r.rn <= :limit
+                ORDER BY r.toc_id, r.node_id ASC
             """),
-            {"toc_ids": "{" + ",".join(toc_ids) + "}"},
+            {"toc_ids": "{" + ",".join(toc_ids) + "}", "limit": limit},
         )
 
         outlines: dict[str, dict] = {}
@@ -239,7 +253,12 @@ class GraphIndexStore(BaseTocStore):
             toc_id = str(row[0])
             outline = outlines.setdefault(
                 toc_id,
-                {"doc_name": row[4] or "", "source_id": str(row[5]), "nodes": []},
+                {
+                    "doc_name": row[5] or "",
+                    "source_id": str(row[6]),
+                    "total_nodes": int(row[4] or 0),
+                    "nodes": [],
+                },
             )
             outline["nodes"].append(
                 {"node_id": row[1], "title": row[2] or "", "depth": row[3] or 0}

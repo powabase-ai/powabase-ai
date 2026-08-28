@@ -15,6 +15,7 @@ Usage:
 
 import copy
 
+from .graph_defaults import GRAPH_DEFAULT_MAX_CHILDREN
 from agentic.knowledge.model_config import (
     CHUNK_EMBED_DEFAULT_CHUNK_SIZE,
     CHUNK_EMBED_DEFAULT_OVERLAP,
@@ -113,7 +114,7 @@ STRATEGY_REGISTRY: dict[str, dict] = {
             "ts_language": "english",
             "graph_expansion": {
                 "include_children": False,
-                "max_children_per_parent": 3,
+                "max_children_per_parent": GRAPH_DEFAULT_MAX_CHILDREN,
                 "include_doc_toc": True,
             },
         },
