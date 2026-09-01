@@ -300,6 +300,43 @@ class TestResolvePageImagesFiltering:
         assert result == {}
         assert fake_storage.fetched == []
 
+    def test_structural_outline_does_not_widen_coverage_for_its_document(self, fake_storage):
+        """A graph_index outline carries structure, not source content, and has
+        no pages by construction. Before it was recognised as structural it
+        took the "no page info -> fetch every image for this source" branch —
+        and since graph references are intra-document, its source is always one
+        already represented by real hits with precise page coverage. One
+        outline therefore discarded the page filter for all of them."""
+        from agentic_project_service.services.context_handler import _resolve_page_images
+
+        SOURCE = "src-O"
+        db = _FakeDbSession([(SOURCE, _build_source(SOURCE, 10))])
+        items = [
+            _make_item(meta={"pages": [3]}, source_id=SOURCE),
+            _make_item(
+                meta={"pages": [], "retrieval_method": "graph_toc", "toc_id": "toc-1"},
+                source_id=SOURCE,
+            ),
+        ]
+
+        _resolve_page_images(db, items)
+
+        fetched_pages = sorted(int(p.split("_")[-1].rstrip(".png")) for p in fake_storage.fetched)
+        assert fetched_pages == [3], f"outline pulled the whole document: {fetched_pages}"
+
+    def test_a_real_item_without_pages_still_falls_back_to_all(self, fake_storage):
+        """The structural exemption must not weaken the conservative fallback
+        for ordinary items that genuinely lack page metadata."""
+        from agentic_project_service.services.context_handler import _resolve_page_images
+
+        SOURCE = "src-Q"
+        db = _FakeDbSession([(SOURCE, _build_source(SOURCE, 4))])
+
+        _resolve_page_images(db, [_make_item(meta={}, source_id=SOURCE)])
+
+        fetched_pages = sorted(int(p.split("_")[-1].rstrip(".png")) for p in fake_storage.fetched)
+        assert fetched_pages == [1, 2, 3, 4]
+
     def test_pages_outside_source_range_simply_yield_nothing(self, fake_storage):
         """If items reference pages that don't exist in the source's
         derivatives (e.g. a stale meta or off-by-one), the filter just

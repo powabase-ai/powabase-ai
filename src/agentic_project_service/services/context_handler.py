@@ -23,6 +23,7 @@ from .settings_registry import get_setting
 from ..models.tenant import ContextHandlerStatus
 from .knowledge_search import (
     _is_structural_item,
+    _is_structural_meta,
     _pages_for_item,
     search_knowledge_base,
     search_knowledge_base_async,
@@ -843,9 +844,13 @@ def execute_retrieval(
     # Attach matched page images to items for frontend debugging
     if source_image_map:
         for item_dict in retrieved_items_list:
-            pages = (item_dict.get("meta") or {}).get("pages", [])
+            meta = item_dict.get("meta") or {}
+            pages = meta.get("pages", [])
             source_id = item_dict.get("source_id")
-            if source_id and source_id in source_image_map:
+            # Structural items (a graph_index outline) have no pages, so the
+            # empty-pages branch below would attach every image of a source
+            # that real hits already cover precisely.
+            if source_id and source_id in source_image_map and not _is_structural_meta(meta):
                 source_images = source_image_map[source_id]
                 if pages:
                     matched = [img for img in source_images if img.get("page") in pages]

@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from agentic.knowledge.model_config import (
@@ -36,6 +37,8 @@ from .storage import get_storage
 from ..db import AI_SCHEMA
 from ..strategies import get_default_retrieval_method, validate_retriever
 from ..strategies.graph_defaults import (
+    GRAPH_DEFAULT_INCLUDE_CHILDREN,
+    GRAPH_DEFAULT_INCLUDE_DOC_TOC,
     GRAPH_DEFAULT_MAX_CHILDREN,
     GRAPH_MAX_CHILDREN_CEILING,
 )
@@ -808,9 +811,9 @@ async def search_knowledge_base_async(
             raise ValueError(f"Knowledge base not found: {knowledge_base_id}")
 
         if indexing_config is None:
-            indexing_config = kb_row[2] or {}
+            indexing_config = _coerce_kb_config(kb_row[2], "indexing_config", knowledge_base_id)
         if retrieval_config is None:
-            retrieval_config = kb_row[3] or {}
+            retrieval_config = _coerce_kb_config(kb_row[3], "retrieval_config", knowledge_base_id)
 
     strategy = indexing_config.get("strategy", "chunk_embed")
 
@@ -1309,7 +1312,31 @@ def _execute_retrieval_pipeline(
     return results
 
 
-def _read_graph_expansion_bool(cfg: dict, key: str, default: bool) -> bool:
+GRAPH_EXPANSION_KEYS = frozenset({"include_children", "max_children_per_parent", "include_doc_toc"})
+
+
+def _coerce_kb_config(raw: Any, field: str, kb_id: str) -> dict:
+    """Return a KB config column as a dict, whatever is actually stored.
+
+    The route now rejects a non-object, but rows written before that landed
+    persist as valid JSONB of the wrong shape — a JSON string, say. Every
+    later ``.get()`` on one raises, and context_handler turns that into an
+    empty knowledge base, so one bad write silently zeroes a KB forever.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if raw is not None:
+        logger.warning(
+            "%s on kb=%s is %s, not an object (%r) — using {}",
+            field,
+            kb_id,
+            type(raw).__name__,
+            raw,
+        )
+    return {}
+
+
+def _read_graph_expansion_bool(cfg: dict, key: str, default: bool, kb_id: str) -> bool:
     """Read one boolean, rejecting rather than coercing non-booleans.
 
     ``bool()`` would fail asymmetrically in the expensive direction: every
@@ -1323,16 +1350,19 @@ def _read_graph_expansion_bool(cfg: dict, key: str, default: bool) -> bool:
         return raw
     if key in cfg:
         logger.warning(
-            "graph_expansion.%s must be a boolean, got %s (%r) — using %s",
+            "graph_expansion.%s must be a boolean, got %s (%r) — using %s (kb=%s)",
             key,
             type(raw).__name__,
             raw,
             default,
+            kb_id,
         )
     return default
 
 
-def _read_graph_expansion_config(retrieval_config: dict | None) -> tuple[bool, int, bool]:
+def _read_graph_expansion_config(
+    retrieval_config: dict | None, knowledge_base_id: str
+) -> tuple[bool, int, bool]:
     """Extract (include_children, max_children_per_parent, include_doc_toc).
 
     Children fan-out is opt-in: a referenced node's substructure is advertised
@@ -1344,34 +1374,65 @@ def _read_graph_expansion_config(retrieval_config: dict | None) -> tuple[bool, i
     raising here would be caught by the bare ``except`` in context_handler
     and reported to the agent as an empty knowledge base, discarding a
     search that had already succeeded.
+
+    Every rejection says which KB it came from, because a misconfigured KB
+    otherwise emits an identical, unattributable warning on every query.
     """
     raw_cfg = (retrieval_config or {}).get("graph_expansion")
     if raw_cfg is not None and not isinstance(raw_cfg, dict):
         logger.warning(
-            "graph_expansion must be an object, got %s (%r) — using defaults",
+            "graph_expansion must be an object, got %s (%r) — using defaults (kb=%s)",
             type(raw_cfg).__name__,
             raw_cfg,
+            knowledge_base_id,
         )
         raw_cfg = None
     cfg = raw_cfg or {}
+
+    # A camelCase spelling is the natural mistake for a caller writing JSONB
+    # from JS, and silently ignoring it looks identical to configuring nothing.
+    unknown = set(cfg) - GRAPH_EXPANSION_KEYS
+    if unknown:
+        logger.warning(
+            "graph_expansion has unknown keys %s — ignored (kb=%s). Known keys: %s",
+            sorted(unknown),
+            knowledge_base_id,
+            sorted(GRAPH_EXPANSION_KEYS),
+        )
 
     raw_cap = cfg.get("max_children_per_parent", GRAPH_DEFAULT_MAX_CHILDREN)
     # bools are ints in Python, and a numeric string would disagree with how
     # Studio reads the same value back, so accept only a real int.
     if isinstance(raw_cap, int) and not isinstance(raw_cap, bool):
         max_children = min(max(0, raw_cap), GRAPH_MAX_CHILDREN_CEILING)
+        if max_children != raw_cap:
+            # Clamping silently would let the INFO summary below report an
+            # effective cap that reads as though the config were honoured.
+            logger.warning(
+                "graph_expansion.max_children_per_parent %r out of range "
+                "[0, %d] — clamped to %d (kb=%s)",
+                raw_cap,
+                GRAPH_MAX_CHILDREN_CEILING,
+                max_children,
+                knowledge_base_id,
+            )
     else:
         if "max_children_per_parent" in cfg:
             logger.warning(
-                "Ignoring non-integer max_children_per_parent: %r",
+                "Ignoring non-integer max_children_per_parent: %r (kb=%s)",
                 raw_cap,
+                knowledge_base_id,
             )
         max_children = GRAPH_DEFAULT_MAX_CHILDREN
 
     return (
-        _read_graph_expansion_bool(cfg, "include_children", False),
+        _read_graph_expansion_bool(
+            cfg, "include_children", GRAPH_DEFAULT_INCLUDE_CHILDREN, knowledge_base_id
+        ),
         max_children,
-        _read_graph_expansion_bool(cfg, "include_doc_toc", True),
+        _read_graph_expansion_bool(
+            cfg, "include_doc_toc", GRAPH_DEFAULT_INCLUDE_DOC_TOC, knowledge_base_id
+        ),
     )
 
 
@@ -1381,11 +1442,16 @@ def _expansion_tier_scores(min_score: float) -> tuple[float, float, float]:
     The step is proportional because a fixed decrement has to assume a score
     scale, and this path has three: cosine on ``[0, 1]``, RRF (also ``[0, 1]``
     — ``reciprocal_rank_fusion`` normalizes so the top hit is exactly 1.0),
-    and whatever a configured reranker emits. It is also floored, because
-    ``min_score`` of exactly 0.0 is reachable — ``bm25_score`` returns 0.0 for
-    an empty tsvector, and the vector store substitutes 0.0 for a NULL
-    similarity — and a purely multiplicative step would collapse all three
-    tiers onto 0.0 there.
+    and whatever a configured reranker emits, which for a cross-encoder is
+    routinely negative — hence ``abs``.
+
+    It is also floored, because a ``min_score`` of exactly 0.0 is reachable
+    and a purely multiplicative step would collapse all three tiers onto it.
+    ``bm25s.retrieve`` pads its top-k with zero-score entries when fewer than
+    ``k`` documents contain any query term (``sparse_retrieval/bm25_index.py``),
+    and an orthogonal embedding scores exactly 0.0. (The tsvector path cannot
+    contribute one: ``full_text_search`` filters on ``@@ websearch_to_tsquery``
+    before scoring.)
 
     Ordering holds within one knowledge base. ``search_multiple_knowledge_bases``
     merges pools by raw score, so an expansion item from a high-scoring KB can
@@ -1393,6 +1459,11 @@ def _expansion_tier_scores(min_score: float) -> tuple[float, float, float]:
     """
     step = max(abs(min_score), 1e-6) * 0.01
     return min_score - step, min_score - 2 * step, min_score - 3 * step
+
+
+def _is_structural_meta(meta: dict | None) -> bool:
+    """``_is_structural_item`` for code holding a serialized item's meta dict."""
+    return (meta or {}).get("retrieval_method") in STRUCTURAL_RETRIEVAL_METHODS
 
 
 def _is_structural_item(item: RetrievedItem) -> bool:
@@ -1405,7 +1476,7 @@ def _is_structural_item(item: RetrievedItem) -> bool:
     always one already represented by real hits — leaving it in that scan
     would discard the page filter for all of them.
     """
-    return (item.meta or {}).get("retrieval_method") in STRUCTURAL_RETRIEVAL_METHODS
+    return _is_structural_meta(item.meta)
 
 
 def _render_toc_outline(nodes: list[dict], total_nodes: int) -> str:
@@ -1417,8 +1488,11 @@ def _render_toc_outline(nodes: list[dict], total_nodes: int) -> str:
     asked for. ``total_nodes`` is the document's real section count, which
     the store knows even though it only returns the first page of rows.
 
-    Titles are searchable — the BM25 document for a node is ``title + text``
-    — so a model reading this can put a section's title in a follow-up query.
+    Titles are searchable on every retrieval path — ``tasks/indexing.py``
+    embeds ``title`` into each node's vector, so a model that reads a title
+    here and puts it in a follow-up query will match. (The sparse index also
+    covers titles, but only when a BM25 index exists: the tsvector fallback
+    scores ``SEARCH_TEXT_COL``, which is ``text`` alone for these nodes.)
     The bracketed ids are for a human or a downstream tool: no route or agent
     tool takes a ``node_id``.
     """
@@ -1441,14 +1515,17 @@ def _expand_graph_neighbors(
     """Pull in first-degree referenced nodes for graph_index results.
 
     Appends, in descending score order beneath the main pool: one outline per
-    document where a reference was actually followed, then the referenced
-    nodes, then — only when ``include_children`` is set — a capped number of
-    each referenced node's direct children.
+    document where a reference was actually followed (unless
+    ``include_doc_toc`` is off), then the referenced nodes, then — only when
+    ``include_children`` is set — a capped number of each referenced node's
+    direct children.
     """
     if not results:
         return results
 
-    include_children, max_children, include_doc_toc = _read_graph_expansion_config(retrieval_config)
+    include_children, max_children, include_doc_toc = _read_graph_expansion_config(
+        retrieval_config, knowledge_base_id
+    )
 
     # Collect existing (toc_id, node_id) pairs for deduplication
     existing_keys: set[tuple[str, str]] = set()
@@ -1492,12 +1569,25 @@ def _expand_graph_neighbors(
     # same treatment the source floor gets above.
     outlines: dict[str, dict] = {}
     if include_doc_toc and node_map:
+        toc_ids = sorted({tid for tid, _ in node_map})
         try:
-            outlines = gi_store.get_toc_outline(
-                sorted({tid for tid, _ in node_map}), GRAPH_TOC_MAX_NODES
+            # SAVEPOINT, not a bare try/except: a DBAPI failure aborts the
+            # transaction, and swallowing it without unwinding leaves the
+            # session deactivated — every later statement then raises
+            # PendingRollbackError, surfacing far from here as an empty
+            # knowledge base or a hard tool failure. db.py makes the same
+            # point about loops. A nested transaction undoes only this
+            # statement, so a pending billing write on the session survives.
+            with db_session.begin_nested():
+                outlines = gi_store.get_toc_outline(toc_ids, GRAPH_TOC_MAX_NODES)
+        except SQLAlchemyError:
+            logger.error(
+                "graph_expansion: outline fetch failed for kb=%s (%d tocs); "
+                "results kept without outlines",
+                knowledge_base_id,
+                len(toc_ids),
+                exc_info=True,
             )
-        except Exception:
-            logger.warning("graph_expansion: outline fetch failed; continuing", exc_info=True)
             outlines = {}
 
     for toc_id, outline in outlines.items():
@@ -1683,9 +1773,9 @@ def search_knowledge_base(
             raise ValueError(f"Knowledge base not found: {knowledge_base_id}")
 
         if indexing_config is None:
-            indexing_config = kb_row[2] or {}
+            indexing_config = _coerce_kb_config(kb_row[2], "indexing_config", knowledge_base_id)
         if retrieval_config is None:
-            retrieval_config = kb_row[3] or {}
+            retrieval_config = _coerce_kb_config(kb_row[3], "retrieval_config", knowledge_base_id)
 
     # Determine strategy and validate retrieval method
     strategy = indexing_config.get("strategy", "chunk_embed")

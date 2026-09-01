@@ -391,6 +391,8 @@ def create_knowledge_base():
 
     indexing_config = {**strategy_def["default_indexing_config"], **user_indexing_config}
     retrieval_config = data.get("retrieval_config", strategy_def["default_retrieval_config"])
+    if not isinstance(retrieval_config, dict):
+        return jsonify({"error": "retrieval_config must be an object"}), 400
 
     db.session.execute(
         text(f"""
@@ -510,6 +512,12 @@ def update_knowledge_base(kb_id: str):
         updates.append("indexing_config = CAST(:indexing_config AS jsonb)")
         params["indexing_config"] = json.dumps(data["indexing_config"])
     if "retrieval_config" in data:
+        if not isinstance(data["retrieval_config"], dict):
+            # A non-object persists as valid JSONB and then breaks every
+            # later search — `retrieval_config.get(...)` raises, and
+            # context_handler reports the knowledge base as empty. Reject at
+            # the boundary instead of degrading at read time.
+            return jsonify({"error": "retrieval_config must be an object"}), 400
         updates.append("retrieval_config = CAST(:retrieval_config AS jsonb)")
         params["retrieval_config"] = json.dumps(data["retrieval_config"])
 

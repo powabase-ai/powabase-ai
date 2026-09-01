@@ -236,7 +236,8 @@ class GraphIndexStore(BaseTocStore):
                            ) AS rn,
                            count(*) OVER (PARTITION BY n.toc_id) AS total_nodes
                     FROM "{AI_SCHEMA}".{self.NODES_TABLE} n
-                    WHERE n.toc_id = ANY(CAST(:toc_ids AS uuid[]))
+                    WHERE n.toc_id = ANY(:toc_ids)
+                      AND n.knowledge_base_id = :kb_id
                 )
                 SELECT r.toc_id, r.node_id, r.title, r.depth, r.total_nodes,
                        t.doc_name, t.source_id
@@ -245,7 +246,17 @@ class GraphIndexStore(BaseTocStore):
                 WHERE r.rn <= :limit
                 ORDER BY r.toc_id, r.node_id ASC
             """),
-            {"toc_ids": "{" + ",".join(toc_ids) + "}", "limit": limit},
+            # The list is passed to the driver rather than hand-built into a
+            # "{a,b}" literal: a toc_id containing a comma or brace would
+            # otherwise produce a malformed array and a DataError.
+            # knowledge_base_id is filtered here — not only at the caller —
+            # because the outline item is stamped with the searching KB's id,
+            # so a toc from another KB would be silently mislabelled.
+            {
+                "toc_ids": [uuid.UUID(tid) for tid in toc_ids],
+                "kb_id": self.kb_id,
+                "limit": limit,
+            },
         )
 
         outlines: dict[str, dict] = {}
@@ -255,7 +266,8 @@ class GraphIndexStore(BaseTocStore):
                 toc_id,
                 {
                     "doc_name": row[5] or "",
-                    "source_id": str(row[6]),
+                    # str(None) would be the literal "None" and a phantom group.
+                    "source_id": str(row[6]) if row[6] else None,
                     "total_nodes": int(row[4] or 0),
                     "nodes": [],
                 },

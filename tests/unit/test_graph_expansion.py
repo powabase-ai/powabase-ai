@@ -20,11 +20,11 @@ real database, in tests/test_graph_index_store.py.
 
 from __future__ import annotations
 
-import ast
-from pathlib import Path
+import logging
 
 import pytest
 from agentic.knowledge.models import RetrievedItem
+from sqlalchemy.exc import SQLAlchemyError
 
 from agentic_project_service.services import knowledge_search
 
@@ -94,6 +94,46 @@ class FakeGraphIndexStore:
         }
 
 
+class _CountingSession:
+    """Answers the one ``SELECT COUNT(*)`` the graph_index branch runs."""
+
+    def __init__(self, node_count: int):
+        self._node_count = node_count
+
+    def execute(self, *args, **kwargs):
+        count = self._node_count
+
+        class _Result:
+            def scalar(self):
+                return count
+
+        return _Result()
+
+
+class _RecordingSession:
+    """Session stub that records how a failed statement was cleaned up."""
+
+    def __init__(self):
+        self.savepoints: list[str] = []
+        self.rollback_calls = 0
+
+    def begin_nested(self):
+        session = self
+
+        class _Savepoint:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                session.savepoints.append("rolled-back" if exc_type else "committed")
+                return False
+
+        return _Savepoint()
+
+    def rollback(self):
+        self.rollback_calls += 1
+
+
 @pytest.fixture
 def install_store(monkeypatch):
     """Install a FakeGraphIndexStore for the duration of one test."""
@@ -127,9 +167,9 @@ def _outline(toc_id=TOC_A, nodes=None, total_nodes=None):
     }
 
 
-def _expand(results, store, retrieval_config=None):
+def _expand(results, store, retrieval_config=None, db_session=None):
     return knowledge_search._expand_graph_neighbors(
-        db_session=None,
+        db_session=db_session if db_session is not None else _RecordingSession(),
         results=results,
         knowledge_base_id=KB_ID,
         retrieval_config=retrieval_config,
@@ -217,6 +257,61 @@ class TestMalformedConfig:
             len(_by_method(out, "graph_expansion_child"))
             == knowledge_search.GRAPH_DEFAULT_MAX_CHILDREN
         )
+
+    def test_a_boolean_cap_is_rejected_not_read_as_one(self, install_store):
+        """isinstance(True, int) is True in Python, so without the explicit
+        bool exclusion this would cap children at 1 rather than defaulting."""
+        five = [_node_row(f"000{i}", parent="0002") for i in range(3, 8)]
+        store = install_store(
+            FakeGraphIndexStore(
+                nodes={(TOC_A, "0002"): _node_row("0002")},
+                children={(TOC_A, "0002"): five},
+                outlines={TOC_A: _outline()},
+            )
+        )
+
+        out = _expand(
+            [_hit("0001", refs=["0002"])],
+            store,
+            {"graph_expansion": {"include_children": True, "max_children_per_parent": True}},
+        )
+
+        assert (
+            len(_by_method(out, "graph_expansion_child"))
+            == knowledge_search.GRAPH_DEFAULT_MAX_CHILDREN
+        )
+
+    def test_malformed_values_are_warned_about_with_the_kb_id(self, install_store, caplog):
+        """Degrading silently is what makes a misconfiguration permanent, and
+        a warning with no KB in it cannot be acted on."""
+        store = install_store(_store_with_ref())
+
+        with caplog.at_level(logging.WARNING):
+            _expand(
+                [_hit("0001", refs=["0002"])],
+                store,
+                {"graph_expansion": {"include_children": "yes", "maxChildrenPerParent": 10}},
+            )
+
+        text = caplog.text
+        assert "include_children" in text
+        assert "maxChildrenPerParent" in text, "an unknown key must not pass silently"
+        assert KB_ID in text
+
+    def test_out_of_range_cap_is_warned_about_not_just_clamped(self, install_store, caplog):
+        """The INFO summary reports the effective cap, which reads as though
+        the configured value had been honoured."""
+        store = install_store(_store_with_ref())
+
+        with caplog.at_level(logging.WARNING):
+            _expand(
+                [_hit("0001", refs=["0002"])],
+                store,
+                {"graph_expansion": {"include_children": True, "max_children_per_parent": 999}},
+            )
+
+        assert "clamped" in caplog.text
+        assert KB_ID in caplog.text
 
     def test_cap_is_bounded_above(self, install_store):
         """A floor without a ceiling restores the unbounded fan-out this
@@ -406,12 +501,45 @@ class TestDocumentOutline:
     def test_outline_failure_does_not_discard_the_search(self, install_store):
         """The outline decorates results that already exist — a statement
         timeout on it must not throw away a search that succeeded."""
-        store = install_store(_store_with_ref(outline_error=RuntimeError("statement timeout")))
+        store = install_store(_store_with_ref(outline_error=SQLAlchemyError("statement timeout")))
 
         out = _expand([_hit("0001", refs=["0002"])], store)
 
         assert _by_method(out, "graph_toc") == []
         assert [r.meta["node_id"] for r in _by_method(out, "graph_expansion")] == ["0002"]
+
+    def test_a_non_database_failure_still_propagates(self, install_store):
+        """Only database errors are treated as best-effort. A bug in the
+        outline path is not transient, and swallowing it would hide the
+        feature disappearing behind a single log line."""
+        store = install_store(_store_with_ref(outline_error=KeyError("total_nodes")))
+
+        with pytest.raises(KeyError):
+            _expand([_hit("0001", refs=["0002"])], store)
+
+    def test_outline_failure_rolls_the_session_back_to_a_savepoint(self, install_store):
+        """Swallowing a DBAPI error without rolling back leaves the session in
+        a deactivated transaction, so the *next* statement raises
+        PendingRollbackError — which context_handler turns into an empty
+        knowledge base, or which detonates outside every try block later. The
+        outline must undo only its own statement, hence a savepoint rather
+        than a full rollback: billing writes may be pending on this session."""
+        session = _RecordingSession()
+        store = _store_with_ref(outline_error=SQLAlchemyError("statement timeout"))
+        install_store(store)
+
+        out = knowledge_search._expand_graph_neighbors(
+            db_session=session,
+            results=[_hit("0001", refs=["0002"])],
+            knowledge_base_id=KB_ID,
+            retrieval_config={"graph_expansion": {"include_children": True}},
+        )
+
+        assert session.savepoints == ["rolled-back"]
+        assert session.rollback_calls == 0, "a full rollback would discard pending billing writes"
+        # The search survives, and the statement after the failure still runs.
+        assert [r.meta["node_id"] for r in _by_method(out, "graph_expansion")] == ["0002"]
+        assert store.children_calls, "expansion must keep using the session afterwards"
 
     def test_outline_renders_ids_and_indents_by_depth(self, install_store):
         store = install_store(_store_with_ref())
@@ -442,6 +570,32 @@ class TestDocumentOutline:
         text = _by_method(out, "graph_toc")[0].text
         assert len(text.splitlines()) == limit + 1
         assert "5 more sections" in text
+
+    def test_a_complete_outline_carries_no_truncation_marker(self, install_store):
+        """`remaining > 0` rather than `>= 0`: a "... (0 more sections)" line
+        would ship on every complete outline the model reads."""
+        store = install_store(_store_with_ref())
+
+        out = _expand([_hit("0001", refs=["0002"])], store)
+
+        assert "more sections" not in _by_method(out, "graph_toc")[0].text
+
+    def test_a_single_omitted_section_is_reported(self, install_store):
+        limit = knowledge_search.GRAPH_TOC_MAX_NODES
+        fetched = [
+            {"node_id": f"{i:04d}", "title": f"Section {i}", "depth": 0}
+            for i in range(1, limit + 1)
+        ]
+        store = install_store(
+            FakeGraphIndexStore(
+                nodes={(TOC_A, "0002"): _node_row("0002")},
+                outlines={TOC_A: _outline(nodes=fetched, total_nodes=limit + 1)},
+            )
+        )
+
+        out = _expand([_hit("0001", refs=["0002"])], store)
+
+        assert "1 more sections" in _by_method(out, "graph_toc")[0].text
 
     def test_outline_is_structural_and_never_triggers_image_fetching(self, install_store):
         """An item with no page info makes context_handler fall back to
@@ -484,6 +638,14 @@ class TestExpansionScores:
         assert child < parent < toc < min_score
         assert child > 0, "tiers must stay on the pool's scale, not clamp to zero"
 
+    def test_tiers_stay_ordered_for_a_negative_pool_minimum(self):
+        """Rerankers are supported for this strategy and cross-encoders emit
+        negative scores routinely. Without abs(), the step goes negative and
+        the three tiers invert onto the wrong side of the pool."""
+        toc, parent, child = knowledge_search._expansion_tier_scores(-2.0)
+
+        assert child < parent < toc < -2.0
+
     def test_tiers_stay_ordered_when_the_pool_minimum_is_zero(self):
         """Reachable: bm25_score returns 0.0 for an empty tsvector, and the
         vector store substitutes 0.0 for a NULL similarity. A step derived by
@@ -520,21 +682,43 @@ class TestWiring:
             "include_doc_toc": True,
         }
 
-    def test_both_call_sites_pass_retrieval_config_to_expansion(self):
-        """Dropping the argument at either call site silently reverts every
-        search to the defaults. Exercising the call sites for real needs a
-        database, so this asserts the wiring structurally instead."""
-        source = Path(knowledge_search.__file__).read_text()
-        calls = [
-            node
-            for node in ast.walk(ast.parse(source))
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_expand_graph_neighbors"
-        ]
+    def test_sync_search_hands_expansion_the_kb_config_and_id(self, monkeypatch):
+        """Dropping — or transposing — the arguments at the call site silently
+        reverts every search to the defaults, or stamps expansion items with a
+        config dict where a knowledge_base_id belongs. Drives the real
+        ``search_knowledge_base`` graph_index branch with a session that only
+        has to answer the node COUNT(*)."""
+        recorded = {}
 
-        assert len(calls) == 2, "expected the sync and async graph_index call sites"
-        for call in calls:
-            passed = [a.id for a in call.args if isinstance(a, ast.Name)]
-            passed += [kw.value.id for kw in call.keywords if isinstance(kw.value, ast.Name)]
-            assert "retrieval_config" in passed
+        def _recording_expand(db_session, results, knowledge_base_id, retrieval_config=None):
+            recorded["kb_id"] = knowledge_base_id
+            recorded["retrieval_config"] = retrieval_config
+            return results
+
+        monkeypatch.setattr(knowledge_search, "_expand_graph_neighbors", _recording_expand)
+        monkeypatch.setattr(
+            knowledge_search,
+            "GraphIndexNodeStore",
+            lambda db_session, knowledge_base_id: object(),
+        )
+        monkeypatch.setattr(
+            knowledge_search,
+            "_execute_retrieval_pipeline",
+            lambda **kwargs: [],
+        )
+
+        retrieval_config = {
+            "method": "vector_search",
+            "graph_expansion": {"include_children": True},
+        }
+        knowledge_search.search_knowledge_base(
+            db_session=_CountingSession(node_count=1),
+            knowledge_base_id=KB_ID,
+            query="q",
+            retrieval_method="vector_search",
+            indexing_config={"strategy": "graph_index"},
+            retrieval_config=retrieval_config,
+        )
+
+        assert recorded["kb_id"] == KB_ID, "arguments transposed"
+        assert recorded["retrieval_config"] is retrieval_config
