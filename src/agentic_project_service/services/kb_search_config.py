@@ -12,9 +12,10 @@ context_handler, or the core tools module.
 # Default number of top results to retrieve per knowledge base.
 DEFAULT_TOP_K = 10
 
-# Maximum context tokens for formatted search results returned to the LLM.
-# This is the budget for the knowledge_search tool's output.
-DEFAULT_MAX_CONTEXT_TOKENS = 16_000
+# The budget for the knowledge_search tool's output is not defined here: it is
+# the KB_DEFAULT_MAX_CONTEXT_TOKENS setting, read through get_setting() by
+# context_handler and tool_registry. A module constant here shadowed it at a
+# stale 16_000 while the setting said otherwise, and nothing imported it.
 
 # ---------------------------------------------------------------------------
 # Context handler retrieval defaults

@@ -415,6 +415,82 @@ class TestChildrenFanOut:
         children = _by_method(out, "graph_expansion_child")
         assert [c.meta["node_id"] for c in children] == ["0004", "0005"]
 
+    def test_referenced_nodes_are_capped(self, install_store):
+        """A hit's references are its largest cost: measured against a real
+        corpus, one node with 12 references pulled 27k tokens of section
+        bodies, more than the whole context budget."""
+        many = {(TOC_A, f"{i:04d}"): _node_row(f"{i:04d}") for i in range(10, 30)}
+        store = install_store(
+            FakeGraphIndexStore(nodes=many, outlines={TOC_A: _outline()})
+        )
+        refs = [f"{i:04d}" for i in range(10, 30)]
+
+        out = _expand(
+            [_hit("0001", refs=refs)],
+            store,
+            {"graph_expansion": {"max_referenced_nodes": 4}},
+        )
+
+        assert len(_by_method(out, "graph_expansion")) == 4
+
+    def test_referenced_node_cap_is_bounded_above(self, install_store):
+        many = {(TOC_A, f"{i:04d}"): _node_row(f"{i:04d}") for i in range(10, 30)}
+        store = install_store(
+            FakeGraphIndexStore(nodes=many, outlines={TOC_A: _outline()})
+        )
+
+        out = _expand(
+            [_hit("0001", refs=[f"{i:04d}" for i in range(10, 30)])],
+            store,
+            {"graph_expansion": {"max_referenced_nodes": 10_000}},
+        )
+
+        assert (
+            len(_by_method(out, "graph_expansion"))
+            <= knowledge_search.GRAPH_MAX_REFERENCED_CEILING
+        )
+
+    def test_the_cap_keeps_references_the_most_hits_agree_on(self, install_store):
+        """Once the cap bites, which references survive has to be decided by
+        something. Consensus first — a section two hits both point at is a
+        better bet than one only the top hit mentions."""
+        nodes = {(TOC_A, n): _node_row(n) for n in ("0010", "0011", "0012")}
+        store = install_store(FakeGraphIndexStore(nodes=nodes, outlines={TOC_A: _outline()}))
+        pool = [
+            _hit("0001", refs=["0010", "0011"], score=0.9),
+            _hit("0002", refs=["0011", "0012"], score=0.5),
+        ]
+
+        out = _expand(pool, store, {"graph_expansion": {"max_referenced_nodes": 1}})
+
+        kept = [r.meta["node_id"] for r in _by_method(out, "graph_expansion")]
+        assert kept == ["0011"], "the reference both hits share should win"
+
+    def test_ties_on_consensus_fall_back_to_the_best_referring_hit(self, install_store):
+        nodes = {(TOC_A, n): _node_row(n) for n in ("0010", "0012")}
+        store = install_store(FakeGraphIndexStore(nodes=nodes, outlines={TOC_A: _outline()}))
+        pool = [
+            _hit("0001", refs=["0010"], score=0.9),
+            _hit("0002", refs=["0012"], score=0.5),
+        ]
+
+        out = _expand(pool, store, {"graph_expansion": {"max_referenced_nodes": 1}})
+
+        assert [r.meta["node_id"] for r in _by_method(out, "graph_expansion")] == ["0010"]
+
+    def test_capping_references_is_reported(self, install_store, caplog):
+        nodes = {(TOC_A, f"{i:04d}"): _node_row(f"{i:04d}") for i in range(10, 20)}
+        store = install_store(FakeGraphIndexStore(nodes=nodes, outlines={TOC_A: _outline()}))
+
+        with caplog.at_level(logging.INFO):
+            _expand(
+                [_hit("0001", refs=[f"{i:04d}" for i in range(10, 20)])],
+                store,
+                {"graph_expansion": {"max_referenced_nodes": 3}},
+            )
+
+        assert "10" in caplog.text and "3" in caplog.text
+
     def test_children_are_not_queried_when_disabled(self, install_store):
         store = install_store(_store_with_ref())
 
@@ -679,6 +755,7 @@ class TestWiring:
         assert cfg == {
             "include_children": False,
             "max_children_per_parent": knowledge_search.GRAPH_DEFAULT_MAX_CHILDREN,
+            "max_referenced_nodes": knowledge_search.GRAPH_DEFAULT_MAX_REFERENCED_NODES,
             "include_doc_toc": True,
         }
 

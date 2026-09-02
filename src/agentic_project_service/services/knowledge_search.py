@@ -7,7 +7,7 @@ Used by both the KB search API endpoint and the agent run endpoint.
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, NamedTuple
 
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -40,7 +40,9 @@ from ..strategies.graph_defaults import (
     GRAPH_DEFAULT_INCLUDE_CHILDREN,
     GRAPH_DEFAULT_INCLUDE_DOC_TOC,
     GRAPH_DEFAULT_MAX_CHILDREN,
+    GRAPH_DEFAULT_MAX_REFERENCED_NODES,
     GRAPH_MAX_CHILDREN_CEILING,
+    GRAPH_MAX_REFERENCED_CEILING,
 )
 
 from agentic.knowledge.retrieval import TreeSearchAlgorithm, apply_source_limits
@@ -1312,7 +1314,23 @@ def _execute_retrieval_pipeline(
     return results
 
 
-GRAPH_EXPANSION_KEYS = frozenset({"include_children", "max_children_per_parent", "include_doc_toc"})
+GRAPH_EXPANSION_KEYS = frozenset(
+    {
+        "include_children",
+        "max_children_per_parent",
+        "max_referenced_nodes",
+        "include_doc_toc",
+    }
+)
+
+
+class GraphExpansionConfig(NamedTuple):
+    """The bounded ``graph_expansion`` block, as expansion actually applies it."""
+
+    include_children: bool
+    max_children: int
+    max_referenced: int
+    include_doc_toc: bool
 
 
 def _coerce_kb_config(raw: Any, field: str, kb_id: str) -> dict:
@@ -1334,6 +1352,38 @@ def _coerce_kb_config(raw: Any, field: str, kb_id: str) -> dict:
             raw,
         )
     return {}
+
+
+def _read_graph_expansion_int(
+    cfg: dict, key: str, default: int, ceiling: int, kb_id: str
+) -> int:
+    """Read one bounded integer, clamping into ``[0, ceiling]``.
+
+    Only a real ``int`` is accepted: ``bool`` is an ``int`` in Python, and a
+    numeric string would disagree with how Studio reads the same value back.
+    Both rejection and clamping are logged — silently clamping would let the
+    summary line report an effective value that reads as though the config
+    had been honoured.
+    """
+    raw = cfg.get(key, default)
+    if not isinstance(raw, int) or isinstance(raw, bool):
+        if key in cfg:
+            logger.warning(
+                "Ignoring non-integer graph_expansion.%s: %r (kb=%s)", key, raw, kb_id
+            )
+        return default
+
+    clamped = min(max(0, raw), ceiling)
+    if clamped != raw:
+        logger.warning(
+            "graph_expansion.%s %r out of range [0, %d] — clamped to %d (kb=%s)",
+            key,
+            raw,
+            ceiling,
+            clamped,
+            kb_id,
+        )
+    return clamped
 
 
 def _read_graph_expansion_bool(cfg: dict, key: str, default: bool, kb_id: str) -> bool:
@@ -1362,8 +1412,8 @@ def _read_graph_expansion_bool(cfg: dict, key: str, default: bool, kb_id: str) -
 
 def _read_graph_expansion_config(
     retrieval_config: dict | None, knowledge_base_id: str
-) -> tuple[bool, int, bool]:
-    """Extract (include_children, max_children_per_parent, include_doc_toc).
+) -> "GraphExpansionConfig":
+    """Read the ``graph_expansion`` block, with every field bounded.
 
     Children fan-out is opt-in: a referenced node's substructure is advertised
     by the document outline rather than paid for in full section bodies.
@@ -1400,37 +1450,25 @@ def _read_graph_expansion_config(
             sorted(GRAPH_EXPANSION_KEYS),
         )
 
-    raw_cap = cfg.get("max_children_per_parent", GRAPH_DEFAULT_MAX_CHILDREN)
-    # bools are ints in Python, and a numeric string would disagree with how
-    # Studio reads the same value back, so accept only a real int.
-    if isinstance(raw_cap, int) and not isinstance(raw_cap, bool):
-        max_children = min(max(0, raw_cap), GRAPH_MAX_CHILDREN_CEILING)
-        if max_children != raw_cap:
-            # Clamping silently would let the INFO summary below report an
-            # effective cap that reads as though the config were honoured.
-            logger.warning(
-                "graph_expansion.max_children_per_parent %r out of range "
-                "[0, %d] — clamped to %d (kb=%s)",
-                raw_cap,
-                GRAPH_MAX_CHILDREN_CEILING,
-                max_children,
-                knowledge_base_id,
-            )
-    else:
-        if "max_children_per_parent" in cfg:
-            logger.warning(
-                "Ignoring non-integer max_children_per_parent: %r (kb=%s)",
-                raw_cap,
-                knowledge_base_id,
-            )
-        max_children = GRAPH_DEFAULT_MAX_CHILDREN
-
-    return (
-        _read_graph_expansion_bool(
+    return GraphExpansionConfig(
+        include_children=_read_graph_expansion_bool(
             cfg, "include_children", GRAPH_DEFAULT_INCLUDE_CHILDREN, knowledge_base_id
         ),
-        max_children,
-        _read_graph_expansion_bool(
+        max_children=_read_graph_expansion_int(
+            cfg,
+            "max_children_per_parent",
+            GRAPH_DEFAULT_MAX_CHILDREN,
+            GRAPH_MAX_CHILDREN_CEILING,
+            knowledge_base_id,
+        ),
+        max_referenced=_read_graph_expansion_int(
+            cfg,
+            "max_referenced_nodes",
+            GRAPH_DEFAULT_MAX_REFERENCED_NODES,
+            GRAPH_MAX_REFERENCED_CEILING,
+            knowledge_base_id,
+        ),
+        include_doc_toc=_read_graph_expansion_bool(
             cfg, "include_doc_toc", GRAPH_DEFAULT_INCLUDE_DOC_TOC, knowledge_base_id
         ),
     )
@@ -1523,39 +1561,57 @@ def _expand_graph_neighbors(
     if not results:
         return results
 
-    include_children, max_children, include_doc_toc = _read_graph_expansion_config(
-        retrieval_config, knowledge_base_id
-    )
+    cfg = _read_graph_expansion_config(retrieval_config, knowledge_base_id)
 
-    # Collect existing (toc_id, node_id) pairs for deduplication
-    existing_keys: set[tuple[str, str]] = set()
-    refs_to_fetch: dict[str, set[str]] = {}  # toc_id -> {node_ids}
+    # Every (toc_id, node_id) already in the pool, collected before any
+    # reference is considered — a hit further down the list still counts as
+    # "already present" for a reference made by the first one.
+    existing_keys: set[tuple[str, str]] = {
+        (meta["toc_id"], meta["node_id"])
+        for meta in (item.meta or {} for item in results)
+        if meta.get("toc_id") and meta.get("node_id")
+    }
+
+    # Candidate references, with what is needed to rank them: how many hits
+    # point at each, and the best score among those hits.
+    ref_hits: dict[tuple[str, str], int] = {}
+    ref_best_score: dict[tuple[str, str], float] = {}
 
     for item in results:
         meta = item.meta or {}
         toc_id = meta.get("toc_id")
-        node_id = meta.get("node_id")
-        if toc_id and node_id:
-            existing_keys.add((toc_id, node_id))
+        if not toc_id:
+            continue
+        score = item.score if item.score is not None else 0.0
+        for ref_nid in meta.get("referenced_nodes") or []:
+            key = (toc_id, ref_nid)
+            if key in existing_keys:
+                continue
+            ref_hits[key] = ref_hits.get(key, 0) + 1
+            ref_best_score[key] = max(ref_best_score.get(key, float("-inf")), score)
 
-        referenced = meta.get("referenced_nodes") or []
-        for ref_nid in referenced:
-            if toc_id and (toc_id, ref_nid) not in existing_keys:
-                refs_to_fetch.setdefault(toc_id, set()).add(ref_nid)
-
-    # Remove any refs that are already in results
-    for toc_id, nids in list(refs_to_fetch.items()):
-        nids -= {k[1] for k in existing_keys if k[0] == toc_id}
-        if not nids:
-            del refs_to_fetch[toc_id]
-
-    if not refs_to_fetch:
+    if not ref_hits:
         logger.debug("graph_expansion: no new refs to expand")
         return results
 
-    # Fetch referenced nodes from DB
+    # Rank before capping: consensus first, because a section two hits both
+    # point at is a better bet than one only the top hit mentions; then the
+    # best referring hit's score; then node_id so the order is deterministic.
+    ranked = sorted(
+        ref_hits,
+        key=lambda k: (-ref_hits[k], -ref_best_score[k], k),
+    )
+    selections = ranked[: cfg.max_referenced]
+    if len(ranked) > len(selections):
+        logger.info(
+            "graph_expansion: %d referenced nodes exceed the cap of %d — "
+            "keeping the most-referenced (kb=%s)",
+            len(ranked),
+            cfg.max_referenced,
+            knowledge_base_id,
+        )
+
     gi_store = GraphIndexStore(db_session=db_session, knowledge_base_id=knowledge_base_id)
-    selections = [(tid, nid) for tid, nids in refs_to_fetch.items() for nid in nids]
     node_map = gi_store.get_nodes_by_ids(selections)
 
     pool_scores = [r.score for r in results if r.score is not None]
@@ -1568,7 +1624,7 @@ def _expand_graph_neighbors(
     # statement timeout here must not throw away a successful search — the
     # same treatment the source floor gets above.
     outlines: dict[str, dict] = {}
-    if include_doc_toc and node_map:
+    if cfg.include_doc_toc and node_map:
         toc_ids = sorted({tid for tid, _ in node_map})
         try:
             # SAVEPOINT, not a bare try/except: a DBAPI failure aborts the
@@ -1642,7 +1698,7 @@ def _expand_graph_neighbors(
     # parent so one heavily-subdivided section can't flood the context.
     children_map = (
         gi_store.get_children_by_parent_ids(list(node_map.keys()))
-        if include_children and max_children
+        if cfg.include_children and cfg.max_children
         else {}
     )
     children_added = 0
@@ -1657,7 +1713,7 @@ def _expand_graph_neighbors(
         # no ORDER BY of its own. Past 9999 nodes the padding stops and this
         # sorts lexically, the same way the SQL would.
         for child_row in sorted(child_rows, key=lambda row: row["node_id"]):
-            if kept >= max_children:
+            if kept >= cfg.max_children:
                 break
             child_key = (toc_id, child_row["node_id"])
             if child_key in all_keys:
@@ -1696,14 +1752,15 @@ def _expand_graph_neighbors(
 
     logger.info(
         "graph_expansion: fetched %d neighbors + %d children + %d outlines "
-        "from %d refs (children=%s cap=%d outline=%s)",
+        "from %d candidate refs (children=%s child_cap=%d ref_cap=%d outline=%s)",
         len(node_map),
         children_added,
         len(outlines),
-        sum(len(nids) for nids in refs_to_fetch.values()),
-        include_children,
-        max_children,
-        include_doc_toc,
+        len(ranked),
+        cfg.include_children,
+        cfg.max_children,
+        cfg.max_referenced,
+        cfg.include_doc_toc,
     )
 
     return results

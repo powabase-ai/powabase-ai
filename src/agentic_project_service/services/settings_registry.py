@@ -872,7 +872,7 @@ def _build_registry() -> dict[str, SettingDef]:
             category=cat,
             label="Max Context Tokens",
             type="int",
-            default=16000,
+            default=32000,
             min=1000,
             max=128000,
             description="Maximum context tokens for formatted search results.",
