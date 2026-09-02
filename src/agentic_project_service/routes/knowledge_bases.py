@@ -200,12 +200,18 @@ def _fetch_kb_or_404(kb_id: str) -> dict | tuple:
 
 
 def _read_existing_retrieval_config(kb_id: str) -> dict:
-    """Read the current retrieval_config from the DB; returns {} if KB missing."""
+    """Read the current retrieval_config from the DB; returns {} if KB missing.
+
+    Coerced rather than returned raw: the caller reads ``.get("method")`` off
+    it before this endpoint validates the *incoming* config, so a KB whose
+    stored value is the wrong shape would 500 on the very request meant to
+    repair it — leaving no way to fix it through the API at all.
+    """
     row = db.session.execute(
         text(f'SELECT retrieval_config FROM "{AI_SCHEMA}".knowledge_bases WHERE id = :id'),
         {"id": kb_id},
     ).fetchone()
-    if row is None or row[0] is None:
+    if row is None or not isinstance(row[0], dict):
         return {}
     return row[0]
 
