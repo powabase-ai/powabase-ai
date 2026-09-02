@@ -1,21 +1,14 @@
-"""KB search configuration — centralized runtime constants.
+"""KB search configuration — constants imported directly by search code.
 
-All tunable parameters for knowledge base search tools live here so they're
-easy to find, review, and adjust without digging through tool_registry,
-context_handler, or the core tools module.
+**A value an operator can change does not belong here.** Those are SettingDefs
+in ``settings_registry``, read at call time through ``get_setting()`` so a DB
+override takes effect; a module constant mirroring one is dead the moment the
+setting moves, while still looking authoritative to the next reader. Two such
+constants lived here — ``DEFAULT_TOP_K`` and ``DEFAULT_MAX_CONTEXT_TOKENS``,
+shadowing ``KB_DEFAULT_TOP_K`` and ``KB_DEFAULT_MAX_CONTEXT_TOKENS`` at stale
+values, imported by nothing — and were removed. Before adding a constant,
+check ``settings_registry`` for the same key.
 """
-
-# ---------------------------------------------------------------------------
-# Tool-level defaults (used by KnowledgeSearchTool / tool_registry)
-# ---------------------------------------------------------------------------
-
-# Default number of top results to retrieve per knowledge base.
-DEFAULT_TOP_K = 10
-
-# The budget for the knowledge_search tool's output is not defined here: it is
-# the KB_DEFAULT_MAX_CONTEXT_TOKENS setting, read through get_setting() by
-# context_handler and tool_registry. A module constant here shadowed it at a
-# stale 16_000 while the setting said otherwise, and nothing imported it.
 
 # ---------------------------------------------------------------------------
 # Context handler retrieval defaults
