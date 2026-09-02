@@ -250,10 +250,16 @@ def _build_registry() -> dict[str, SettingDef]:
             category=cat,
             label="Agent Max Context Tokens",
             type="int",
-            default=32000,
+            default=64000,
             min=1000,
             max=256000,
-            description="Maximum tokens for formatted context sent to the agent LLM.",
+            description=(
+                "Budget for the retrieval context an agent run assembles for "
+                "its LLM. Distinct from Max Context Tokens under Knowledge "
+                "Bases, which bounds one knowledge_search tool result; keep "
+                "this at or above that value, since a single search result "
+                "has to fit inside the context a run builds."
+            ),
         ),
         SettingDef(
             key="DELEGATE_MAX_STEPS",
@@ -872,10 +878,16 @@ def _build_registry() -> dict[str, SettingDef]:
             category=cat,
             label="Max Context Tokens",
             type="int",
-            default=16000,
+            default=64000,
             min=1000,
             max=128000,
-            description="Maximum context tokens for formatted search results.",
+            description=(
+                "Budget for one knowledge_search result. Items past it are "
+                "dropped in score order, so this is a backstop: the deliberate "
+                "bounds are top_k and, for GraphIndex, the graph_expansion "
+                "caps. Costs recur — a result stays in an agent's history and "
+                "is resent on every later step of the run."
+            ),
         ),
         SettingDef(
             key="DEFAULT_IMAGE_DELIVERY",

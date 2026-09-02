@@ -209,6 +209,75 @@ class GraphIndexStore(BaseTocStore):
             },
         )
 
+    def get_toc_outline(self, toc_ids: list[str], limit: int) -> dict[str, dict]:
+        """Fetch title-only outlines for whole documents.
+
+        Deliberately not ``get_all_nodes_for_toc``, which selects every node's
+        full text — retrieval wants the structure, not the document.
+
+        Paged in SQL rather than in Python: this runs on the search path, and
+        a 500-section document would otherwise ship 500 rows to render the
+        first ``limit`` of them. ``total_nodes`` still reports the real count
+        so the caller can say how many sections it left out.
+
+        Returns:
+            {toc_id: {"doc_name", "source_id", "total_nodes", "nodes":
+            [{node_id, title, depth}]}}, nodes in document order.
+        """
+        if not toc_ids:
+            return {}
+
+        result = self.session.execute(
+            text(f"""
+                WITH ranked AS (
+                    SELECT n.toc_id, n.node_id, n.title, n.depth,
+                           row_number() OVER (
+                               PARTITION BY n.toc_id ORDER BY n.node_id ASC
+                           ) AS rn,
+                           count(*) OVER (PARTITION BY n.toc_id) AS total_nodes
+                    FROM "{AI_SCHEMA}".{self.NODES_TABLE} n
+                    WHERE n.toc_id = ANY(:toc_ids)
+                      AND n.knowledge_base_id = :kb_id
+                )
+                SELECT r.toc_id, r.node_id, r.title, r.depth, r.total_nodes,
+                       t.doc_name, t.source_id
+                FROM ranked r
+                JOIN "{AI_SCHEMA}".{self.TOC_TABLE} t ON t.id = r.toc_id
+                WHERE r.rn <= :limit
+                ORDER BY r.toc_id, r.node_id ASC
+            """),
+            # The list is passed to the driver rather than hand-built into a
+            # "{a,b}" literal: a toc_id containing a comma or brace would
+            # otherwise produce a malformed array and a DataError.
+            # knowledge_base_id is filtered here — not only at the caller —
+            # because the outline item is stamped with the searching KB's id,
+            # so a toc from another KB would be silently mislabelled.
+            {
+                "toc_ids": [uuid.UUID(tid) for tid in toc_ids],
+                "kb_id": self.kb_id,
+                "limit": limit,
+            },
+        )
+
+        outlines: dict[str, dict] = {}
+        for row in result:
+            toc_id = str(row[0])
+            outline = outlines.setdefault(
+                toc_id,
+                {
+                    "doc_name": row[5] or "",
+                    # str(None) would be the literal "None" and a phantom group.
+                    "source_id": str(row[6]) if row[6] else None,
+                    "total_nodes": int(row[4] or 0),
+                    "nodes": [],
+                },
+            )
+            outline["nodes"].append(
+                {"node_id": row[1], "title": row[2] or "", "depth": row[3] or 0}
+            )
+
+        return outlines
+
     def count_nodes(self, indexed_source_id: str | None = None) -> int:
         """Total node count for this KB, optionally scoped to one source."""
         sql = f'SELECT COUNT(*) FROM "{AI_SCHEMA}".{self.NODES_TABLE} WHERE knowledge_base_id = :kb_id'

@@ -15,6 +15,12 @@ Usage:
 
 import copy
 
+from .graph_defaults import (
+    GRAPH_DEFAULT_INCLUDE_CHILDREN,
+    GRAPH_DEFAULT_INCLUDE_DOC_TOC,
+    GRAPH_DEFAULT_MAX_CHILDREN,
+    GRAPH_DEFAULT_MAX_REFERENCED_NODES,
+)
 from agentic.knowledge.model_config import (
     CHUNK_EMBED_DEFAULT_CHUNK_SIZE,
     CHUNK_EMBED_DEFAULT_OVERLAP,
@@ -111,6 +117,12 @@ STRATEGY_REGISTRY: dict[str, dict] = {
             "top_k": 5,
             "context_mode": "text",
             "ts_language": "english",
+            "graph_expansion": {
+                "include_children": GRAPH_DEFAULT_INCLUDE_CHILDREN,
+                "max_children_per_parent": GRAPH_DEFAULT_MAX_CHILDREN,
+                "max_referenced_nodes": GRAPH_DEFAULT_MAX_REFERENCED_NODES,
+                "include_doc_toc": GRAPH_DEFAULT_INCLUDE_DOC_TOC,
+            },
         },
     },
     "doc2json": {

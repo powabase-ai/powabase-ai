@@ -22,6 +22,9 @@ from ..db import AI_SCHEMA
 from .settings_registry import get_setting
 from ..models.tenant import ContextHandlerStatus
 from .knowledge_search import (
+    _coerce_kb_config,
+    _is_structural_item,
+    _is_structural_meta,
     _pages_for_item,
     search_knowledge_base,
     search_knowledge_base_async,
@@ -180,6 +183,12 @@ def _resolve_page_images(
     for item in items:
         sid = item.source_id
         if not sid:
+            continue
+        if _is_structural_item(item):
+            # Structural items (e.g. a graph_index document outline) have no
+            # pages by construction. Counting them here would put their source
+            # in fetch_all_for, which wins over needed_pages — discarding the
+            # page filter for every other item from that same document.
             continue
         item_pages = _pages_for_item(item)
         if item_pages:
@@ -448,6 +457,42 @@ def _search_single_kb(
             thread_session.close()
 
 
+def _load_kb_configs(
+    rows: list[Any], include_chunking: bool
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict]]:
+    """Turn ``(id, name, indexing_config, retrieval_config)`` rows into the
+    display metadata and per-KB retrieval configs the retrieval paths use.
+
+    Both configs are coerced here rather than at each read. They are
+    unvalidated JSONB — the route rejects a non-object now, but rows written
+    before that persist, and a JSON string is valid JSONB. The callers then
+    ``.get()`` these at eight sites, several of them (the enrichment hoist,
+    the per-KB context mode) outside the per-KB ``try``, so a single bad row
+    would fail the entire multi-KB retrieval instead of degrading one KB.
+
+    Both retrieval paths read the same columns, so the loop lives here once:
+    duplicating it is how the raw reads survived the write-side fix.
+    """
+    kb_display: dict[str, dict[str, Any]] = {}
+    kb_retrieval_configs: dict[str, dict] = {}
+
+    for row in rows:
+        kb_id = str(row[0])
+        cfg = _coerce_kb_config(row[2], "indexing_config", kb_id)
+        display: dict[str, Any] = {
+            "kb_name": row[1] or "",
+            "indexing_strategy": cfg.get("strategy", "chunk_embed"),
+        }
+        if include_chunking:
+            display["chunk_size"] = cfg.get("chunk_size")
+            display["overlap"] = cfg.get("overlap")
+
+        kb_display[kb_id] = display
+        kb_retrieval_configs[kb_id] = _coerce_kb_config(row[3], "retrieval_config", kb_id)
+
+    return kb_display, kb_retrieval_configs
+
+
 def execute_retrieval(
     db_session: Session,
     query: str,
@@ -478,6 +523,7 @@ def execute_retrieval(
     per_kb_methods: dict[str, str] = {}
     all_items: list[RetrievedItem] = []
 
+
     # Fetch KB display metadata (name, strategy, retrieval_config) for enriching items
     kb_ids = [c.get("id") for c in knowledge_base_configs if c.get("id")]
     kb_display: dict[str, dict[str, str]] = {}
@@ -491,15 +537,7 @@ def execute_retrieval(
             ),
             params,
         ).fetchall()
-        for row in rows:
-            cfg = row[2] or {}
-            kb_display[str(row[0])] = {
-                "kb_name": row[1] or "",
-                "indexing_strategy": cfg.get("strategy", "chunk_embed"),
-                "chunk_size": cfg.get("chunk_size"),
-                "overlap": cfg.get("overlap"),
-            }
-            kb_retrieval_configs[str(row[0])] = row[3] or {}
+        kb_display, kb_retrieval_configs = _load_kb_configs(rows, include_chunking=True)
 
     # 1. Search each KB individually, capturing per-KB errors
     valid_kb_configs = [c for c in knowledge_base_configs if c.get("id")]
@@ -836,9 +874,13 @@ def execute_retrieval(
     # Attach matched page images to items for frontend debugging
     if source_image_map:
         for item_dict in retrieved_items_list:
-            pages = (item_dict.get("meta") or {}).get("pages", [])
+            meta = item_dict.get("meta") or {}
+            pages = meta.get("pages", [])
             source_id = item_dict.get("source_id")
-            if source_id and source_id in source_image_map:
+            # Structural items (a graph_index outline) have no pages, so the
+            # empty-pages branch below would attach every image of a source
+            # that real hits already cover precisely.
+            if source_id and source_id in source_image_map and not _is_structural_meta(meta):
                 source_images = source_image_map[source_id]
                 if pages:
                     matched = [img for img in source_images if img.get("page") in pages]
@@ -957,13 +999,7 @@ async def execute_retrieval_async(
             ),
             params,
         ).fetchall()
-        for row in rows:
-            cfg = row[2] or {}
-            kb_display[str(row[0])] = {
-                "kb_name": row[1] or "",
-                "indexing_strategy": cfg.get("strategy", "chunk_embed"),
-            }
-            kb_retrieval_configs[str(row[0])] = row[3] or {}
+        kb_display, kb_retrieval_configs = _load_kb_configs(rows, include_chunking=False)
 
     # Search each KB
     for kb_config in valid_kb_configs:

@@ -200,12 +200,18 @@ def _fetch_kb_or_404(kb_id: str) -> dict | tuple:
 
 
 def _read_existing_retrieval_config(kb_id: str) -> dict:
-    """Read the current retrieval_config from the DB; returns {} if KB missing."""
+    """Read the current retrieval_config from the DB; returns {} if KB missing.
+
+    Coerced rather than returned raw: the caller reads ``.get("method")`` off
+    it before this endpoint validates the *incoming* config, so a KB whose
+    stored value is the wrong shape would 500 on the very request meant to
+    repair it — leaving no way to fix it through the API at all.
+    """
     row = db.session.execute(
         text(f'SELECT retrieval_config FROM "{AI_SCHEMA}".knowledge_bases WHERE id = :id'),
         {"id": kb_id},
     ).fetchone()
-    if row is None or row[0] is None:
+    if row is None or not isinstance(row[0], dict):
         return {}
     return row[0]
 
@@ -391,6 +397,8 @@ def create_knowledge_base():
 
     indexing_config = {**strategy_def["default_indexing_config"], **user_indexing_config}
     retrieval_config = data.get("retrieval_config", strategy_def["default_retrieval_config"])
+    if not isinstance(retrieval_config, dict):
+        return jsonify({"error": "retrieval_config must be an object"}), 400
 
     db.session.execute(
         text(f"""
@@ -510,6 +518,12 @@ def update_knowledge_base(kb_id: str):
         updates.append("indexing_config = CAST(:indexing_config AS jsonb)")
         params["indexing_config"] = json.dumps(data["indexing_config"])
     if "retrieval_config" in data:
+        if not isinstance(data["retrieval_config"], dict):
+            # A non-object persists as valid JSONB and then breaks every
+            # later search — `retrieval_config.get(...)` raises, and
+            # context_handler reports the knowledge base as empty. Reject at
+            # the boundary instead of degrading at read time.
+            return jsonify({"error": "retrieval_config must be an object"}), 400
         updates.append("retrieval_config = CAST(:retrieval_config AS jsonb)")
         params["retrieval_config"] = json.dumps(data["retrieval_config"])
 
