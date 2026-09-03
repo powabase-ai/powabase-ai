@@ -5,9 +5,14 @@ in ``settings_registry``, read at call time through ``get_setting()`` so a DB
 override takes effect; a module constant mirroring one is dead the moment the
 setting moves, while still looking authoritative to the next reader. Two such
 constants lived here — ``DEFAULT_TOP_K`` and ``DEFAULT_MAX_CONTEXT_TOKENS``,
-shadowing ``KB_DEFAULT_TOP_K`` and ``KB_DEFAULT_MAX_CONTEXT_TOKENS`` at stale
-values, imported by nothing — and were removed. Before adding a constant,
-check ``settings_registry`` for the same key.
+mirroring ``KB_DEFAULT_TOP_K`` and ``KB_DEFAULT_MAX_CONTEXT_TOKENS``, imported
+by nothing — and were removed. They matched their settings exactly until this
+change raised the settings, which is the point: a mirror is correct right up
+to the edit that makes it wrong, and nothing fails when it does. Before adding
+a constant, check ``settings_registry`` for the same key — and note the rule
+is not fully swept: ``agentic.knowledge.model_config`` still defines its own
+``DEFAULT_MAX_CONTEXT_TOKENS``, used as an ORM ``server_default`` and a tool
+field default.
 """
 
 # ---------------------------------------------------------------------------
