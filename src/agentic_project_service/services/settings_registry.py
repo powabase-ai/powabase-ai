@@ -254,11 +254,13 @@ def _build_registry() -> dict[str, SettingDef]:
             min=1000,
             max=256000,
             description=(
-                "Budget for the retrieval context an agent run assembles for "
-                "its LLM. Distinct from Max Context Tokens under Knowledge "
-                "Bases, which bounds one knowledge_search tool result; keep "
-                "this at or above that value, since a single search result "
-                "has to fit inside the context a run builds."
+                "Budget for the context an agent preloads before its first "
+                "LLM call. Distinct from Max Context Tokens under Knowledge "
+                "Bases, which bounds one knowledge_search tool result: the "
+                "two are separate budgets that add up within a run, not one "
+                "inside the other. This one lands in the system prompt, which "
+                "compaction cannot prune, so it is resent in full on every "
+                "step of the run."
             ),
         ),
         SettingDef(
@@ -882,11 +884,13 @@ def _build_registry() -> dict[str, SettingDef]:
             min=1000,
             max=128000,
             description=(
-                "Budget for one knowledge_search result. Items past it are "
-                "dropped in score order, so this is a backstop: the deliberate "
-                "bounds are top_k and, for GraphIndex, the graph_expansion "
-                "caps. Costs recur — a result stays in an agent's history and "
-                "is resent on every later step of the run."
+                "Budget for one knowledge_search result, and for a "
+                "context_handler retrieval that does not set its own. Items "
+                "past it are dropped by position once results are grouped by "
+                "document, not by score, so this is a backstop: the "
+                "deliberate bounds are top_k and, for GraphIndex, the "
+                "graph_expansion caps. Costs recur — a result stays in an "
+                "agent's history and is resent on every later step of the run."
             ),
         ),
         SettingDef(

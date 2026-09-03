@@ -77,11 +77,22 @@ class FakeGraphIndexStore:
         self.outline_calls: list[list] = []
 
     def get_nodes_by_ids(self, selections):
-        return {key: self._nodes[key] for key in selections if key in self._nodes}
+        # Reversed on purpose. The real store ORs the pairs into one WHERE
+        # with no ORDER BY, so the dict comes back in DB row order and the
+        # caller must not inherit its ranking from this mapping. Returning
+        # `selections` order here would hide exactly that bug.
+        return {
+            key: self._nodes[key] for key in reversed(list(selections)) if key in self._nodes
+        }
 
     def get_children_by_parent_ids(self, parent_selections):
         self.children_calls.append(list(parent_selections))
-        return {key: self._children[key] for key in parent_selections if key in self._children}
+        # Reversed for the same reason as get_nodes_by_ids.
+        return {
+            key: self._children[key]
+            for key in reversed(list(parent_selections))
+            if key in self._children
+        }
 
     def get_toc_outline(self, toc_ids, limit):
         self.outline_calls.append(list(toc_ids))
@@ -477,6 +488,66 @@ class TestChildrenFanOut:
         out = _expand(pool, store, {"graph_expansion": {"max_referenced_nodes": 1}})
 
         assert [r.meta["node_id"] for r in _by_method(out, "graph_expansion")] == ["0010"]
+
+    def test_a_hit_naming_a_reference_twice_does_not_outrank_consensus(self, install_store):
+        """ref_hits counts how many *hits* point at a section. Nothing
+        guarantees one hit's referenced_nodes is deduplicated, and counting
+        occurrences instead lets a single hit manufacture its own consensus."""
+        nodes = {(TOC_A, n): _node_row(n) for n in ("0010", "0011")}
+        store = install_store(FakeGraphIndexStore(nodes=nodes, outlines={TOC_A: _outline()}))
+        pool = [
+            _hit("0001", refs=["0010", "0010"], score=0.5),
+            _hit("0002", refs=["0011"], score=0.9),
+        ]
+
+        out = _expand(pool, store, {"graph_expansion": {"max_referenced_nodes": 1}})
+
+        kept = [r.meta["node_id"] for r in _by_method(out, "graph_expansion")]
+        assert kept == ["0011"], "a doubled reference in one hit is still one hit"
+
+    def test_emitted_order_follows_the_ranking_not_the_store(self, install_store):
+        """The ranking has to reach the emitted list, not just the fetch.
+        Every referenced node carries the same score and context formatting
+        truncates positionally, so emission order decides which references
+        survive a tight token budget."""
+        nodes = {(TOC_A, n): _node_row(n) for n in ("0010", "0011", "0019")}
+        store = install_store(FakeGraphIndexStore(nodes=nodes, outlines={TOC_A: _outline()}))
+        pool = [
+            _hit("0001", refs=["0010", "0011"], score=0.9),
+            _hit("0002", refs=["0011", "0019"], score=0.2),
+        ]
+
+        out = _expand(pool, store, {"graph_expansion": {"max_referenced_nodes": 3}})
+
+        kept = [r.meta["node_id"] for r in _by_method(out, "graph_expansion")]
+        # 0011 has two hits; 0010 and 0019 have one each, ordered by their
+        # referring hit's score.
+        assert kept == ["0011", "0010", "0019"]
+
+    def test_children_follow_their_parents_ranking(self, install_store):
+        """Children inherit their parent's standing, so a positional cut
+        should reach the least-agreed-on parent's subtree first."""
+        nodes = {(TOC_A, n): _node_row(n) for n in ("0010", "0019")}
+        children = {
+            (TOC_A, "0010"): [_node_row("0010.1", parent="0010")],
+            (TOC_A, "0019"): [_node_row("0019.1", parent="0019")],
+        }
+        store = install_store(
+            FakeGraphIndexStore(nodes=nodes, children=children, outlines={TOC_A: _outline()})
+        )
+        pool = [
+            _hit("0001", refs=["0010"], score=0.9),
+            _hit("0002", refs=["0019"], score=0.2),
+        ]
+
+        out = _expand(
+            pool,
+            store,
+            {"graph_expansion": {"include_children": True, "max_referenced_nodes": 2}},
+        )
+
+        kept = [r.meta["node_id"] for r in _by_method(out, "graph_expansion_child")]
+        assert kept == ["0010.1", "0019.1"]
 
     def test_capping_references_is_reported(self, install_store, caplog):
         nodes = {(TOC_A, f"{i:04d}"): _node_row(f"{i:04d}") for i in range(10, 20)}

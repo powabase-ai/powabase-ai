@@ -466,7 +466,7 @@ def _load_kb_configs(
     Both configs are coerced here rather than at each read. They are
     unvalidated JSONB — the route rejects a non-object now, but rows written
     before that persist, and a JSON string is valid JSONB. The callers then
-    ``.get()`` these at eight sites, several of them (the enrichment hoist,
+    ``.get()`` these at many sites, several of them (the enrichment hoist,
     the per-KB context mode) outside the per-KB ``try``, so a single bad row
     would fail the entire multi-KB retrieval instead of degrading one KB.
 

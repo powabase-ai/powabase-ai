@@ -1487,9 +1487,11 @@ def _expansion_tier_scores(min_score: float) -> tuple[float, float, float]:
     and a purely multiplicative step would collapse all three tiers onto it.
     ``bm25s.retrieve`` pads its top-k with zero-score entries when fewer than
     ``k`` documents contain any query term (``sparse_retrieval/bm25_index.py``),
-    and an orthogonal embedding scores exactly 0.0. (The tsvector path cannot
-    contribute one: ``full_text_search`` filters on ``@@ websearch_to_tsquery``
-    before scoring.)
+    and an orthogonal embedding scores exactly 0.0. The tsvector path can reach
+    it too: ``@@ websearch_to_tsquery`` gates which rows are admitted, not what
+    they score — ``ts_rank`` only orders the SQL and the emitted score is a
+    Python BM25 over the parsed tsvector — so a row admitted purely by a
+    negated term has no positive lexeme left to score and comes back 0.0.
 
     Ordering holds within one knowledge base. ``search_multiple_knowledge_bases``
     merges pools by raw score, so an expansion item from a high-scoring KB can
@@ -1583,7 +1585,11 @@ def _expand_graph_neighbors(
         if not toc_id:
             continue
         score = item.score if item.score is not None else 0.0
-        for ref_nid in meta.get("referenced_nodes") or []:
+        # dict.fromkeys de-duplicates within one hit's list while keeping its
+        # order: ref_hits counts how many *hits* point at a section, and
+        # nothing guarantees a single hit lists a reference only once. Without
+        # this, one hit naming a section twice outranks two hits that agree.
+        for ref_nid in dict.fromkeys(meta.get("referenced_nodes") or []):
             key = (toc_id, ref_nid)
             if key in existing_keys:
                 continue
@@ -1631,9 +1637,10 @@ def _expand_graph_neighbors(
             # transaction, and swallowing it without unwinding leaves the
             # session deactivated — every later statement then raises
             # PendingRollbackError, surfacing far from here as an empty
-            # knowledge base or a hard tool failure. db.py makes the same
-            # point about loops. A nested transaction undoes only this
-            # statement, so a pending billing write on the session survives.
+            # knowledge base or a hard tool failure. db.py names the same
+            # hazard with a coarser remedy (a full rollback). A nested
+            # transaction undoes only this statement, so anything else the
+            # caller has pending on a shared request session survives.
             with db_session.begin_nested():
                 outlines = gi_store.get_toc_outline(toc_ids, GRAPH_TOC_MAX_NODES)
         except SQLAlchemyError:
@@ -1667,8 +1674,19 @@ def _expand_graph_neighbors(
             )
         )
 
-    for (toc_id, node_id), node_row in node_map.items():
-        all_keys.add((toc_id, node_id))
+    # Iterate `selections`, not `node_map`: the map is keyed by the rows the
+    # store returned, in DB row order (`get_nodes_by_ids` ORs the pairs into
+    # one WHERE with no ORDER BY), so walking it discards the ranking above.
+    # Every referenced node carries the same score and `format_items_as_context`
+    # truncates positionally, so emission order decides which references
+    # survive a tight budget — the ranking has to reach the list, not just the
+    # fetch.
+    for key in selections:
+        node_row = node_map.get(key)
+        if node_row is None:
+            continue
+        toc_id, node_id = key
+        all_keys.add(key)
         node_meta = node_row.get("meta") or {}
         start_page = node_meta.get("start_page")
         end_page = node_meta.get("end_page")
@@ -1696,14 +1714,22 @@ def _expand_graph_neighbors(
 
     # Expand children of referenced parent nodes — opt-in, and capped per
     # parent so one heavily-subdivided section can't flood the context.
+    parents = [key for key in selections if key in node_map]
     children_map = (
-        gi_store.get_children_by_parent_ids(list(node_map.keys()))
+        gi_store.get_children_by_parent_ids(parents)
         if cfg.include_children and cfg.max_children
         else {}
     )
     children_added = 0
 
-    for (toc_id, parent_node_id), child_rows in children_map.items():
+    # Ranked parent order, for the same reason the parents themselves are
+    # emitted in it: children inherit their parent's standing, so a positional
+    # truncation should reach the least-agreed-on parent's subtree first.
+    for parent_key in parents:
+        child_rows = children_map.get(parent_key)
+        if not child_rows:
+            continue
+        toc_id, parent_node_id = parent_key
         # The cap charges only newly-added children: one already in the pool
         # is skipped without consuming budget, so a parent can contribute up
         # to max_children *beyond* what the search already found.
