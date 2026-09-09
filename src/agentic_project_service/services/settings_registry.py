@@ -258,10 +258,11 @@ def _build_registry() -> dict[str, SettingDef]:
                 "LLM call. Distinct from Max Context Tokens under Knowledge "
                 "Bases, which bounds one knowledge_search tool result: the "
                 "two are separate budgets that add up within a run, not one "
-                "inside the other. This one lands in the run's opening prompt "
-                "— the system prompt, or the first user message when the "
-                "context carries images — which pruning never rewrites, so it "
-                "is resent in full on every step of the run."
+                "inside the other. It is resent on every step, and pruning "
+                "never reclaims it — pruning only rewrites tool results. On "
+                "the text path it goes in the system prompt and survives "
+                "compaction too; when the context carries images it goes in "
+                "a user message instead, which compaction does replace."
             ),
         ),
         SettingDef(

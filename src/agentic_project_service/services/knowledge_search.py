@@ -1345,13 +1345,19 @@ def _page_span(meta: dict) -> list[int]:
     """
     start = meta.get("start_page")
     end = meta.get("end_page")
-    try:
-        if start is not None and end is not None:
+    # Two blocks rather than one try, matching `_pages_for_item`: sharing a
+    # try makes an unreadable *end* skip the start-only fallback, which is
+    # the fetch-everything case above rather than a narrower page list.
+    if start is not None and end is not None:
+        try:
             return list(range(int(start), int(end) + 1))
-        if start is not None:
+        except (TypeError, ValueError):
+            pass
+    if start is not None:
+        try:
             return [int(start)]
-    except (TypeError, ValueError):
-        pass
+        except (TypeError, ValueError):
+            pass
     return []
 
 
@@ -1364,19 +1370,24 @@ def _require_indexing_config(raw: Any, kb_id: str) -> dict:
     in?", and ``{}`` is not a missing answer but a different one: it reads as
     ``chunk_embed``, whose ``compatible_retrievers`` include the ``hybrid``
     a graph_index KB ships, so nothing downstream objects. The search then
-    runs against ``chunks`` for a KB whose data is in ``graph_index_nodes``,
-    returns nothing, and the caller reports zero results with no error and an
-    ``indexing_strategy`` of ``chunk_embed`` — stating a wrong fact rather
-    than omitting an unknown one.
+    runs against ``chunks`` for a KB whose data is in ``graph_index_nodes``
+    and finds none, which the caller reports as a completed retrieval with
+    ``errors: []`` and no results — no indication anywhere that the search
+    was aimed at the wrong table.
 
     Raising instead puts the KB id and the stored shape in ``errors[]``,
     where an operator can act on it.
     """
     if raw is None or isinstance(raw, dict):
         return raw or {}
+    # Truncated: this reaches an HTTP body and a per-KB error message, and
+    # the malformed value can be arbitrarily large JSONB.
+    shown = repr(raw)
+    if len(shown) > 120:
+        shown = shown[:117] + "..."
     raise ValueError(
         f"knowledge base {kb_id} has a malformed indexing_config "
-        f"({type(raw).__name__}: {raw!r}); retrieval cannot determine which "
+        f"({type(raw).__name__}: {shown}); retrieval cannot determine which "
         "indexing strategy it was built with"
     )
 
@@ -1387,7 +1398,8 @@ def _coerce_kb_config(raw: Any, field: str, kb_id: str) -> dict:
     The route now rejects a non-object, but rows written before that landed
     persist as valid JSONB of the wrong shape — a JSON string, say. Every
     later ``.get()`` on one raises, and context_handler turns that into an
-    empty knowledge base with only a warning to explain it.
+    empty knowledge base — with a warning and a per-KB entry in ``errors[]``,
+    but only for the sites that sit inside its per-KB try.
 
     Only safe where a missing config means "use the defaults" — see
     ``_require_indexing_config`` for the column where it does not.
@@ -1794,6 +1806,10 @@ def _expand_graph_neighbors(
     # Expand children of referenced parent nodes — opt-in, and capped per
     # parent so one heavily-subdivided section can't flood the context.
     parents = [key for key in selections if key in node_map]
+    # A cap of 0 means off, and is answered without a query — so it also
+    # never reaches the "withheld N children" log below. That asymmetry is
+    # deliberate: 0 withholds every child by construction, which is what the
+    # operator asked for, not something the cap did to a request.
     children_map = (
         gi_store.get_children_by_parent_ids(parents)
         if cfg.include_children and cfg.max_children
@@ -1878,8 +1894,8 @@ def _expand_graph_neighbors(
     # selected and 6 found would otherwise read exactly like 6 selected.
     logger.info(
         "graph_expansion: emitted %d neighbors + %d children + %d outlines "
-        "from %d candidate refs (%d selected children=%s child_cap=%d "
-        "ref_cap=%d outline=%s)",
+        "from %d candidate refs (%d selected, children=%s, child_cap=%d, "
+        "ref_cap=%d, outline=%s, kb=%s)",
         neighbors_added,
         children_added,
         len(outlines),
@@ -1889,6 +1905,7 @@ def _expand_graph_neighbors(
         cfg.max_children,
         cfg.max_referenced,
         cfg.include_doc_toc,
+        knowledge_base_id,
     )
 
     return results

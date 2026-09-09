@@ -3,6 +3,7 @@
 import json
 import logging
 import uuid
+from typing import Any
 
 from flask import Blueprint, jsonify, request
 from sqlalchemy import text
@@ -40,22 +41,27 @@ _GRAPH_EXPANSION_CEILINGS: dict[str, int] = {
 _GRAPH_EXPANSION_SWITCHES: tuple[str, ...] = ("include_children", "include_doc_toc")
 
 
-def _config_shape_error(data: dict) -> str | None:
+def _config_shape_error(data: Any) -> str | None:
     """Reject a config payload the read path could only guess at.
 
     Both columns are JSONB with no schema, so whatever lands here is what
-    every later read has to survive. A non-object is the shape that hurts:
-    ``.get()`` on one raises, and the caller turns that into an empty
-    knowledge base — or, for ``indexing_config``, into a search routed at the
-    wrong table. Reject at the boundary instead of degrading at read time.
+    every later read has to survive. The read path copes with a non-object
+    either way — ``retrieval_config`` degrades to the defaults with a warning
+    and a recorded per-KB error, ``indexing_config`` raises rather than guess
+    a strategy — but coping is not the same as accepting: a value no read can
+    use should not be stored in the first place.
 
     ``graph_expansion`` is checked against the same bounds the search path
     clamps to. Clamping is the right behaviour for a row already written, but
     accepting 1000000 over the API, echoing it back to Studio, and then
-    applying 100 makes the ceiling a suggestion. Unknown keys are left alone
-    — the read path warns about those, and rejecting them here would break a
-    newer Studio against an older service mid-deploy.
+    applying 100 makes the ceiling a suggestion. Unknown keys inside the
+    block are left alone — the read path warns about those, and rejecting
+    them here would break a newer Studio against an older service mid-deploy.
+    Unknown keys elsewhere in ``retrieval_config`` are not checked by anyone.
     """
+    if not isinstance(data, dict):
+        return "request body must be an object"
+
     for field in ("indexing_config", "retrieval_config"):
         if field in data and not isinstance(data[field], dict):
             return f"{field} must be an object"
@@ -72,7 +78,9 @@ def _config_shape_error(data: dict) -> str | None:
         if key not in expansion:
             continue
         value = expansion[key]
-        # bool is an int in Python, and `true` would clamp to a cap of 1.
+        # bool is an int in Python. The read path already rejects one and
+        # falls back to the default, so this changes nothing at read time —
+        # it refuses the value rather than silently substituting another.
         if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= ceiling:
             return (
                 f"retrieval_config.graph_expansion.{key} must be an integer between 0 and {ceiling}"

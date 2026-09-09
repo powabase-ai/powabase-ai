@@ -3,24 +3,32 @@
 The columns are unvalidated JSONB, so whatever the route writes is what every
 later read has to survive. Two shapes are worth rejecting at the boundary:
 
-*A non-object.* ``retrieval_config`` has been guarded since the round-4 fix;
-``indexing_config`` was not, so ``PATCH {"indexing_config": "graph_index"}``
-returned 200 and wrote ``'"graph_index"'`` — the row that then makes a
-graph_index knowledge base search the wrong table and report success.
+*A non-object.* ``retrieval_config`` was guarded first; ``indexing_config``
+was not, so ``PATCH {"indexing_config": "graph_index"}`` returned 200 and
+wrote ``'"graph_index"'`` — the row that then makes a graph_index knowledge
+base search the wrong table and report a completed retrieval with no
+results and no error.
 
 *A graph_expansion outside its bounds.* The read path clamps and warns, so a
 ``max_referenced_nodes`` of 1000000 was accepted, read back by Studio as
 1000000, and silently applied as 100. A ceiling the API accepts and then
 ignores is not a contract.
 
-These run against the pure validator rather than the routes, so they run in
-CI — ``tests/test_knowledge_bases.py`` needs Postgres and no CI job runs it.
+Most of these run against the pure validator, so they run in CI —
+``tests/test_knowledge_bases.py`` needs Postgres and no CI job runs it. The
+last class drives the two routes through a Flask test client, because a
+validator nothing calls is dead weight that no unit test of the validator
+can notice: both call sites can be deleted with every other test here
+still green.
 """
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
+from agentic_project_service.routes import knowledge_bases as kb_routes
 from agentic_project_service.routes.knowledge_bases import _config_shape_error
 from agentic_project_service.strategies.graph_defaults import (
     GRAPH_MAX_CHILDREN_CEILING,
@@ -29,6 +37,16 @@ from agentic_project_service.strategies.graph_defaults import (
 
 
 class TestConfigShape:
+    def test_a_non_object_body_is_rejected(self):
+        """``request.get_json()`` returns whatever was sent. A truthy non-dict
+        — ``[1, 2]`` — passes the route's emptiness check, and every read here
+        would then raise: ``field in data`` is a harmless membership test that
+        lets it through as far as ``.get``."""
+        error = _config_shape_error([1, 2])
+
+        assert error is not None
+        assert "object" in error
+
     def test_well_formed_configs_pass(self):
         assert (
             _config_shape_error(
@@ -112,8 +130,10 @@ class TestGraphExpansionBounds:
 
     @pytest.mark.parametrize("value", ["10", 10.5, True, None])
     def test_a_non_integer_cap_is_rejected(self, value):
-        """``True`` is an int in Python and would clamp to 1 — a cap of one
-        reference is not what an operator writing ``true`` meant."""
+        """``True`` is an int in Python, so it needs its own check to be
+        refused here. The read path already declines to interpret it and
+        falls back to the default — so this is not preventing a failure, it
+        is refusing to store a value whose stored form and effect disagree."""
         error = self._error({"max_referenced_nodes": value})
 
         assert error is not None
@@ -121,8 +141,9 @@ class TestGraphExpansionBounds:
 
     @pytest.mark.parametrize("value", ["false", 0, 1, None])
     def test_a_non_boolean_switch_is_rejected(self, value):
-        """``"false"`` is truthy — the string that enables the flood the
-        default exists to prevent."""
+        """``"false"`` is a string, and the read path returns the default for
+        one rather than coercing — so this refuses the value instead of
+        storing something whose stored form and effect disagree."""
         error = self._error({"include_children": value})
 
         assert error is not None
@@ -130,3 +151,80 @@ class TestGraphExpansionBounds:
 
     def test_both_switches_accept_booleans(self):
         assert self._error({"include_children": True, "include_doc_toc": False}) is None
+
+
+class TestTheRoutesCallIt:
+    """Wiring, not logic. Every test above passes with both call sites
+    deleted; these are the ones that don't. The validator runs before any
+    DB access on both routes, so a test client with auth patched is enough.
+    """
+
+    def _client(self):
+        from flask import Flask
+
+        app = Flask(__name__)
+        app.register_blueprint(kb_routes.knowledge_bases_bp)
+        return app.test_client()
+
+    def _post(self, body):
+        with patch(
+            "agentic_project_service.auth.decode_jwt",
+            return_value={"sub": "user-1", "role": "authenticated"},
+        ):
+            return self._client().post(
+                "/api/knowledge-bases",
+                json=body,
+                headers={"Authorization": "Bearer fake"},
+            )
+
+    def _patch(self, body):
+        with patch(
+            "agentic_project_service.auth.decode_jwt",
+            return_value={"sub": "user-1", "role": "authenticated"},
+        ):
+            return self._client().patch(
+                "/api/knowledge-bases/11111111-1111-1111-1111-111111111111",
+                json=body,
+                headers={"Authorization": "Bearer fake"},
+            )
+
+    def test_create_rejects_a_non_object_indexing_config(self):
+        """It used to 500 here — ``.get("strategy")`` ran three lines before
+        the retrieval_config guard."""
+        response = self._post({"name": "KB", "indexing_config": "graph_index"})
+
+        assert response.status_code == 400
+        assert "indexing_config" in response.get_json()["error"]
+
+    def test_update_rejects_a_non_object_indexing_config(self):
+        """It used to return 200 and write ``'"graph_index"'``."""
+        response = self._patch({"indexing_config": "graph_index"})
+
+        assert response.status_code == 400
+        assert "indexing_config" in response.get_json()["error"]
+
+    def test_create_rejects_a_cap_above_the_ceiling(self):
+        response = self._post(
+            {
+                "name": "KB",
+                "retrieval_config": {"graph_expansion": {"max_referenced_nodes": 1000000}},
+            }
+        )
+
+        assert response.status_code == 400
+        assert "max_referenced_nodes" in response.get_json()["error"]
+
+    def test_update_rejects_a_cap_above_the_ceiling(self):
+        response = self._patch(
+            {"retrieval_config": {"graph_expansion": {"max_referenced_nodes": 1000000}}}
+        )
+
+        assert response.status_code == 400
+        assert "max_referenced_nodes" in response.get_json()["error"]
+
+    def test_update_with_a_non_object_body_is_a_400_not_a_500(self):
+        """A truthy non-dict body passes the route's emptiness check and then
+        reaches the validator's reads."""
+        response = self._patch([1, 2])
+
+        assert response.status_code == 400

@@ -3,8 +3,8 @@
 The expansion unit tests fake the store, so nothing there exercises this
 query — and it is the kind that unit fakes cannot vouch for: a window
 function that pages per document, a count that has to survive that paging,
-and a knowledge_base_id filter whose absence is invisible until two tenants
-share a database.
+and a knowledge_base_id filter whose absence is invisible until one project
+has two knowledge bases.
 """
 
 from __future__ import annotations

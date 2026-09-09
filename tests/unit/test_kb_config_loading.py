@@ -68,6 +68,10 @@ class TestLoadKbConfigs:
         assert "kb-1" in caplog.text
 
     def test_a_string_indexing_config_degrades_to_empty(self):
+        """Display metadata only. The *search* path refuses this row rather
+        than defaulting its strategy (``_require_indexing_config``), so what
+        this pins is that assembling the response doesn't also blow up —
+        not that ``chunk_embed`` is a safe thing to assume anywhere else."""
         display, _ = _load_kb_configs(
             [_row("kb-1", indexing_config="graph_index")], include_chunking=True
         )

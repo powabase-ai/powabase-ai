@@ -455,9 +455,10 @@ class TestChildrenFanOut:
 
     def test_referenced_node_cap_is_bounded_above(self, install_store):
         """A configured million restores exactly the unbounded fan-out the cap
-        removes. Asserted as an equality against a pool with more references
-        than the ceiling — ``<= ceiling`` would hold for any cap at all,
-        including one read straight from the config."""
+        removes. The pool deliberately holds more references than the ceiling
+        and the assertion is an equality: against a smaller pool, or written
+        as ``<= ceiling``, it would hold for any cap at all — including a
+        million read straight from the config."""
         refs = [f"{i:04d}" for i in range(10, 160)]
         many = {(TOC_A, ref): _node_row(ref) for ref in refs}
         store = install_store(FakeGraphIndexStore(nodes=many, outlines={TOC_A: _outline()}))
@@ -503,6 +504,41 @@ class TestChildrenFanOut:
         out = _expand(pool, store, {"graph_expansion": {"max_referenced_nodes": 1}})
 
         assert [r.meta["node_id"] for r in _by_method(out, "graph_expansion")] == ["0012"]
+
+    def test_the_score_key_is_the_best_referring_hit_not_the_worst_or_the_first(
+        self, install_store
+    ):
+        """Both references have two hits, so consensus ties and the score key
+        alone decides. The scores are arranged so `max` picks 0021 while
+        `min` and first-seen both pick 0012 — a fixture where each reference
+        is named once cannot separate those three, because they are the same
+        number."""
+        nodes = {(TOC_A, n): _node_row(n) for n in ("0012", "0021")}
+        store = install_store(FakeGraphIndexStore(nodes=nodes, outlines={TOC_A: _outline()}))
+        pool = [
+            _hit("0001", refs=["0021"], score=0.1),
+            _hit("0002", refs=["0012"], score=0.5),
+            _hit("0003", refs=["0021"], score=0.9),
+            _hit("0004", refs=["0012"], score=0.4),
+        ]
+
+        out = _expand(pool, store, {"graph_expansion": {"max_referenced_nodes": 1}})
+
+        kept = [r.meta["node_id"] for r in _by_method(out, "graph_expansion")]
+        assert kept == ["0021"], "0021's best hit is 0.9; its first and worst are 0.1"
+
+    def test_the_final_tiebreak_is_the_key_not_the_order_references_were_seen(self, install_store):
+        """Consensus and score both tie, so only the key separates them. It is
+        seen in descending order, so insertion order — what a dropped or
+        reversed tiebreak falls back to — gives the opposite answer."""
+        nodes = {(TOC_A, n): _node_row(n) for n in ("0020", "0030")}
+        store = install_store(FakeGraphIndexStore(nodes=nodes, outlines={TOC_A: _outline()}))
+        pool = [_hit("0001", refs=["0030", "0020"], score=0.5)]
+
+        out = _expand(pool, store, {"graph_expansion": {"max_referenced_nodes": 2}})
+
+        kept = [r.meta["node_id"] for r in _by_method(out, "graph_expansion")]
+        assert kept == ["0020", "0030"]
 
     def test_a_hit_naming_a_reference_twice_does_not_outrank_consensus(self, install_store):
         """ref_hits counts how many *hits* point at a section. Nothing
@@ -985,10 +1021,16 @@ class TestExpansionReporting:
         assert KB_ID in caplog.text
 
     def test_the_summary_says_how_many_references_were_selected(self, install_store, caplog):
-        """The map's keys are a subset of the selections, so its size was
-        already the emitted count — renaming it changes nothing on its own.
-        What was missing is the other number: without ``selected``, 10 chosen
-        and 6 resolved reads exactly like 6 chosen."""
+        """Whenever the store's keys spell their toc_ids the way the pool
+        does, the map is a subset of the selections and its size is already
+        the emitted count — so renaming it changes nothing on its own. What
+        was missing is the other number: without ``selected``, 10 chosen and
+        6 resolved reads exactly like 6 chosen.
+
+        Asserted against the summary record alone. ``caplog.text`` also holds
+        the missing-row warning, which contains "of N selected references" —
+        so a whole-text assertion passes with the summary's count mutated
+        away, which is the very confound this test was added to remove."""
         store = install_store(
             FakeGraphIndexStore(
                 nodes={(TOC_A, "0002"): _node_row("0002")},
@@ -997,10 +1039,14 @@ class TestExpansionReporting:
         )
 
         with caplog.at_level(logging.INFO):
-            _expand([_hit("0001", refs=["0002", "0404"])], store)
+            _expand([_hit("0001", refs=["0002", "0404", "0405"])], store)
 
-        assert "emitted 1 neighbors" in caplog.text
-        assert "2 selected" in caplog.text
+        summaries = [r.getMessage() for r in caplog.records if "emitted" in r.getMessage()]
+        assert len(summaries) == 1
+        # Three distinct numbers, so no two of them can stand in for another.
+        assert "emitted 1 neighbors" in summaries[0]
+        assert "3 selected" in summaries[0]
+        assert "from 3 candidate refs" in summaries[0]
 
     def test_the_child_cap_reports_what_it_dropped(self, install_store, caplog):
         """The low child default is justified by the outline naming the
@@ -1032,10 +1078,14 @@ class TestExpansionReporting:
         assert "withheld 2 of 4 children" in caplog.text
         assert "outline=False" in caplog.text
 
-    def test_children_already_in_the_pool_are_not_counted_as_dropped(self, install_store):
+    def test_children_already_in_the_pool_are_not_counted_as_dropped(self, install_store, caplog):
         """A child the search already found is skipped without consuming cap
-        budget, so it is not something the cap withheld either."""
-        children = [_node_row(f"000{i}", parent="0002") for i in range(3, 6)]
+        budget, so it is not something the cap withheld either.
+
+        The pooled child sits *after* the cut on purpose: anywhere before it,
+        a naive "everything left in the list" count gives the same answer as
+        the dedup-aware one and the distinction goes untested."""
+        children = [_node_row(f"000{i}", parent="0002") for i in range(3, 7)]
         store = install_store(
             FakeGraphIndexStore(
                 nodes={(TOC_A, "0002"): _node_row("0002")},
@@ -1044,14 +1094,17 @@ class TestExpansionReporting:
             )
         )
 
-        out = _expand(
-            [_hit("0001", refs=["0002"]), _hit("0003")],
-            store,
-            {"graph_expansion": {"include_children": True, "max_children_per_parent": 3}},
-        )
+        with caplog.at_level(logging.INFO):
+            out = _expand(
+                [_hit("0001", refs=["0002"]), _hit("0006")],
+                store,
+                {"graph_expansion": {"include_children": True, "max_children_per_parent": 2}},
+            )
 
         kept = [c.meta["node_id"] for c in _by_method(out, "graph_expansion_child")]
-        assert kept == ["0004", "0005"]
+        assert kept == ["0003", "0004"]
+        # 0005 was withheld; 0006 was already in the pool, so it was not.
+        assert "withheld 1 of 3 children" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -1094,6 +1147,14 @@ class TestExpansionPages:
         """meta is JSONB written by the indexer; a string here must not raise
         in the middle of a successful search."""
         assert self._pages_of(install_store, {"start_page": "seven"}) == []
+
+    def test_an_unparseable_end_page_falls_back_to_the_start(self, install_store):
+        """The start-only fallback has to be reachable when it is the *end*
+        that is unreadable — which is the only way this differs from
+        ``_pages_for_item``, and the direction that matters: returning ``[]``
+        for a node that knows its start page is what sends the image path
+        into the fetch-everything fallback."""
+        assert self._pages_of(install_store, {"start_page": 3, "end_page": "x"}) == [3]
 
 
 # ---------------------------------------------------------------------------
