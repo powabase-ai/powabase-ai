@@ -15,10 +15,8 @@ jobs:
   # sets no env of its own — anything declared here would be dead config that
   # drifts from the conftest.
   #
-  # The database-backed tier (tests/ minus tests/unit/) is NOT run here yet: its
-  # schema/role bootstrap is still being finished. Adding it as a permanently-red
-  # continue-on-error job would train readers to ignore this workflow, so it is
-  # left out until it can run green and gate.
+  # The database-backed tier runs in the `store` job below, scoped to the store
+  # tests rather than all of tests/ — see that job's comment for why.
   unit:
     name: pytest tests/unit (Python 3.13)
     runs-on: ubuntu-latest
@@ -40,3 +38,48 @@ jobs:
       # this stops uv re-resolving mid-suite.
       - name: Run unit tests
         run: uv run --no-sync pytest tests/unit -q
+
+  # SQL that no gate executes is SQL nobody finds out about: a cast or column
+  # change would make the graph_index document outline silently disappear from
+  # every query, with the unit tier green — its fakes cannot see a query.
+  #
+  # Scoped to the store tests rather than all of tests/ deliberately. The rest
+  # of the database tier still has the schema/role bootstrap gaps the comment
+  # above used to describe, and a permanently-red job would train readers to
+  # ignore this workflow. Widen the path as each file is made to pass.
+  store:
+    name: pytest store (Postgres 16 + pgvector)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: supabase_admin
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U supabase_admin -d postgres_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # conftest os.environ.setdefault()s this, so an explicit value wins and
+      # keeps the connection string in one place next to the service above.
+      DATABASE_URL: postgresql+psycopg://supabase_admin:postgres@localhost:5432/postgres_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      # The `app` fixture creates the ai schema, the vector extension and the
+      # ORM tables itself, so no migration step is needed here.
+      - name: Run store tests
+        run: uv run --no-sync pytest tests/test_graph_index_store.py -q

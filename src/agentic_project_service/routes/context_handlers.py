@@ -64,7 +64,8 @@ def create_context_handler():
     Request body:
         query: str (required) - The search query
         knowledge_bases: list[dict] (required) - KB configs with 'id' and optional params
-        max_context_tokens: int (optional, default 32000) - Token limit
+        max_context_tokens: int (optional) - Token limit; defaults to the
+            KB_DEFAULT_MAX_CONTEXT_TOKENS setting, which an operator can change
 
     Returns:
         201 with full handler object on success
@@ -79,7 +80,14 @@ def create_context_handler():
     if not knowledge_bases:
         return jsonify({"error": "knowledge_bases is required and must not be empty"}), 400
 
-    max_context_tokens = data.get("max_context_tokens", get_setting("DEFAULT_MAX_CONTEXT_TOKENS"))
+    # The KB budget, not the agent one: this route runs a retrieval, and the
+    # value goes straight to `execute_retrieval`. Passing a value always
+    # meant its own KB_DEFAULT_MAX_CONTEXT_TOKENS fallback never fired, so an
+    # operator raising the KB budget saw no change here and one raising the
+    # agent budget silently moved a retrieval API's default.
+    max_context_tokens = data.get(
+        "max_context_tokens", get_setting("KB_DEFAULT_MAX_CONTEXT_TOKENS")
+    )
 
     try:
         handler_id, result = create_and_execute(

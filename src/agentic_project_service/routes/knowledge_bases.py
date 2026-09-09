@@ -3,6 +3,7 @@
 import json
 import logging
 import uuid
+from typing import Any
 
 from flask import Blueprint, jsonify, request
 from sqlalchemy import text
@@ -18,6 +19,10 @@ from ..services.sparse_retrieval import (
 )
 from ..services import billing_port as billing
 from ..strategies import get_strategy
+from ..strategies.graph_defaults import (
+    GRAPH_MAX_CHILDREN_CEILING,
+    GRAPH_MAX_REFERENCED_CEILING,
+)
 from ..tasks.indexing import (
     build_bm25_for_kb,
     index_source,
@@ -26,6 +31,66 @@ from ..tasks.indexing import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# The graph_expansion knobs, and what each will accept from a caller.
+_GRAPH_EXPANSION_CEILINGS: dict[str, int] = {
+    "max_referenced_nodes": GRAPH_MAX_REFERENCED_CEILING,
+    "max_children_per_parent": GRAPH_MAX_CHILDREN_CEILING,
+}
+_GRAPH_EXPANSION_SWITCHES: tuple[str, ...] = ("include_children", "include_doc_toc")
+
+
+def _config_shape_error(data: Any) -> str | None:
+    """Reject a config payload the read path could only guess at.
+
+    Both columns are JSONB with no schema, so whatever lands here is what
+    every later read has to survive. The read path copes with a non-object
+    either way — ``retrieval_config`` degrades to the defaults with a warning
+    and a recorded per-KB error, ``indexing_config`` raises rather than guess
+    a strategy — but coping is not the same as accepting: a value no read can
+    use should not be stored in the first place.
+
+    ``graph_expansion`` is checked against the same bounds the search path
+    clamps to. Clamping is the right behaviour for a row already written, but
+    accepting 1000000 over the API, echoing it back to Studio, and then
+    applying 100 makes the ceiling a suggestion. Unknown keys inside the
+    block are left alone — the read path warns about those, and rejecting
+    them here would break a newer Studio against an older service mid-deploy.
+    Unknown keys elsewhere in ``retrieval_config`` are not checked by anyone.
+    """
+    if not isinstance(data, dict):
+        return "request body must be an object"
+
+    for field in ("indexing_config", "retrieval_config"):
+        if field in data and not isinstance(data[field], dict):
+            return f"{field} must be an object"
+
+    retrieval_config = data.get("retrieval_config")
+    if not isinstance(retrieval_config, dict) or "graph_expansion" not in retrieval_config:
+        return None
+
+    expansion = retrieval_config["graph_expansion"]
+    if not isinstance(expansion, dict):
+        return "retrieval_config.graph_expansion must be an object"
+
+    for key, ceiling in _GRAPH_EXPANSION_CEILINGS.items():
+        if key not in expansion:
+            continue
+        value = expansion[key]
+        # bool is an int in Python. The read path already rejects one and
+        # falls back to the default, so this changes nothing at read time —
+        # it refuses the value rather than silently substituting another.
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= ceiling:
+            return (
+                f"retrieval_config.graph_expansion.{key} must be an integer between 0 and {ceiling}"
+            )
+
+    for key in _GRAPH_EXPANSION_SWITCHES:
+        if key in expansion and not isinstance(expansion[key], bool):
+            return f"retrieval_config.graph_expansion.{key} must be a boolean"
+
+    return None
 
 
 # Conservative pre-charge estimate for an indexing op at queue time. The
@@ -200,12 +265,30 @@ def _fetch_kb_or_404(kb_id: str) -> dict | tuple:
 
 
 def _read_existing_retrieval_config(kb_id: str) -> dict:
-    """Read the current retrieval_config from the DB; returns {} if KB missing."""
+    """Read the current retrieval_config from the DB; returns {} if KB missing.
+
+    Coerced rather than returned raw: the caller reads ``.get("method")`` off
+    it before this endpoint validates the *incoming* config, so a KB whose
+    stored value is the wrong shape would 500 on the very request meant to
+    repair it — leaving no way to fix it through the API at all.
+    """
     row = db.session.execute(
         text(f'SELECT retrieval_config FROM "{AI_SCHEMA}".knowledge_bases WHERE id = :id'),
         {"id": kb_id},
     ).fetchone()
-    if row is None or row[0] is None:
+    if row is None:
+        return {}
+    if not isinstance(row[0], dict):
+        # Distinguished from a missing KB and from a NULL config, because
+        # this is the one an operator has to know about: the request is
+        # about to overwrite a stored value nothing could read.
+        if row[0] is not None:
+            logger.warning(
+                "retrieval_config on kb=%s is %s, not an object — "
+                "treating the previous method as unset",
+                kb_id,
+                type(row[0]).__name__,
+            )
         return {}
     return row[0]
 
@@ -375,6 +458,14 @@ def list_knowledge_bases():
 def create_knowledge_base():
     """Create a new knowledge base."""
     data = request.get_json()
+    # Before the name check, not after: that check reads `.get("name")`, so a
+    # truthy non-dict body dies there rather than reaching the shape guard.
+    # An absent body skips it and keeps its own "Name is required" answer.
+    if data is not None:
+        shape_error = _config_shape_error(data)
+        if shape_error:
+            return jsonify({"error": shape_error}), 400
+
     if not data or not data.get("name"):
         return jsonify({"error": "Name is required"}), 400
 
@@ -491,6 +582,10 @@ def update_knowledge_base(kb_id: str):
     data = request.get_json()
     if not data:
         return jsonify({"error": "No data provided"}), 400
+
+    shape_error = _config_shape_error(data)
+    if shape_error:
+        return jsonify({"error": shape_error}), 400
 
     # Capture old method BEFORE the UPDATE so we can detect transitions.
     old_method = None

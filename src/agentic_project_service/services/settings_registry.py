@@ -250,10 +250,20 @@ def _build_registry() -> dict[str, SettingDef]:
             category=cat,
             label="Agent Max Context Tokens",
             type="int",
-            default=32000,
+            default=64000,
             min=1000,
             max=256000,
-            description="Maximum tokens for formatted context sent to the agent LLM.",
+            description=(
+                "Budget for the context an agent preloads before its first "
+                "LLM call. Distinct from Max Context Tokens under Knowledge "
+                "Bases, which bounds one knowledge_search tool result: the "
+                "two are separate budgets that add up within a run, not one "
+                "inside the other. It is resent on every step, and pruning "
+                "never reclaims it — pruning only rewrites tool results. On "
+                "the text path it goes in the system prompt and survives "
+                "compaction too; when the context carries images it goes in "
+                "a user message instead, which compaction does replace."
+            ),
         ),
         SettingDef(
             key="DELEGATE_MAX_STEPS",
@@ -872,10 +882,20 @@ def _build_registry() -> dict[str, SettingDef]:
             category=cat,
             label="Max Context Tokens",
             type="int",
-            default=16000,
+            default=64000,
             min=1000,
             max=128000,
-            description="Maximum context tokens for formatted search results.",
+            description=(
+                "Budget for one knowledge_search result, and for a "
+                "context_handler retrieval that does not set its own. Items "
+                "past it are dropped by position once results are grouped by "
+                "document, not by score, so this is a backstop: the "
+                "deliberate bounds are top_k and, for GraphIndex, the "
+                "graph_expansion caps. Costs recur — a result stays in the "
+                "run's history and is resent on every later step, until the "
+                "run crosses its context threshold: old tool results are the "
+                "first thing pruning replaces."
+            ),
         ),
         SettingDef(
             key="DEFAULT_IMAGE_DELIVERY",

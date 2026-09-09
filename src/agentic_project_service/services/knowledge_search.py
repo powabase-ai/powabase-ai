@@ -7,9 +7,10 @@ Used by both the KB search API endpoint and the agent run endpoint.
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, NamedTuple
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from agentic.knowledge.model_config import (
@@ -35,6 +36,14 @@ from .run_context import (
 from .storage import get_storage
 from ..db import AI_SCHEMA
 from ..strategies import get_default_retrieval_method, validate_retriever
+from ..strategies.graph_defaults import (
+    GRAPH_DEFAULT_INCLUDE_CHILDREN,
+    GRAPH_DEFAULT_INCLUDE_DOC_TOC,
+    GRAPH_DEFAULT_MAX_CHILDREN,
+    GRAPH_DEFAULT_MAX_REFERENCED_NODES,
+    GRAPH_MAX_CHILDREN_CEILING,
+    GRAPH_MAX_REFERENCED_CEILING,
+)
 
 from agentic.knowledge.retrieval import TreeSearchAlgorithm, apply_source_limits
 
@@ -65,6 +74,14 @@ PER_SOURCE_CANDIDATE_CAP = 200
 # Bound how many sources we back-fill per search so a KB with thousands of
 # small sources can't blow up the candidate pool.
 PER_SOURCE_FLOOR_SOURCE_CAP = 50
+
+# Outline lines per document. A 500-section contract is ~5k tokens of pure
+# structure otherwise; beyond this the outline truncates with a marker.
+GRAPH_TOC_MAX_NODES = 200
+
+# Retrieval methods whose items carry structure rather than source content.
+# They have no pages, and must be kept out of the image page-coverage scan.
+STRUCTURAL_RETRIEVAL_METHODS = frozenset({"graph_toc"})
 
 
 def _read_source_limits(
@@ -109,9 +126,10 @@ def _merge_floor_items(
     Without a reranker to re-score the merged pool uniformly, raw cosine values
     would sort floor items above genuine top matches and corrupt the ranking.
     When set, newly-added floor items are re-scored to sit just below the main
-    pool's minimum (preserving their relative order) — the same pool-relative
-    approach as ``_expand_graph_neighbors``. For pure ``vector_search`` the pool
-    is already cosine, so this is left off and true scores are preserved.
+    pool's minimum (preserving their relative order). Note this still uses a
+    fixed 0.01 step, where ``_expansion_tier_scores`` derives one from the
+    pool's own minimum; the two should converge. For pure ``vector_search``
+    the pool is already cosine, so this is left off and true scores kept.
     """
     seen = {it.item_id for it in main}
     new_items = [it for it in floor if it.item_id not in seen]
@@ -795,9 +813,9 @@ async def search_knowledge_base_async(
             raise ValueError(f"Knowledge base not found: {knowledge_base_id}")
 
         if indexing_config is None:
-            indexing_config = kb_row[2] or {}
+            indexing_config = _require_indexing_config(kb_row[2], knowledge_base_id)
         if retrieval_config is None:
-            retrieval_config = kb_row[3] or {}
+            retrieval_config = _coerce_kb_config(kb_row[3], "retrieval_config", knowledge_base_id)
 
     strategy = indexing_config.get("strategy", "chunk_embed")
 
@@ -997,7 +1015,7 @@ async def search_knowledge_base_async(
             request_id=rid,
         )
 
-        results = _expand_graph_neighbors(db_session, results, knowledge_base_id)
+        results = _expand_graph_neighbors(db_session, results, knowledge_base_id, retrieval_config)
 
         if source_ids:
             source_ids_set = set(source_ids)
@@ -1296,57 +1314,464 @@ def _execute_retrieval_pipeline(
     return results
 
 
+GRAPH_EXPANSION_KEYS = frozenset(
+    {
+        "include_children",
+        "max_children_per_parent",
+        "max_referenced_nodes",
+        "include_doc_toc",
+    }
+)
+
+
+class GraphExpansionConfig(NamedTuple):
+    """The bounded ``graph_expansion`` block, as expansion actually applies it."""
+
+    include_children: bool
+    max_children: int
+    max_referenced: int
+    include_doc_toc: bool
+
+
+def _page_span(meta: dict) -> list[int]:
+    """The pages a graph_index node covers, as an inclusive range.
+
+    Mirrors ``_pages_for_item``'s handling of the same two keys, including
+    its start-only fallback. Both matter: page 0 is a page, and a node with
+    ``start_page`` but no ``end_page`` is ordinary. Either one stamped as
+    ``pages: []`` sends the image path down its "attach every image of this
+    source" fallback — the amplification the structural guard was added to
+    prevent, reached on an ordinary node instead of the outline.
+    """
+    start = meta.get("start_page")
+    end = meta.get("end_page")
+    # Two blocks rather than one try, matching `_pages_for_item`: sharing a
+    # try makes an unreadable *end* skip the start-only fallback, which is
+    # the fetch-everything case above rather than a narrower page list.
+    if start is not None and end is not None:
+        try:
+            return list(range(int(start), int(end) + 1))
+        except (TypeError, ValueError):
+            pass
+    if start is not None:
+        try:
+            return [int(start)]
+        except (TypeError, ValueError):
+            pass
+    return []
+
+
+def _require_indexing_config(raw: Any, kb_id: str) -> dict:
+    """Return ``indexing_config`` as a dict, or refuse to guess.
+
+    Deliberately not ``_coerce_kb_config``. That one answers "which knobs did
+    the operator set?", and ``{}`` — use the defaults — is a correct answer.
+    This one answers "which table does this knowledge base store its items
+    in?", and ``{}`` is not a missing answer but a different one: it reads as
+    ``chunk_embed``, whose ``compatible_retrievers`` include the ``hybrid``
+    a graph_index KB ships, so nothing downstream objects. The search then
+    runs against ``chunks`` for a KB whose data is in ``graph_index_nodes``
+    and finds none, which the caller reports as a completed retrieval with
+    ``errors: []`` and no results — no indication anywhere that the search
+    was aimed at the wrong table.
+
+    Raising instead puts the KB id and the stored shape in ``errors[]``,
+    where an operator can act on it.
+    """
+    if raw is None or isinstance(raw, dict):
+        return raw or {}
+    # Truncated: this reaches an HTTP body and a per-KB error message, and
+    # the malformed value can be arbitrarily large JSONB.
+    shown = repr(raw)
+    if len(shown) > 120:
+        shown = shown[:117] + "..."
+    raise ValueError(
+        f"knowledge base {kb_id} has a malformed indexing_config "
+        f"({type(raw).__name__}: {shown}); retrieval cannot determine which "
+        "indexing strategy it was built with"
+    )
+
+
+def _coerce_kb_config(raw: Any, field: str, kb_id: str) -> dict:
+    """Return a KB config column as a dict, whatever is actually stored.
+
+    The route now rejects a non-object, but rows written before that landed
+    persist as valid JSONB of the wrong shape — a JSON string, say. Every
+    later ``.get()`` on one raises, and context_handler turns that into an
+    empty knowledge base — with a warning and a per-KB entry in ``errors[]``,
+    but only for the sites that sit inside its per-KB try.
+
+    Only safe where a missing config means "use the defaults" — see
+    ``_require_indexing_config`` for the column where it does not.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if raw is not None:
+        logger.warning(
+            "%s on kb=%s is %s, not an object (%r) — using {}",
+            field,
+            kb_id,
+            type(raw).__name__,
+            raw,
+        )
+    return {}
+
+
+def _read_graph_expansion_int(cfg: dict, key: str, default: int, ceiling: int, kb_id: str) -> int:
+    """Read one bounded integer, clamping into ``[0, ceiling]``.
+
+    Only a real ``int`` is accepted: ``bool`` is an ``int`` in Python, and a
+    numeric string would disagree with how Studio reads the same value back.
+    Both rejection and clamping are logged — silently clamping would let the
+    summary line report an effective value that reads as though the config
+    had been honoured.
+    """
+    raw = cfg.get(key, default)
+    if not isinstance(raw, int) or isinstance(raw, bool):
+        if key in cfg:
+            logger.warning("Ignoring non-integer graph_expansion.%s: %r (kb=%s)", key, raw, kb_id)
+        return default
+
+    clamped = min(max(0, raw), ceiling)
+    if clamped != raw:
+        logger.warning(
+            "graph_expansion.%s %r out of range [0, %d] — clamped to %d (kb=%s)",
+            key,
+            raw,
+            ceiling,
+            clamped,
+            kb_id,
+        )
+    return clamped
+
+
+def _read_graph_expansion_bool(cfg: dict, key: str, default: bool, kb_id: str) -> bool:
+    """Read one boolean, rejecting rather than coercing non-booleans.
+
+    ``bool()`` would fail asymmetrically in the expensive direction: every
+    non-empty string is truthy, so ``"false"`` would switch children *on*.
+    The graph_index registry entry already stores string booleans elsewhere
+    (``"if_add_node_summary": "yes"``), so a caller writing ``"no"`` here by
+    analogy is a live possibility, and Studio reads these strictly too.
+    """
+    raw = cfg.get(key, default)
+    if isinstance(raw, bool):
+        return raw
+    if key in cfg:
+        logger.warning(
+            "graph_expansion.%s must be a boolean, got %s (%r) — using %s (kb=%s)",
+            key,
+            type(raw).__name__,
+            raw,
+            default,
+            kb_id,
+        )
+    return default
+
+
+def _read_graph_expansion_config(
+    retrieval_config: dict | None, knowledge_base_id: str
+) -> "GraphExpansionConfig":
+    """Read the ``graph_expansion`` block, with every field bounded.
+
+    Children fan-out is opt-in: a referenced node's substructure is advertised
+    by the document outline rather than paid for in full section bodies.
+
+    ``retrieval_config`` is unvalidated JSONB, and this runs on every
+    graph_index search that returns anything, ahead of the no-references
+    early-out. A malformed block therefore has to degrade to defaults:
+    raising here would be caught by the bare ``except`` in context_handler
+    and reported to the agent as an empty knowledge base, discarding a
+    search that had already succeeded.
+
+    Every rejection says which KB it came from, because a misconfigured KB
+    otherwise emits an identical, unattributable warning on every query.
+    """
+    raw_cfg = (retrieval_config or {}).get("graph_expansion")
+    if raw_cfg is not None and not isinstance(raw_cfg, dict):
+        logger.warning(
+            "graph_expansion must be an object, got %s (%r) — using defaults (kb=%s)",
+            type(raw_cfg).__name__,
+            raw_cfg,
+            knowledge_base_id,
+        )
+        raw_cfg = None
+    cfg = raw_cfg or {}
+
+    # A camelCase spelling is the natural mistake for a caller writing JSONB
+    # from JS, and silently ignoring it looks identical to configuring nothing.
+    unknown = set(cfg) - GRAPH_EXPANSION_KEYS
+    if unknown:
+        logger.warning(
+            "graph_expansion has unknown keys %s — ignored (kb=%s). Known keys: %s",
+            sorted(unknown),
+            knowledge_base_id,
+            sorted(GRAPH_EXPANSION_KEYS),
+        )
+
+    return GraphExpansionConfig(
+        include_children=_read_graph_expansion_bool(
+            cfg, "include_children", GRAPH_DEFAULT_INCLUDE_CHILDREN, knowledge_base_id
+        ),
+        max_children=_read_graph_expansion_int(
+            cfg,
+            "max_children_per_parent",
+            GRAPH_DEFAULT_MAX_CHILDREN,
+            GRAPH_MAX_CHILDREN_CEILING,
+            knowledge_base_id,
+        ),
+        max_referenced=_read_graph_expansion_int(
+            cfg,
+            "max_referenced_nodes",
+            GRAPH_DEFAULT_MAX_REFERENCED_NODES,
+            GRAPH_MAX_REFERENCED_CEILING,
+            knowledge_base_id,
+        ),
+        include_doc_toc=_read_graph_expansion_bool(
+            cfg, "include_doc_toc", GRAPH_DEFAULT_INCLUDE_DOC_TOC, knowledge_base_id
+        ),
+    )
+
+
+def _expansion_tier_scores(min_score: float) -> tuple[float, float, float]:
+    """Score the expansion band beneath the pool: outline, node, child.
+
+    The step is proportional because a fixed decrement has to assume a score
+    scale, and this path has three: cosine on ``[0, 1]``, RRF (also ``[0, 1]``
+    — ``reciprocal_rank_fusion`` normalizes so the top hit is exactly 1.0),
+    and whatever a configured reranker emits, which for a cross-encoder is
+    routinely negative — hence ``abs``.
+
+    It is also floored, because a ``min_score`` of exactly 0.0 is reachable
+    and a purely multiplicative step would collapse all three tiers onto it.
+    ``bm25s.retrieve`` pads its top-k with zero-score entries when fewer than
+    ``k`` documents contain any query term (``sparse_retrieval/bm25_index.py``),
+    and an orthogonal embedding scores exactly 0.0. The tsvector path can reach
+    it too: ``@@ websearch_to_tsquery`` gates which rows are admitted, not what
+    they score — ``ts_rank`` only orders the SQL and the emitted score is a
+    Python BM25 over the parsed tsvector — so a row admitted purely by a
+    negated term has no positive lexeme left to score and comes back 0.0.
+
+    Ordering holds within one knowledge base. ``search_multiple_knowledge_bases``
+    merges pools by raw score, so an expansion item from a high-scoring KB can
+    still outrank a genuine hit from a low-scoring one.
+    """
+    step = max(abs(min_score), 1e-6) * 0.01
+    return min_score - step, min_score - 2 * step, min_score - 3 * step
+
+
+def _is_structural_meta(meta: dict | None) -> bool:
+    """``_is_structural_item`` for code holding a serialized item's meta dict."""
+    return (meta or {}).get("retrieval_method") in STRUCTURAL_RETRIEVAL_METHODS
+
+
+def _is_structural_item(item: RetrievedItem) -> bool:
+    """True for items carrying document structure rather than source content.
+
+    These have no pages by construction, and an item with no page info makes
+    the image path fall back to fetching *every* image for its source
+    (``context_handler``'s ``fetch_all_for``, which wins over precise page
+    coverage). Graph references are intra-document, so an outline's source is
+    always one already represented by real hits — leaving it in that scan
+    would discard the page filter for all of them.
+    """
+    return _is_structural_meta(item.meta)
+
+
+def _render_toc_outline(nodes: list[dict], total_nodes: int) -> str:
+    """Render a document outline: one indented ``[node_id] Title`` per line.
+
+    Same shape the indexing-time enricher builds (``graph_enricher``'s
+    ``_build_toc_context``), minus its optional ``— summary`` suffix and plus
+    a bound: a long document's full outline is thousands of tokens nobody
+    asked for. ``total_nodes`` is the document's real section count, which
+    the store knows even though it only returns the first page of rows.
+
+    Titles are searchable on every retrieval path — ``tasks/indexing.py``
+    embeds ``title`` into each node's vector, so a model that reads a title
+    here and puts it in a follow-up query will match. (The sparse index also
+    covers titles, but only when a BM25 index exists: the tsvector fallback
+    scores ``SEARCH_TEXT_COL``, which is ``text`` alone for these nodes.)
+    The bracketed ids are for a human or a downstream tool: no route or agent
+    tool takes a ``node_id``.
+    """
+    lines = [
+        f"{'  ' * int(node.get('depth') or 0)}[{node['node_id']}] {node.get('title') or ''}".rstrip()
+        for node in nodes[:GRAPH_TOC_MAX_NODES]
+    ]
+    remaining = total_nodes - len(lines)
+    if remaining > 0:
+        lines.append(f"... ({remaining} more sections)")
+    return "\n".join(lines)
+
+
 def _expand_graph_neighbors(
     db_session: Session,
     results: list[RetrievedItem],
     knowledge_base_id: str,
+    retrieval_config: dict | None = None,
 ) -> list[RetrievedItem]:
-    """Pull in first-degree referenced nodes for graph_index results."""
+    """Pull in first-degree referenced nodes for graph_index results.
+
+    Appends, in descending score order beneath the main pool: one outline per
+    document where a reference was actually followed (unless
+    ``include_doc_toc`` is off), then the referenced nodes, then — only when
+    ``include_children`` is set — a capped number of each referenced node's
+    direct children.
+
+    Appends to ``results`` in place and returns it; the return value is for
+    the caller's convenience, not a copy.
+    """
     if not results:
         return results
 
-    # Collect existing (toc_id, node_id) pairs for deduplication
-    existing_keys: set[tuple[str, str]] = set()
-    refs_to_fetch: dict[str, set[str]] = {}  # toc_id -> {node_ids}
+    cfg = _read_graph_expansion_config(retrieval_config, knowledge_base_id)
+
+    # Every (toc_id, node_id) already in the pool, collected before any
+    # reference is considered — a hit further down the list still counts as
+    # "already present" for a reference made by the first one.
+    existing_keys: set[tuple[str, str]] = {
+        (meta["toc_id"], meta["node_id"])
+        for meta in (item.meta or {} for item in results)
+        if meta.get("toc_id") and meta.get("node_id")
+    }
+
+    # Candidate references, with what is needed to rank them: how many hits
+    # point at each, and the best score among those hits.
+    ref_hits: dict[tuple[str, str], int] = {}
+    ref_best_score: dict[tuple[str, str], float] = {}
 
     for item in results:
         meta = item.meta or {}
         toc_id = meta.get("toc_id")
-        node_id = meta.get("node_id")
-        if toc_id and node_id:
-            existing_keys.add((toc_id, node_id))
+        if not toc_id:
+            continue
+        score = item.score if item.score is not None else 0.0
+        # dict.fromkeys de-duplicates within one hit's list while keeping its
+        # order: ref_hits counts how many *hits* point at a section, and
+        # nothing guarantees a single hit lists a reference only once. Without
+        # this, one hit naming a section twice outranks two hits that agree.
+        for ref_nid in dict.fromkeys(meta.get("referenced_nodes") or []):
+            key = (toc_id, ref_nid)
+            if key in existing_keys:
+                continue
+            ref_hits[key] = ref_hits.get(key, 0) + 1
+            ref_best_score[key] = max(ref_best_score.get(key, float("-inf")), score)
 
-        referenced = meta.get("referenced_nodes") or []
-        for ref_nid in referenced:
-            if toc_id and (toc_id, ref_nid) not in existing_keys:
-                refs_to_fetch.setdefault(toc_id, set()).add(ref_nid)
-
-    # Remove any refs that are already in results
-    for toc_id, nids in list(refs_to_fetch.items()):
-        nids -= {k[1] for k in existing_keys if k[0] == toc_id}
-        if not nids:
-            del refs_to_fetch[toc_id]
-
-    if not refs_to_fetch:
+    if not ref_hits:
         logger.debug("graph_expansion: no new refs to expand")
         return results
 
-    # Fetch referenced nodes from DB
+    # Rank before capping: consensus first, because a section two hits both
+    # point at is a better bet than one only the top hit mentions; then the
+    # best referring hit's score; then the (toc_id, node_id) key itself, so
+    # the order is deterministic — that last tiebreak sorts by document
+    # before node_id, which matters only when two sections in different
+    # documents tie on both of the keys above.
+    #
+    # The ranking is global across the search, but `format_items_as_context`
+    # groups items by document before it truncates, so a positional cut
+    # respects this order only within a document.
+    ranked = sorted(
+        ref_hits,
+        key=lambda k: (-ref_hits[k], -ref_best_score[k], k),
+    )
+    selections = ranked[: cfg.max_referenced]
+    if len(ranked) > len(selections):
+        logger.info(
+            "graph_expansion: %d referenced nodes exceed the cap of %d — "
+            "keeping the most-referenced (kb=%s)",
+            len(ranked),
+            cfg.max_referenced,
+            knowledge_base_id,
+        )
+
     gi_store = GraphIndexStore(db_session=db_session, knowledge_base_id=knowledge_base_id)
-    selections = [(tid, nid) for tid, nids in refs_to_fetch.items() for nid in nids]
     node_map = gi_store.get_nodes_by_ids(selections)
 
-    # Build RetrievedItems for referenced nodes
-    min_score = min(r.score for r in results) if results else 0.0
-    parent_score = max(0.0, min_score - 0.01)
+    pool_scores = [r.score for r in results if r.score is not None]
+    min_score = min(pool_scores) if pool_scores else 0.0
+    toc_score, parent_score, child_score = _expansion_tier_scores(min_score)
     all_keys = set(existing_keys)
 
-    for (toc_id, node_id), node_row in node_map.items():
-        all_keys.add((toc_id, node_id))
+    # One outline per document that actually contributed a referenced node.
+    # Best-effort: the outline decorates results that already exist, so a
+    # statement timeout here must not throw away a successful search — the
+    # same treatment the source floor gets above.
+    outlines: dict[str, dict] = {}
+    if cfg.include_doc_toc and node_map:
+        toc_ids = sorted({tid for tid, _ in node_map})
+        try:
+            # SAVEPOINT, not a bare try/except: a DBAPI failure aborts the
+            # transaction, and swallowing it without unwinding leaves the
+            # session deactivated — every later statement then raises
+            # PendingRollbackError, surfacing far from here as an empty
+            # knowledge base or a hard tool failure. db.py names the same
+            # hazard with a coarser remedy (a full rollback). A nested
+            # transaction undoes only this statement, so anything else the
+            # caller has pending on a shared request session survives.
+            with db_session.begin_nested():
+                outlines = gi_store.get_toc_outline(toc_ids, GRAPH_TOC_MAX_NODES)
+        except SQLAlchemyError:
+            logger.error(
+                "graph_expansion: outline fetch failed for kb=%s (%d tocs); "
+                "results kept without outlines",
+                knowledge_base_id,
+                len(toc_ids),
+                exc_info=True,
+            )
+            outlines = {}
+
+    for toc_id, outline in outlines.items():
+        outline_nodes = outline.get("nodes") or []
+        if not outline_nodes:
+            continue
+        results.append(
+            RetrievedItem(
+                item_id=toc_id,
+                text=_render_toc_outline(outline_nodes, outline.get("total_nodes") or 0),
+                score=toc_score,
+                source_id=outline.get("source_id"),
+                knowledge_base_id=knowledge_base_id,
+                meta={
+                    "toc_id": toc_id,
+                    "doc_name": outline.get("doc_name", ""),
+                    "retrieval_method": "graph_toc",
+                    "score_type": "graph_doc_outline",
+                    "pages": [],
+                },
+            )
+        )
+
+    # Iterate `selections`, not `node_map`: the map is keyed by the rows the
+    # store returned, in DB row order (`get_nodes_by_ids` ORs the pairs into
+    # one WHERE with no ORDER BY), so walking it discards the ranking above.
+    # Every referenced node carries the same score and `format_items_as_context`
+    # truncates positionally, so emission order decides which references
+    # survive a tight budget — the ranking has to reach the list, not just the
+    # fetch.
+    neighbors_added = 0
+    missing_rows = 0
+    for key in selections:
+        node_row = node_map.get(key)
+        if node_row is None:
+            # A reference can outlive the section it names: the search-index
+            # row carrying `referenced_nodes` and the graph_index_nodes row it
+            # points at are written and deleted separately, so a partial
+            # delete or re-index leaves danglers. Counted rather than dropped
+            # silently — the search still succeeds, but with less than it
+            # selected, which otherwise looks like a corpus with nothing more
+            # to give. It is also the only signal for a subtler miss: `key`
+            # comes from item meta while the map's keys come off the uuid
+            # column, so any non-canonical spelling written into meta would
+            # drop every reference after the store had already fetched them.
+            missing_rows += 1
+            continue
+        neighbors_added += 1
+        toc_id, node_id = key
+        all_keys.add(key)
         node_meta = node_row.get("meta") or {}
-        start_page = node_meta.get("start_page")
-        end_page = node_meta.get("end_page")
-        pages = list(range(int(start_page), int(end_page) + 1)) if start_page and end_page else []
+        pages = _page_span(node_meta)
 
         results.append(
             RetrievedItem(
@@ -1368,24 +1793,67 @@ def _expand_graph_neighbors(
             )
         )
 
-    # Expand children of referenced parent nodes
-    children_map = gi_store.get_children_by_parent_ids(list(node_map.keys()))
-    child_score = max(0.0, parent_score - 0.01)
-    children_added = 0
+    if missing_rows:
+        logger.warning(
+            "graph_expansion: %d of %d selected references have no node row "
+            "(kb=%s) — referenced_nodes naming sections that no longer exist, "
+            "or a partial re-index",
+            missing_rows,
+            len(selections),
+            knowledge_base_id,
+        )
 
-    for (toc_id, parent_node_id), child_rows in children_map.items():
-        for child_row in child_rows:
+    # Expand children of referenced parent nodes — opt-in, and capped per
+    # parent so one heavily-subdivided section can't flood the context.
+    parents = [key for key in selections if key in node_map]
+    # A cap of 0 means off, and is answered without a query — so it also
+    # never reaches the "withheld N children" log below. That asymmetry is
+    # deliberate: 0 withholds every child by construction, which is what the
+    # operator asked for, not something the cap did to a request.
+    children_map = (
+        gi_store.get_children_by_parent_ids(parents)
+        if cfg.include_children and cfg.max_children
+        else {}
+    )
+    children_added = 0
+    children_withheld = 0
+
+    # Ranked parent order, for the same reason the parents themselves are
+    # emitted in it: children inherit their parent's standing, so a positional
+    # truncation should reach the least-agreed-on parent's subtree first.
+    for parent_key in parents:
+        child_rows = children_map.get(parent_key)
+        if not child_rows:
+            continue
+        toc_id, parent_node_id = parent_key
+        # The cap charges only newly-added children: one already in the pool
+        # is skipped without consuming budget, so a parent can contribute up
+        # to max_children *beyond* what the search already found.
+        kept = 0
+        # node_id is zero-padded and sequential (write_node_id zfills to 4 in
+        # pre-order), so this is document order — and the children query has
+        # no ORDER BY of its own. Past 9999 nodes the padding stops and this
+        # sorts lexically, the same way the SQL would.
+        ordered_children = sorted(child_rows, key=lambda row: row["node_id"])
+        for position, child_row in enumerate(ordered_children):
+            if kept >= cfg.max_children:
+                # Count what the cap actually withheld, not what was left in
+                # the list: a child already in the pool would have been
+                # skipped without consuming budget, so it was not withheld.
+                children_withheld += sum(
+                    1
+                    for row in ordered_children[position:]
+                    if (toc_id, row["node_id"]) not in all_keys
+                )
+                break
             child_key = (toc_id, child_row["node_id"])
             if child_key in all_keys:
                 continue
             all_keys.add(child_key)
+            kept += 1
 
             child_meta = child_row.get("meta") or {}
-            start_page = child_meta.get("start_page")
-            end_page = child_meta.get("end_page")
-            pages = (
-                list(range(int(start_page), int(end_page) + 1)) if start_page and end_page else []
-            )
+            pages = _page_span(child_meta)
 
             results.append(
                 RetrievedItem(
@@ -1409,11 +1877,35 @@ def _expand_graph_neighbors(
             )
             children_added += 1
 
+    if children_withheld:
+        # The low default is justified by the outline naming the sections it
+        # omits — so the pairing is worth recording, because include_doc_toc
+        # can be off and then nothing names them.
+        logger.info(
+            "graph_expansion: the child cap withheld %d of %d children (cap=%d outline=%s kb=%s)",
+            children_withheld,
+            children_withheld + children_added,
+            cfg.max_children,
+            cfg.include_doc_toc,
+            knowledge_base_id,
+        )
+
+    # Emitted, not fetched: with references that no longer resolve, 10
+    # selected and 6 found would otherwise read exactly like 6 selected.
     logger.info(
-        "graph_expansion: fetched %d neighbors + %d children from %d refs",
-        len(node_map),
+        "graph_expansion: emitted %d neighbors + %d children + %d outlines "
+        "from %d candidate refs (%d selected, children=%s, child_cap=%d, "
+        "ref_cap=%d, outline=%s, kb=%s)",
+        neighbors_added,
         children_added,
-        sum(len(nids) for nids in refs_to_fetch.values()),
+        len(outlines),
+        len(ranked),
+        len(selections),
+        cfg.include_children,
+        cfg.max_children,
+        cfg.max_referenced,
+        cfg.include_doc_toc,
+        knowledge_base_id,
     )
 
     return results
@@ -1483,9 +1975,9 @@ def search_knowledge_base(
             raise ValueError(f"Knowledge base not found: {knowledge_base_id}")
 
         if indexing_config is None:
-            indexing_config = kb_row[2] or {}
+            indexing_config = _require_indexing_config(kb_row[2], knowledge_base_id)
         if retrieval_config is None:
-            retrieval_config = kb_row[3] or {}
+            retrieval_config = _coerce_kb_config(kb_row[3], "retrieval_config", knowledge_base_id)
 
     # Determine strategy and validate retrieval method
     strategy = indexing_config.get("strategy", "chunk_embed")
@@ -1730,7 +2222,7 @@ def search_knowledge_base(
         )
 
         # Graph expansion: pull in first-degree referenced nodes
-        results = _expand_graph_neighbors(db_session, results, knowledge_base_id)
+        results = _expand_graph_neighbors(db_session, results, knowledge_base_id, retrieval_config)
 
         # Post-filter by source_ids — graph expansion may add nodes from
         # other sources that weren't in the original filter set.
@@ -1913,6 +2405,11 @@ def _format_chunk_annotation(item: RetrievedItem) -> str:
     parts: list[str] = []
     meta = item.meta or {}
 
+    if _is_structural_item(item):
+        # Structure, not source text. Without this it reaches the model as a
+        # bare citation marker with nothing saying it is an outline.
+        return "Document outline (section titles only)"
+
     title = meta.get("title")
     pages = meta.get("pages")
     if title:
@@ -2094,7 +2591,11 @@ def format_items_as_context(
                 for orig_idx, item in group_items:
                     kb_mode = (per_kb_context_mode or {}).get(item.knowledge_base_id, "text")
 
-                    if kb_mode == "image" and item.source_id in (source_image_map or {}):
+                    if (
+                        kb_mode == "image"
+                        and item.source_id in (source_image_map or {})
+                        and not _is_structural_item(item)
+                    ):
                         pages = _pages_for_item(item)
                         source_images = (source_image_map or {}).get(item.source_id, [])
                         matched_images = (
@@ -2214,7 +2715,11 @@ def format_items_as_context(
             for i, item in enumerate(items):
                 kb_mode = (per_kb_context_mode or {}).get(item.knowledge_base_id, "text")
 
-                if kb_mode == "image" and item.source_id in (source_image_map or {}):
+                if (
+                    kb_mode == "image"
+                    and item.source_id in (source_image_map or {})
+                    and not _is_structural_item(item)
+                ):
                     pages = _pages_for_item(item)
                     source_images = (source_image_map or {}).get(item.source_id, [])
                     matched_images = (
