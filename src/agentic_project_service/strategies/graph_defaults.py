@@ -3,16 +3,18 @@
 The four defaults are a contract: the registry ships them as a KB's initial
 ``retrieval_config.graph_expansion``, and ``knowledge_search`` applies the
 same values to any KB whose config predates the setting. Defining them twice
-would let a registry edit and the fallback drift apart silently, with the
-test that compares them updated to match.
+would let a registry edit and the fallback drift apart silently — a KB
+created today behaving differently from one created last month, with nothing
+failing.
 
 They live in their own leaf module because ``registry`` cannot import from
 ``services``: ``services/__init__`` imports ``knowledge_search``, which
 imports ``strategies``, so that direction closes a cycle.
 
 The ceilings are not part of that contract — they bound what a caller may
-configure and are read only by the search path — but they live here so the
-graph_expansion knobs have one home.
+configure, and are read by both the route that accepts a config and the
+search path that reads one back — but they live here so the graph_expansion
+knobs have one home.
 """
 
 # Children of a referenced node are opt-in; when asked for, at most this many
@@ -31,8 +33,9 @@ GRAPH_DEFAULT_INCLUDE_DOC_TOC = True
 GRAPH_DEFAULT_MAX_REFERENCED_NODES = 10
 
 # Hard ceilings on the two caps. Without them, a configured million restores
-# exactly the unbounded fan-out this bounding removes — the same reason top_k
-# is bounded at the route layer. Set well above any sensible value: they exist
-# to refuse absurdity, not to tune.
+# exactly the unbounded fan-out this bounding removes. Rejected at the route
+# the way top_k is, and clamped again where the config is read, because rows
+# written before the guard existed are still out there. Set well above any
+# sensible value: they exist to refuse absurdity, not to tune.
 GRAPH_MAX_CHILDREN_CEILING = 20
 GRAPH_MAX_REFERENCED_CEILING = 100

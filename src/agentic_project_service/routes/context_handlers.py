@@ -64,7 +64,8 @@ def create_context_handler():
     Request body:
         query: str (required) - The search query
         knowledge_bases: list[dict] (required) - KB configs with 'id' and optional params
-        max_context_tokens: int (optional, default 32000) - Token limit
+        max_context_tokens: int (optional) - Token limit; defaults to the
+            DEFAULT_MAX_CONTEXT_TOKENS setting, which an operator can change
 
     Returns:
         201 with full handler object on success

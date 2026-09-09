@@ -18,6 +18,10 @@ from ..services.sparse_retrieval import (
 )
 from ..services import billing_port as billing
 from ..strategies import get_strategy
+from ..strategies.graph_defaults import (
+    GRAPH_MAX_CHILDREN_CEILING,
+    GRAPH_MAX_REFERENCED_CEILING,
+)
 from ..tasks.indexing import (
     build_bm25_for_kb,
     index_source,
@@ -26,6 +30,59 @@ from ..tasks.indexing import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# The graph_expansion knobs, and what each will accept from a caller.
+_GRAPH_EXPANSION_CEILINGS: dict[str, int] = {
+    "max_referenced_nodes": GRAPH_MAX_REFERENCED_CEILING,
+    "max_children_per_parent": GRAPH_MAX_CHILDREN_CEILING,
+}
+_GRAPH_EXPANSION_SWITCHES: tuple[str, ...] = ("include_children", "include_doc_toc")
+
+
+def _config_shape_error(data: dict) -> str | None:
+    """Reject a config payload the read path could only guess at.
+
+    Both columns are JSONB with no schema, so whatever lands here is what
+    every later read has to survive. A non-object is the shape that hurts:
+    ``.get()`` on one raises, and the caller turns that into an empty
+    knowledge base — or, for ``indexing_config``, into a search routed at the
+    wrong table. Reject at the boundary instead of degrading at read time.
+
+    ``graph_expansion`` is checked against the same bounds the search path
+    clamps to. Clamping is the right behaviour for a row already written, but
+    accepting 1000000 over the API, echoing it back to Studio, and then
+    applying 100 makes the ceiling a suggestion. Unknown keys are left alone
+    — the read path warns about those, and rejecting them here would break a
+    newer Studio against an older service mid-deploy.
+    """
+    for field in ("indexing_config", "retrieval_config"):
+        if field in data and not isinstance(data[field], dict):
+            return f"{field} must be an object"
+
+    retrieval_config = data.get("retrieval_config")
+    if not isinstance(retrieval_config, dict) or "graph_expansion" not in retrieval_config:
+        return None
+
+    expansion = retrieval_config["graph_expansion"]
+    if not isinstance(expansion, dict):
+        return "retrieval_config.graph_expansion must be an object"
+
+    for key, ceiling in _GRAPH_EXPANSION_CEILINGS.items():
+        if key not in expansion:
+            continue
+        value = expansion[key]
+        # bool is an int in Python, and `true` would clamp to a cap of 1.
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= ceiling:
+            return (
+                f"retrieval_config.graph_expansion.{key} must be an integer between 0 and {ceiling}"
+            )
+
+    for key in _GRAPH_EXPANSION_SWITCHES:
+        if key in expansion and not isinstance(expansion[key], bool):
+            return f"retrieval_config.graph_expansion.{key} must be a boolean"
+
+    return None
 
 
 # Conservative pre-charge estimate for an indexing op at queue time. The
@@ -211,7 +268,19 @@ def _read_existing_retrieval_config(kb_id: str) -> dict:
         text(f'SELECT retrieval_config FROM "{AI_SCHEMA}".knowledge_bases WHERE id = :id'),
         {"id": kb_id},
     ).fetchone()
-    if row is None or not isinstance(row[0], dict):
+    if row is None:
+        return {}
+    if not isinstance(row[0], dict):
+        # Distinguished from a missing KB and from a NULL config, because
+        # this is the one an operator has to know about: the request is
+        # about to overwrite a stored value nothing could read.
+        if row[0] is not None:
+            logger.warning(
+                "retrieval_config on kb=%s is %s, not an object — "
+                "treating the previous method as unset",
+                kb_id,
+                type(row[0]).__name__,
+            )
         return {}
     return row[0]
 
@@ -384,6 +453,10 @@ def create_knowledge_base():
     if not data or not data.get("name"):
         return jsonify({"error": "Name is required"}), 400
 
+    shape_error = _config_shape_error(data)
+    if shape_error:
+        return jsonify({"error": shape_error}), 400
+
     kb_id = str(uuid.uuid4())
 
     # Determine strategy and use registry defaults
@@ -397,8 +470,6 @@ def create_knowledge_base():
 
     indexing_config = {**strategy_def["default_indexing_config"], **user_indexing_config}
     retrieval_config = data.get("retrieval_config", strategy_def["default_retrieval_config"])
-    if not isinstance(retrieval_config, dict):
-        return jsonify({"error": "retrieval_config must be an object"}), 400
 
     db.session.execute(
         text(f"""
@@ -500,6 +571,10 @@ def update_knowledge_base(kb_id: str):
     if not data:
         return jsonify({"error": "No data provided"}), 400
 
+    shape_error = _config_shape_error(data)
+    if shape_error:
+        return jsonify({"error": shape_error}), 400
+
     # Capture old method BEFORE the UPDATE so we can detect transitions.
     old_method = None
     if "retrieval_config" in data:
@@ -518,12 +593,6 @@ def update_knowledge_base(kb_id: str):
         updates.append("indexing_config = CAST(:indexing_config AS jsonb)")
         params["indexing_config"] = json.dumps(data["indexing_config"])
     if "retrieval_config" in data:
-        if not isinstance(data["retrieval_config"], dict):
-            # A non-object persists as valid JSONB and then breaks every
-            # later search — `retrieval_config.get(...)` raises, and
-            # context_handler reports the knowledge base as empty. Reject at
-            # the boundary instead of degrading at read time.
-            return jsonify({"error": "retrieval_config must be an object"}), 400
         updates.append("retrieval_config = CAST(:retrieval_config AS jsonb)")
         params["retrieval_config"] = json.dumps(data["retrieval_config"])
 

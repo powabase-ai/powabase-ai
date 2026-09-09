@@ -1,9 +1,10 @@
 """Database-backed tests for GraphIndexStore.get_toc_outline.
 
 The expansion unit tests fake the store, so nothing there exercises this
-query — and it is the kind that unit fakes cannot vouch for: a ``uuid[]``
-cast that rejects non-uuid text, a window function that pages per document,
-and a count that has to survive that paging.
+query — and it is the kind that unit fakes cannot vouch for: a window
+function that pages per document, a count that has to survive that paging,
+and a knowledge_base_id filter whose absence is invisible until two tenants
+share a database.
 """
 
 from __future__ import annotations
@@ -108,6 +109,17 @@ class TestGetTocOutline:
                 db_session=db.session, knowledge_base_id=toc_with_nodes["kb_id"]
             )
             outlines = store.get_toc_outline([str(uuid.uuid4())], 200)
+
+        assert outlines == {}
+
+    def test_a_toc_from_another_knowledge_base_is_not_returned(self, app, toc_with_nodes):
+        """The toc_id alone identifies the row; the outline item built from it
+        is stamped with the *searching* KB's id, so a toc belonging to another
+        knowledge base would reach the model mislabelled as this one's.
+        Dropping the filter passes every other test in this file."""
+        with app.app_context():
+            store = GraphIndexStore(db_session=db.session, knowledge_base_id=str(uuid.uuid4()))
+            outlines = store.get_toc_outline([toc_with_nodes["toc_id"]], 200)
 
         assert outlines == {}
 

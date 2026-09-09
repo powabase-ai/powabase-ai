@@ -246,9 +246,12 @@ class GraphIndexStore(BaseTocStore):
                 WHERE r.rn <= :limit
                 ORDER BY r.toc_id, r.node_id ASC
             """),
-            # The list is passed to the driver rather than hand-built into a
-            # "{a,b}" literal: a toc_id containing a comma or brace would
-            # otherwise produce a malformed array and a DataError.
+            # Bound as a uuid[] through the driver rather than formatted into
+            # the SQL. Callers reach this with ids taken off node rows the
+            # database just returned, so uuid.UUID() is a type conversion
+            # here and not a guard — a caller passing arbitrary text would
+            # get a ValueError, which is not a SQLAlchemyError and so is not
+            # what the caller's best-effort wrapper catches.
             # knowledge_base_id is filtered here — not only at the caller —
             # because the outline item is stamped with the searching KB's id,
             # so a toc from another KB would be silently mislabelled.

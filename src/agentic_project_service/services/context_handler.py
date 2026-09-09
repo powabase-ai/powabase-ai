@@ -296,7 +296,7 @@ def _resolve_page_images(
 def _batch_fetch_source_metadata(
     db_session: Session,
     all_items: list[RetrievedItem],
-    kb_display: dict[str, dict[str, str]],
+    kb_display: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     """Batch-fetch source-level metadata for retrieved items.
 
@@ -360,7 +360,7 @@ def _batch_fetch_source_metadata(
 def _should_enrich_query(
     valid_kb_configs: list[dict[str, Any]],
     kb_retrieval_configs: dict[str, dict],
-    kb_display: dict[str, dict[str, str]],
+    kb_display: dict[str, dict[str, Any]],
 ) -> tuple[bool, str | None]:
     """Determine whether query enrichment should run for any KB.
 
@@ -523,10 +523,9 @@ def execute_retrieval(
     per_kb_methods: dict[str, str] = {}
     all_items: list[RetrievedItem] = []
 
-
     # Fetch KB display metadata (name, strategy, retrieval_config) for enriching items
     kb_ids = [c.get("id") for c in knowledge_base_configs if c.get("id")]
-    kb_display: dict[str, dict[str, str]] = {}
+    kb_display: dict[str, dict[str, Any]] = {}
     kb_retrieval_configs: dict[str, dict] = {}
     if kb_ids:
         placeholders = ", ".join(f":kb_{i}" for i in range(len(kb_ids)))
@@ -988,7 +987,7 @@ async def execute_retrieval_async(
 
     # Fetch KB display metadata
     kb_ids = [c.get("id") for c in valid_kb_configs]
-    kb_display: dict[str, dict[str, str]] = {}
+    kb_display: dict[str, dict[str, Any]] = {}
     kb_retrieval_configs: dict[str, dict] = {}
     if kb_ids:
         placeholders = ", ".join(f":kb_{i}" for i in range(len(kb_ids)))

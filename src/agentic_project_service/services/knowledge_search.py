@@ -813,7 +813,7 @@ async def search_knowledge_base_async(
             raise ValueError(f"Knowledge base not found: {knowledge_base_id}")
 
         if indexing_config is None:
-            indexing_config = _coerce_kb_config(kb_row[2], "indexing_config", knowledge_base_id)
+            indexing_config = _require_indexing_config(kb_row[2], knowledge_base_id)
         if retrieval_config is None:
             retrieval_config = _coerce_kb_config(kb_row[3], "retrieval_config", knowledge_base_id)
 
@@ -1333,13 +1333,64 @@ class GraphExpansionConfig(NamedTuple):
     include_doc_toc: bool
 
 
+def _page_span(meta: dict) -> list[int]:
+    """The pages a graph_index node covers, as an inclusive range.
+
+    Mirrors ``_pages_for_item``'s handling of the same two keys, including
+    its start-only fallback. Both matter: page 0 is a page, and a node with
+    ``start_page`` but no ``end_page`` is ordinary. Either one stamped as
+    ``pages: []`` sends the image path down its "attach every image of this
+    source" fallback — the amplification the structural guard was added to
+    prevent, reached on an ordinary node instead of the outline.
+    """
+    start = meta.get("start_page")
+    end = meta.get("end_page")
+    try:
+        if start is not None and end is not None:
+            return list(range(int(start), int(end) + 1))
+        if start is not None:
+            return [int(start)]
+    except (TypeError, ValueError):
+        pass
+    return []
+
+
+def _require_indexing_config(raw: Any, kb_id: str) -> dict:
+    """Return ``indexing_config`` as a dict, or refuse to guess.
+
+    Deliberately not ``_coerce_kb_config``. That one answers "which knobs did
+    the operator set?", and ``{}`` — use the defaults — is a correct answer.
+    This one answers "which table does this knowledge base store its items
+    in?", and ``{}`` is not a missing answer but a different one: it reads as
+    ``chunk_embed``, whose ``compatible_retrievers`` include the ``hybrid``
+    a graph_index KB ships, so nothing downstream objects. The search then
+    runs against ``chunks`` for a KB whose data is in ``graph_index_nodes``,
+    returns nothing, and the caller reports zero results with no error and an
+    ``indexing_strategy`` of ``chunk_embed`` — stating a wrong fact rather
+    than omitting an unknown one.
+
+    Raising instead puts the KB id and the stored shape in ``errors[]``,
+    where an operator can act on it.
+    """
+    if raw is None or isinstance(raw, dict):
+        return raw or {}
+    raise ValueError(
+        f"knowledge base {kb_id} has a malformed indexing_config "
+        f"({type(raw).__name__}: {raw!r}); retrieval cannot determine which "
+        "indexing strategy it was built with"
+    )
+
+
 def _coerce_kb_config(raw: Any, field: str, kb_id: str) -> dict:
     """Return a KB config column as a dict, whatever is actually stored.
 
     The route now rejects a non-object, but rows written before that landed
     persist as valid JSONB of the wrong shape — a JSON string, say. Every
     later ``.get()`` on one raises, and context_handler turns that into an
-    empty knowledge base, so one bad write silently zeroes a KB forever.
+    empty knowledge base with only a warning to explain it.
+
+    Only safe where a missing config means "use the defaults" — see
+    ``_require_indexing_config`` for the column where it does not.
     """
     if isinstance(raw, dict):
         return raw
@@ -1354,9 +1405,7 @@ def _coerce_kb_config(raw: Any, field: str, kb_id: str) -> dict:
     return {}
 
 
-def _read_graph_expansion_int(
-    cfg: dict, key: str, default: int, ceiling: int, kb_id: str
-) -> int:
+def _read_graph_expansion_int(cfg: dict, key: str, default: int, ceiling: int, kb_id: str) -> int:
     """Read one bounded integer, clamping into ``[0, ceiling]``.
 
     Only a real ``int`` is accepted: ``bool`` is an ``int`` in Python, and a
@@ -1368,9 +1417,7 @@ def _read_graph_expansion_int(
     raw = cfg.get(key, default)
     if not isinstance(raw, int) or isinstance(raw, bool):
         if key in cfg:
-            logger.warning(
-                "Ignoring non-integer graph_expansion.%s: %r (kb=%s)", key, raw, kb_id
-            )
+            logger.warning("Ignoring non-integer graph_expansion.%s: %r (kb=%s)", key, raw, kb_id)
         return default
 
     clamped = min(max(0, raw), ceiling)
@@ -1559,6 +1606,9 @@ def _expand_graph_neighbors(
     ``include_doc_toc`` is off), then the referenced nodes, then — only when
     ``include_children`` is set — a capped number of each referenced node's
     direct children.
+
+    Appends to ``results`` in place and returns it; the return value is for
+    the caller's convenience, not a copy.
     """
     if not results:
         return results
@@ -1602,7 +1652,14 @@ def _expand_graph_neighbors(
 
     # Rank before capping: consensus first, because a section two hits both
     # point at is a better bet than one only the top hit mentions; then the
-    # best referring hit's score; then node_id so the order is deterministic.
+    # best referring hit's score; then the (toc_id, node_id) key itself, so
+    # the order is deterministic — that last tiebreak sorts by document
+    # before node_id, which matters only when two sections in different
+    # documents tie on both of the keys above.
+    #
+    # The ranking is global across the search, but `format_items_as_context`
+    # groups items by document before it truncates, so a positional cut
+    # respects this order only within a document.
     ranked = sorted(
         ref_hits,
         key=lambda k: (-ref_hits[k], -ref_best_score[k], k),
@@ -1681,16 +1738,28 @@ def _expand_graph_neighbors(
     # truncates positionally, so emission order decides which references
     # survive a tight budget — the ranking has to reach the list, not just the
     # fetch.
+    neighbors_added = 0
+    missing_rows = 0
     for key in selections:
         node_row = node_map.get(key)
         if node_row is None:
+            # A reference can outlive the section it names: the search-index
+            # row carrying `referenced_nodes` and the graph_index_nodes row it
+            # points at are written and deleted separately, so a partial
+            # delete or re-index leaves danglers. Counted rather than dropped
+            # silently — the search still succeeds, but with less than it
+            # selected, which otherwise looks like a corpus with nothing more
+            # to give. It is also the only signal for a subtler miss: `key`
+            # comes from item meta while the map's keys come off the uuid
+            # column, so any non-canonical spelling written into meta would
+            # drop every reference after the store had already fetched them.
+            missing_rows += 1
             continue
+        neighbors_added += 1
         toc_id, node_id = key
         all_keys.add(key)
         node_meta = node_row.get("meta") or {}
-        start_page = node_meta.get("start_page")
-        end_page = node_meta.get("end_page")
-        pages = list(range(int(start_page), int(end_page) + 1)) if start_page and end_page else []
+        pages = _page_span(node_meta)
 
         results.append(
             RetrievedItem(
@@ -1712,6 +1781,16 @@ def _expand_graph_neighbors(
             )
         )
 
+    if missing_rows:
+        logger.warning(
+            "graph_expansion: %d of %d selected references have no node row "
+            "(kb=%s) — referenced_nodes naming sections that no longer exist, "
+            "or a partial re-index",
+            missing_rows,
+            len(selections),
+            knowledge_base_id,
+        )
+
     # Expand children of referenced parent nodes — opt-in, and capped per
     # parent so one heavily-subdivided section can't flood the context.
     parents = [key for key in selections if key in node_map]
@@ -1721,6 +1800,7 @@ def _expand_graph_neighbors(
         else {}
     )
     children_added = 0
+    children_withheld = 0
 
     # Ranked parent order, for the same reason the parents themselves are
     # emitted in it: children inherit their parent's standing, so a positional
@@ -1738,8 +1818,17 @@ def _expand_graph_neighbors(
         # pre-order), so this is document order — and the children query has
         # no ORDER BY of its own. Past 9999 nodes the padding stops and this
         # sorts lexically, the same way the SQL would.
-        for child_row in sorted(child_rows, key=lambda row: row["node_id"]):
+        ordered_children = sorted(child_rows, key=lambda row: row["node_id"])
+        for position, child_row in enumerate(ordered_children):
             if kept >= cfg.max_children:
+                # Count what the cap actually withheld, not what was left in
+                # the list: a child already in the pool would have been
+                # skipped without consuming budget, so it was not withheld.
+                children_withheld += sum(
+                    1
+                    for row in ordered_children[position:]
+                    if (toc_id, row["node_id"]) not in all_keys
+                )
                 break
             child_key = (toc_id, child_row["node_id"])
             if child_key in all_keys:
@@ -1748,11 +1837,7 @@ def _expand_graph_neighbors(
             kept += 1
 
             child_meta = child_row.get("meta") or {}
-            start_page = child_meta.get("start_page")
-            end_page = child_meta.get("end_page")
-            pages = (
-                list(range(int(start_page), int(end_page) + 1)) if start_page and end_page else []
-            )
+            pages = _page_span(child_meta)
 
             results.append(
                 RetrievedItem(
@@ -1776,13 +1861,30 @@ def _expand_graph_neighbors(
             )
             children_added += 1
 
+    if children_withheld:
+        # The low default is justified by the outline naming the sections it
+        # omits — so the pairing is worth recording, because include_doc_toc
+        # can be off and then nothing names them.
+        logger.info(
+            "graph_expansion: the child cap withheld %d of %d children (cap=%d outline=%s kb=%s)",
+            children_withheld,
+            children_withheld + children_added,
+            cfg.max_children,
+            cfg.include_doc_toc,
+            knowledge_base_id,
+        )
+
+    # Emitted, not fetched: with references that no longer resolve, 10
+    # selected and 6 found would otherwise read exactly like 6 selected.
     logger.info(
-        "graph_expansion: fetched %d neighbors + %d children + %d outlines "
-        "from %d candidate refs (children=%s child_cap=%d ref_cap=%d outline=%s)",
-        len(node_map),
+        "graph_expansion: emitted %d neighbors + %d children + %d outlines "
+        "from %d candidate refs (%d selected children=%s child_cap=%d "
+        "ref_cap=%d outline=%s)",
+        neighbors_added,
         children_added,
         len(outlines),
         len(ranked),
+        len(selections),
         cfg.include_children,
         cfg.max_children,
         cfg.max_referenced,
@@ -1856,7 +1958,7 @@ def search_knowledge_base(
             raise ValueError(f"Knowledge base not found: {knowledge_base_id}")
 
         if indexing_config is None:
-            indexing_config = _coerce_kb_config(kb_row[2], "indexing_config", knowledge_base_id)
+            indexing_config = _require_indexing_config(kb_row[2], knowledge_base_id)
         if retrieval_config is None:
             retrieval_config = _coerce_kb_config(kb_row[3], "retrieval_config", knowledge_base_id)
 

@@ -258,9 +258,10 @@ def _build_registry() -> dict[str, SettingDef]:
                 "LLM call. Distinct from Max Context Tokens under Knowledge "
                 "Bases, which bounds one knowledge_search tool result: the "
                 "two are separate budgets that add up within a run, not one "
-                "inside the other. This one lands in the system prompt, which "
-                "compaction cannot prune, so it is resent in full on every "
-                "step of the run."
+                "inside the other. This one lands in the run's opening prompt "
+                "— the system prompt, or the first user message when the "
+                "context carries images — which pruning never rewrites, so it "
+                "is resent in full on every step of the run."
             ),
         ),
         SettingDef(
@@ -889,8 +890,10 @@ def _build_registry() -> dict[str, SettingDef]:
                 "past it are dropped by position once results are grouped by "
                 "document, not by score, so this is a backstop: the "
                 "deliberate bounds are top_k and, for GraphIndex, the "
-                "graph_expansion caps. Costs recur — a result stays in an "
-                "agent's history and is resent on every later step of the run."
+                "graph_expansion caps. Costs recur — a result stays in the "
+                "run's history and is resent on every later step, until the "
+                "run crosses its context threshold: old tool results are the "
+                "first thing pruning replaces."
             ),
         ),
         SettingDef(

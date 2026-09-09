@@ -11,7 +11,8 @@ bodies. These tests pin the bounded replacement:
 - the config block is read defensively: it is unvalidated JSONB, so a
   malformed value must degrade to defaults rather than take the search down
 - the synthetic scores stay strictly ordered even when the pool's own
-  minimum is 0.0, which hybrid and full-text searches both reach
+  minimum is 0.0, which the BM25 leg reaches on a row admitted by a negated
+  term (hybrid's fused scores are strictly positive)
 
 The store is faked at the class boundary — these are unit tests for the
 expansion logic. ``get_toc_outline``'s SQL is covered separately, against a
@@ -38,19 +39,31 @@ TOC_B = "toc-b"
 # ---------------------------------------------------------------------------
 
 
+def _source_for(toc_id: str) -> str:
+    """One document per toc_id, the way indexing writes them."""
+    return "src-A" if toc_id == TOC_A else "src-B"
+
+
 def _hit(node_id: str, *, toc_id: str = TOC_A, refs: list[str] | None = None, score: float = 0.9):
     """A search result as the retrieval pipeline hands it to expansion."""
     return RetrievedItem(
         item_id=f"row-{toc_id}-{node_id}",
         text=f"body of {node_id}",
         score=score,
-        source_id="src-A",
+        source_id=_source_for(toc_id),
         knowledge_base_id=KB_ID,
         meta={"toc_id": toc_id, "node_id": node_id, "referenced_nodes": refs or []},
     )
 
 
-def _node_row(node_id: str, *, toc_id: str = TOC_A, parent: str | None = None, refs=None):
+def _node_row(
+    node_id: str,
+    *,
+    toc_id: str = TOC_A,
+    parent: str | None = None,
+    refs=None,
+    source_id: str | None = None,
+):
     """A graph_index_nodes row as the store returns it."""
     return {
         "id": f"row-{toc_id}-{node_id}",
@@ -61,7 +74,7 @@ def _node_row(node_id: str, *, toc_id: str = TOC_A, parent: str | None = None, r
         "depth": 0 if parent is None else 1,
         "parent_node_id": parent,
         "meta": {"referenced_nodes": refs or []},
-        "source_id": "src-A",
+        "source_id": source_id or _source_for(toc_id),
     }
 
 
@@ -81,9 +94,7 @@ class FakeGraphIndexStore:
         # with no ORDER BY, so the dict comes back in DB row order and the
         # caller must not inherit its ranking from this mapping. Returning
         # `selections` order here would hide exactly that bug.
-        return {
-            key: self._nodes[key] for key in reversed(list(selections)) if key in self._nodes
-        }
+        return {key: self._nodes[key] for key in reversed(list(selections)) if key in self._nodes}
 
     def get_children_by_parent_ids(self, parent_selections):
         self.children_calls.append(list(parent_selections))
@@ -172,7 +183,7 @@ def _outline(toc_id=TOC_A, nodes=None, total_nodes=None):
     )
     return {
         "doc_name": "Master Services Agreement",
-        "source_id": "src-A",
+        "source_id": _source_for(toc_id),
         "nodes": resolved,
         "total_nodes": total_nodes if total_nodes is not None else len(resolved),
     }
@@ -428,12 +439,10 @@ class TestChildrenFanOut:
 
     def test_referenced_nodes_are_capped(self, install_store):
         """A hit's references are its largest cost: measured against a real
-        corpus, one node with 12 references pulled 27k tokens of section
-        bodies, more than the whole context budget."""
+        corpus, one node with 12 references pulled ~27k tokens of section
+        bodies — against the 16k KB context budget in force at the time."""
         many = {(TOC_A, f"{i:04d}"): _node_row(f"{i:04d}") for i in range(10, 30)}
-        store = install_store(
-            FakeGraphIndexStore(nodes=many, outlines={TOC_A: _outline()})
-        )
+        store = install_store(FakeGraphIndexStore(nodes=many, outlines={TOC_A: _outline()}))
         refs = [f"{i:04d}" for i in range(10, 30)]
 
         out = _expand(
@@ -445,20 +454,23 @@ class TestChildrenFanOut:
         assert len(_by_method(out, "graph_expansion")) == 4
 
     def test_referenced_node_cap_is_bounded_above(self, install_store):
-        many = {(TOC_A, f"{i:04d}"): _node_row(f"{i:04d}") for i in range(10, 30)}
-        store = install_store(
-            FakeGraphIndexStore(nodes=many, outlines={TOC_A: _outline()})
-        )
+        """A configured million restores exactly the unbounded fan-out the cap
+        removes. Asserted as an equality against a pool with more references
+        than the ceiling — ``<= ceiling`` would hold for any cap at all,
+        including one read straight from the config."""
+        refs = [f"{i:04d}" for i in range(10, 160)]
+        many = {(TOC_A, ref): _node_row(ref) for ref in refs}
+        store = install_store(FakeGraphIndexStore(nodes=many, outlines={TOC_A: _outline()}))
 
         out = _expand(
-            [_hit("0001", refs=[f"{i:04d}" for i in range(10, 30)])],
+            [_hit("0001", refs=refs)],
             store,
             {"graph_expansion": {"max_referenced_nodes": 10_000}},
         )
 
+        assert len(refs) > knowledge_search.GRAPH_MAX_REFERENCED_CEILING, "fixture too small"
         assert (
-            len(_by_method(out, "graph_expansion"))
-            <= knowledge_search.GRAPH_MAX_REFERENCED_CEILING
+            len(_by_method(out, "graph_expansion")) == knowledge_search.GRAPH_MAX_REFERENCED_CEILING
         )
 
     def test_the_cap_keeps_references_the_most_hits_agree_on(self, install_store):
@@ -478,16 +490,19 @@ class TestChildrenFanOut:
         assert kept == ["0011"], "the reference both hits share should win"
 
     def test_ties_on_consensus_fall_back_to_the_best_referring_hit(self, install_store):
+        """The stronger hit points at the *higher* node_id on purpose: with the
+        scores keyed the other way round, node_id order alone would produce
+        the same answer and the score key would be untested."""
         nodes = {(TOC_A, n): _node_row(n) for n in ("0010", "0012")}
         store = install_store(FakeGraphIndexStore(nodes=nodes, outlines={TOC_A: _outline()}))
         pool = [
-            _hit("0001", refs=["0010"], score=0.9),
-            _hit("0002", refs=["0012"], score=0.5),
+            _hit("0001", refs=["0012"], score=0.9),
+            _hit("0002", refs=["0010"], score=0.5),
         ]
 
         out = _expand(pool, store, {"graph_expansion": {"max_referenced_nodes": 1}})
 
-        assert [r.meta["node_id"] for r in _by_method(out, "graph_expansion")] == ["0010"]
+        assert [r.meta["node_id"] for r in _by_method(out, "graph_expansion")] == ["0012"]
 
     def test_a_hit_naming_a_reference_twice_does_not_outrank_consensus(self, install_store):
         """ref_hits counts how many *hits* point at a section. Nothing
@@ -513,16 +528,17 @@ class TestChildrenFanOut:
         nodes = {(TOC_A, n): _node_row(n) for n in ("0010", "0011", "0019")}
         store = install_store(FakeGraphIndexStore(nodes=nodes, outlines={TOC_A: _outline()}))
         pool = [
-            _hit("0001", refs=["0010", "0011"], score=0.9),
-            _hit("0002", refs=["0011", "0019"], score=0.2),
+            _hit("0001", refs=["0019", "0011"], score=0.9),
+            _hit("0002", refs=["0011", "0010"], score=0.2),
         ]
 
         out = _expand(pool, store, {"graph_expansion": {"max_referenced_nodes": 3}})
 
         kept = [r.meta["node_id"] for r in _by_method(out, "graph_expansion")]
-        # 0011 has two hits; 0010 and 0019 have one each, ordered by their
-        # referring hit's score.
-        assert kept == ["0011", "0010", "0019"]
+        # 0011 has two hits; 0019 and 0010 have one each, ordered by their
+        # referring hit's score — which is the reverse of node_id order, so
+        # neither the store's order nor a tiebreak-only sort produces this.
+        assert kept == ["0011", "0019", "0010"]
 
     def test_children_follow_their_parents_ranking(self, install_store):
         """Children inherit their parent's standing, so a positional cut
@@ -560,7 +576,11 @@ class TestChildrenFanOut:
                 {"graph_expansion": {"max_referenced_nodes": 3}},
             )
 
-        assert "10" in caplog.text and "3" in caplog.text
+        # Asserted on the cap line's own wording: the summary line that always
+        # logs already contains both numbers, so a bare "10"/"3" check passes
+        # with the statement under test deleted.
+        assert "exceed the cap of" in caplog.text
+        assert "10 referenced nodes" in caplog.text
 
     def test_children_are_not_queried_when_disabled(self, install_store):
         store = install_store(_store_with_ref())
@@ -670,7 +690,8 @@ class TestDocumentOutline:
         PendingRollbackError — which context_handler turns into an empty
         knowledge base, or which detonates outside every try block later. The
         outline must undo only its own statement, hence a savepoint rather
-        than a full rollback: billing writes may be pending on this session."""
+        than a full rollback: whatever the caller already has pending on this
+        session stays pending."""
         session = _RecordingSession()
         store = _store_with_ref(outline_error=SQLAlchemyError("statement timeout"))
         install_store(store)
@@ -683,7 +704,9 @@ class TestDocumentOutline:
         )
 
         assert session.savepoints == ["rolled-back"]
-        assert session.rollback_calls == 0, "a full rollback would discard pending billing writes"
+        assert session.rollback_calls == 0, (
+            "a full rollback would discard the caller's pending work"
+        )
         # The search survives, and the statement after the failure still runs.
         assert [r.meta["node_id"] for r in _by_method(out, "graph_expansion")] == ["0002"]
         assert store.children_calls, "expansion must keep using the session afterwards"
@@ -785,13 +808,19 @@ class TestExpansionScores:
         assert child < parent < toc < min_score
         assert child > 0, "tiers must stay on the pool's scale, not clamp to zero"
 
-    def test_tiers_stay_ordered_for_a_negative_pool_minimum(self):
+    def test_tiers_stay_on_scale_for_a_negative_pool_minimum(self):
         """Rerankers are supported for this strategy and cross-encoders emit
-        negative scores routinely. Without abs(), the step goes negative and
-        the three tiers invert onto the wrong side of the pool."""
-        toc, parent, child = knowledge_search._expansion_tier_scores(-2.0)
+        negative scores routinely.
 
-        assert child < parent < toc < -2.0
+        Ordering alone does not catch a missing ``abs()``: the step would fall
+        back to the 1e-6 floor and the tiers would still come out ordered,
+        just six orders of magnitude too close together to survive a float
+        comparison. The size of the step is the thing to assert."""
+        min_score = -2.0
+        toc, parent, child = knowledge_search._expansion_tier_scores(min_score)
+
+        assert child < parent < toc < min_score
+        assert toc == pytest.approx(min_score - abs(min_score) * 0.01)
 
     def test_tiers_stay_ordered_when_the_pool_minimum_is_zero(self):
         """Reachable: bm25_score returns 0.0 for an empty tsvector, and the
@@ -819,6 +848,18 @@ class TestExpansionScores:
 
 
 class TestWiring:
+    def test_the_shipped_bounds_are_the_ones_that_were_chosen(self):
+        """Literals, not the constants themselves. Every other assertion here
+        compares the registry to the constant, which pins the link and leaves
+        the value free — the bound this whole feature is named for was not
+        pinned by anything until this test."""
+        assert knowledge_search.GRAPH_DEFAULT_MAX_REFERENCED_NODES == 10
+        assert knowledge_search.GRAPH_DEFAULT_MAX_CHILDREN == 3
+        assert knowledge_search.GRAPH_MAX_REFERENCED_CEILING == 100
+        assert knowledge_search.GRAPH_MAX_CHILDREN_CEILING == 20
+        assert knowledge_search.GRAPH_DEFAULT_INCLUDE_CHILDREN is False
+        assert knowledge_search.GRAPH_DEFAULT_INCLUDE_DOC_TOC is True
+
     def test_registry_ships_the_documented_defaults(self):
         from agentic_project_service.strategies.registry import STRATEGY_REGISTRY
 
@@ -829,6 +870,10 @@ class TestWiring:
             "max_referenced_nodes": knowledge_search.GRAPH_DEFAULT_MAX_REFERENCED_NODES,
             "include_doc_toc": True,
         }
+        # Adding a knob to the registry but not to the frozenset makes the
+        # read path log "unknown key" on every query for every KB created
+        # with the defaults.
+        assert set(cfg) == knowledge_search.GRAPH_EXPANSION_KEYS
 
     def test_sync_search_hands_expansion_the_kb_config_and_id(self, monkeypatch):
         """Dropping — or transposing — the arguments at the call site silently
@@ -870,3 +915,235 @@ class TestWiring:
 
         assert recorded["kb_id"] == KB_ID, "arguments transposed"
         assert recorded["retrieval_config"] is retrieval_config
+
+    @pytest.mark.asyncio
+    async def test_async_search_hands_expansion_the_kb_config_and_id(self, monkeypatch):
+        """The agent path runs the async variant, and nothing in tests/
+        referenced ``search_knowledge_base_async`` at all — so it could revert
+        to the defaults, or transpose the same two arguments, with CI green."""
+        recorded = {}
+
+        def _recording_expand(db_session, results, knowledge_base_id, retrieval_config=None):
+            recorded["kb_id"] = knowledge_base_id
+            recorded["retrieval_config"] = retrieval_config
+            return results
+
+        async def _empty_pipeline(**kwargs):
+            return []
+
+        monkeypatch.setattr(knowledge_search, "_expand_graph_neighbors", _recording_expand)
+        monkeypatch.setattr(
+            knowledge_search,
+            "GraphIndexNodeStore",
+            lambda db_session, knowledge_base_id: object(),
+        )
+        monkeypatch.setattr(knowledge_search, "_aexecute_retrieval_pipeline", _empty_pipeline)
+
+        retrieval_config = {
+            "method": "vector_search",
+            "graph_expansion": {"include_children": True},
+        }
+        await knowledge_search.search_knowledge_base_async(
+            db_session=_CountingSession(node_count=1),
+            knowledge_base_id=KB_ID,
+            query="q",
+            retrieval_method="vector_search",
+            indexing_config={"strategy": "graph_index"},
+            retrieval_config=retrieval_config,
+        )
+
+        assert recorded["kb_id"] == KB_ID, "arguments transposed"
+        assert recorded["retrieval_config"] is retrieval_config
+
+
+# ---------------------------------------------------------------------------
+# What expansion reports about itself
+# ---------------------------------------------------------------------------
+
+
+class TestExpansionReporting:
+    """Expansion drops things for three different reasons, and a drop nobody
+    can see reads as a corpus that had nothing to give."""
+
+    def test_a_reference_with_no_node_row_is_reported(self, install_store, caplog):
+        """`referenced_nodes` and `graph_index_nodes` are written and deleted
+        separately, so a reference can outlive the section it names. The old
+        loop walked the fetched map and never noticed; the ranked loop
+        computes the miss explicitly, which makes discarding it a choice."""
+        store = install_store(
+            FakeGraphIndexStore(
+                nodes={(TOC_A, "0002"): _node_row("0002")},
+                outlines={TOC_A: _outline()},
+            )
+        )
+
+        with caplog.at_level(logging.WARNING):
+            out = _expand([_hit("0001", refs=["0002", "0404"])], store)
+
+        assert len(_by_method(out, "graph_expansion")) == 1
+        assert "1 of 2" in caplog.text
+        assert KB_ID in caplog.text
+
+    def test_the_summary_says_how_many_references_were_selected(self, install_store, caplog):
+        """The map's keys are a subset of the selections, so its size was
+        already the emitted count — renaming it changes nothing on its own.
+        What was missing is the other number: without ``selected``, 10 chosen
+        and 6 resolved reads exactly like 6 chosen."""
+        store = install_store(
+            FakeGraphIndexStore(
+                nodes={(TOC_A, "0002"): _node_row("0002")},
+                outlines={TOC_A: _outline()},
+            )
+        )
+
+        with caplog.at_level(logging.INFO):
+            _expand([_hit("0001", refs=["0002", "0404"])], store)
+
+        assert "emitted 1 neighbors" in caplog.text
+        assert "2 selected" in caplog.text
+
+    def test_the_child_cap_reports_what_it_dropped(self, install_store, caplog):
+        """The low child default is justified by the outline naming the
+        sections it omits — but ``include_doc_toc`` can be off, and then the
+        stated mitigation is absent with nothing recording the loss."""
+        children = [_node_row(f"000{i}", parent="0002") for i in range(3, 7)]
+        store = install_store(
+            FakeGraphIndexStore(
+                nodes={(TOC_A, "0002"): _node_row("0002")},
+                children={(TOC_A, "0002"): children},
+                outlines={TOC_A: _outline()},
+            )
+        )
+
+        with caplog.at_level(logging.INFO):
+            out = _expand(
+                [_hit("0001", refs=["0002"])],
+                store,
+                {
+                    "graph_expansion": {
+                        "include_children": True,
+                        "max_children_per_parent": 2,
+                        "include_doc_toc": False,
+                    }
+                },
+            )
+
+        assert len(_by_method(out, "graph_expansion_child")) == 2
+        assert "withheld 2 of 4 children" in caplog.text
+        assert "outline=False" in caplog.text
+
+    def test_children_already_in_the_pool_are_not_counted_as_dropped(self, install_store):
+        """A child the search already found is skipped without consuming cap
+        budget, so it is not something the cap withheld either."""
+        children = [_node_row(f"000{i}", parent="0002") for i in range(3, 6)]
+        store = install_store(
+            FakeGraphIndexStore(
+                nodes={(TOC_A, "0002"): _node_row("0002")},
+                children={(TOC_A, "0002"): children},
+                outlines={TOC_A: _outline()},
+            )
+        )
+
+        out = _expand(
+            [_hit("0001", refs=["0002"]), _hit("0003")],
+            store,
+            {"graph_expansion": {"include_children": True, "max_children_per_parent": 3}},
+        )
+
+        kept = [c.meta["node_id"] for c in _by_method(out, "graph_expansion_child")]
+        assert kept == ["0004", "0005"]
+
+
+# ---------------------------------------------------------------------------
+# Page spans on expansion items
+# ---------------------------------------------------------------------------
+
+
+class TestExpansionPages:
+    """An expansion item with no pages makes the image path fall back to
+    attaching every image of its source — the amplification the structural
+    guard exists to prevent, reached through a different door. ``page and``
+    is falsy for page 0 and for a section whose end page was never recorded.
+    """
+
+    def _pages_of(self, install_store, node_meta):
+        row = _node_row("0002")
+        row["meta"] = {**row["meta"], **node_meta}
+        store = install_store(
+            FakeGraphIndexStore(nodes={(TOC_A, "0002"): row}, outlines={TOC_A: _outline()})
+        )
+
+        out = _expand([_hit("0001", refs=["0002"])], store)
+        return _by_method(out, "graph_expansion")[0].meta["pages"]
+
+    def test_a_span_becomes_an_inclusive_range(self, install_store):
+        assert self._pages_of(install_store, {"start_page": 3, "end_page": 5}) == [3, 4, 5]
+
+    def test_page_zero_is_a_page(self, install_store):
+        assert self._pages_of(install_store, {"start_page": 0, "end_page": 0}) == [0]
+
+    def test_a_start_only_span_still_yields_its_page(self, install_store):
+        """``_pages_for_item`` has had this fallback all along; expansion
+        stamped `pages: []` for the same node."""
+        assert self._pages_of(install_store, {"start_page": 7}) == [7]
+
+    def test_no_page_metadata_yields_no_pages(self, install_store):
+        assert self._pages_of(install_store, {}) == []
+
+    def test_unparseable_pages_yield_no_pages(self, install_store):
+        """meta is JSONB written by the indexer; a string here must not raise
+        in the middle of a successful search."""
+        assert self._pages_of(install_store, {"start_page": "seven"}) == []
+
+
+# ---------------------------------------------------------------------------
+# More than one document
+# ---------------------------------------------------------------------------
+
+
+class TestAcrossDocuments:
+    """Every other fixture here lives in one document. The ranking is global
+    across the search, so a fixture that cannot tell two documents apart
+    cannot show it working."""
+
+    def test_the_ranking_spans_documents(self, install_store):
+        nodes = {
+            (TOC_A, "0010"): _node_row("0010"),
+            (TOC_B, "0020"): _node_row("0020", toc_id=TOC_B, source_id="src-B"),
+        }
+        store = install_store(
+            FakeGraphIndexStore(
+                nodes=nodes,
+                outlines={TOC_A: _outline(), TOC_B: _outline(toc_id=TOC_B)},
+            )
+        )
+        pool = [
+            _hit("0001", refs=["0020"], toc_id=TOC_B, score=0.9),
+            _hit("0002", refs=["0010"], score=0.5),
+        ]
+
+        out = _expand(pool, store, {"graph_expansion": {"max_referenced_nodes": 1}})
+
+        kept = _by_method(out, "graph_expansion")
+        assert [r.meta["node_id"] for r in kept] == ["0020"]
+        assert kept[0].source_id == "src-B", "expansion items carry their own document"
+
+    def test_one_outline_per_document_a_reference_was_followed_into(self, install_store):
+        nodes = {
+            (TOC_A, "0010"): _node_row("0010"),
+            (TOC_B, "0020"): _node_row("0020", toc_id=TOC_B, source_id="src-B"),
+        }
+        store = install_store(
+            FakeGraphIndexStore(
+                nodes=nodes,
+                outlines={TOC_A: _outline(), TOC_B: _outline(toc_id=TOC_B)},
+            )
+        )
+        pool = [
+            _hit("0001", refs=["0020"], toc_id=TOC_B, score=0.9),
+            _hit("0002", refs=["0010"], score=0.5),
+        ]
+
+        out = _expand(pool, store)
+
+        assert sorted(r.item_id for r in _by_method(out, "graph_toc")) == [TOC_A, TOC_B]
