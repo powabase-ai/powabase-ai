@@ -37,6 +37,9 @@ class SparseIndexStore:
     # Class-level cache shared across instances (OrderedDict for LRU)
     _cache_lock = threading.Lock()
     _managers: OrderedDict[str, BM25IndexManager] = OrderedDict()
+    # What the cached manager was loaded from, per cache key. Compared against
+    # the files on every lookup so a rebuild by another process is noticed.
+    _stamps: dict[str, tuple | None] = {}
     _loading_events: dict[str, threading.Event] = {}
     _max_cache_size: int = SPARSE_INDEX_CACHE_SIZE
 
@@ -120,11 +123,34 @@ class SparseIndexStore:
         """
         while len(cls._managers) > cls._max_cache_size:
             key, _ = cls._managers.popitem(last=False)
+            cls._stamps.pop(key, None)
             # If there's a loading event, set it to unblock waiters before evicting
             event = cls._loading_events.pop(key, None)
             if event:
                 event.set()
             logger.debug("Evicted sparse index cache entry: %s", key)
+
+    def index_stamp(self, item_table: str = "chunks") -> tuple | None:
+        """A value that changes whenever the on-disk index changes.
+
+        Every build path writes ``metadata.json`` last and atomically, so its
+        (mtime, size) is the write barrier: seeing a new one means the rest of
+        the files are already in place. ``item_ids.json`` is the fallback for
+        indexes built before the sidecar existed — using both means an index
+        cannot look fresh merely because it predates the newer file.
+
+        ``None`` means no index on disk, which is itself a state worth
+        noticing: an index deleted by another process must not keep being
+        served from this one's cache.
+        """
+        stamp: list = []
+        for name in ("metadata.json", "item_ids.json"):
+            try:
+                info = os.stat(os.path.join(self.get_index_path(item_table), name))
+            except OSError:
+                continue
+            stamp.append((name, info.st_mtime_ns, info.st_size))
+        return tuple(stamp) or None
 
     def get_or_load_manager(self, item_table: str = "chunks") -> BM25IndexManager:
         """Get cached manager or load from disk.
@@ -133,6 +159,15 @@ class SparseIndexStore:
         receiving unloaded managers. Loading is done outside the lock to avoid
         blocking unrelated cache operations.
 
+        The cached manager is only handed back while the files it came from
+        are unchanged. Indexing runs in the worker process and searching in
+        the API process, so *every* rebuild happens somewhere other than the
+        process holding the cache — the in-process invalidation the write
+        paths do is invisible to the reader. Without the check the API serves
+        its first load forever, and once the item count grows the id mapping
+        no longer covers the corpus positions bm25s returns: an IndexError
+        out of the search, not a merely stale result.
+
         Args:
             item_table: Table name.
 
@@ -140,6 +175,9 @@ class SparseIndexStore:
             BM25IndexManager instance (may be empty if no index exists).
         """
         cache_key = f"{self.kb_id}:{item_table}"
+        # Stat outside the lock: two files, and no reason to hold up other
+        # knowledge bases for it.
+        current_stamp = self.index_stamp(item_table)
 
         while True:
             with self._cache_lock:
@@ -148,8 +186,17 @@ class SparseIndexStore:
                     manager = self._managers[cache_key]
                     # If no loading event, manager is fully loaded and ready
                     if cache_key not in self._loading_events:
-                        self._managers.move_to_end(cache_key)
-                        return manager
+                        if self._stamps.get(cache_key) == current_stamp:
+                            self._managers.move_to_end(cache_key)
+                            return manager
+                        logger.info(
+                            "Sparse index changed on disk, reloading: %s", cache_key
+                        )
+                        self._managers.pop(cache_key, None)
+                        self._stamps.pop(cache_key, None)
+                        continue
+                    # Otherwise, get the event to wait on
+                    event = self._loading_events[cache_key]
                     # Otherwise, get the event to wait on
                     event = self._loading_events[cache_key]
                 else:
@@ -185,6 +232,10 @@ class SparseIndexStore:
         finally:
             # Signal completion and remove loading event
             with self._cache_lock:
+                # The stamp taken *before* loading: if the files changed while
+                # this load was in flight, the next lookup sees a difference
+                # and reloads rather than trusting a half-read index.
+                self._stamps[cache_key] = current_stamp
                 event.set()
                 self._loading_events.pop(cache_key, None)
 
@@ -218,6 +269,10 @@ class SparseIndexStore:
         cache_key = f"{self.kb_id}:{item_table}"
         with self._cache_lock:
             self._managers[cache_key] = manager
+            # Stamped from the files just written: without this the next
+            # lookup in *this* process sees "no stamp" and reloads an index it
+            # already has in hand.
+            self._stamps[cache_key] = self.index_stamp(item_table)
             # Clear loading event - we're replacing with a fully built manager
             event = self._loading_events.pop(cache_key, None)
             if event:
@@ -267,6 +322,7 @@ class SparseIndexStore:
         cache_key = f"{self.kb_id}:{item_table}"
         with self._cache_lock:
             self._managers.pop(cache_key, None)
+            self._stamps.pop(cache_key, None)
             event = self._loading_events.pop(cache_key, None)
             if event:
                 event.set()
@@ -326,6 +382,7 @@ class SparseIndexStore:
 
                     if not manager.is_empty():
                         manager.save(self.get_index_path(item_table))
+                        self._stamps[cache_key] = self.index_stamp(item_table)
 
                     self._managers.move_to_end(cache_key)
                     break  # Done!
@@ -390,6 +447,7 @@ class SparseIndexStore:
                         self._delete_index_unlocked(item_table)
                     else:
                         manager.save(self.get_index_path(item_table))
+                        self._stamps[cache_key] = self.index_stamp(item_table)
                         self._managers.move_to_end(cache_key)
                     break  # Done!
 
@@ -419,6 +477,7 @@ class SparseIndexStore:
 
         cache_key = f"{self.kb_id}:{item_table}"
         self._managers.pop(cache_key, None)
+        self._stamps.pop(cache_key, None)
         # Also clear loading event if present, unblocking any waiters
         event = self._loading_events.pop(cache_key, None)
         if event:
@@ -446,6 +505,7 @@ class SparseIndexStore:
             keys_to_remove = [k for k in self._managers if k.startswith(f"{self.kb_id}:")]
             for key in keys_to_remove:
                 self._managers.pop(key, None)
+                self._stamps.pop(key, None)
                 # Set event before popping to unblock any waiting threads
                 event = self._loading_events.pop(key, None)
                 if event:
@@ -456,6 +516,7 @@ class SparseIndexStore:
         """Clear all cached managers (for testing/cleanup)."""
         with cls._cache_lock:
             cls._managers.clear()
+            cls._stamps.clear()
             # Set all events before clearing to unblock any waiting threads
             for event in cls._loading_events.values():
                 event.set()
