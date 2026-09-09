@@ -458,12 +458,16 @@ def list_knowledge_bases():
 def create_knowledge_base():
     """Create a new knowledge base."""
     data = request.get_json()
+    # Before the name check, not after: that check reads `.get("name")`, so a
+    # truthy non-dict body dies there rather than reaching the shape guard.
+    # An absent body skips it and keeps its own "Name is required" answer.
+    if data is not None:
+        shape_error = _config_shape_error(data)
+        if shape_error:
+            return jsonify({"error": shape_error}), 400
+
     if not data or not data.get("name"):
         return jsonify({"error": "Name is required"}), 400
-
-    shape_error = _config_shape_error(data)
-    if shape_error:
-        return jsonify({"error": shape_error}), 400
 
     kb_id = str(uuid.uuid4())
 

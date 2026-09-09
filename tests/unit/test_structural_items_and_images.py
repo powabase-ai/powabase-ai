@@ -7,18 +7,20 @@ a document whose other items already carry precise page coverage. One
 outline in the pool therefore discards the page filter for every other item
 from the same document.
 
-Three call sites guard against that, and each was deletable with the whole
-suite green: the page scan in ``_resolve_page_images``, and the image-attach
-branches in ``format_items_as_context``'s grouped and ungrouped paths.
+Three call sites guard against that. Two were deletable with the whole suite
+green — the image-attach branches in ``format_items_as_context``'s grouped
+and ungrouped paths — and are covered here. The third, the page scan in
+``_resolve_page_images``, was already pinned by
+``test_page_resolution.py::TestResolvePageImagesFiltering::
+test_structural_outline_does_not_widen_coverage_for_its_document``, which
+fails when it is removed; a claim that all three deleted free was wrong.
 """
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
 from agentic.knowledge.models import RetrievedItem
 
-from agentic_project_service.services import context_handler, knowledge_search
+from agentic_project_service.services import knowledge_search
 
 KB_ID = "kb-1"
 SOURCE_ID = "src-A"
@@ -56,43 +58,6 @@ def _outline_item() -> RetrievedItem:
             "pages": [],
         },
     )
-
-
-class _SourceRowSession:
-    """Answers the one derivatives SELECT with three pages of images."""
-
-    def execute(self, *args, **kwargs):
-        class _Result:
-            def fetchall(self):
-                return [
-                    (
-                        SOURCE_ID,
-                        {
-                            "image": [
-                                {"page": p, "storage_path": f"bucket/p{p}.png", "format": "png"}
-                                for p in (1, 2, 3)
-                            ]
-                        },
-                    )
-                ]
-
-        return _Result()
-
-
-class _FakeStorage:
-    def download_from_path(self, path):
-        return b"png-bytes"
-
-
-def test_an_outline_does_not_widen_the_page_fetch():
-    """`_resolve_page_images`: with the guard gone the outline's empty pages
-    put its source in fetch_all_for, which wins over needed_pages."""
-    items = [_node_item([1]), _outline_item()]
-
-    with patch.object(context_handler, "get_storage", return_value=_FakeStorage()):
-        resolved = context_handler._resolve_page_images(_SourceRowSession(), items)
-
-    assert [img["page"] for img in resolved[SOURCE_ID]] == [1]
 
 
 def _image_blocks(items, grouped: bool):

@@ -1030,28 +1030,44 @@ class TestExpansionReporting:
         Asserted against the summary record alone. ``caplog.text`` also holds
         the missing-row warning, which contains "of N selected references" —
         so a whole-text assertion passes with the summary's count mutated
-        away, which is the very confound this test was added to remove."""
+        away, which is the very confound this test was added to remove.
+
+        The fixture makes the three counts differ: 5 references, a cap of 4,
+        and 2 of the 4 selected resolvable. Equal numbers are substitutable
+        ones — with 3 refs under a cap of 10, ``candidates``, ``selected``
+        and each other are the same integer and any of them can stand in."""
+        refs = ["0002", "0003", "0404", "0405", "0406"]
         store = install_store(
             FakeGraphIndexStore(
-                nodes={(TOC_A, "0002"): _node_row("0002")},
+                nodes={
+                    (TOC_A, "0002"): _node_row("0002"),
+                    (TOC_A, "0003"): _node_row("0003"),
+                },
                 outlines={TOC_A: _outline()},
             )
         )
 
         with caplog.at_level(logging.INFO):
-            _expand([_hit("0001", refs=["0002", "0404", "0405"])], store)
+            _expand(
+                [_hit("0001", refs=refs)],
+                store,
+                {"graph_expansion": {"max_referenced_nodes": 4}},
+            )
 
         summaries = [r.getMessage() for r in caplog.records if "emitted" in r.getMessage()]
         assert len(summaries) == 1
-        # Three distinct numbers, so no two of them can stand in for another.
-        assert "emitted 1 neighbors" in summaries[0]
-        assert "3 selected" in summaries[0]
-        assert "from 3 candidate refs" in summaries[0]
+        assert "emitted 2 neighbors" in summaries[0]
+        assert "4 selected" in summaries[0]
+        assert "from 5 candidate refs" in summaries[0]
 
     def test_the_child_cap_reports_what_it_dropped(self, install_store, caplog):
         """The low child default is justified by the outline naming the
         sections it omits — but ``include_doc_toc`` can be off, and then the
-        stated mitigation is absent with nothing recording the loss."""
+        stated mitigation is absent with nothing recording the loss.
+
+        Read off the child-cap record, not ``caplog.text``: the summary line
+        emits ``outline=%s`` too, so a whole-text assertion is satisfied by
+        the wrong line and the cap record's own fields go unpinned."""
         children = [_node_row(f"000{i}", parent="0002") for i in range(3, 7)]
         store = install_store(
             FakeGraphIndexStore(
@@ -1075,8 +1091,11 @@ class TestExpansionReporting:
             )
 
         assert len(_by_method(out, "graph_expansion_child")) == 2
-        assert "withheld 2 of 4 children" in caplog.text
-        assert "outline=False" in caplog.text
+        cap_lines = [r.getMessage() for r in caplog.records if "withheld" in r.getMessage()]
+        assert len(cap_lines) == 1
+        assert "withheld 2 of 4 children" in cap_lines[0]
+        assert "cap=2" in cap_lines[0]
+        assert "outline=False" in cap_lines[0], "the cap line has to carry it, not the summary"
 
     def test_children_already_in_the_pool_are_not_counted_as_dropped(self, install_store, caplog):
         """A child the search already found is skipped without consuming cap
@@ -1105,6 +1124,81 @@ class TestExpansionReporting:
         assert kept == ["0003", "0004"]
         # 0005 was withheld; 0006 was already in the pool, so it was not.
         assert "withheld 1 of 3 children" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Behaviour that is correct today and was pinned by nothing
+# ---------------------------------------------------------------------------
+
+
+class TestUnpinnedInvariants:
+    """None of these was failing. Each is a way a later edit could spend the
+    budget this feature exists to bound, without any test objecting."""
+
+    def test_a_reference_already_in_the_pool_is_not_re_emitted(self, install_store):
+        """The search already returned 0002 and paid for it once. Re-adding it
+        spends cap budget on a duplicate — invisible in the response, which
+        just looks like a shorter answer."""
+        store = install_store(
+            FakeGraphIndexStore(
+                nodes={(TOC_A, "0002"): _node_row("0002")},
+                outlines={TOC_A: _outline()},
+            )
+        )
+        pool = [_hit("0001", refs=["0002"], score=0.9), _hit("0002", score=0.4)]
+
+        out = _expand(pool, store)
+
+        assert _by_method(out, "graph_expansion") == []
+
+    def test_a_negative_cap_from_a_legacy_row_means_none_not_all_but_one(self, install_store):
+        """The route rejects a negative cap on write; the read-path clamp is
+        for rows written before it. Unclamped, ``ranked[:-1]`` drops one
+        reference from the *end* and keeps the rest — a cap that expands."""
+        refs = [f"{i:04d}" for i in range(10, 15)]
+        store = install_store(
+            FakeGraphIndexStore(
+                nodes={(TOC_A, r): _node_row(r) for r in refs},
+                outlines={TOC_A: _outline()},
+            )
+        )
+
+        out = _expand(
+            [_hit("0001", refs=refs)],
+            store,
+            {"graph_expansion": {"max_referenced_nodes": -1}},
+        )
+
+        assert _by_method(out, "graph_expansion") == []
+
+    def test_a_scoreless_item_in_the_pool_does_not_break_the_tiers(self, install_store):
+        """``score`` is Optional on RetrievedItem, and the tier floor is
+        ``min()`` over the pool — over a list containing None it raises, and
+        expansion fails the whole search rather than a scored subset."""
+        store = install_store(_store_with_ref())
+        scoreless = _hit("0009")
+        scoreless.score = None
+        pool = [_hit("0001", refs=["0002"], score=0.7), scoreless]
+
+        out = _expand(pool, store)
+
+        assert [r.meta["node_id"] for r in _by_method(out, "graph_expansion")] == ["0002"]
+
+    def test_a_child_cap_of_zero_asks_the_store_for_nothing(self, install_store, caplog):
+        """0 means off, and off should cost no query. It also must not report
+        a withholding: everything it withheld is what was asked for."""
+        store = install_store(_store_with_ref())
+
+        with caplog.at_level(logging.INFO):
+            out = _expand(
+                [_hit("0001", refs=["0002"])],
+                store,
+                {"graph_expansion": {"include_children": True, "max_children_per_parent": 0}},
+            )
+
+        assert store.children_calls == []
+        assert _by_method(out, "graph_expansion_child") == []
+        assert "withheld" not in caplog.text
 
 
 # ---------------------------------------------------------------------------

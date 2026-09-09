@@ -38,10 +38,10 @@ from agentic_project_service.strategies.graph_defaults import (
 
 class TestConfigShape:
     def test_a_non_object_body_is_rejected(self):
-        """``request.get_json()`` returns whatever was sent. A truthy non-dict
-        — ``[1, 2]`` — passes the route's emptiness check, and every read here
-        would then raise: ``field in data`` is a harmless membership test that
-        lets it through as far as ``.get``."""
+        """``request.get_json()`` returns whatever was sent, and a truthy
+        non-dict — ``[1, 2]`` — reaches here on both routes: every read below
+        would raise on one, since ``field in data`` is a harmless membership
+        test that lets it through as far as ``.get``."""
         error = _config_shape_error([1, 2])
 
         assert error is not None
@@ -222,9 +222,34 @@ class TestTheRoutesCallIt:
         assert response.status_code == 400
         assert "max_referenced_nodes" in response.get_json()["error"]
 
-    def test_update_with_a_non_object_body_is_a_400_not_a_500(self):
-        """A truthy non-dict body passes the route's emptiness check and then
-        reaches the validator's reads."""
-        response = self._patch([1, 2])
+    @pytest.mark.parametrize("body", [[1, 2], "a string", 123])
+    def test_update_with_a_non_object_body_is_a_400_not_a_500(self, body):
+        """PATCH's emptiness check is ``if not data``, which a truthy non-dict
+        passes; the validator's own reads are then what it reaches."""
+        assert self._patch(body).status_code == 400
+
+    @pytest.mark.parametrize("body", [[1, 2], "a string", 123])
+    def test_create_with_a_non_object_body_is_a_400_not_a_500(self, body):
+        """POST's is ``if not data or not data.get("name")``, so the body dies
+        one line *before* the validator unless the guard runs first. Every
+        other case here is paired across the two routes; this one was not,
+        and the unpaired route was the one that still 500'd."""
+        assert self._post(body).status_code == 400
+
+    def test_a_malformed_stored_config_does_not_break_the_request_that_repairs_it(self):
+        """``_read_existing_retrieval_config`` runs before the UPDATE, to spot
+        a method transition. Reading a stored non-object raw would 500 the one
+        request that can fix it — leaving no way to repair the row through the
+        API at all, which is the failure its docstring names."""
+        with patch.object(kb_routes.db, "session") as session:
+            session.execute.return_value.fetchone.return_value = ("hybrid",)
+
+            assert kb_routes._read_existing_retrieval_config("kb-1") == {}
+
+    def test_create_with_an_empty_object_still_asks_for_a_name(self):
+        """An empty body is not a malformed one — moving the guard earlier
+        must not take over the answer the route already gives."""
+        response = self._post({})
 
         assert response.status_code == 400
+        assert "Name" in response.get_json()["error"]
