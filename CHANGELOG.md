@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/powabase-ai/powabase-ai/compare/v0.7.0...v0.8.0) (2026-09-09)
+
+
+### Features
+
+* **graph_index:** bound graph expansion, ship a document outline instead ([#64](https://github.com/powabase-ai/powabase-ai/issues/64)) ([401273f](https://github.com/powabase-ai/powabase-ai/commit/401273f5b9ed6b028cacd92cfee25e0a48bfaced))
+
 ## [0.7.0](https://github.com/powabase-ai/powabase-ai/compare/v0.6.1...v0.7.0) (2026-08-13)
 
 
