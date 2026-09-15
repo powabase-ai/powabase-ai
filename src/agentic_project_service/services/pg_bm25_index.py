@@ -360,18 +360,46 @@ def pg_bm25_status(knowledge_base_id: str, strategy: str | None, session=None) -
 # Index lifecycle
 # ---------------------------------------------------------------------------
 
-# pg_search refuses a second bm25 index on a relation that already has one, so
-# only the first knowledge base to claim an item table gets an index; the rest
-# keep the existing keyword path. Recognised rather than raised so a Celery
-# retry does not hammer a condition no retry can clear.
+# pg_search supports exactly one bm25 index per relation, so only the first
+# knowledge base to claim an item table gets one; every other KB on that table
+# keeps the existing keyword path.
+#
+# The limit has to be enforced here because pg_search only half-enforces it,
+# and the half it misses is the damaging one. Verified against 0.25.9: a plain
+# CREATE INDEX on a table that already has a bm25 index is refused with the
+# message below, but CREATE INDEX CONCURRENTLY -- which is what a concurrent
+# build has to use -- creates it. With two present, unscored matching still
+# works for both KBs while a *scored* query against the older index fails with
+# "Unsupported query shape". So building a second index does not just fail to
+# help the second KB, it breaks keyword search for the first one.
 _ONE_INDEX_PER_RELATION = "only have one ParadeDB index"
 
-_KB_CONFIG_SQL = (
-    "SELECT indexing_config->>'strategy', "
-    "retrieval_config->>'method', "
-    "retrieval_config->>'ts_language' "
-    f'FROM "{AI_SCHEMA}".knowledge_bases WHERE id = :id'
-)
+
+def _other_bm25_index_on_table(conn, item_table: str, own_index: str) -> str | None:
+    """Name of a bm25 index on this item table that is not ``own_index``."""
+    row = conn.execute(
+        text(
+            "SELECT ic.relname FROM pg_class ic "
+            "JOIN pg_index i ON i.indexrelid = ic.oid "
+            "JOIN pg_am am ON am.oid = ic.relam "
+            "JOIN pg_class tc ON tc.oid = i.indrelid "
+            "JOIN pg_namespace tn ON tn.oid = tc.relnamespace "
+            "WHERE tn.nspname = :schema AND tc.relname = :item_table "
+            "AND am.amname = 'bm25' AND ic.relname <> :own LIMIT 1"
+        ),
+        {"schema": AI_SCHEMA, "item_table": item_table, "own": own_index},
+    ).first()
+    return row[0] if row else None
+
+
+def _kb_config_sql() -> str:
+    """The three KB fields that decide whether and how to index it."""
+    return (
+        "SELECT indexing_config->>'strategy', "
+        "retrieval_config->>'method', "
+        "retrieval_config->>'ts_language' "
+        f'FROM "{AI_SCHEMA}".knowledge_bases WHERE id = :id'
+    )
 
 
 def _autocommit_connection(engine):
@@ -402,7 +430,7 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
         if not pg_search_installed(conn):
             return {"status": "skipped", "reason": "extension_absent"}
 
-        row = conn.execute(text(_KB_CONFIG_SQL), {"id": kb_id}).first()
+        row = conn.execute(text(_kb_config_sql()), {"id": kb_id}).first()
         if row is None:
             return {"status": "skipped", "reason": "kb_not_found"}
         strategy, method, ts_language = row[0], row[1], row[2]
@@ -429,6 +457,19 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
 
         if existing_def and indexdef_matches_tokenizer(existing_def, cast):
             return {**outcome, "status": bm25_index_state(conn, kb_id, item_table)}
+
+        occupant = _other_bm25_index_on_table(conn, item_table, name)
+        if occupant:
+            logger.warning(
+                "Not building BM25 index %s: %s.%s already carries %s and pg_search "
+                "supports one bm25 index per table; building a second one would break "
+                "scored queries against the first. This KB keeps the existing keyword path",
+                name,
+                AI_SCHEMA,
+                item_table,
+                occupant,
+            )
+            return {**outcome, "status": "skipped", "reason": "table_index_conflict"}
 
         try:
             if existing_def:

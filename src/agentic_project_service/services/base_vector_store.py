@@ -594,7 +594,13 @@ class BasePgVectorStore:
         """
         params["top_k"] = top_k
 
-        result = self.session.execute(text(search_query), params)
+        # Inside a savepoint so a failure leaves the caller's session usable.
+        # Without it, a rejected query aborts the whole transaction and the
+        # keyword fallback dies too with "current transaction is aborted" —
+        # which is exactly the case this path has to degrade through.
+        with self.session.begin_nested():
+            rows = self.session.execute(text(search_query), params).fetchall()
+
         items = [
             RetrievedItem(
                 item_id=str(row[0]),
@@ -604,7 +610,7 @@ class BasePgVectorStore:
                 knowledge_base_id=self.kb_id,
                 meta=row[4] or {},
             )
-            for row in result
+            for row in rows
         ]
         return self._resolve_results(items) if _resolve else items
 
