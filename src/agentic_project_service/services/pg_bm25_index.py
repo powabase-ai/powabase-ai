@@ -350,7 +350,9 @@ def pg_bm25_status(knowledge_base_id: str, strategy: str | None, session=None) -
             return None
         return bm25_index_state(session, knowledge_base_id, item_table)
     except Exception as exc:
-        logger.debug("Could not compute pg_search BM25 status for KB %s: %s", knowledge_base_id, exc)
+        logger.debug(
+            "Could not compute pg_search BM25 status for KB %s: %s", knowledge_base_id, exc
+        )
         return None
 
 
@@ -430,9 +432,7 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
 
         try:
             if existing_def:
-                logger.info(
-                    "Rebuilding BM25 index %s: tokenizer changed to %s", name, cast
-                )
+                logger.info("Rebuilding BM25 index %s: tokenizer changed to %s", name, cast)
                 conn.execute(text(bm25_drop_ddl(kb_id, item_table)))
             conn.execute(text(bm25_index_ddl(kb_id, item_table, ts_language)))
         except Exception as exc:
@@ -473,7 +473,9 @@ def drop_bm25_index(knowledge_base_id: str, engine=None) -> dict:
                 dropped.append(bm25_index_name(kb_id, item_table))
             except Exception:
                 logger.warning(
-                    "Could not drop BM25 index for KB %s on %s", kb_id, item_table,
+                    "Could not drop BM25 index for KB %s on %s",
+                    kb_id,
+                    item_table,
                     exc_info=True,
                 )
 

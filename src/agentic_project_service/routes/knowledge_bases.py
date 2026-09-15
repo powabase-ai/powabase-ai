@@ -13,6 +13,7 @@ from ..celery import celery_app
 from ..db import db, AI_SCHEMA
 from ..services.ai_provider_keys_resolver import get_all_user_provider_keys
 from ..services.base_vector_store import KeywordSearchTimeout
+from ..services.pg_bm25_index import pg_bm25_status, pg_search_installed
 from ..services.settings_registry import get_setting
 from ..services.sparse_retrieval import (
     SparseIndexStore,
@@ -26,6 +27,8 @@ from ..strategies.graph_defaults import (
 )
 from ..tasks.indexing import (
     build_bm25_for_kb,
+    drop_pg_bm25_index,
+    ensure_pg_bm25_index,
     index_source,
     reindex_knowledge_base,
     reenrich_graph_references,
@@ -326,12 +329,65 @@ def _count_items_for_kb_bm25(kb_id: str, item_table: str) -> int:
     return int(row[0]) if row else 0
 
 
+_KEYWORD_RETRIEVAL_METHODS = ("hybrid", "full_text")
+
+
+def _pg_search_available() -> bool:
+    """Is the pg_search extension installed in this project's database?
+
+    Cached inside the service; never raises, so a caller can branch on it
+    without a guard of its own.
+    """
+    try:
+        return pg_search_installed(db.session)
+    except Exception:
+        logger.debug("Could not determine pg_search availability", exc_info=True)
+        return False
+
+
+def _pg_bm25_inputs_changed(old_config: dict, new_config: dict) -> bool:
+    """Does this retrieval_config edit change the KB's pg_search index?
+
+    Two edits do: turning on a keyword retrieval method, and changing
+    ts_language (the tokenizer is baked into the index, so that one is a drop
+    and recreate). Everything else leaves the index correct as it stands.
+    """
+    if new_config.get("method") not in _KEYWORD_RETRIEVAL_METHODS:
+        return False
+    if old_config.get("method") not in _KEYWORD_RETRIEVAL_METHODS:
+        return True
+    return old_config.get("ts_language") != new_config.get("ts_language")
+
+
+def _dispatch_ensure_pg_bm25_index(kb_id: str) -> None:
+    """Ask a worker to reconcile this KB's pg_search index; never fatal.
+
+    The task itself decides whether there is anything to do — no extension, a
+    strategy with no keyword table, an index that already matches — so this
+    can be fired off without reading any of that on the request path.
+    """
+    try:
+        ensure_pg_bm25_index.delay(kb_id)
+    except Exception:
+        logger.warning(
+            "Failed to dispatch the pg_search BM25 index build for KB %s; "
+            "keyword search keeps its existing path until it is retried",
+            kb_id,
+            exc_info=True,
+        )
+
+
 def _compute_bm25_status(kb) -> str | None:
-    """Returns 'absent' | 'stale' | 'ready', or None when not applicable.
+    """Returns 'absent' | 'building' | 'stale' | 'ready', or None if N/A.
+
+    A pg_search index, when there is one, is the authority: it is what the
+    keyword path will actually use, and 'building' is a state only it has.
+    The bm25s file index answers otherwise.
 
     Returns None (caller should omit the field) when:
       - the KB's retrieval method does not use BM25, OR
-      - BM25_AUTO_INDEXING is on (platform manages it; user has nothing to act on).
+      - there is no pg_search index to report on AND BM25_AUTO_INDEXING is on
+        (platform manages the file index; user has nothing to act on).
     """
     if isinstance(kb, dict):
         retrieval_config = kb.get("retrieval_config") or {}
@@ -343,12 +399,17 @@ def _compute_bm25_status(kb) -> str | None:
         kb_id = kb.id
 
     method = retrieval_config.get("method")
-    if method not in ("hybrid", "full_text"):
-        return None
-    if get_setting("BM25_AUTO_INDEXING"):
+    if method not in _KEYWORD_RETRIEVAL_METHODS:
         return None
 
     strategy = indexing_config.get("strategy")
+    pg_state = pg_bm25_status(kb_id, strategy)
+    if pg_state is not None:
+        return pg_state
+
+    if get_setting("BM25_AUTO_INDEXING"):
+        return None
+
     item_table = _STRATEGY_TO_ITEM_TABLE.get(strategy)
     if item_table is None:
         return None
@@ -508,6 +569,11 @@ def create_knowledge_base():
     )
     db.session.commit()
 
+    if isinstance(retrieval_config, dict) and (
+        retrieval_config.get("method") in _KEYWORD_RETRIEVAL_METHODS
+    ):
+        _dispatch_ensure_pg_bm25_index(kb_id)
+
     return jsonify(
         {
             "id": kb_id,
@@ -594,10 +660,12 @@ def update_knowledge_base(kb_id: str):
     if shape_error:
         return jsonify({"error": shape_error}), 400
 
-    # Capture old method BEFORE the UPDATE so we can detect transitions.
+    # Capture the old config BEFORE the UPDATE so we can detect transitions.
     old_method = None
+    old_retrieval_config: dict = {}
     if "retrieval_config" in data:
-        old_method = _read_existing_retrieval_config(kb_id).get("method")
+        old_retrieval_config = _read_existing_retrieval_config(kb_id)
+        old_method = old_retrieval_config.get("method")
 
     updates = []
     params = {"id": kb_id}
@@ -631,7 +699,13 @@ def update_knowledge_base(kb_id: str):
     db.session.commit()
 
     if "retrieval_config" in data:
-        new_method = (data.get("retrieval_config") or {}).get("method")
+        new_retrieval_config = data.get("retrieval_config") or {}
+        if not isinstance(new_retrieval_config, dict):
+            new_retrieval_config = {}
+        if _pg_bm25_inputs_changed(old_retrieval_config, new_retrieval_config):
+            _dispatch_ensure_pg_bm25_index(kb_id)
+
+        new_method = new_retrieval_config.get("method")
         transitioned_to_bm25 = old_method not in ("hybrid", "full_text") and new_method in (
             "hybrid",
             "full_text",
@@ -803,6 +877,18 @@ def delete_knowledge_base(kb_id: str):
         {"id": kb_id},
     )
     db.session.commit()
+
+    # The KB row is gone, so nothing else will ever reconcile its BM25 index;
+    # dropping it also frees the item table for another KB's index.
+    try:
+        drop_pg_bm25_index.delay(kb_id)
+    except Exception:
+        logger.warning(
+            "Failed to dispatch the pg_search BM25 index drop for deleted KB %s; "
+            "the index is now orphaned and has to be dropped by hand",
+            kb_id,
+            exc_info=True,
+        )
 
     response = {"message": "Knowledge base deleted"}
     if agent_dep_names:
@@ -1631,9 +1717,10 @@ def search_knowledge_base_route(kb_id: str):
 def build_bm25_endpoint(kb_id: str):
     """Dispatch a one-shot BM25 rebuild for this KB.
 
-    Manual operator path: re-tokenizes the entire item table for this
-    KB's strategy (chunks/full_documents/graph_index_nodes) and writes
-    a fresh BM25 index, replacing whatever was there.
+    Manual operator path. With pg_search installed this reconciles the KB's
+    ``USING bm25`` index; without it, it re-tokenizes the entire item table
+    for the KB's strategy and writes a fresh bm25s file index, replacing
+    whatever was there.
 
     Returns 202 + the Celery task id. Caller can poll ``bm25_status`` on
     the KB to observe completion.
@@ -1657,8 +1744,9 @@ def build_bm25_endpoint(kb_id: str):
             }
         ), 400
 
+    task = ensure_pg_bm25_index if _pg_search_available() else build_bm25_for_kb
     try:
-        t = build_bm25_for_kb.delay(kb_id)
+        t = task.delay(kb_id)
     except Exception:
         logger.exception("Failed to dispatch build-bm25 task for KB %s", kb_id)
         return jsonify({"error": "Failed to start BM25 build task"}), 503

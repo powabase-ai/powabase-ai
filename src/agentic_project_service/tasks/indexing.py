@@ -2545,3 +2545,28 @@ def build_bm25_for_kb(self, kb_id: str) -> dict:
         len(item_ids),
     )
     return {"item_table": item_table, "item_count": len(item_ids)}
+
+
+@celery_app.task(max_retries=2, default_retry_delay=300)
+@billing.no_billing_context
+def ensure_pg_bm25_index(kb_id: str) -> dict:
+    """Create or rebuild this KB's pg_search BM25 index.
+
+    Dispatched whenever the index's inputs change — a new KB, a switch to a
+    keyword retrieval method, a ts_language change (which the service handles
+    by dropping and recreating, since the tokenizer is baked into the index) —
+    and by the operator build-bm25 endpoint. Cheap and idempotent when there
+    is nothing to do; returns the service's own outcome dict.
+    """
+    from ..services import pg_bm25_index
+
+    return pg_bm25_index.ensure_bm25_index(kb_id)
+
+
+@celery_app.task(max_retries=2, default_retry_delay=300)
+@billing.no_billing_context
+def drop_pg_bm25_index(kb_id: str) -> dict:
+    """Drop every pg_search BM25 index this KB owns (dispatched on KB delete)."""
+    from ..services import pg_bm25_index
+
+    return pg_bm25_index.drop_bm25_index(kb_id)
