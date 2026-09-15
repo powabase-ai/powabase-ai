@@ -51,14 +51,19 @@ def test_build_picks_chunks_table_for_chunk_embed(
     assert result == {"item_table": "chunks", "item_count": 2}
 
 
-def test_build_picks_full_documents_for_page_index(
+def test_build_picks_full_documents_for_full_document(
     mock_kb_lookup, mock_iter_items, mock_sparse_store_cls
 ):
+    """full_documents belongs to the full_document strategy.
+
+    page_index is compatible with tree_search only and stores its text in
+    page_index_toc/page_index_nodes, so it has no BM25 item table at all.
+    """
     from agentic_project_service.tasks.indexing import build_bm25_for_kb
 
     mock_kb_lookup.return_value = {
         "id": "kb-2",
-        "indexing_config": {"strategy": "page_index"},
+        "indexing_config": {"strategy": "full_document"},
     }
     mock_iter_items.return_value = iter([[{"id": "d1", "text": "summary one"}]])
     sparse_store = mock_sparse_store_cls.return_value

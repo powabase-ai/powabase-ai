@@ -148,6 +148,14 @@ def _iter_items_for_kb_bm25(kb_id: str, item_table: str, batch_size: int = 10_00
             f"WHERE i.knowledge_base_id = :kb "
             f"ORDER BY n.id"
         )
+    elif item_table == "doc2json_documents":
+        sql = text(
+            f"SELECT d.id::text, d.summary "
+            f'FROM "{AI_SCHEMA}".doc2json_documents d '
+            f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = d.indexed_source_id '
+            f"WHERE i.knowledge_base_id = :kb "
+            f"ORDER BY d.id"
+        )
     else:
         raise ValueError(f"Unsupported item_table for BM25 rebuild: {item_table}")
 
