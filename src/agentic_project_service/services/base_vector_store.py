@@ -12,10 +12,12 @@ from typing import Any
 from agentic.knowledge.model_config import HYBRID_DEFAULT_VECTOR_WEIGHT
 from agentic.knowledge.models import RetrievedItem
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from ..db import AI_SCHEMA
 from .kb_search_config import HNSW_ITERATIVE_SCAN_MODE
+from .settings_registry import get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +101,25 @@ def ensure_embedding_index(session: Session, schema: str, dims: int) -> None:
         )
 
 
+_QUERY_CANCELED = "57014"
+
+
+class KeywordSearchTimeout(RuntimeError):
+    """The SQL keyword-search fallback exceeded BM25_FALLBACK_TIMEOUT_MS."""
+
+    def __init__(self, knowledge_base_id: str, timeout_ms: int):
+        super().__init__(
+            f"Keyword search on knowledge base {knowledge_base_id} exceeded "
+            f"{timeout_ms} ms (no BM25 index; one is being built)"
+        )
+        self.knowledge_base_id = knowledge_base_id
+        self.timeout_ms = timeout_ms
+
+
+def _bm25_fallback_timeout_ms() -> int:
+    return int(get_setting("BM25_FALLBACK_TIMEOUT_MS"))
+
+
 class BasePgVectorStore:
     """Base class for pgvector-backed stores.
 
@@ -172,6 +193,38 @@ class BasePgVectorStore:
                 mode,
                 e,
             )
+
+    def _fetch_with_timeout(self, sql: str, params: dict[str, Any], timeout_ms: int) -> list:
+        """Run one query under a statement_timeout scoped to a savepoint.
+
+        Rolling back to the savepoint on cancellation reverts the timeout and
+        clears the aborted-transaction state, so the caller's session stays
+        usable; on success the previous timeout is put back explicitly.
+        """
+        try:
+            with self.session.begin_nested():
+                previous = self.session.execute(
+                    text("SELECT current_setting('statement_timeout')")
+                ).scalar()
+                self.session.execute(
+                    text("SELECT set_config('statement_timeout', :ms, true)"),
+                    {"ms": str(timeout_ms)},
+                )
+                rows = self.session.execute(text(sql), params).fetchall()
+                self.session.execute(
+                    text("SELECT set_config('statement_timeout', :ms, true)"),
+                    {"ms": previous},
+                )
+                return rows
+        except OperationalError as e:
+            if getattr(e.orig, "sqlstate", None) == _QUERY_CANCELED:
+                logger.warning(
+                    "Keyword search fallback cancelled after %d ms (kb=%s)",
+                    timeout_ms,
+                    self.kb_id,
+                )
+                raise KeywordSearchTimeout(self.kb_id, timeout_ms) from e
+            raise
 
     async def vector_search(
         self,
@@ -432,9 +485,9 @@ class BasePgVectorStore:
             LIMIT :safety_limit"""
         params["safety_limit"] = top_k * 10
 
+        timeout_ms = _bm25_fallback_timeout_ms()
         try:
-            result = self.session.execute(text(search_query), params)
-            rows = result.fetchall()
+            rows = self._fetch_with_timeout(search_query, params, timeout_ms)
 
             if not rows:
                 return []
