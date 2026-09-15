@@ -12,6 +12,7 @@ from ..auth import require_auth
 from ..celery import celery_app
 from ..db import db, AI_SCHEMA
 from ..services.ai_provider_keys_resolver import get_all_user_provider_keys
+from ..services.base_vector_store import KeywordSearchTimeout
 from ..services.settings_registry import get_setting
 from ..services.sparse_retrieval import (
     SparseIndexStore,
@@ -1601,6 +1602,17 @@ def search_knowledge_base_route(kb_id: str):
             }
         )
 
+    except KeywordSearchTimeout as e:
+        return jsonify(
+            {
+                "error": (
+                    "Keyword search timed out: this knowledge base has no BM25 "
+                    "index yet. A build has been queued; retry shortly."
+                ),
+                "code": "keyword_search_timeout",
+                "timeout_ms": e.timeout_ms,
+            }
+        ), 503
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:

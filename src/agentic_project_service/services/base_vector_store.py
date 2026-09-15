@@ -680,6 +680,47 @@ class BasePgVectorStore:
             logger.error(f"Failed to fetch items by ID: {e}")
             raise
 
+    async def keyword_search_for_hybrid(
+        self,
+        query: str,
+        top_k: int,
+        filter_metadata: dict | None,
+        item_ids: set[str] | None,
+        source_ids: list[str] | None,
+        ts_language: str = "english",
+        use_bm25s: bool = True,
+    ) -> list[RetrievedItem]:
+        """Keyword leg of a hybrid search; empty when the SQL fallback times out.
+
+        Hybrid still has its vector leg, so a slow keyword fallback should cost
+        that search its keyword signal, not the whole answer.
+        """
+        try:
+            if use_bm25s:
+                return await self.bm25s_search(
+                    query=query,
+                    top_k=top_k,
+                    filter_metadata=filter_metadata,
+                    item_ids=item_ids,
+                    _resolve=False,
+                    source_ids=source_ids,
+                )
+            return await self.full_text_search(
+                query,
+                top_k=top_k,
+                filter_metadata=filter_metadata,
+                item_ids=item_ids,
+                ts_language=ts_language,
+                _resolve=False,
+                source_ids=source_ids,
+            )
+        except KeywordSearchTimeout:
+            logger.warning(
+                "Hybrid search on KB %s is returning vector results only: keyword fallback timed out",
+                self.kb_id,
+            )
+            return []
+
     async def hybrid_search(
         self,
         query: str,
@@ -705,14 +746,14 @@ class BasePgVectorStore:
             _resolve=False,
             source_ids=source_ids,
         )
-        text_results = await self.full_text_search(
+        text_results = await self.keyword_search_for_hybrid(
             query,
             top_k=fetch_count,
             filter_metadata=filter_metadata,
             item_ids=item_ids,
-            ts_language=ts_language,
-            _resolve=False,
             source_ids=source_ids,
+            ts_language=ts_language,
+            use_bm25s=False,
         )
 
         keyword_weight = 1.0 - vector_weight
