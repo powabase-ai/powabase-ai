@@ -16,6 +16,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from ..db import AI_SCHEMA
+from . import pg_bm25_index
 from .kb_search_config import HNSW_ITERATIVE_SCAN_MODE
 from .settings_registry import get_setting
 
@@ -538,6 +539,96 @@ class BasePgVectorStore:
             logger.error(f"Full-text search failed: {e}")
             raise
 
+    async def pg_bm25_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        filter_metadata: dict | None = None,
+        item_ids: set[str] | None = None,
+        _resolve: bool = True,
+        source_ids: list[str] | None = None,
+    ) -> list[RetrievedItem]:
+        """BM25 search answered by this KB's pg_search index.
+
+        Requires that index to exist and be valid — see
+        ``pg_bm25_index.bm25_index_ready``. The KB id is interpolated as a
+        validated UUID literal because a bound parameter does not match the
+        index's partial predicate, which would cost the query its index; every
+        other value, the query text included, is bound.
+        """
+        kb_literal = pg_bm25_index._validated_kb_id(self.kb_id)
+        normalized = pg_bm25_index.normalize_bm25_query(query)
+        if not normalized:
+            return []
+
+        match_expression = pg_bm25_index.bm25_text_expression(self.TABLE, alias="c")
+        search_query = f"""
+            SELECT
+                c.id,
+                c.{self.TEXT_COL},
+                pdb.score(c.id) AS score,
+                c.source_id,
+                c.meta
+            FROM "{self.schema}".{self.TABLE} c
+            WHERE c.knowledge_base_id = '{kb_literal}'
+              AND {match_expression} ||| :bm25_query
+        """
+        params: dict[str, Any] = {"bm25_query": normalized}
+
+        if item_ids is not None:
+            search_query += " AND c.id = ANY(CAST(:item_ids AS uuid[]))"
+            params["item_ids"] = "{" + ",".join(item_ids) + "}"
+
+        if source_ids is not None:
+            search_query += " AND c.source_id = ANY(CAST(:source_ids AS uuid[]))"
+            params["source_ids"] = "{" + ",".join(source_ids) + "}"
+
+        if filter_metadata:
+            for key, value in filter_metadata.items():
+                search_query += f" AND c.meta @> CAST(:filter_{key} AS jsonb)"
+                params[f"filter_{key}"] = json.dumps({key: value})
+
+        search_query += """
+            ORDER BY pdb.score(c.id) DESC
+            LIMIT :top_k
+        """
+        params["top_k"] = top_k
+
+        result = self.session.execute(text(search_query), params)
+        items = [
+            RetrievedItem(
+                item_id=str(row[0]),
+                text=row[1],
+                score=float(row[2]) if row[2] is not None else 0.0,
+                source_id=str(row[3]) if row[3] else None,
+                knowledge_base_id=self.kb_id,
+                meta=row[4] or {},
+            )
+            for row in result
+        ]
+        return self._resolve_results(items) if _resolve else items
+
+    def _pg_bm25_is_usable(self) -> bool:
+        """Can this KB's keyword leg be served by pg_search right now?
+
+        Never raises: this runs on the search path, where an unanswerable
+        question has to mean "keep the old path". Readiness is only probed
+        once the extension is known to be installed, and both answers are
+        cached, so the common case costs nothing.
+        """
+        try:
+            if not pg_bm25_index.pg_search_installed(self.session):
+                return False
+            return pg_bm25_index.bm25_index_ready(self.session, self.kb_id, self.TABLE)
+        except Exception as exc:
+            logger.debug(
+                "Could not determine pg_search availability for KB %s: %s; "
+                "using the existing keyword path",
+                self.kb_id,
+                exc,
+            )
+            return False
+
     async def bm25s_search(
         self,
         query: str,
@@ -547,10 +638,11 @@ class BasePgVectorStore:
         _resolve: bool = True,
         source_ids: list[str] | None = None,
     ) -> list[RetrievedItem]:
-        """BM25 search using pre-built bm25s index.
+        """BM25 keyword search: pg_search index, else bm25s file index, else SQL.
 
-        Uses the sparse_retrieval package for fast pre-indexed BM25 search.
-        Falls back to legacy full_text_search() if no index exists.
+        Prefers this KB's pg_search index when the extension is installed and
+        that index is ready. Otherwise the pre-built bm25s file index, and
+        failing that the bounded tsvector fallback.
 
         Args:
             query: Search query (may include conversation context).
@@ -564,6 +656,25 @@ class BasePgVectorStore:
             List of RetrievedItem ordered by BM25 score.
         """
         from .sparse_retrieval import SparseIndexStore
+
+        if self._pg_bm25_is_usable():
+            try:
+                return await self.pg_bm25_search(
+                    query,
+                    top_k=top_k,
+                    filter_metadata=filter_metadata,
+                    item_ids=item_ids,
+                    _resolve=_resolve,
+                    source_ids=source_ids,
+                )
+            except Exception:
+                logger.warning(
+                    "pg_search keyword search failed for KB %s table %s; "
+                    "falling back to the existing keyword path",
+                    self.kb_id,
+                    self.TABLE,
+                    exc_info=True,
+                )
 
         sparse_store = SparseIndexStore(knowledge_base_id=self.kb_id)
 
