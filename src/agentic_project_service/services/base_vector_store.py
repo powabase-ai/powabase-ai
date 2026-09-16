@@ -133,10 +133,16 @@ class KeywordSearchTimeout(RuntimeError):
 # process. The read helper runs on every keyword search, so without this a
 # single bad row would emit one warning per search for as long as it sits in
 # project_settings — burying the first one. Bounded by the number of distinct
-# bad values, which is bounded by how often someone writes the setting. Also
-# keys the pg_search keyword-search failure warning (one per KB, table and
-# exception type).
+# bad values, which is bounded by how often someone writes the setting.
 _WARNED_TIMEOUT_OVERRIDES: set[str] = set()
+
+# pg_search keyword-search failures already reported at WARNING, keyed by KB,
+# table and the failure's first line, so a different cause of the same
+# exception type is reported too. One per knowledge base can add up, so the
+# set is cleared when it reaches the bound: a persisting failure then warns
+# again, once.
+_WARNED_PG_BM25_FAILURES: set[str] = set()
+_WARNED_PG_BM25_FAILURES_MAX = 1024
 
 
 def _warn_once_per_bad_value(key: str, message: str, *args: Any) -> None:
@@ -145,6 +151,17 @@ def _warn_once_per_bad_value(key: str, message: str, *args: Any) -> None:
         logger.debug(message, *args)
         return
     _WARNED_TIMEOUT_OVERRIDES.add(key)
+    logger.warning(message, *args)
+
+
+def _warn_once_per_pg_bm25_failure(key: str, message: str, *args: Any) -> None:
+    """WARNING the first time this failure is seen (within the bound), DEBUG afterwards."""
+    if key in _WARNED_PG_BM25_FAILURES:
+        logger.debug(message, *args)
+        return
+    if len(_WARNED_PG_BM25_FAILURES) >= _WARNED_PG_BM25_FAILURES_MAX:
+        _WARNED_PG_BM25_FAILURES.clear()
+    _WARNED_PG_BM25_FAILURES.add(key)
     logger.warning(message, *args)
 
 
@@ -888,9 +905,9 @@ class BasePgVectorStore:
                 # Once per KB, table and cause at WARNING, without a traceback:
                 # this runs on every search for as long as the cause lasts (a
                 # readiness answer cached past a dropped index, say).
-                cause = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
-                _warn_once_per_bad_value(
-                    f"pg_bm25:{self.kb_id}:{self.TABLE}:{type(exc).__name__}",
+                cause = pg_bm25_index.first_error_line(exc)
+                _warn_once_per_pg_bm25_failure(
+                    f"{self.kb_id}:{self.TABLE}:{cause[:200]}",
                     "pg_search keyword search failed for KB %s table %s (%s); "
                     "falling back to the existing keyword path",
                     self.kb_id,

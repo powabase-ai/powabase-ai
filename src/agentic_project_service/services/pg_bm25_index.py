@@ -93,16 +93,25 @@ MOVE_LOCK_TIMEOUT_MS = 5_000
 # close a cycle; a transaction that only starts waiting after the request starts
 # its deadlock check after the queued try has already timed out. A move that
 # cannot get the lock in time rolls back (SQLSTATE 55P03) and its task retries.
+# A queued request by anyone else for a conflicting lock on DEFAULT makes every
+# ``NOWAIT`` try fail for as long as it waits, so the move then has only its
+# single queued try.
+#
+# The cycle above involves the connection holding the parent lock, so it bears
+# on the ATTACH and on dropping the check. The check itself is added from a
+# second connection that holds no lock: its queued try cannot close a cycle
+# through the move that Postgres could see.
 #
 # One cycle is left open, and has been reproduced. A session already blocked on
 # the move (a write through the parent) runs its one-time deadlock check
 # ``deadlock_timeout`` after it began waiting. If a holder of DEFAULT starts
 # waiting on that session -- for a row it has locked, say -- after the holder
 # check but within the queued try's window, the check finds move -> holder ->
-# session -> move, and Postgres aborts one of the three with SQLSTATE 40P01.
-# No row is lost: the aborted transaction rolls back whole, a move that loses
-# rolls back and retries, ``index_source`` requeues, and an API writer receives
-# the error. Closing it precisely would mean skipping the queued try whenever
+# session -> move, and Postgres aborts the session whose check found it -- the
+# one already blocked on the move -- with SQLSTATE 40P01. No row is lost: the
+# aborted transaction rolls back whole, ``index_source`` requeues, and an API
+# writer receives the error. (``index_source`` itself no longer takes part:
+# the move gate keeps its transactions out of the move.) Closing it precisely would mean skipping the queued try whenever
 # any session waits on the move, and under steady writes one always does --
 # for the whole copy of a large move -- so large moves would starve.
 #
@@ -489,11 +498,12 @@ def partition_build_lock_relation(item_table: str) -> str:
 def partition_build_lock_sql() -> str:
     """Try to claim the right to move rows out of this table's DEFAULT partition.
 
-    Two concurrent moves out of one DEFAULT partition deadlock each other: each
-    takes SHARE on it and then asks to upgrade to the ACCESS EXCLUSIVE its own
-    ATTACH needs, so each waits for the other's SHARE. Observed on a real
-    project as ``deadlock detected`` with both tasks failing. Serialising the
-    moves per item table removes the cycle entirely.
+    Two concurrent moves out of one DEFAULT partition cannot both finish: each
+    takes SHARE on it and then needs the ACCESS EXCLUSIVE its own ATTACH takes,
+    which the other's SHARE refuses. Before the ACCESS EXCLUSIVE tries were
+    made ``NOWAIT`` this was observed on a real project as ``deadlock
+    detected`` with both tasks failing; now both would merely give up.
+    Serialising the moves per item table avoids the conflict altogether.
 
     Session-scoped, not transaction-scoped: preparing the clone and moving the
     rows are separate transactions, so a ``pg_advisory_xact_lock`` would be
@@ -842,7 +852,7 @@ def pg_search_installed(session, *, use_cache: bool = True) -> bool:
         logger.warning(
             "Could not determine whether pg_search is installed (%s); using the "
             "existing keyword path for this request",
-            str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+            first_error_line(exc),
         )
         return False
     _extension_cache = (now, installed)
@@ -891,7 +901,7 @@ def bm25_index_state(session, knowledge_base_id: str, item_table: str) -> str:
             "Could not read BM25 index state for KB %s on %s: %s",
             knowledge_base_id,
             item_table,
-            str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+            first_error_line(exc),
         )
         return "absent"
 
@@ -914,7 +924,7 @@ def bm25_index_ready(session, knowledge_base_id: str, item_table: str) -> bool:
             "existing keyword path for this request",
             knowledge_base_id,
             item_table,
-            str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+            first_error_line(exc),
         )
         return False
     if len(_ready_cache) >= _READY_CACHE_MAX_ENTRIES:
@@ -974,7 +984,7 @@ def keyword_index_backend(session, strategy: str | None) -> str | None:
             "as the bm25s file index",
             AI_SCHEMA,
             item_table,
-            str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+            first_error_line(exc),
         )
         return "bm25s"
     return "pg_search" if partitioned else "bm25s"
@@ -993,7 +1003,8 @@ def pg_search_serves_kb(session, knowledge_base_id: str, strategy: str | None) -
     Not cached, unlike ``bm25_index_ready``: a cached "ready" can outlive an
     index dropped by another process for the cache's TTL, and stopping
     maintenance on it would silently freeze the file index search falls back
-    to. One catalog lookup per call. Never raises; "can't tell" is False.
+    to. Two or three catalog lookups per call (the extension, whether the table
+    is partitioned, the index). Never raises; "can't tell" is False.
     """
     try:
         if keyword_index_backend(session, strategy) != "pg_search":
@@ -1007,7 +1018,7 @@ def pg_search_serves_kb(session, knowledge_base_id: str, strategy: str | None) -
             "Could not tell whether pg_search serves KB %s (%s); treating its keyword index "
             "as the bm25s file index",
             knowledge_base_id,
-            str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+            first_error_line(exc),
         )
         return False
 
@@ -1247,11 +1258,16 @@ class Bm25IndexBuildFailed(RuntimeError):
     """
 
 
-def _first_line(exc: BaseException) -> str:
+def first_error_line(exc: BaseException) -> str:
     """The first line of an error's message, or its type name when it has none."""
-    message = str(getattr(exc, "orig", None) or exc)
-    lines = message.splitlines()
-    return lines[0] if lines and lines[0] else type(exc).__name__
+    orig = getattr(exc, "orig", None)
+    for candidate in (orig, exc):
+        if candidate is None:
+            continue
+        lines = [line for line in str(candidate).splitlines() if line.strip()]
+        if lines:
+            return lines[0]
+    return type(orig if orig is not None else exc).__name__
 
 
 def _sqlstate(exc: BaseException) -> str | None:
@@ -1294,11 +1310,23 @@ def is_partition_move_race(exc: BaseException) -> bool:
     planned before the ATTACH), or the move's temporary ``bm25_move_<kb>``
     check on DEFAULT. An ordinary CHECK violation is a real error and is not
     matched.
+
+    Read from the error's diagnostics when the server sends them, so a
+    translated message classifies the same: a CHECK violation always names its
+    constraint, and a partition constraint violation names none. Only a server
+    that sends no fields at all is read by its (untranslated) message.
     """
     orig = getattr(exc, "orig", None)
     if getattr(orig, "sqlstate", None) != "23514":
         return False
-    message = str(orig)
+    diag = getattr(orig, "diag", None)
+    constraint = getattr(diag, "constraint_name", None)
+    table = getattr(diag, "table_name", None)
+    if constraint is not None or table is not None:
+        if constraint is None:
+            return True
+        return re.fullmatch(rf"{_DEFAULT_MOVE_CHECK_PREFIX}[0-9a-f]{{32}}", constraint) is not None
+    message = first_error_line(exc)
     return "violates partition constraint" in message or (
         f'violates check constraint "{_DEFAULT_MOVE_CHECK_PREFIX}' in message
     )
@@ -1388,7 +1416,7 @@ def _fail_move(
             item_table,
             step,
             _sqlstate(exc),
-            _first_line(exc),
+            first_error_line(exc),
             exc_info=exc,
         )
         return
@@ -1401,7 +1429,7 @@ def _fail_move(
         item_table,
         step,
         _sqlstate(exc),
-        _first_line(exc),
+        first_error_line(exc),
         holders,
     )
 
@@ -1935,9 +1963,10 @@ def _queued_lock_try(conn, item_table: str, lock_timeout_ms: int) -> bool:
     Not deadlock-free. A session blocked on the caller's parent lock can have
     its one-time deadlock check fire while this request waits, and a holder of
     DEFAULT that began waiting on that session after ``_default_holder_is_waiting``
-    looked closes a three-party cycle within this window: Postgres aborts one
-    party with SQLSTATE 40P01. No row is lost -- ``index_source`` requeues, an
-    API writer receives the error, a move that loses rolls back and retries.
+    looked closes a three-party cycle within this window: Postgres aborts the
+    blocked session, whose deadlock check is the one that finds it, with
+    SQLSTATE 40P01. No row is lost -- ``index_source`` requeues, an API writer
+    receives the error.
     It is left open because the precise guard, no queued try while anything
     waits on the move, would starve large moves under steady writes (see
     ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS``).
@@ -2050,7 +2079,7 @@ def clear_leftover_move_checks_at_start(engine) -> dict[str, list[str] | str]:
                     "Could not check %s.%s for leftover move checks at start-up: %s",
                     AI_SCHEMA,
                     item_table,
-                    str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+                    first_error_line(exc),
                 )
             continue
         if outcomes[item_table]:
@@ -2083,7 +2112,7 @@ def move_check_refusal_item_table(exc: BaseException) -> str | None:
     schema = getattr(diag, "schema_name", None)
     if constraint is None and table is None and schema is None:
         match = re.search(
-            r'relation "([^"]+)" violates check constraint "([^"]+)"', str(orig).splitlines()[0]
+            r'relation "([^"]+)" violates check constraint "([^"]+)"', first_error_line(exc)
         )
         if match is None:
             return None
@@ -2116,7 +2145,7 @@ def clear_move_check_after_refusal(engine, exc: BaseException) -> list[str]:
         logger.debug(
             "A refused write was not traced to a move check on a DEFAULT partition; "
             "nothing to clear: %s",
-            str(getattr(exc, "orig", exc)).splitlines()[0] if str(exc) else type(exc).__name__,
+            first_error_line(exc),
         )
         return []
     try:
@@ -2127,9 +2156,7 @@ def clear_move_check_after_refusal(engine, exc: BaseException) -> list[str]:
             "write is retried later",
             AI_SCHEMA,
             default_partition_name(item_table),
-            str(getattr(clear_exc, "orig", clear_exc)).splitlines()[0]
-            if str(clear_exc)
-            else type(clear_exc).__name__,
+            first_error_line(clear_exc),
         )
         return []
     if dropped:
@@ -2171,7 +2198,7 @@ def _drop_failed_move_check(conn, kb_id: str, item_table: str) -> None:
             AI_SCHEMA,
             default_partition_name(item_table),
             MOVE_CHECK_CLEANUP_WAIT_SECONDS,
-            str(getattr(exc, "orig", exc)).splitlines()[0],
+            first_error_line(exc),
             kb_id,
         )
 
@@ -2358,7 +2385,7 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
     closes that gap, because no writer can reach DEFAULT through the parent
     until the move commits.
 
-    Because step 3 is one transaction, every reader sees the knowledge base's
+    Because step 2 is one transaction, every reader sees the knowledge base's
     rows either all in DEFAULT or all in the partition, and writers through the
     parent wait for the commit and then plan against the new partition list
     (see ``partition_lock_parent_ddl``). That is the deliberate choice over the
@@ -2598,8 +2625,8 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None, on_progress=None) -> 
 
     Idempotent, and a no-op whenever a BM25 index is not the right answer: no
     extension, no such KB, a retrieval method that never runs a keyword leg, a
-    strategy with no keyword item table, an item table that is never
-    partitioned, or one the conversion migration has not reached. A tokenizer
+    strategy with no keyword item table, or an item table the conversion
+    migration has not reached. A tokenizer
     that no longer matches the KB's ``ts_language`` is dropped and recreated --
     the tokenizer is baked into the index, so a language change cannot be
     applied in place. This KB's index on any *other* item table -- left by a
@@ -2683,7 +2710,7 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None, on_progress=None) -> 
                     "next BM25 index build on this table",
                     AI_SCHEMA,
                     default_partition_name(item_table),
-                    str(getattr(exc, "orig", exc)).splitlines()[0],
+                    first_error_line(exc),
                 )
         else:
             if _relkind(conn, default_partition_name(item_table)) is None:
@@ -2838,7 +2865,7 @@ def _ensure_index_locked(
         if _sqlstate(exc) == "XX000":
             raise Bm25IndexBuildFailed(
                 f"the concurrent build of {AI_SCHEMA}.{name} failed inside pg_search "
-                f"({_first_line(exc)}); the next ensure rebuilds it"
+                f"({first_error_line(exc)}); the next ensure rebuilds it"
             ) from exc
         raise
     finally:

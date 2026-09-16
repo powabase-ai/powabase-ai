@@ -360,7 +360,7 @@ def test_a_failing_pg_query_warns_once_with_its_cause_and_no_traceback(caplog, m
     """The fallback runs on every search while the pg path keeps failing, so a
     traceback per search would flood the log. One WARNING names the cause; the
     repeats go to DEBUG."""
-    monkeypatch.setattr(bvs, "_WARNED_TIMEOUT_OVERRIDES", set())
+    monkeypatch.setattr(bvs, "_WARNED_PG_BM25_FAILURES", set())
     store = _ChunkStore(db_session=_spy_session(), knowledge_base_id=KB)
 
     async def pg(*a, **k):

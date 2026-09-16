@@ -194,13 +194,17 @@ def _fetch_kb_for_bm25_build(kb_id: str) -> dict:
 
 
 def _iter_items_for_kb_bm25(kb_id: str, item_table: str, batch_size: int = 10_000):
-    """Yield batches of {id, text} for the right item_table for this KB."""
+    """Yield batches of {id, text} for the right item_table for this KB.
+
+    The item table's own ``knowledge_base_id`` predicate is what prunes the scan
+    to the KB's partition; the join alone would read every partition.
+    """
     if item_table == "chunks":
         sql = text(
             f"SELECT c.id::text, c.text "
             f'FROM "{AI_SCHEMA}".chunks c '
             f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = c.indexed_source_id '
-            f"WHERE i.knowledge_base_id = :kb "
+            f"WHERE c.knowledge_base_id = :kb AND i.knowledge_base_id = :kb "
             f"ORDER BY c.id"
         )
     elif item_table == "full_documents":
@@ -208,7 +212,7 @@ def _iter_items_for_kb_bm25(kb_id: str, item_table: str, batch_size: int = 10_00
             f"SELECT d.id::text, d.summary "
             f'FROM "{AI_SCHEMA}".full_documents d '
             f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = d.indexed_source_id '
-            f"WHERE i.knowledge_base_id = :kb "
+            f"WHERE d.knowledge_base_id = :kb AND i.knowledge_base_id = :kb "
             f"ORDER BY d.id"
         )
     elif item_table == "graph_index_nodes":
@@ -216,7 +220,7 @@ def _iter_items_for_kb_bm25(kb_id: str, item_table: str, batch_size: int = 10_00
             f"SELECT n.id::text, COALESCE(n.title, '') || ' ' || COALESCE(n.text, '') "
             f'FROM "{AI_SCHEMA}".graph_index_nodes n '
             f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = n.indexed_source_id '
-            f"WHERE i.knowledge_base_id = :kb "
+            f"WHERE n.knowledge_base_id = :kb AND i.knowledge_base_id = :kb "
             f"ORDER BY n.id"
         )
     else:
@@ -2174,7 +2178,7 @@ def index_source(
                 ),
                 sqlstate,
                 MOVE_CONFLICT_REQUEUE_COUNTDOWN_SECONDS,
-                str(exc).splitlines()[0],
+                pg_bm25_index.first_error_line(exc),
             )
             if pg_bm25_index.is_partition_move_race(exc):
                 # A move check left on DEFAULT by a move that could not drop
