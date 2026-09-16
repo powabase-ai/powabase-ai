@@ -5,7 +5,7 @@ import logging
 import uuid
 from typing import Any
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, make_response, request
 from sqlalchemy import text
 
 from ..auth import require_auth
@@ -17,6 +17,7 @@ from ..services.base_vector_store import (
     get_retrieval_degradations,
     reset_retrieval_degradations,
 )
+from ..services import pg_bm25_index
 from ..services.bm25_build_outcome import read_bm25_build_outcome
 from ..services.pg_bm25_index import (
     keyword_index_backend,
@@ -390,14 +391,19 @@ def _pg_bm25_inputs_changed(old_config: dict, new_config: dict) -> bool:
 def _dispatch_ensure_pg_bm25_index(kb_id: str) -> None:
     """Ask a worker to reconcile this KB's pg_search partition and index.
 
-    Never fatal, and always off the request path: the first run for a KB moves
-    that KB's rows out of the item table's DEFAULT partition in one
-    transaction, and writes to that whole item table -- every KB on it -- wait
-    for the full move. Readers do not wait on its SHARE locks; readers of the
-    DEFAULT partition wait at most a fraction of a second for each of its
-    ACCESS EXCLUSIVE steps (see ``create_partition``). Dispatching it at KB
-    creation, before the KB has any rows, is what keeps that move free for
-    every KB created from here on.
+    Never fatal, and always off the request path. For a KB whose rows are
+    still in the item table's DEFAULT partition, the run moves them into the
+    KB's own partition in one transaction, and writes to that whole item
+    table -- every KB on it -- are blocked for the full move. Readers do not
+    wait on its SHARE locks; readers of the DEFAULT partition wait at most a
+    fraction of a second for each of its ACCESS EXCLUSIVE steps (see
+    ``create_partition``).
+
+    So only two callers dispatch it: KB creation, before the KB has any rows
+    (which is what keeps the move free for every KB created from here on),
+    and a PATCH that ``_pg_ensure_cannot_move_rows`` clears; the operator's
+    ``POST /build-bm25`` dispatches the task directly. A PATCH on a KB with
+    rows in DEFAULT dispatches nothing and points at ``/build-bm25`` instead.
 
     The task itself decides whether there is anything to do at all: no
     extension, a strategy with no keyword table, an item table that is not
@@ -412,6 +418,49 @@ def _dispatch_ensure_pg_bm25_index(kb_id: str) -> None:
             kb_id,
             exc_info=True,
         )
+
+
+def _pg_ensure_cannot_move_rows(kb_id: str, strategy: str | None) -> bool:
+    """May a PATCH dispatch the pg_search ensure for this KB?
+
+    Yes only when the ensure cannot start a table-wide move: the KB's
+    partition on the strategy's item table already exists (the ensure only
+    builds or rebuilds the index on it), or the KB has no rows in that table's
+    DEFAULT partition (there is nothing to move; an empty KB gets its partition
+    without blocking writers). A KB with rows in DEFAULT -- or one the catalog
+    cannot answer for -- is left to the operator's ``POST /build-bm25``.
+    Never raises; "can't tell" is False.
+    """
+    item_table = pg_bm25_item_table(strategy or "chunk_embed")
+    if item_table is None:
+        return False
+    try:
+        if pg_bm25_index.partition_exists(db.session, kb_id, item_table):
+            return True
+        return pg_bm25_index.kb_has_rows_in_default(db.session, kb_id, item_table) is False
+    except Exception:
+        logger.warning(
+            "Could not tell whether KB %s has its own %s partition or rows in DEFAULT; "
+            "not dispatching the pg_search index build from this update",
+            kb_id,
+            item_table,
+            exc_info=True,
+        )
+        return False
+
+
+def _build_bm25_required_note(kb_id: str, strategy: str | None) -> str:
+    """The PATCH response note for a KB whose index this update did not build."""
+    item_table = pg_bm25_item_table(strategy or "chunk_embed") or "item"
+    return (
+        "This knowledge base's keyword index was not built by this update: its "
+        f"{item_table} rows are still in the table's shared DEFAULT partition, and "
+        "moving them into their own partition blocks writes to the whole "
+        f"{AI_SCHEMA}.{item_table} table -- every knowledge base on it -- for the "
+        "duration of the move. Build it when that is acceptable with "
+        f"POST /api/knowledge-bases/{kb_id}/build-bm25. Until then keyword search "
+        "keeps its existing path."
+    )
 
 
 def _dispatch_drop_pg_bm25_index(kb_id: str) -> None:
@@ -797,6 +846,8 @@ def update_knowledge_base(kb_id: str):
     if shape_error:
         return jsonify({"error": shape_error}), 400
 
+    # Set when this update needs a pg_search index build it must not start.
+    bm25_note: str | None = None
     # Capture the old config BEFORE the UPDATE so we can detect transitions.
     old_method = None
     old_retrieval_config: dict = {}
@@ -851,12 +902,15 @@ def update_knowledge_base(kb_id: str):
 
         if is_keyword:
             # Exactly one index build, for the index the keyword leg will read.
-            backend = _keyword_index_backend(new_strategy or _read_kb_strategy(kb_id))
+            strategy = new_strategy or _read_kb_strategy(kb_id)
+            backend = _keyword_index_backend(strategy)
             if backend == "pg_search":
                 if strategy_changed or _pg_bm25_inputs_changed(
                     old_retrieval_config, new_retrieval_config
                 ):
-                    _dispatch_ensure_pg_bm25_index(kb_id)
+                    bm25_note = _dispatch_pg_ensure_from_patch(
+                        kb_id, strategy, strategy_changed=strategy_changed
+                    )
             else:
                 if backend == "bm25s" and not was_keyword and get_setting("BM25_AUTO_INDEXING"):
                     try:
@@ -880,11 +934,39 @@ def update_knowledge_base(kb_id: str):
         method = _read_existing_retrieval_config(kb_id).get("method")
         if method in _KEYWORD_RETRIEVAL_METHODS and _pg_search_available():
             if _keyword_index_backend(new_strategy) == "pg_search":
-                _dispatch_ensure_pg_bm25_index(kb_id)
+                bm25_note = _dispatch_pg_ensure_from_patch(
+                    kb_id, new_strategy, strategy_changed=True
+                )
             else:
                 _dispatch_drop_pg_bm25_index(kb_id)
 
-    return get_knowledge_base(kb_id)
+    response = get_knowledge_base(kb_id)
+    if bm25_note is None:
+        return response
+    response = make_response(response)
+    body = response.get_json(silent=True)
+    if response.status_code != 200 or not isinstance(body, dict):
+        return response
+    body["bm25_note"] = bm25_note
+    return jsonify(body), 200
+
+
+def _dispatch_pg_ensure_from_patch(
+    kb_id: str, strategy: str | None, *, strategy_changed: bool
+) -> str | None:
+    """Dispatch the ensure for a PATCH, unless it would start a table-wide move.
+
+    Returns None when dispatched, else the response note pointing at
+    ``POST /build-bm25``. A strategy change that cannot build the new index
+    still drops the KB's index on the table it left, which nothing reads any
+    more (the ensure would otherwise have done that).
+    """
+    if _pg_ensure_cannot_move_rows(kb_id, strategy):
+        _dispatch_ensure_pg_bm25_index(kb_id)
+        return None
+    if strategy_changed:
+        _dispatch_drop_pg_bm25_index(kb_id)
+    return _build_bm25_required_note(kb_id, strategy)
 
 
 @knowledge_bases_bp.route("/<kb_id>/sources", methods=["GET"])

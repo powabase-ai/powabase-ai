@@ -51,6 +51,28 @@ def tasks():
         yield {"ensure": ensure, "build": build, "drop": drop}
 
 
+class _gate:
+    """Patch the two catalog reads that decide whether a PATCH may dispatch the
+    ensure. ``kb_has_rows_in_default`` is created if the service does not
+    define it yet."""
+
+    def __init__(self, partition, rows_in_default):
+        self._patches = {
+            "partition_exists": patch(f"{S}.partition_exists", return_value=partition),
+            "kb_has_rows_in_default": patch(
+                f"{S}.kb_has_rows_in_default", return_value=rows_in_default, create=True
+            ),
+        }
+
+    def __enter__(self):
+        return {name: p.__enter__() for name, p in self._patches.items()}
+
+    def __exit__(self, *exc):
+        for p in reversed(list(self._patches.values())):
+            p.__exit__(*exc)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # The single predicate
 # ---------------------------------------------------------------------------
@@ -165,7 +187,16 @@ class TestCreate:
 
 
 class TestUpdate:
-    def _patch(self, old_config, new_config, backend, *, auto_indexing=True):
+    def _patch(
+        self,
+        old_config,
+        new_config,
+        backend,
+        *,
+        auto_indexing=True,
+        partition=True,
+        rows_in_default=False,
+    ):
         kb_id = str(uuid.uuid4())
         with (
             _AUTH,
@@ -176,6 +207,7 @@ class TestUpdate:
             patch(f"{R}._pg_search_available", return_value=backend == "pg_search"),
             patch(f"{R}.get_setting", return_value=auto_indexing),
             patch(f"{R}.get_knowledge_base", return_value=({"id": kb_id}, 200)),
+            _gate(partition, rows_in_default) as gate,
         ):
             resp = _client().patch(
                 f"/api/knowledge-bases/{kb_id}",
@@ -183,6 +215,8 @@ class TestUpdate:
                 headers=_headers(),
             )
         assert resp.status_code == 200
+        self.body = resp.get_json()
+        self.gate = gate
         return kb_id
 
     @pytest.mark.parametrize("method", ["hybrid", "full_text"])
@@ -239,13 +273,149 @@ class TestUpdate:
         tasks["drop"].delay.side_effect = Exception("broker unreachable")
         self._patch({"method": "hybrid"}, {"method": "vector_search"}, "pg_search")
 
+    @pytest.mark.parametrize(
+        "old, new",
+        [
+            ({"method": "hybrid"}, {"method": "full_text"}),
+            ({"method": "full_text"}, {"method": "hybrid"}),
+            (
+                {"method": "hybrid", "ts_language": "german"},
+                {"method": "hybrid", "ts_language": "german"},
+            ),
+            ({"method": "hybrid"}, {"method": "hybrid", "top_k": 7}),
+        ],
+    )
+    def test_keyword_to_keyword_on_pg_search_dispatches_nothing(self, tasks, old, new):
+        """Nothing about the index changes, so nothing may be dispatched -- even
+        for a KB whose partition exists and whose ensure would be cheap."""
+        self._patch(old, new, "pg_search", partition=True)
+        tasks["ensure"].delay.assert_not_called()
+        tasks["build"].delay.assert_not_called()
+        tasks["drop"].delay.assert_not_called()
+        assert "bm25_note" not in self.body
+
+
+class TestUpdateDoesNotStartAMove:
+    """A PATCH may reconcile a KB's pg_search index only when that cannot move
+    rows out of DEFAULT: its partition already exists, or it has no rows in
+    DEFAULT to move. Anything else blocks writes to the whole item table for
+    the length of the move, which only an operator may start
+    (``POST /build-bm25``)."""
+
+    _patch = TestUpdate._patch
+
+    @pytest.mark.parametrize(
+        "old, new",
+        [
+            ({"method": "vector_search"}, {"method": "hybrid"}),
+            (
+                {"method": "hybrid", "ts_language": "english"},
+                {"method": "hybrid", "ts_language": "german"},
+            ),
+        ],
+    )
+    def test_an_existing_partition_dispatches_the_ensure(self, tasks, old, new):
+        kb_id = self._patch(old, new, "pg_search", partition=True, rows_in_default=None)
+        tasks["ensure"].delay.assert_called_once_with(kb_id)
+        assert "bm25_note" not in self.body
+        assert self.gate["partition_exists"].call_args.args[1:] == (kb_id, "chunks")
+
+    def test_no_rows_in_default_dispatches_the_ensure(self, tasks):
+        kb_id = self._patch(
+            {"method": "vector_search"},
+            {"method": "hybrid"},
+            "pg_search",
+            partition=False,
+            rows_in_default=False,
+        )
+        tasks["ensure"].delay.assert_called_once_with(kb_id)
+        assert "bm25_note" not in self.body
+        assert self.gate["kb_has_rows_in_default"].call_args.args[1:] == (kb_id, "chunks")
+
+    @pytest.mark.parametrize("rows_in_default", [True, None])
+    @pytest.mark.parametrize(
+        "old, new",
+        [
+            ({"method": "vector_search"}, {"method": "hybrid"}),
+            ({"method": "vector_search"}, {"method": "full_text"}),
+            (
+                {"method": "hybrid", "ts_language": "english"},
+                {"method": "hybrid", "ts_language": "german"},
+            ),
+        ],
+    )
+    def test_rows_in_default_dispatch_nothing_and_point_at_build_bm25(
+        self, tasks, old, new, rows_in_default
+    ):
+        """``None`` is "cannot tell", which must not start a move either."""
+        kb_id = self._patch(old, new, "pg_search", partition=False, rows_in_default=rows_in_default)
+        tasks["ensure"].delay.assert_not_called()
+        tasks["build"].delay.assert_not_called()
+        tasks["drop"].delay.assert_not_called()
+        note = self.body["bm25_note"]
+        assert f"POST /api/knowledge-bases/{kb_id}/build-bm25" in note
+        assert "blocks writes" in note
+        assert "chunks" in note
+
+    def test_an_unreadable_gate_dispatches_nothing(self, tasks):
+        with patch(f"{S}.partition_exists", side_effect=RuntimeError("connection lost")):
+            kb_id = str(uuid.uuid4())
+            with (
+                _AUTH,
+                patch(f"{R}.db"),
+                patch(f"{R}._read_existing_retrieval_config", return_value={}),
+                patch(f"{R}._read_kb_strategy", return_value="chunk_embed"),
+                patch(f"{R}._keyword_index_backend", return_value="pg_search"),
+                patch(f"{R}._pg_search_available", return_value=True),
+                patch(f"{R}.get_setting", return_value=True),
+                patch(f"{R}.get_knowledge_base", return_value=({"id": kb_id}, 200)),
+            ):
+                resp = _client().patch(
+                    f"/api/knowledge-bases/{kb_id}",
+                    json={"retrieval_config": {"method": "hybrid"}},
+                    headers=_headers(),
+                )
+        assert resp.status_code == 200
+        tasks["ensure"].delay.assert_not_called()
+        assert "build-bm25" in resp.get_json()["bm25_note"]
+
+    def test_a_failed_get_is_returned_without_a_note(self, tasks):
+        kb_id = str(uuid.uuid4())
+        with (
+            _AUTH,
+            patch(f"{R}.db"),
+            patch(f"{R}._read_existing_retrieval_config", return_value={}),
+            patch(f"{R}._read_kb_strategy", return_value="chunk_embed"),
+            patch(f"{R}._keyword_index_backend", return_value="pg_search"),
+            patch(f"{R}._pg_search_available", return_value=True),
+            patch(f"{R}.get_knowledge_base", return_value=({"error": "gone"}, 404)),
+            _gate(False, True),
+        ):
+            resp = _client().patch(
+                f"/api/knowledge-bases/{kb_id}",
+                json={"retrieval_config": {"method": "hybrid"}},
+                headers=_headers(),
+            )
+        assert resp.status_code == 404
+        assert resp.get_json() == {"error": "gone"}
+
 
 class TestUpdateStrategy:
     """A PATCH that changes ``indexing_config.strategy`` moves the keyword text
     to another item table, so the KB needs its index there -- and the one on
     the old table is dead weight."""
 
-    def _patch(self, body, *, old_strategy, new_backend, method="hybrid", pg_available=True):
+    def _patch(
+        self,
+        body,
+        *,
+        old_strategy,
+        new_backend,
+        method="hybrid",
+        pg_available=True,
+        partition=True,
+        rows_in_default=False,
+    ):
         kb_id = str(uuid.uuid4())
         with (
             _AUTH,
@@ -256,9 +426,12 @@ class TestUpdateStrategy:
             patch(f"{R}._pg_search_available", return_value=pg_available),
             patch(f"{R}.get_setting", return_value=True),
             patch(f"{R}.get_knowledge_base", return_value=({"id": kb_id}, 200)),
+            _gate(partition, rows_in_default) as gate,
         ):
             resp = _client().patch(f"/api/knowledge-bases/{kb_id}", json=body, headers=_headers())
         assert resp.status_code == 200
+        self.body = resp.get_json()
+        self.gate = gate
         return kb_id, backend
 
     @pytest.mark.parametrize("method", ["hybrid", "full_text"])
@@ -311,6 +484,32 @@ class TestUpdateStrategy:
         )
         tasks["ensure"].delay.assert_not_called()
         tasks["drop"].delay.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"indexing_config": {"strategy": "full_document"}},
+            {
+                "indexing_config": {"strategy": "full_document"},
+                "retrieval_config": {"method": "hybrid"},
+            },
+        ],
+    )
+    def test_rows_in_the_new_tables_default_start_no_move(self, tasks, body):
+        """The index on the table the KB left is dead weight either way, so it
+        is dropped; the new one waits for POST /build-bm25."""
+        kb_id, _ = self._patch(
+            body,
+            old_strategy="chunk_embed",
+            new_backend="pg_search",
+            partition=False,
+            rows_in_default=True,
+        )
+        tasks["ensure"].delay.assert_not_called()
+        tasks["drop"].delay.assert_called_once_with(kb_id, drop_partitions=False)
+        assert "build-bm25" in self.body["bm25_note"]
+        assert "full_documents" in self.body["bm25_note"]
+        assert self.gate["partition_exists"].call_args.args[1:] == (kb_id, "full_documents")
 
     def test_strategy_and_retrieval_change_together_dispatch_one_ensure(self, tasks):
         kb_id, _ = self._patch(
