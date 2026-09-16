@@ -166,18 +166,22 @@ def test_create_ddl_shape():
     ddl = pgb.bm25_index_ddl(KB, "chunks", "german")
     assert ddl == (
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
-        f'bm25_chunks_{uuid.UUID(KB).hex} ON "ai".chunks '
+        f'bm25_chunks_{uuid.UUID(KB).hex} ON "ai".chunks_kb_{uuid.UUID(KB).hex} '
         "USING bm25 (id, (text::pdb.simple('stemmer=german')), source_id, meta) "
-        "WITH (key_field = 'id') "
-        f"WHERE knowledge_base_id = '{KB}'"
+        "WITH (key_field = 'id')"
     )
 
 
-def test_create_ddl_uses_the_kb_literal_not_a_bind_parameter():
-    """The partial index predicate is only matched by a literal in the query."""
+def test_create_ddl_scopes_the_kb_by_relation_not_by_predicate():
+    """One index per relation, so the knowledge base *is* the relation.
+
+    The index carries no ``WHERE`` clause and no bind parameter: the partition
+    bound is what restricts it to this KB's rows.
+    """
     ddl = pgb.bm25_index_ddl(KB, "chunks", "german")
-    assert f"'{KB}'" in ddl
-    assert ":" not in ddl.split("WHERE")[-1]
+    assert "WHERE" not in ddl
+    assert ":" not in ddl
+    assert uuid.UUID(KB).hex in ddl
 
 
 def test_create_ddl_is_concurrent_and_idempotent():
