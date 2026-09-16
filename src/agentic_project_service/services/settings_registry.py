@@ -1093,6 +1093,21 @@ def _build_registry() -> dict[str, SettingDef]:
                 "not the whole request."
             ),
         ),
+        SettingDef(
+            key="BM25_MOVE_LONG_HOLDER_SECONDS",
+            category=cat,
+            label="BM25 Move Long-Holder Timeout (s)",
+            type="int",
+            default=5,
+            min=1,
+            max=300,
+            advanced=True,
+            description=(
+                "A transaction holding the default partition for longer than "
+                "this makes a knowledge base's partition move give up and "
+                "retry later instead of blocking writes behind it."
+            ),
+        ),
     ]
 
     # =========================================================================
