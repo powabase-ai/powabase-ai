@@ -915,6 +915,34 @@ def test_a_crashed_move_is_resumed_with_no_row_lost_or_duplicated(engine, sessio
     assert len(_search(session, "Wanderung", top_k=5)) == 5
 
 
+def test_ensure_repairs_an_index_whose_concurrent_build_failed(engine, session, caplog):
+    """B3: an INVALID bm25 index with no build running is dropped and rebuilt.
+
+    ``indisvalid = false`` is exactly what a cancelled, killed or failed
+    CREATE INDEX CONCURRENTLY leaves behind.
+    """
+    assert pgb.ensure_bm25_index(KB_A, engine=engine)["status"] == "ready"
+    name = pgb.bm25_index_name(KB_A, "chunks")
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(
+            text(
+                f"UPDATE pg_index SET indisvalid = false WHERE indexrelid = '{SCHEMA}.{name}'::regclass"
+            )
+        )
+    assert pgb.bm25_index_state(session, KB_A, "chunks") == "building"
+    session.rollback()
+    pgb.reset_pg_bm25_caches()
+
+    with caplog.at_level("WARNING"):
+        result = pgb.ensure_bm25_index(KB_A, engine=engine)
+
+    assert result["status"] == "ready"
+    assert pgb.bm25_index_state(session, KB_A, "chunks") == "ready"
+    session.rollback()
+    assert name in caplog.text
+    assert len(_search(session, "Wanderung", top_k=5)) == 2
+
+
 def test_ensure_is_idempotent_and_does_not_rebuild_the_partition(engine, session):
     first = pgb.ensure_bm25_index(KB_A, engine=engine)
     created = _indexdef(session)

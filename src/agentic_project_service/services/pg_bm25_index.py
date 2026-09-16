@@ -616,8 +616,9 @@ def bm25_index_state(session, knowledge_base_id: str, item_table: str) -> str:
     (a leftover from the unpartitioned design, say) must not read as ready.
 
     ``building`` is an index row with ``indisvalid = false`` -- what a
-    CREATE INDEX CONCURRENTLY still in flight (or one that failed) leaves
-    behind. Such an index cannot answer a query, so it is not ready.
+    CREATE INDEX CONCURRENTLY still in flight leaves behind, and also one that
+    failed until the next ``ensure_bm25_index`` drops and rebuilds it. Such an
+    index cannot answer a query, so it is not ready.
     """
     if item_table not in PARTITIONED_ITEM_TABLES:
         return "absent"
@@ -872,11 +873,15 @@ def _acquire_partition_build_lock(conn, item_table: str) -> None:
 
 
 def _release_partition_build_lock(conn, item_table: str) -> None:
+    _release_advisory_lock(conn, partition_build_lock_relation(item_table))
+
+
+def _release_advisory_lock(conn, relation: str) -> None:
     """Give the lock back, and if that cannot be done, throw the session away.
 
     The lock is session-scoped, and a pooled connection handed back to the pool
     keeps its session -- so a lock left behind would keep every later build on
-    this item table waiting. Invalidating the connection ends the backend, which
+    this item table (or of this index) waiting. Invalidating the connection ends the backend, which
     releases it for certain.
 
     Rolls back first. The unlock is committed, and on a connection whose move
@@ -887,17 +892,13 @@ def _release_partition_build_lock(conn, item_table: str) -> None:
     """
     try:
         conn.rollback()
-        conn.execute(
-            text(partition_build_unlock_sql()),
-            {"relation": partition_build_lock_relation(item_table)},
-        )
+        conn.execute(text(partition_build_unlock_sql()), {"relation": relation})
         conn.commit()
     except Exception:
         logger.warning(
-            "Could not release the partition build lock for %s.%s; discarding the "
+            "Could not release the advisory lock on %s; discarding the "
             "connection so the lock cannot outlive it",
-            AI_SCHEMA,
-            item_table,
+            relation,
             exc_info=True,
         )
         try:
@@ -1179,7 +1180,6 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
 
         name = bm25_index_name(kb_id, item_table)
         partition = partition_name(kb_id, item_table)
-        cast = bm25_tokenizer_cast(item_table, ts_language)
         outcome: dict = {"index": name, "item_table": item_table, "partition": partition}
 
         # An unattached partition is a move that did not finish -- a crash, or a
@@ -1213,26 +1213,79 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
             outcome["writes_blocked_seconds"] = move["writes_blocked_seconds"]
             outcome["partition_created"] = True
 
-        existing = conn.execute(
-            text(
-                "SELECT pg_get_indexdef(c.oid) FROM pg_class c "
-                "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE n.nspname = :schema AND c.relname = :name AND c.relkind = 'i'"
-            ),
-            {"schema": AI_SCHEMA, "name": name},
-        ).first()
-        existing_def = existing[0] if existing else None
+        # Everything from reading the index's state to replacing it runs under
+        # a lock on this one index, so two ensures for the same KB cannot drop
+        # each other's in-flight build. Not waited for: whoever holds it is
+        # building this index right now.
+        index_lock = bm25_index_lock_relation(kb_id, item_table)
+        if not conn.execute(text(partition_build_lock_sql()), {"relation": index_lock}).scalar():
+            return {**outcome, "status": "building"}
+        try:
+            return _ensure_index_locked(conn, outcome, kb_id, item_table, ts_language)
+        finally:
+            _release_advisory_lock(conn, index_lock)
 
-        if existing_def and indexdef_matches_tokenizer(existing_def, cast):
-            return {**outcome, "status": bm25_index_state(conn, kb_id, item_table)}
 
-        if existing_def:
-            logger.info("Rebuilding BM25 index %s: tokenizer changed to %s", name, cast)
-            conn.execute(text(bm25_drop_ddl(kb_id, item_table)))
-        conn.execute(text(bm25_index_ddl(kb_id, item_table, ts_language)))
+def bm25_index_lock_relation(knowledge_base_id: Any, item_table: str) -> str:
+    """Advisory-lock subject for building one KB's index (not the partition move)."""
+    return f"{AI_SCHEMA}.{bm25_index_name(knowledge_base_id, item_table)}"
 
-        invalidate_bm25_index_cache(kb_id)
+
+def _index_build_in_progress(conn, partition: str) -> bool:
+    """Is some other backend running CREATE INDEX (or REINDEX) on this partition?"""
+    row = conn.execute(
+        text(
+            "SELECT 1 FROM pg_stat_progress_create_index "
+            "WHERE relid = to_regclass(:partition) AND pid <> pg_backend_pid()"
+        ),
+        {"partition": _qualified(partition)},
+    ).first()
+    return row is not None
+
+
+def _ensure_index_locked(conn, outcome: dict, kb_id: str, item_table: str, ts_language) -> dict:
+    name = bm25_index_name(kb_id, item_table)
+    partition = partition_name(kb_id, item_table)
+    cast = bm25_tokenizer_cast(item_table, ts_language)
+    existing = conn.execute(
+        text(
+            "SELECT pg_get_indexdef(c.oid), i.indisvalid FROM pg_class c "
+            "JOIN pg_index i ON i.indexrelid = c.oid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = :schema AND c.relname = :name AND c.relkind = 'i'"
+        ),
+        {"schema": AI_SCHEMA, "name": name},
+    ).first()
+    existing_def = existing[0] if existing else None
+
+    if existing_def and not existing[1]:
+        if _index_build_in_progress(conn, partition):
+            return {**outcome, "status": "building"}
+        # INVALID with nothing building it: what a cancelled, killed or failed
+        # CREATE INDEX CONCURRENTLY leaves behind. Its definition still matches,
+        # and ``IF NOT EXISTS`` would make a re-run a no-op, so without this the
+        # KB would report ``building`` for ever and never be searchable by it.
+        logger.warning(
+            "BM25 index %s.%s is INVALID and no build is running on %s (an earlier "
+            "CREATE INDEX CONCURRENTLY failed or was cancelled); dropping and rebuilding it",
+            AI_SCHEMA,
+            name,
+            partition,
+        )
+        conn.execute(text(bm25_drop_ddl(kb_id, item_table)))
+        existing_def = None
+        outcome["repaired_invalid_index"] = True
+
+    if existing_def and indexdef_matches_tokenizer(existing_def, cast):
         return {**outcome, "status": bm25_index_state(conn, kb_id, item_table)}
+
+    if existing_def:
+        logger.info("Rebuilding BM25 index %s: tokenizer changed to %s", name, cast)
+        conn.execute(text(bm25_drop_ddl(kb_id, item_table)))
+    conn.execute(text(bm25_index_ddl(kb_id, item_table, ts_language)))
+
+    invalidate_bm25_index_cache(kb_id)
+    return {**outcome, "status": bm25_index_state(conn, kb_id, item_table)}
 
 
 def drop_bm25_index(knowledge_base_id: str, engine=None, drop_partitions: bool = False) -> dict:

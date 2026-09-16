@@ -60,6 +60,7 @@ class _FakeConn:
         build_lock=True,
         check_constraint=False,
         partition_foreign_keys=(),
+        build_in_progress=False,
     ):
         self.extension = extension
         self.kb_row = kb_row
@@ -72,6 +73,7 @@ class _FakeConn:
         self.build_lock = build_lock
         self.check_constraint = check_constraint
         self.partition_foreign_keys = list(partition_foreign_keys)
+        self.build_in_progress = build_in_progress
         self.statements: list[str] = []
         self.commits: list[int] = []
         self.rollbacks: list[int] = []
@@ -103,7 +105,14 @@ class _FakeConn:
         elif "knowledge_bases" in sql and "pg_class" not in sql:
             row = self.kb_row
         elif "pg_get_indexdef" in sql:
-            row = (self.indexdef,) if self.indexdef else None
+            if not self.indexdef:
+                row = None
+            elif "indisvalid" in sql:
+                row = (self.indexdef, self.indisvalid)
+            else:
+                row = (self.indexdef,)
+        elif "pg_stat_progress_create_index" in sql:
+            row = (1,) if self.build_in_progress else None
         elif "relkind" in sql:
             kind = self.relkinds.get((params or {}).get("relname"))
             row = (kind,) if kind else None
@@ -202,9 +211,52 @@ def test_ensure_creates_the_index_on_an_autocommit_connection():
     assert _ddl(conn) == [pgb.bm25_index_ddl(KB, "chunks", "german")]
 
 
-def test_ensure_reports_building_while_the_index_is_invalid():
-    conn = _FakeConn(relkinds=_with_partition(), indisvalid=False)
+_EXISTING_GERMAN = (
+    f"CREATE INDEX bm25_chunks_{HEX} ON ai.chunks_kb_{HEX} USING bm25 "
+    "(id, ((text)::pdb.simple('stemmer=german')), source_id, meta) WITH (key_field=id)"
+)
+
+
+def test_ensure_reports_building_while_a_build_is_really_running():
+    conn = _FakeConn(
+        relkinds=_with_partition(),
+        indexdef=_EXISTING_GERMAN,
+        indisvalid=False,
+        build_in_progress=True,
+    )
     assert pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))["status"] == "building"
+    assert _ddl(conn) == []
+
+
+def test_ensure_repairs_an_invalid_index_that_no_build_is_working_on(caplog):
+    """B3: a cancelled or killed CREATE INDEX CONCURRENTLY leaves an INVALID index.
+
+    It used to be reported as ``building`` for ever: the definition still
+    matched, so nothing was rebuilt, and ``IF NOT EXISTS`` made a re-run a
+    no-op. With no row in ``pg_stat_progress_create_index`` for the partition,
+    nothing is building it, so it is dropped and rebuilt -- loudly.
+    """
+    conn = _FakeConn(relkinds=_with_partition(), indexdef=_EXISTING_GERMAN, indisvalid=False)
+
+    with caplog.at_level("WARNING"):
+        pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    assert _ddl(conn) == [
+        pgb.bm25_drop_ddl(KB, "chunks"),
+        pgb.bm25_index_ddl(KB, "chunks", "german"),
+    ]
+    assert f"bm25_chunks_{HEX}" in caplog.text
+    assert "INVALID" in caplog.text
+    # Decided under a lock of its own, so two ensures cannot drop each other's build.
+    lock_at = max(i for i, s in enumerate(conn.statements) if "pg_try_advisory_lock" in s)
+    assert lock_at < conn.statements.index(pgb.bm25_drop_ddl(KB, "chunks"))
+
+
+def test_ensure_reports_building_when_another_ensure_holds_the_index_lock():
+    conn = _FakeConn(relkinds=_with_partition(), build_lock=False)
+    out = pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+    assert out["status"] == "building"
+    assert _ddl(conn) == []
 
 
 # ---------------------------------------------------------------------------
