@@ -114,16 +114,20 @@ _TIMEOUT_ELAPSED_TOLERANCE = 0.9
 class KeywordSearchTimeout(RuntimeError):
     """The SQL keyword-search fallback outran the BM25_FALLBACK_TIMEOUT_MS setting.
 
-    Nothing builds an index in response: the message names the two remedies a
-    caller actually has, so a client cannot read it as "retry in a moment".
+    Nothing builds an index in response, so the message names the remedies a
+    caller actually has rather than letting it read as "retry in a moment". It
+    hedges the build remedy because this layer cannot see the KB's strategy: a
+    strategy with no BM25 item table cannot be helped by a build at all. The
+    search route resolves the strategy and states one definite remedy.
     """
 
     def __init__(self, knowledge_base_id: str, timeout_ms: int):
         super().__init__(
             f"Keyword search on knowledge base {knowledge_base_id} exceeded "
             f"{timeout_ms} ms because the knowledge base has no BM25 index. "
-            f"Build one with POST /api/knowledge-bases/{knowledge_base_id}/build-bm25, "
-            f"or switch the knowledge base's retrieval method to vector_search."
+            f"Switch the knowledge base's retrieval method to vector_search, or, "
+            f"if its indexing strategy supports a BM25 index, build one with "
+            f"POST /api/knowledge-bases/{knowledge_base_id}/build-bm25."
         )
         self.knowledge_base_id = knowledge_base_id
         self.timeout_ms = timeout_ms

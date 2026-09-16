@@ -1549,6 +1549,50 @@ def get_items_by_sources(kb_id: str):
     )
 
 
+def _keyword_timeout_remedy(kb_id: str) -> str:
+    """Name a remedy this KB's caller can actually carry out.
+
+    POST /build-bm25 only helps a KB whose strategy has an item table AND whose
+    STORED retrieval method is hybrid or full_text. For an unmapped strategy it
+    answers 202 and the task then dies with ValueError and retries twice; for a
+    per-request method override with a vector_search stored method it 400s. The
+    unmapped strategies are exactly the ones permanently on the tsvector
+    fallback, so they are the likeliest 503 producers here and must never be
+    pointed at that endpoint.
+    """
+    generic = (
+        f"Build the index with POST /api/knowledge-bases/{kb_id}/build-bm25, or "
+        "switch this knowledge base's retrieval method to vector_search."
+    )
+    try:
+        kb = _fetch_kb_or_404(kb_id)
+    except Exception:
+        logger.warning("Could not read KB %s to tailor the keyword-timeout remedy", kb_id)
+        return generic
+    if isinstance(kb, tuple):  # 404 response tuple
+        return generic
+
+    strategy = (kb.get("indexing_config") or {}).get("strategy")
+    if strategy not in _STRATEGY_TO_ITEM_TABLE:
+        return (
+            f"This knowledge base's indexing strategy ({strategy}) has no BM25 "
+            "index, so keyword search always uses the SQL fallback; a build "
+            "cannot change that. Switch this knowledge base's retrieval method "
+            "to vector_search."
+        )
+
+    stored_method = (kb.get("retrieval_config") or {}).get("method")
+    if stored_method not in ("hybrid", "full_text"):
+        return (
+            "Set this knowledge base's stored retrieval method to hybrid or "
+            f"full_text, then build the index with POST /api/knowledge-bases/{kb_id}"
+            "/build-bm25 — a per-request retrieval_method is not enough for that "
+            "endpoint. Or query with vector_search instead."
+        )
+
+    return generic
+
+
 @knowledge_bases_bp.route("/<kb_id>/search", methods=["POST"])
 @require_auth
 def search_knowledge_base_route(kb_id: str):
@@ -1616,10 +1660,9 @@ def search_knowledge_base_route(kb_id: str):
                 "error": (
                     "Keyword search timed out: this knowledge base has no BM25 "
                     "index, so the query fell back to a scan that exceeded its "
-                    f"time budget. Build the index with POST /api/knowledge-bases/{kb_id}"
-                    "/build-bm25, or switch this knowledge base's retrieval "
-                    "method to vector_search. No build starts on its own, so "
-                    "retrying the same search will time out again."
+                    f"time budget. {_keyword_timeout_remedy(kb_id)} No build "
+                    "starts on its own, so retrying the same search will time "
+                    "out again."
                 ),
                 "code": "keyword_search_timeout",
                 "timeout_ms": e.timeout_ms,

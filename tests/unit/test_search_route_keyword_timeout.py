@@ -4,6 +4,7 @@ reports a hybrid search that silently lost its keyword leg."""
 import uuid
 from unittest.mock import patch
 
+import pytest
 from agentic.knowledge.models import RetrievedItem
 
 from agentic_project_service.routes import knowledge_bases as kb_route
@@ -19,27 +20,82 @@ def _app():
     return app
 
 
-@patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role"})
-@patch("agentic_project_service.routes.knowledge_bases.db")
-@patch("agentic_project_service.services.knowledge_search.search_knowledge_base")
-def test_keyword_timeout_is_503(mock_search, _db, _jwt):
+def _kb(strategy: str, stored_method: str) -> dict:
+    return {
+        "id": "kb",
+        "indexing_config": {"strategy": strategy},
+        "retrieval_config": {"method": stored_method},
+    }
+
+
+def _timeout_503(kb: dict | tuple, request_method: str = "full_text"):
+    """Drive the 503 path with a given KB row and return the parsed body."""
     kb_id = str(uuid.uuid4())
-    mock_search.side_effect = KeywordSearchTimeout(kb_id, 10000)
-    with _app().test_client() as c:
+    with (
+        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role"}),
+        patch("agentic_project_service.routes.knowledge_bases.db"),
+        patch("agentic_project_service.routes.knowledge_bases._fetch_kb_or_404", return_value=kb),
+        patch(
+            "agentic_project_service.services.knowledge_search.search_knowledge_base",
+            side_effect=KeywordSearchTimeout(kb_id, 10000),
+        ),
+        _app().test_client() as c,
+    ):
         resp = c.post(
             f"/api/knowledge-bases/{kb_id}/search",
             headers={"Authorization": "Bearer fake.jwt.token"},
-            json={"query": "weather", "retrieval_method": "full_text"},
+            json={"query": "weather", "retrieval_method": request_method},
         )
     assert resp.status_code == 503
     body = resp.get_json()
     assert body["code"] == "keyword_search_timeout"
     assert body["timeout_ms"] == 10000
-    # Nothing self-heals here, so the body must name the two real remedies
-    # rather than promise a build that no code path queues.
+    # Every branch must keep saying that nothing self-heals.
+    assert "No build starts on its own" in body["error"]
+    assert "queued" not in body["error"]
+    return body
+
+
+def test_keyword_timeout_is_503():
+    """The buildable case: mapped strategy, stored method already hybrid."""
+    body = _timeout_503(_kb("chunk_embed", "hybrid"))
     assert "build-bm25" in body["error"]
     assert "vector_search" in body["error"]
-    assert "queued" not in body["error"]
+
+
+@pytest.mark.parametrize("strategy", ["doc2json", "page_index"])
+def test_unmapped_strategy_is_never_told_to_build(strategy):
+    """These strategies have no BM25 item table, so a build cannot help them.
+
+    POST /build-bm25 would answer 202 and the task would then die with
+    ValueError and retry twice. They are also the knowledge bases permanently on
+    the tsvector fallback, i.e. the likeliest 503 producers, so naming that
+    endpoint here would send every one of them down a dead end.
+    """
+    body = _timeout_503(_kb(strategy, "hybrid"))
+    assert "build-bm25" not in body["error"]
+    assert "vector_search" in body["error"]
+    assert strategy in body["error"]
+
+
+def test_stored_method_must_allow_a_build_before_one_is_suggested():
+    """A per-request retrieval_method override does not make /build-bm25 work.
+
+    That endpoint 400s unless the KB's STORED method is hybrid or full_text, so
+    the remedy has to name that step first.
+    """
+    body = _timeout_503(_kb("chunk_embed", "vector_search"), request_method="full_text")
+    assert "stored retrieval method" in body["error"]
+    assert "hybrid or full_text" in body["error"]
+    assert "build-bm25" in body["error"]
+
+
+def test_unresolvable_kb_falls_back_to_the_generic_remedy():
+    """A 404 tuple or a failed lookup must not produce a nonsense strategy name."""
+    body = _timeout_503((None, 404))
+    assert "build-bm25" in body["error"]
+    assert "vector_search" in body["error"]
+    assert "None" not in body["error"]
 
 
 def _item() -> RetrievedItem:
