@@ -2068,8 +2068,22 @@ def build_bm25_endpoint(kb_id: str):
     table for the KB's strategy and writes a fresh bm25s file index, replacing
     whatever was there.
 
-    Returns 202 + the Celery task id. Caller can poll ``bm25_status`` on
-    the KB to observe completion.
+    Two things the operator must know before calling it (both are repeated in
+    the 202 body's ``note``):
+
+    - For a KB whose rows are still in the item table's shared DEFAULT
+      partition, the move into its own partition runs in one transaction that
+      blocks writes to that whole item table -- every knowledge base on it --
+      for its duration. The block grows with the number of rows moved (on the
+      order of seconds per hundred thousand rows; see the measurements in
+      ``pg_bm25_index.create_partition``), so schedule it. A KB that already
+      has its partition, or has no rows, blocks nothing.
+    - The pg_search extension is created when the project service starts. After
+      swapping in a Postgres image that provides it, restart the project
+      service first; until then this builds the bm25s file index instead.
+
+    Returns 202 + the Celery task id. Caller can poll ``bm25_status`` (and
+    ``bm25_status_reason``) on the KB to observe completion.
     """
     err = _require_uuid(kb_id, "knowledge base id")
     if err:
@@ -2141,7 +2155,27 @@ def build_bm25_endpoint(kb_id: str):
     except Exception:
         logger.exception("Failed to dispatch build-bm25 task for KB %s", kb_id)
         return jsonify({"error": "Failed to start BM25 build task"}), 503
-    return jsonify({"task_id": t.id, "knowledge_base_id": kb_id}), 202
+    return jsonify(
+        {
+            "task_id": t.id,
+            "knowledge_base_id": kb_id,
+            "note": _build_bm25_note(_STRATEGY_TO_ITEM_TABLE[strategy]),
+        }
+    ), 202
+
+
+def _build_bm25_note(item_table: str) -> str:
+    """The operator obligations ``POST /build-bm25`` repeats in its 202 body."""
+    return (
+        "On a Postgres server with pg_search, the first build for a knowledge base "
+        "whose rows are still in the shared DEFAULT partition moves them into its own "
+        f"partition, which blocks writes to the whole {AI_SCHEMA}.{item_table} table "
+        "(every knowledge base on it) for the duration of the move; it grows with the "
+        "number of rows moved. pg_search is enabled when the project service starts: "
+        "after swapping in a Postgres image that provides it, restart the project "
+        "service before building, or this builds the bm25s file index instead. "
+        "Poll bm25_status on the knowledge base for progress."
+    )
 
 
 # =============================================================================

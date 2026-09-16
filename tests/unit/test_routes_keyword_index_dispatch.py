@@ -548,7 +548,9 @@ class TestBuildEndpoint:
         ):
             kb_id, resp = self._post()
         assert resp.status_code == 202
-        assert resp.get_json() == {"task_id": "task-ensure", "knowledge_base_id": kb_id}
+        body = resp.get_json()
+        assert (body["task_id"], body["knowledge_base_id"]) == ("task-ensure", kb_id)
+        assert set(body) == {"task_id", "knowledge_base_id", "note"}
         tasks["ensure"].delay.assert_called_once_with(kb_id)
         tasks["build"].delay.assert_not_called()
 
@@ -582,6 +584,28 @@ class TestBuildEndpoint:
         assert resp.status_code == 202
         tasks["build"].delay.assert_called_once_with(kb_id)
         tasks["ensure"].delay.assert_not_called()
+
+    @pytest.mark.parametrize("installed", [True, False])
+    def test_the_202_states_the_write_block_and_the_restart(self, tasks, installed):
+        """Both obligations an operator has before calling this: the first build
+        of an existing KB blocks writes to its whole item table, and the
+        extension is only enabled once the service restarts after the Postgres
+        image swap (otherwise this silently builds the file index)."""
+        with (
+            patch(f"{S}.pg_search_installed", return_value=installed),
+            patch(f"{S}._item_table_is_partitioned", return_value=True),
+        ):
+            _, resp = self._post()
+        assert resp.status_code == 202
+        note = resp.get_json()["note"]
+        assert "blocks writes" in note
+        assert "chunks" in note
+        assert "restart the project service" in note
+
+    def test_the_docstring_states_the_write_block_and_the_restart(self):
+        doc = " ".join(kb_route.build_bm25_endpoint.__doc__.split())
+        assert "blocks writes" in doc
+        assert "restart" in doc
 
     def test_an_unmapped_strategy_is_a_400_on_pg_search_too(self, tasks):
         with (
