@@ -360,11 +360,16 @@ def _pg_bm25_inputs_changed(old_config: dict, new_config: dict) -> bool:
 
 
 def _dispatch_ensure_pg_bm25_index(kb_id: str) -> None:
-    """Ask a worker to reconcile this KB's pg_search index; never fatal.
+    """Ask a worker to reconcile this KB's pg_search partition and index.
 
-    The task itself decides whether there is anything to do — no extension, a
-    strategy with no keyword table, an index that already matches — so this
-    can be fired off without reading any of that on the request path.
+    Never fatal, and always off the request path: the first run for a KB moves
+    that KB's rows out of the item table's DEFAULT partition, which is real
+    work. Dispatching it at KB creation — before the KB has any rows — is what
+    keeps that move free for every KB created from here on.
+
+    The task itself decides whether there is anything to do at all: no
+    extension, a strategy with no keyword table, an item table that is not
+    partitioned, a partition and index that already match.
     """
     try:
         ensure_pg_bm25_index.delay(kb_id)

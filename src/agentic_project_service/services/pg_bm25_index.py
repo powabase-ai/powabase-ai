@@ -356,10 +356,10 @@ def evacuate_batch_sql(knowledge_base_id: Any, item_table: str) -> str:
     default = default_partition_name(item_table)
     return (
         "WITH moved AS ("
-        f"  DELETE FROM {_qualified(default)}"
-        f"  WHERE id IN (SELECT id FROM {_qualified(default)}"
-        "               WHERE knowledge_base_id = CAST(:kb AS uuid) LIMIT :batch)"
-        "  RETURNING *"
+        f" DELETE FROM {_qualified(default)}"
+        f" WHERE id IN (SELECT id FROM {_qualified(default)}"
+        " WHERE knowledge_base_id = CAST(:kb AS uuid) LIMIT :batch)"
+        " RETURNING *"
         f") INSERT INTO {_qualified(partition)} SELECT * FROM moved"
     )
 
