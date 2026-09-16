@@ -1748,7 +1748,20 @@ def build_bm25_endpoint(kb_id: str):
     if isinstance(kb, tuple):  # _fetch_kb_or_404 returns a response tuple on 404
         return kb
 
-    method = (kb.get("retrieval_config") or {}).get("method")
+    # Legacy rows can hold a config column as a JSON string, and the
+    # keyword-timeout 503 points exactly those KBs here, so read it the same
+    # way the remedy did rather than 500 on a str.
+    retrieval_config = _kb_config_as_dict(kb.get("retrieval_config"))
+    if retrieval_config is None:
+        return jsonify(
+            {
+                "error": (
+                    "This knowledge base's retrieval_config is not a JSON object; "
+                    "save it again before building a BM25 index."
+                )
+            }
+        ), 400
+    method = retrieval_config.get("method")
     if method not in ("hybrid", "full_text"):
         return jsonify(
             {
@@ -1762,7 +1775,20 @@ def build_bm25_endpoint(kb_id: str):
     # Refuse up front what build_bm25_for_kb would refuse after a 202: a
     # strategy with no BM25 item table. Same map and same chunk_embed default
     # as the task, so the two cannot disagree.
-    strategy = (kb.get("indexing_config") or {}).get("strategy", "chunk_embed")
+    # indexing_config is refused rather than parsed when it is not an object:
+    # the build task reads it as one, and search already rejects a string
+    # indexing_config, so a 202 here would only move the crash into the task.
+    indexing_config = kb.get("indexing_config")
+    if indexing_config is not None and not isinstance(indexing_config, dict):
+        return jsonify(
+            {
+                "error": (
+                    "This knowledge base's indexing_config is not a JSON object; "
+                    "save it again before building a BM25 index."
+                )
+            }
+        ), 400
+    strategy = (indexing_config or {}).get("strategy", "chunk_embed")
     if strategy not in _STRATEGY_TO_ITEM_TABLE:
         return jsonify(
             {
