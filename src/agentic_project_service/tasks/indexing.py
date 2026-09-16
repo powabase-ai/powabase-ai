@@ -2135,10 +2135,17 @@ def index_source(
             # timeout (40P01, 55P03) to another transaction -- a move holding
             # the item table, typically. Nothing is wrong with the source:
             # re-queue it within the attempts bound instead of failing it.
+            sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
             logger.warning(
-                "Indexing of source %s raced a partition move of KB %s; re-queueing: %s",
+                "Indexing of source %s in KB %s hit %s (SQLSTATE %s); retried in %d s while "
+                "attempts remain: %s",
                 source_id,
                 knowledge_base_id,
+                {"23514": "a partition move race", "40P01": "a deadlock"}.get(
+                    sqlstate, "a lock conflict"
+                ),
+                sqlstate,
+                MOVE_CONFLICT_REQUEUE_COUNTDOWN_SECONDS,
                 str(exc).splitlines()[0],
             )
             if pg_bm25_index.is_partition_move_race(exc):

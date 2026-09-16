@@ -287,3 +287,32 @@ def test_the_requeue_delay_outlasts_a_moves_own_cleanup_but_not_an_index_build_r
     countdown = indexing.MOVE_CONFLICT_REQUEUE_COUNTDOWN_SECONDS
     assert countdown > pgb.MOVE_CHECK_CLEANUP_WAIT_SECONDS + pgb.DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS
     assert countdown < indexing._pg_bm25_retry_countdown(0)
+
+
+@pytest.mark.parametrize(
+    ("exc", "sqlstate"),
+    [
+        (_operational("40P01", "deadlock detected"), "40P01"),
+        (_operational("55P03", "canceling statement due to lock timeout"), "55P03"),
+        (_check_refusal(), "23514"),
+    ],
+)
+def test_the_requeue_warning_names_the_sqlstate_without_blaming_a_move(
+    harness, caplog, exc, sqlstate
+):
+    """A deadlock or lock timeout can come from any other transaction, not only
+    a partition move, so the warning says what happened rather than guessing."""
+    monkeypatch, _requeue, _failed = harness
+    monkeypatch.setattr(pgb, "clear_move_check_after_refusal", MagicMock(return_value=[]))
+
+    def _raise(**_kwargs):
+        raise exc
+
+    monkeypatch.setattr(indexing, "_run_index_body", _raise)
+
+    with caplog.at_level("WARNING"):
+        indexing.index_source.run(KB, SRC, indexed_source_id=IS_ID)
+
+    (message,) = [r.getMessage() for r in caplog.records if SRC in r.getMessage()]
+    assert f"SQLSTATE {sqlstate}" in message
+    assert "raced a partition move" not in message

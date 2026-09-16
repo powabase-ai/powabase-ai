@@ -1678,9 +1678,10 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
       1.2-1.3 s, 250 000 rows 2.7-3.2 s, 500 000 rows 4.9-5.2 s -- about
       10 s per million rows moved, plus a VALIDATE of ~0.3 s that grows with
       DEFAULT. A move that gives up still held writers for as long as it ran:
-      1.8-2.3 s with a long reader in the way. A long reader already there
-      when the move starts costs them nothing: the move gives up before
-      taking the parent lock.
+      its copy time plus up to about 2 s of lock tries when a long reader
+      arrives mid-move (1.8-2.3 s for the 40 000-row move above). A long
+      reader already there when the move starts costs them nothing: the move
+      gives up before taking the parent lock.
     * **readers** do not block on the SHARE locks. They can wait on the
       ACCESS EXCLUSIVE steps on DEFAULT (the check going up, the ATTACH, the
       check's drop after a failed move): new readers of DEFAULT, and queries
