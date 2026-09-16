@@ -173,18 +173,18 @@ def test_detach_and_drop_partition_ddl():
     )
 
 
-def test_evacuation_sql_moves_a_bounded_batch_and_binds_its_values():
-    sql = pgb.evacuate_batch_sql(KB, "chunks")
+def test_the_move_copies_then_deletes_and_binds_the_kb():
+    insert_sql, delete_sql = pgb.move_rows_sql(KB, "chunks")
 
     # Identifiers are interpolated (validated); values are bound.
-    assert f'"ai".chunks_kb_{KB_HEX}' in sql
-    assert '"ai".chunks_default' in sql
-    assert ":kb" in sql
-    assert "LIMIT :batch" in sql
-    assert KB not in sql, "the KB id must be bound here, not interpolated"
-    assert sql.count("DELETE") == 1
-    assert sql.count("INSERT") == 1
-    assert "RETURNING *" in sql
+    assert insert_sql == (
+        f'INSERT INTO "ai".chunks_kb_{KB_HEX} SELECT * FROM "ai".chunks_default '
+        "WHERE knowledge_base_id = CAST(:kb AS uuid)"
+    )
+    assert delete_sql == (
+        'DELETE FROM "ai".chunks_default WHERE knowledge_base_id = CAST(:kb AS uuid)'
+    )
+    assert KB not in insert_sql + delete_sql, "the KB id must be bound, not interpolated"
 
 
 def test_the_partition_carries_a_check_constraint_matching_its_bound():
@@ -239,7 +239,8 @@ def test_the_build_lock_is_a_try_lock_keyed_on_the_qualified_table():
 
 
 def test_the_build_lock_is_released_by_name_not_by_transaction():
-    """It has to outlive the transactions, because the move is several of them."""
+    """It has to outlive the transactions: preparing the clone, the move and the
+    index build are separate ones."""
     assert "pg_advisory_unlock" in pgb.partition_build_unlock_sql()
     assert "hashtextextended(:relation, 0)" in pgb.partition_build_unlock_sql()
 
@@ -254,20 +255,25 @@ def test_a_contended_build_is_a_named_error_not_a_bare_exception():
     assert issubclass(pgb.PartitionBuildInProgress, Exception)
 
 
-def test_the_cutover_batch_is_smaller_than_the_bulk_batch():
-    """The cutover batches run under the lock, so they are sized to be quick."""
-    assert 0 < pgb.CUTOVER_BATCH_ROWS < pgb.EVACUATION_BATCH_ROWS
+def test_the_parent_is_locked_against_writers_not_readers():
+    """SHARE on the parent itself, which is what makes a mid-move write safe.
+
+    A write through the parent resolves its partitions when it is planned. One
+    that only waited on the DEFAULT partition's lock would already have planned
+    against the old partition list, and after the ATTACH it would find the
+    moved rows gone: an UPDATE or DELETE silently matching nothing. Waiting on
+    the parent's own lock instead, it plans after the ATTACH commits and reaches
+    the rows in their new partition. ``ONLY``, because a LOCK on a partitioned
+    table otherwise recurses into every partition. SHARE conflicts with ROW
+    EXCLUSIVE and not with ACCESS SHARE, so readers carry on.
+    """
+    assert pgb.partition_lock_parent_ddl("chunks") == ('LOCK TABLE ONLY "ai".chunks IN SHARE MODE')
+    with pytest.raises(ValueError):
+        pgb.partition_lock_parent_ddl("doc2json_documents")
 
 
 def test_the_default_partition_is_locked_against_writers_not_readers():
-    """SHARE, because a writer during the move breaks the ATTACH outright.
-
-    A row inserted into DEFAULT after the evacuation drained but before the
-    ATTACH makes Postgres refuse the attach ("updated partition constraint for
-    default partition would be violated by some row") and the whole move rolls
-    back. SHARE conflicts with ROW EXCLUSIVE, so it holds writers off the
-    DEFAULT partition for the duration while every reader carries on.
-    """
+    """Also SHARE on DEFAULT, for any writer that names the partition directly."""
     sql = pgb.partition_lock_default_ddl("chunks")
 
     assert sql == 'LOCK TABLE "ai".chunks_default IN SHARE MODE'
@@ -275,9 +281,9 @@ def test_the_default_partition_is_locked_against_writers_not_readers():
         pgb.partition_lock_default_ddl("doc2json_documents")
 
 
-def test_evacuation_sql_refuses_an_unpartitioned_table():
+def test_move_sql_refuses_an_unpartitioned_table():
     with pytest.raises(ValueError):
-        pgb.evacuate_batch_sql(KB, "doc2json_documents")
+        pgb.move_rows_sql(KB, "doc2json_documents")
 
 
 def test_mirror_relation_settings_sql_copies_owner_grants_and_rls():

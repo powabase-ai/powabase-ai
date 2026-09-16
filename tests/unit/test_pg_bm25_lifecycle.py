@@ -55,12 +55,11 @@ class _FakeConn:
         indisvalid=True,
         relkinds=None,
         foreign_keys=("FOREIGN KEY (source_id) REFERENCES ai.sources(id) ON DELETE CASCADE",),
-        evacuated=(0,),
+        moved=0,
         attached=True,
         build_lock=True,
         check_constraint=False,
         partition_foreign_keys=(),
-        evacuated_forever=None,
     ):
         self.extension = extension
         self.kb_row = kb_row
@@ -68,12 +67,11 @@ class _FakeConn:
         self.indisvalid = indisvalid
         self.relkinds = dict(_MIGRATED if relkinds is None else relkinds)
         self.foreign_keys = list(foreign_keys)
-        self.evacuated = list(evacuated)
+        self.moved = moved
         self.attached = attached
         self.build_lock = build_lock
         self.check_constraint = check_constraint
         self.partition_foreign_keys = list(partition_foreign_keys)
-        self.evacuated_forever = evacuated_forever
         self.statements: list[str] = []
         self.commits: list[int] = []
         self.options: dict = {}
@@ -125,11 +123,8 @@ class _FakeConn:
             rows = [(fk,) for fk in source]
         elif "indisvalid" in sql:
             row = (self.indisvalid,)
-        elif "moved AS" in sql:
-            if self.evacuated_forever is not None:
-                result.rowcount = self.evacuated_forever
-            else:
-                result.rowcount = self.evacuated.pop(0) if self.evacuated else 0
+        elif sql.startswith("INSERT INTO") and "_kb_" in sql.split(" SELECT")[0]:
+            result.rowcount = self.moved
         result.first.return_value = row
         result.fetchone.return_value = row
         result.scalar.return_value = row[0] if row else None
@@ -166,7 +161,7 @@ def _ddl(conn) -> list[str]:
 #: down: the clone, the row moves, ATTACH/DETACH, the settings mirror, the drop.
 _PARTITION_WORK = (
     "PARTITION",
-    "moved AS",
+    "DELETE FROM",
     "(LIKE ",
     "INSERT INTO",
     "DROP TABLE",
@@ -204,33 +199,42 @@ def test_ensure_reports_building_while_the_index_is_invalid():
 # ---------------------------------------------------------------------------
 
 
-def test_ensure_moves_the_bulk_of_the_rows_without_holding_a_table_lock():
-    """The whole point of the online move: writers keep working during the bulk.
+def test_ensure_moves_every_row_and_attaches_in_one_transaction():
+    """B1: the move is atomic, so no write through the parent can be lost.
 
-    Locking the DEFAULT partition for the length of the move blocks every write
-    to the item table -- measured at 13.4 s for 40 000 rows on a 512 MB
-    Postgres, minutes at real scale. So the bulk batches each commit on their
-    own with no table-wide lock held, and only the short cutover takes one.
+    The earlier online design committed batches into the unattached partition,
+    where an UPDATE or DELETE through the parent could not see them -- verified
+    to lose updates and resurrect deleted rows. Now every step from taking the
+    locks to mirroring the settings is one transaction, writers wait on the
+    parent's lock, and readers keep a consistent snapshot throughout.
     """
-    conn = _FakeConn(evacuated=(10_000, 4_000, 0, 0))
+    conn = _FakeConn(moved=14_000)
 
     out = pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
 
     assert out["status"] == "ready"
     assert out["partition_created"] is True
     assert out["rows_moved"] == 14_000
-    statements = _partition_ddl(conn)
-    lock = pgb.partition_lock_default_ddl("chunks")
-    bulk = pgb.evacuate_batch_sql(KB, "chunks")
-    # Every bulk batch happens before the lock is taken, and the bulk phase
-    # stops as soon as a batch comes back short -- chasing the last few rows
-    # unlocked is pointless while a writer can still add more, and against a
-    # writer appending to the same knowledge base it would never terminate.
-    first_lock = statements.index(lock)
-    assert statements[:first_lock].count(bulk) == 2
-    # ...and each of them committed on its own.
-    bulk_commits = [c for c in conn.commits if c <= conn.statements.index(lock)]
-    assert len(bulk_commits) >= 2, conn.commits
+    assert out["writes_blocked_seconds"] >= 0
+    insert_sql, delete_sql = pgb.move_rows_sql(KB, "chunks")
+    timeout = next(i for i, s in enumerate(conn.statements) if "SET LOCAL lock_timeout" in s)
+    parent_lock = conn.statements.index(pgb.partition_lock_parent_ddl("chunks"))
+    default_lock = conn.statements.index(pgb.partition_lock_default_ddl("chunks"))
+    insert_at = conn.statements.index(insert_sql)
+    delete_at = conn.statements.index(delete_sql)
+    attach_at = conn.statements.index(pgb.partition_attach_ddl(KB, "chunks"))
+    mirror_at = max(i for i, s in enumerate(conn.statements) if s.strip().startswith("DO $$"))
+    # Bounded wait for the locks, parent first (the order writers take them in),
+    # then the whole move, then ATTACH and the settings mirror.
+    assert timeout < parent_lock < default_lock < insert_at < delete_at < attach_at < mirror_at
+    # One transaction: nothing commits between the timeout and the mirror.
+    assert not [c for c in conn.commits if timeout < c <= mirror_at], conn.commits
+    assert any(c > mirror_at for c in conn.commits)
+    # Exactly one copy and one delete: no batching left over from the online design.
+    assert conn.statements.count(insert_sql) == 1
+    assert conn.statements.count(delete_sql) == 1
+    # The index build is outside it -- CONCURRENTLY cannot run in a transaction.
+    assert _ddl(conn) == [pgb.bm25_index_ddl(KB, "chunks", "german")]
 
 
 def test_ensure_takes_the_build_lock_before_touching_anything():
@@ -240,7 +244,7 @@ def test_ensure_takes_the_build_lock_before_touching_anything():
     `LOCK TABLE ... IN SHARE MODE`. The advisory lock serialises the moves, so
     the second caller waits (or is told to retry) instead.
     """
-    conn = _FakeConn(evacuated=(5, 0))
+    conn = _FakeConn(moved=5)
 
     pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
 
@@ -266,36 +270,8 @@ def test_ensure_declines_cleanly_when_another_build_holds_the_lock(monkeypatch):
     assert _ddl(conn) == []
 
 
-def test_the_cutover_drains_the_delta_attaches_and_mirrors_in_one_transaction():
-    conn = _FakeConn(evacuated=(10_000, 0, 7, 0))
-
-    out = pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
-
-    assert out["rows_moved"] == 10_007
-    statements = _partition_ddl(conn)
-    lock = pgb.partition_lock_default_ddl("chunks")
-    attach = pgb.partition_attach_ddl(KB, "chunks")
-    cutover = statements[statements.index(lock) :]
-
-    assert cutover[0] == lock
-    assert cutover.count(pgb.evacuate_batch_sql(KB, "chunks")) == 2
-    assert cutover.index(attach) > cutover.index(pgb.evacuate_batch_sql(KB, "chunks"))
-    assert cutover[-1].strip().startswith("DO $$")
-    # One transaction: nothing commits between taking the lock and mirroring.
-    lock_position = conn.statements.index(lock)
-    mirror_position = (
-        len(conn.statements)
-        - 1
-        - next(i for i, s in enumerate(reversed(conn.statements)) if s.strip().startswith("DO $$"))
-    )
-    assert not [c for c in conn.commits if lock_position < c <= mirror_position]
-    # The index build is outside it -- CONCURRENTLY cannot run in a transaction.
-    assert _ddl(conn) == [pgb.bm25_index_ddl(KB, "chunks", "german")]
-    assert out["cutover_seconds"] >= 0
-
-
 def test_ensure_adds_the_check_constraint_so_the_attach_skips_its_scan():
-    conn = _FakeConn(evacuated=(0,))
+    conn = _FakeConn()
 
     pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
 
@@ -311,13 +287,11 @@ def test_a_resumed_move_does_not_add_the_check_constraint_twice():
 
 
 def test_ensure_resumes_a_partition_that_exists_but_was_never_attached():
-    """A crash mid-move leaves the partition unattached and partly filled.
-
-    Rows are then split across DEFAULT and the partition -- none lost, none
-    duplicated, because each batch was its own transaction -- and a retry has to
+    """A crash after the clone was prepared leaves it unattached (and empty,
+    because the move itself is one transaction that rolled back). A retry has to
     finish the job rather than decide there is nothing to do.
     """
-    conn = _FakeConn(relkinds=_with_partition(), attached=False, evacuated=(40, 0, 0))
+    conn = _FakeConn(relkinds=_with_partition(), attached=False, moved=40)
 
     out = pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
 
@@ -405,23 +379,6 @@ def test_ensure_skips_when_the_default_partition_is_missing():
     assert out["status"] == "skipped"
     assert out["reason"] == "default_partition_absent"
     assert _partition_ddl(conn) == []
-
-
-def test_the_bulk_phase_gives_up_rather_than_looping_against_a_writer():
-    """A full batch every time means the writer is keeping pace with the move.
-
-    The unlocked bulk phase cannot win that race -- it would loop for ever -- so
-    it stops at its cap and hands the remainder to the cutover, which holds
-    writers off the DEFAULT partition and therefore does terminate.
-    """
-    conn = _FakeConn(evacuated_forever=pgb.EVACUATION_BATCH_ROWS)
-
-    with pytest.raises(RuntimeError, match="did not drain"):
-        pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
-
-    # It got as far as the cutover; the raise came from there, not the bulk loop.
-    assert pgb.partition_lock_default_ddl("chunks") in conn.statements
-    assert pgb.partition_attach_ddl(KB, "chunks") not in conn.statements
 
 
 def test_ensure_is_a_no_op_without_the_extension():

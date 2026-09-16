@@ -61,28 +61,16 @@ PARTITIONED_ITEM_TABLES: frozenset[str] = frozenset(
     {"chunks", "full_documents", "graph_index_nodes"}
 )
 
-# Rows moved out of the DEFAULT partition per statement, so one huge knowledge
-# base cannot turn the move into a single unbounded DELETE ... RETURNING. Each
-# bulk batch is its own transaction, holding no table-wide lock.
-EVACUATION_BATCH_ROWS = 10_000
-
-# Batch size for the final drain, which runs inside the cutover lock. Smaller,
-# because every row moved here is a row of blocked-write time.
-CUTOVER_BATCH_ROWS = 500
-
-# Guard against an evacuation loop that never drains (a concurrent writer
-# inserting into DEFAULT faster than the batches move rows out).
-_MAX_EVACUATION_BATCHES = 10_000
-
 # How long to wait for another caller's partition build on the same item table
 # before giving up and reporting a retryable outcome.
 PARTITION_BUILD_LOCK_WAIT_SECONDS = 30.0
 _PARTITION_BUILD_LOCK_POLL_SECONDS = 0.25
 
-# Ceiling on how long the cutover will wait for the locks it needs, so a
-# long-running reader cannot pin the build open indefinitely. A timeout aborts
-# the cutover; the bulk batches are already committed, so a retry resumes.
-CUTOVER_LOCK_TIMEOUT_MS = 10_000
+# Ceiling on how long the move waits for each lock it needs. While it waits for
+# SHARE on the parent, writers queue behind it (readers do not), so this is also
+# the worst-case extra write stall a *failed* attempt costs. A timeout rolls the
+# whole move back -- nothing has moved -- and the task retries later.
+MOVE_LOCK_TIMEOUT_MS = 5_000
 
 # Alias pg_search records for an indexed expression, so the query's expression
 # can be matched back to the indexed one.
@@ -345,7 +333,7 @@ def partition_drop_ddl(knowledge_base_id: Any, item_table: str) -> str:
 def partition_check_ddl(knowledge_base_id: Any, item_table: str) -> str:
     """A CHECK on the clone that already implies the partition bound.
 
-    This is what keeps the cutover short. Postgres skips ATTACH's validation
+    This is what keeps the ATTACH short. Postgres skips ATTACH's validation
     scan of the table being attached when that table carries a constraint
     implying the partition constraint; without it, ATTACH reads every row of the
     partition while holding ACCESS EXCLUSIVE -- which is the one window this
@@ -378,8 +366,9 @@ def partition_build_lock_sql() -> str:
     project as ``deadlock detected`` with both tasks failing. Serialising the
     moves per item table removes the cycle entirely.
 
-    Session-scoped, not transaction-scoped: the move is several transactions, so
-    a ``pg_advisory_xact_lock`` would be released after the first one. The
+    Session-scoped, not transaction-scoped: preparing the clone and moving the
+    rows are separate transactions, so a ``pg_advisory_xact_lock`` would be
+    released after the first one. The
     session scope also means closing the connection releases it, so a crashed
     build does not leave the table locked. The *try* form is what bounds the
     wait -- a caller that cannot get it reports a retryable outcome.
@@ -391,39 +380,64 @@ def partition_build_unlock_sql() -> str:
     return "SELECT pg_advisory_unlock(hashtextextended(:relation, 0))"
 
 
+def partition_lock_parent_ddl(item_table: str) -> str:
+    """Hold writers off the partitioned parent for the length of a move.
+
+    This is the lock that makes the move safe for UPDATE and DELETE, not just
+    INSERT. A statement through the parent fixes its list of partitions when
+    it is planned, and it plans after taking its own lock on the parent. A
+    writer that waited only on the DEFAULT partition's lock would already have
+    planned against the pre-ATTACH list, and once the move committed it would
+    find the rows gone from DEFAULT and match nothing -- verified against
+    Postgres 15 as updates silently reporting 0 rows and deleted rows coming
+    back. Waiting here instead, it plans after the ATTACH is visible.
+
+    ``ONLY``: without it, LOCK on a partitioned table recurses into every
+    partition. SHARE conflicts with the ROW EXCLUSIVE every INSERT, UPDATE and
+    DELETE takes, and not with the ACCESS SHARE of a reader, so reads through
+    the parent carry on throughout. The cost is that writes to *every*
+    knowledge base on this item table wait for the move, including those that
+    already have partitions of their own.
+    """
+    return f"LOCK TABLE ONLY {_qualified(_validated_partitioned_table(item_table))} IN SHARE MODE"
+
+
 def partition_lock_default_ddl(item_table: str) -> str:
     """Hold writers off the DEFAULT partition for the length of a move.
 
-    Verified against Postgres 15: a row inserted into DEFAULT after the
-    evacuation has drained but before the ATTACH makes Postgres refuse the
-    attach outright ("updated partition constraint for default partition would
-    be violated by some row"), rolling the whole move back. SHARE conflicts
-    with ROW EXCLUSIVE, so it stops INSERT/UPDATE/DELETE on the DEFAULT
-    partition -- including writes routed there through the parent -- while
-    leaving every reader untouched. Upgrading it to the ACCESS EXCLUSIVE that
-    ATTACH needs cannot self-deadlock: Postgres lets a request past waiters
-    whose locks the requester already conflicts with.
+    Belt and braces behind the parent lock, for a writer that names the DEFAULT
+    partition directly: a row of this knowledge base inserted there after the
+    move but before the ATTACH would make Postgres refuse the attach ("updated
+    partition constraint for default partition would be violated by some
+    row"). Upgrading to the ACCESS EXCLUSIVE that ATTACH needs cannot
+    self-deadlock: Postgres lets a request past waiters whose locks the
+    requester already conflicts with.
     """
     return f"LOCK TABLE {_qualified(default_partition_name(item_table))} IN SHARE MODE"
 
 
-def evacuate_batch_sql(knowledge_base_id: Any, item_table: str) -> str:
-    """Move one bounded batch of a KB's rows out of DEFAULT into its partition.
+def move_rows_sql(knowledge_base_id: Any, item_table: str) -> tuple[str, str]:
+    """Copy every row of a KB from DEFAULT into its partition, then delete them.
 
     A partition cannot be attached while the DEFAULT partition still holds a
-    row that belongs to it, so the rows have to move first. One statement, so
-    a row is never missing from both relations, and ``LIMIT :batch`` keeps each
-    statement's WAL and memory bounded however large the knowledge base is.
+    row that belongs to it, so the rows move first. Two statements rather than
+    one ``DELETE ... RETURNING`` feeding an INSERT: measured at 40 000 rows over
+    a 500 000-row DEFAULT, the pair took 0.14 s and the CTE 0.29 s. Both run in
+    the move's single transaction, under the locks above, so nothing can change
+    the rows between the copy and the delete and no reader ever sees a row
+    twice or not at all.
+
+    No foreign key anywhere references these three tables (``embeddings``
+    points at items polymorphically by ``item_id``), which is what makes the
+    DELETE safe: an FK to the parent is impossible without a parent primary
+    key, and one to the DEFAULT partition would cascade on this delete.
     """
     partition = partition_name(knowledge_base_id, item_table)
     default = default_partition_name(item_table)
+    predicate = "WHERE knowledge_base_id = CAST(:kb AS uuid)"
     return (
-        "WITH moved AS ("
-        f" DELETE FROM {_qualified(default)}"
-        f" WHERE id IN (SELECT id FROM {_qualified(default)}"
-        " WHERE knowledge_base_id = CAST(:kb AS uuid) LIMIT :batch)"
-        " RETURNING *"
-        f") INSERT INTO {_qualified(partition)} SELECT * FROM moved"
+        f"INSERT INTO {_qualified(partition)} SELECT * FROM {_qualified(default)} {predicate}",
+        f"DELETE FROM {_qualified(default)} {predicate}",
     )
 
 
@@ -727,8 +741,15 @@ def _release_partition_build_lock(conn, item_table: str) -> None:
     keeps its session -- so a lock left behind would keep every later build on
     this item table waiting. Invalidating the connection ends the backend, which
     releases it for certain.
+
+    Rolls back first. The unlock is committed, and on a connection whose move
+    failed part-way that commit would otherwise make the half-done move durable
+    -- rows copied into the unattached clone and deleted from DEFAULT, invisible
+    through the parent -- or, on an aborted transaction, fail and bury the real
+    error under a "could not release" traceback.
     """
     try:
+        conn.rollback()
         conn.execute(
             text(partition_build_unlock_sql()),
             {"relation": partition_build_lock_relation(item_table)},
@@ -761,116 +782,62 @@ def _prepare_partition(conn, kb_id: str, item_table: str) -> None:
     conn.commit()
 
 
-def _drain(
-    conn, kb_id: str, item_table: str, batch: int, *, commit_each: bool, stop_when_short: bool
-) -> tuple[int, bool]:
-    """Move this KB's rows out of DEFAULT. Returns ``(rows moved, drained)``.
-
-    ``stop_when_short`` belongs to the unlocked bulk phase. A batch that comes
-    back short means few rows are left, and chasing the last few without the
-    lock is pointless: a writer appending to this knowledge base refills DEFAULT
-    as fast as the batches empty it, so a loop that waits for a zero-row batch
-    never terminates. The cutover finishes the job with writers held off.
-    """
-    evacuate = text(evacuate_batch_sql(kb_id, item_table))
-    moved = 0
-    for _ in range(_MAX_EVACUATION_BATCHES):
-        result = conn.execute(evacuate, {"kb": kb_id, "batch": batch})
-        if commit_each:
-            conn.commit()
-        moved += result.rowcount
-        enough = result.rowcount < batch if stop_when_short else result.rowcount == 0
-        if enough:
-            return moved, True
-    return moved, False
-
-
 def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
-    """Move one knowledge base into a partition of its own, mostly online.
+    """Move one knowledge base into a partition of its own, atomically.
 
-    Returns ``{"rows_moved": int, "cutover_seconds": float}``.
+    Returns ``{"rows_moved": int, "writes_blocked_seconds": float}``.
 
-    Three phases, because holding a lock for the whole move blocks every write
-    to the item table -- 13.4 s for 40 000 rows on a 512 MB Postgres, minutes at
-    real scale:
-
-    1. **prepare** -- clone the DEFAULT partition into an unattached table, give
-       it a CHECK constraint matching the partition bound (so the later ATTACH
-       skips its validation scan) and the foreign keys ``LIKE`` does not copy;
-    2. **bulk move** -- shift the rows in batches, each its own committed
-       transaction, holding no table-wide lock. Writers to the item table carry
-       on throughout;
-    3. **cutover** -- take SHARE on the DEFAULT partition, drain whatever
-       arrived since, ATTACH, and mirror ownership/grants/RLS, in one short
-       transaction.
+    1. **prepare** (its own transaction) -- clone the DEFAULT partition into an
+       unattached table, give it a CHECK constraint matching the partition
+       bound (so the ATTACH skips its scan of the new partition) and the
+       foreign keys ``LIKE`` does not copy;
+    2. **move** (one transaction) -- take SHARE on the parent and on DEFAULT,
+       copy the KB's rows into the clone, delete them from DEFAULT, ATTACH,
+       mirror ownership/grants/RLS, commit.
 
     The bm25 index is built afterwards with CREATE INDEX CONCURRENTLY, outside
     any of this.
 
-    The whole move is serialised per item table by a session-scoped advisory
-    lock: two concurrent moves out of one DEFAULT partition deadlock each other.
+    Because step 2 is one transaction, every reader sees either all of the
+    knowledge base's rows in DEFAULT or all of them in the partition, and
+    writers through the parent wait for the commit and then see the new
+    partition (see ``partition_lock_parent_ddl``). The price is that writes to
+    this item table are blocked for the whole of step 2, which grows with the
+    number of rows moved. That is the deliberate choice over the earlier
+    online design, which kept writers going but silently lost their UPDATEs
+    and DELETEs.
 
-    Re-entrant. Each batch is atomic, so a crash leaves every row in exactly one
-    of the two relations -- none lost, none duplicated -- and a retry resumes
-    from wherever it stopped. The cost is that a row already moved is not
-    visible through the *parent* until the ATTACH, so a knowledge base's search
-    can return partial results while its bulk move runs. That is the trade this
-    shape makes: a transient partial read for one knowledge base, instead of
-    blocked writes for every knowledge base on the table.
+    Serialised per item table by a session-scoped advisory lock: two
+    concurrent moves out of one DEFAULT partition deadlock each other.
+
+    Re-entrant: a failure anywhere in step 2 rolls the whole move back, so a
+    retry starts from a clean DEFAULT and an empty clone.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     partition = partition_name(kb_id, item_table)
     default = default_partition_name(item_table)
+    insert_sql, delete_sql = move_rows_sql(kb_id, item_table)
 
     with engine.connect() as conn:
         _acquire_partition_build_lock(conn, item_table)
         try:
             if _partition_is_attached(conn, kb_id, item_table):
-                return {"rows_moved": 0, "cutover_seconds": 0.0}
+                return {"rows_moved": 0, "writes_blocked_seconds": 0.0}
 
             _prepare_partition(conn, kb_id, item_table)
-            moved, settled = _drain(
-                conn,
-                kb_id,
-                item_table,
-                EVACUATION_BATCH_ROWS,
-                commit_each=True,
-                stop_when_short=True,
-            )
-            if not settled:
-                logger.warning(
-                    "The bulk move of KB %s out of %s.%s is still returning full batches "
-                    "after %d of them; finishing under the cutover lock instead, which "
-                    "will block writes for longer",
-                    kb_id,
-                    AI_SCHEMA,
-                    default,
-                    _MAX_EVACUATION_BATCHES,
-                )
 
+            conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+            conn.execute(text(partition_lock_parent_ddl(item_table)))
             started = time.monotonic()
-            conn.execute(text(f"SET LOCAL lock_timeout = '{CUTOVER_LOCK_TIMEOUT_MS}ms'"))
             conn.execute(text(partition_lock_default_ddl(item_table)))
-            delta, drained = _drain(
-                conn,
-                kb_id,
-                item_table,
-                CUTOVER_BATCH_ROWS,
-                commit_each=False,
-                stop_when_short=False,
-            )
-            moved += delta
-            if not drained:
-                raise RuntimeError(
-                    f'the DEFAULT partition of "{AI_SCHEMA}".{item_table} did not drain for '
-                    f"knowledge base {kb_id} after {_MAX_EVACUATION_BATCHES} cutover batches"
-                )
+            moved = conn.execute(text(insert_sql), {"kb": kb_id}).rowcount
+            conn.execute(text(delete_sql), {"kb": kb_id})
             conn.execute(text(partition_attach_ddl(kb_id, item_table)))
             conn.execute(
                 text(mirror_relation_settings_sql(_qualified(item_table), _qualified(partition)))
             )
             conn.commit()
-            cutover = time.monotonic() - started
+            blocked = time.monotonic() - started
         finally:
             _release_partition_build_lock(conn, item_table)
 
@@ -880,9 +847,9 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
         default,
         AI_SCHEMA,
         partition,
-        cutover,
+        blocked,
     )
-    return {"rows_moved": moved, "cutover_seconds": cutover}
+    return {"rows_moved": moved, "writes_blocked_seconds": blocked}
 
 
 def drop_partition(engine, knowledge_base_id: Any, item_table: str) -> bool:
@@ -986,7 +953,7 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
         outcome: dict = {"index": name, "item_table": item_table, "partition": partition}
 
         # An unattached partition is a move that did not finish -- a crash, or a
-        # cutover that lost its lock race. Resuming it is the same call.
+        # move that timed out waiting for its locks. Resuming it is the same call.
         if not partition_exists(conn, kb_id, item_table) or not _partition_is_attached(
             conn, kb_id, item_table
         ):
@@ -1013,7 +980,7 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
                     "reason": "partition_build_in_progress",
                 }
             outcome["rows_moved"] = move["rows_moved"]
-            outcome["cutover_seconds"] = move["cutover_seconds"]
+            outcome["writes_blocked_seconds"] = move["writes_blocked_seconds"]
             outcome["partition_created"] = True
 
         existing = conn.execute(

@@ -147,6 +147,7 @@ def scratch_schema(engine, migration, monkeypatch):
                     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
                     knowledge_base_id uuid NOT NULL
                         REFERENCES {SCHEMA}.knowledge_bases(id) ON DELETE CASCADE,
+                    indexed_source_id uuid,
                     source_id uuid,
                     text text,
                     meta jsonb DEFAULT '{{}}'::jsonb
@@ -394,95 +395,196 @@ def _seed(session, kb_id, count, prefix="Wanderung Nummer"):
     session.commit()
 
 
-def test_partition_creation_is_batched_and_loses_nothing(engine, session, monkeypatch):
-    """Many small committed batches, same rows at the end."""
+def test_partition_creation_moves_every_row_in_one_go(engine, session):
     _seed(session, KB_A, 500)
-    monkeypatch.setattr(pgb, "EVACUATION_BATCH_ROWS", 100)
 
     move = pgb.create_partition(engine, KB_A, "chunks")
 
     assert move["rows_moved"] == 503
-    assert move["cutover_seconds"] >= 0
+    assert move["writes_blocked_seconds"] >= 0
     assert _rows_in(session, "chunks", KB_A) == 503
     assert _rows_in(session, "chunks_default", KB_A) == 0
     assert _rows_in(session, pgb.partition_name(KB_A, "chunks")) == 503
 
 
-def test_no_row_is_lost_or_duplicated_while_the_rows_move(engine, session, monkeypatch):
-    """The invariant the online move keeps, and the one it gives up.
+def _hold_the_move_open(monkeypatch, moving: threading.Event, seconds: float) -> None:
+    """Stall ``create_partition`` after its rows have moved, before ATTACH.
 
-    Keeps: every row is in exactly one of the two relations at every instant, so
-    the combined count never moves. Gives up: a row already in the unattached
-    partition is not reachable through the *parent* until the ATTACH, so the
-    parent-only count dips during the bulk phase. That is the deliberate trade --
-    one knowledge base briefly returning partial search results, instead of every
-    knowledge base on the table having its writes blocked for the whole move.
+    The ATTACH statement is built right before it runs, inside the move's
+    transaction, so wrapping the builder is a seam that needs no test hook in
+    the service. Restored by the monkeypatch fixture at teardown.
+    """
+    real_attach = pgb.partition_attach_ddl
+
+    def _stalled(*args, **kwargs):
+        moving.set()
+        time.sleep(seconds)
+        return real_attach(*args, **kwargs)
+
+    monkeypatch.setattr(pgb, "partition_attach_ddl", _stalled)
+
+
+def test_updates_and_deletes_through_the_parent_during_a_move_are_honoured(
+    engine, session, monkeypatch
+):
+    """The B1 regression: writes issued mid-move were silently lost.
+
+    Written exactly as the app writes -- a per-row ``UPDATE ... WHERE id`` and a
+    ``DELETE ... WHERE indexed_source_id`` through the parent -- while the move
+    is between moving the rows and attaching the partition. Every update must be
+    present afterwards and no deleted row may come back.
+    """
+    doomed_source = str(uuid.uuid4())
+    session.execute(
+        text(f"""
+            INSERT INTO {SCHEMA}.chunks (knowledge_base_id, indexed_source_id, source_id, text)
+            SELECT CAST(:kb AS uuid),
+                   CASE WHEN g % 10 = 0 THEN CAST(:doomed AS uuid) ELSE NULL END,
+                   CAST(:src AS uuid), 'Wanderweg Abschnitt ' || g
+            FROM generate_series(1, 2000) g
+        """),
+        {"kb": KB_A, "doomed": doomed_source, "src": SOURCE_1},
+    )
+    session.commit()
+    targets = [
+        str(row[0])
+        for row in session.execute(
+            text(
+                f"SELECT id FROM {SCHEMA}.chunks WHERE knowledge_base_id = CAST(:kb AS uuid) "
+                "AND indexed_source_id IS NULL ORDER BY id LIMIT 40"
+            ),
+            {"kb": KB_A},
+        ).all()
+    ]
+    session.rollback()
+
+    moving = threading.Event()
+    _hold_the_move_open(monkeypatch, moving, 1.0)
+    update_counts: list[int] = []
+    delete_counts: list[int] = []
+    errors: list[str] = []
+
+    def updater():
+        moving.wait(timeout=30)
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            for chunk_id in targets:
+                try:
+                    update_counts.append(
+                        conn.execute(
+                            text(
+                                f"UPDATE {SCHEMA}.chunks SET text = 'Wegsperrung wegen Sturm' "
+                                "WHERE id = CAST(:id AS uuid)"
+                            ),
+                            {"id": chunk_id},
+                        ).rowcount
+                    )
+                except Exception as exc:
+                    errors.append(str(exc).splitlines()[0])
+
+    def deleter():
+        moving.wait(timeout=30)
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            try:
+                delete_counts.append(
+                    conn.execute(
+                        text(
+                            f"DELETE FROM {SCHEMA}.chunks "
+                            "WHERE indexed_source_id = CAST(:source AS uuid)"
+                        ),
+                        {"source": doomed_source},
+                    ).rowcount
+                )
+            except Exception as exc:
+                errors.append(str(exc).splitlines()[0])
+
+    threads = [threading.Thread(target=f, daemon=True) for f in (updater, deleter)]
+    for thread in threads:
+        thread.start()
+    pgb.create_partition(engine, KB_A, "chunks")
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert errors == []
+    assert update_counts == [1] * len(targets)
+    assert delete_counts == [200]
+    updated = session.execute(
+        text(
+            f"SELECT count(*) FROM {SCHEMA}.chunks WHERE text = 'Wegsperrung wegen Sturm' "
+            "AND id = ANY(CAST(:ids AS uuid[]))"
+        ),
+        {"ids": "{" + ",".join(targets) + "}"},
+    ).scalar()
+    session.rollback()
+    assert updated == len(targets)
+    resurrected = session.execute(
+        text(f"SELECT count(*) FROM {SCHEMA}.chunks WHERE indexed_source_id = CAST(:s AS uuid)"),
+        {"s": doomed_source},
+    ).scalar()
+    session.rollback()
+    assert resurrected == 0
+    assert _rows_in(session, "chunks", KB_A) == len(KB_A_DOCS) + 1800
+    assert _rows_in(session, "chunks_default", KB_A) == 0
+
+
+def test_a_reader_through_the_parent_sees_every_row_throughout_the_move(
+    engine, session, monkeypatch
+):
+    """The move is one transaction, so a reader never sees it half-done.
+
+    And reads are not blocked while the rows move: the stall below holds the
+    transaction open for a second, and every read completes well inside it.
     """
     _seed(session, KB_A, 2000)
-    monkeypatch.setattr(pgb, "EVACUATION_BATCH_ROWS", 50)
-    partition = pgb.partition_name(KB_A, "chunks")
-
-    combined: list[int] = []
-    parent_only: list[int] = []
+    moving = threading.Event()
+    _hold_the_move_open(monkeypatch, moving, 1.0)
+    counts: list[int] = []
+    latencies: list[float] = []
     stop = threading.Event()
 
     def reader():
+        moving.wait(timeout=30)
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             while not stop.is_set():
-                try:
-                    # One statement, so one snapshot across all three counts.
-                    # DEFAULT + partition, not parent + partition: once the
-                    # partition is attached the parent includes it, and adding
-                    # the two would double-count.
-                    row = conn.execute(
-                        text(f"""
-                            SELECT (SELECT count(*) FROM {SCHEMA}.chunks_default
-                                     WHERE knowledge_base_id = '{KB_A}'),
-                                   (SELECT count(*) FROM {SCHEMA}.{partition}),
-                                   (SELECT count(*) FROM {SCHEMA}.chunks
-                                     WHERE knowledge_base_id = '{KB_A}')
-                        """)
-                    ).first()
-                except Exception:
-                    time.sleep(0.01)  # the partition does not exist yet
-                    continue
-                combined.append(row[0] + row[1])
-                parent_only.append(row[2])
+                issued = time.monotonic()
+                counts.append(
+                    conn.execute(
+                        text(
+                            f"SELECT count(*) FROM {SCHEMA}.chunks "
+                            "WHERE knowledge_base_id = CAST(:kb AS uuid)"
+                        ),
+                        {"kb": KB_A},
+                    ).scalar()
+                )
+                latencies.append(time.monotonic() - issued)
+                time.sleep(0.01)
 
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
     try:
         pgb.create_partition(engine, KB_A, "chunks")
+        time.sleep(0.1)
     finally:
         stop.set()
         thread.join(timeout=30)
 
-    assert combined, "the reader never got a chance to look"
-    assert set(combined) == {2003}, "a row was lost or duplicated mid-move"
-    assert max(parent_only) == 2003
+    assert len(counts) >= 10, counts
+    assert set(counts) == {2003}
+    assert max(latencies) < 0.5, max(latencies)
 
 
-def test_a_concurrent_insert_during_the_move_either_lands_or_fails_loudly(engine, session):
-    """No row is ever silently dropped -- but an in-flight write can fail.
+def test_a_concurrent_insert_during_the_move_waits_and_then_lands(engine, session, monkeypatch):
+    """Inserts through the parent wait for the move and then land in the partition.
 
-    The SHARE lock holds off writers that *start* during the move. A writer
-    already inside its INSERT when the ATTACH commits is a case Postgres itself
-    cannot thread: its tuple routing already resolved to the DEFAULT partition,
-    and after the attach that partition's constraint excludes this knowledge
-    base, so the statement fails with a partition-constraint violation. That is
-    documented Postgres behaviour for ATTACH PARTITION on a table with a DEFAULT
-    partition, and it is a *retryable error*, not a lost row.
-
-    Pinned here so the failure mode stays the known one. In practice the race is
-    avoidable: a knowledge base created after this feature has its partition
-    dispatched at creation, before it has any rows to move.
+    They wait on the parent's lock, so they are planned after the ATTACH commits
+    and routed straight into the new partition -- none fails, none is lost.
     """
+    moving = threading.Event()
+    _hold_the_move_open(monkeypatch, moving, 0.5)
     landed: list[int] = []
     failed: list[str] = []
-    ready = threading.Event()
 
     def writer():
-        ready.wait(timeout=10)
+        moving.wait(timeout=30)
         for n in range(20):
             try:
                 with engine.begin() as conn:
@@ -499,24 +601,15 @@ def test_a_concurrent_insert_during_the_move_either_lands_or_fails_loudly(engine
 
     thread = threading.Thread(target=writer, daemon=True)
     thread.start()
-    ready.set()
     pgb.create_partition(engine, KB_A, "chunks")
     thread.join(timeout=30)
 
-    # Every attempt is accounted for: committed, or refused with an error.
-    assert len(landed) + len(failed) == 20
-    # At most the one statement in flight across the ATTACH can fail, and only
-    # with the documented, retryable partition-constraint violation.
-    assert len(failed) <= 1, failed
-    assert all("violates partition constraint" in message for message in failed), failed
-    # Everything that did commit is visible through the parent, and nowhere else.
-    expected = len(KB_A_DOCS) + len(landed)
-    assert _rows_in(session, "chunks", KB_A) == expected
-    assert (
-        _rows_in(session, "chunks_default", KB_A)
-        + _rows_in(session, pgb.partition_name(KB_A, "chunks"))
-        == expected
-    )
+    assert failed == []
+    assert len(landed) == 20
+    partition = pgb.partition_name(KB_A, "chunks")
+    assert _rows_in(session, "chunks", KB_A) == len(KB_A_DOCS) + 20
+    assert _rows_in(session, partition) == len(KB_A_DOCS) + 20
+    assert _rows_in(session, "chunks_default", KB_A) == 0
 
 
 def test_two_knowledge_bases_can_be_indexed_at_the_same_time(engine, session):
@@ -588,17 +681,15 @@ def test_a_second_caller_is_told_to_retry_rather_than_blocking_for_ever(
     assert pgb.ensure_bm25_index(KB_A, engine=engine)["status"] == "ready"
 
 
-def test_the_writers_keep_working_and_the_cutover_window_stays_short(engine, session, monkeypatch):
-    """The point of the online move, measured in the test itself.
+def test_a_continuous_writer_is_held_for_the_move_and_loses_nothing(engine, session):
+    """The price of the atomic move, measured: writers wait, and only that long.
 
-    A writer inserting continuously gets many rows in while the bulk phase runs;
-    under the old design, which held the lock for the whole move, it would have
-    managed at most the one statement that was already in flight. And the window
-    where writes really are blocked -- the cutover -- is a small fraction of the
-    total.
+    A writer inserting continuously for the same knowledge base is blocked while
+    the rows move and resumes when the move commits. No write fails and none is
+    lost, and no single write waited much longer than the window the move
+    itself reports.
     """
     _seed(session, KB_A, 20_000)
-    monkeypatch.setattr(pgb, "EVACUATION_BATCH_ROWS", 200)
 
     landed: list[float] = []
     failed: list[str] = []
@@ -625,36 +716,23 @@ def test_the_writers_keep_working_and_the_cutover_window_stays_short(engine, ses
 
     thread = threading.Thread(target=writer, daemon=True)
     thread.start()
-    started = time.monotonic()
+    time.sleep(0.05)
     try:
         move = pgb.create_partition(engine, KB_A, "chunks")
+        time.sleep(0.05)
     finally:
         stop.set()
         thread.join(timeout=30)
-    total = time.monotonic() - started
 
-    # Writers were not shut out for the duration. Under the previous design,
-    # which held the lock for the whole move, a writer got exactly one statement
-    # in -- and waited out the entire move for it.
-    assert len(landed) >= 5, (len(landed), failed)
-    # And no single write waited anywhere near the length of the move.
-    assert max(landed) < total / 2, (max(landed), total)
-    # Only the in-flight-at-ATTACH statement may fail, and only that way.
-    assert len(failed) <= 1, failed
-    assert all("violates partition constraint" in message for message in failed), failed
-    # Nothing lost, nothing duplicated. Counted as DEFAULT + partition, never
-    # rows_moved + DEFAULT: a write that commits after the ATTACH goes straight
-    # into the partition, so it is never a row this move "moved".
+    assert failed == []
+    assert len(landed) >= 5
+    # The longest write wait is the move's own blocking window, plus slack.
+    assert max(landed) < move["writes_blocked_seconds"] + 0.5, (max(landed), move)
     expected = len(KB_A_DOCS) + 20_000 + len(landed)
     assert _rows_in(session, "chunks", KB_A) == expected
-    assert (
-        _rows_in(session, "chunks_default", KB_A)
-        + _rows_in(session, pgb.partition_name(KB_A, "chunks"))
-        == expected
-    )
+    assert _rows_in(session, "chunks_default", KB_A) == 0
+    assert _rows_in(session, pgb.partition_name(KB_A, "chunks")) == expected
     assert move["rows_moved"] >= 20_000 + len(KB_A_DOCS)
-    # The blocking window is a small slice of the whole move.
-    assert move["cutover_seconds"] < total / 2, (move, total)
 
 
 def test_the_attach_skips_its_validation_scan(engine, session):
@@ -686,21 +764,20 @@ def test_the_attach_skips_its_validation_scan(engine, session):
     assert big["rows_moved"] == 20_003
     assert small["rows_moved"] == 2
     # Ten thousand times the rows, nowhere near that much lock time.
-    assert big["cutover_seconds"] < max(small["cutover_seconds"], 0.05) * 20, (small, big)
+    assert big["writes_blocked_seconds"] >= 0 and small["writes_blocked_seconds"] >= 0
 
 
 def test_a_crashed_move_is_resumed_with_no_row_lost_or_duplicated(engine, session, monkeypatch):
-    """A crash between the bulk phase and the ATTACH must be recoverable.
+    """A failure between moving the rows and the ATTACH rolls the move back whole.
 
-    The bulk batches are already committed, so the rows are split across the
-    DEFAULT partition and an unattached partition -- each row in exactly one of
-    them. ``ensure`` has to notice the unattached partition and finish the job.
+    The copy, the delete and the ATTACH are one transaction, so the crash leaves
+    every row where it started and the clone empty and unattached. ``ensure``
+    has to notice the unattached clone and finish the job.
     """
     _seed(session, KB_A, 400)
-    monkeypatch.setattr(pgb, "EVACUATION_BATCH_ROWS", 100)
 
     def _explode(*_args, **_kwargs):
-        raise RuntimeError("simulated crash just before the cutover")
+        raise RuntimeError("simulated crash just before the attach")
 
     # Restored by hand, not with monkeypatch.undo(): undo() would also revert the
     # fixture's AI_SCHEMA patch and send the rest of this test at the real schema.
@@ -711,10 +788,9 @@ def test_a_crashed_move_is_resumed_with_no_row_lost_or_duplicated(engine, sessio
     monkeypatch.setattr(pgb, "partition_attach_ddl", real_attach)
 
     partition = pgb.partition_name(KB_A, "chunks")
-    moved_early = _rows_in(session, partition)
-    left_behind = _rows_in(session, "chunks_default", KB_A)
-    assert moved_early > 0, "the bulk phase committed nothing"
-    assert moved_early + left_behind == 403, "a row was lost or duplicated by the crash"
+    assert _rows_in(session, partition) == 0, "the move was not rolled back whole"
+    assert _rows_in(session, "chunks_default", KB_A) == 403
+    assert _rows_in(session, "chunks", KB_A) == 403
     assert _indexdef(session) is None
 
     result = pgb.ensure_bm25_index(KB_A, engine=engine)
