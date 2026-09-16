@@ -27,7 +27,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session
 
 from agentic_project_service.services import base_vector_store as bvs
@@ -735,36 +735,120 @@ def test_a_continuous_writer_is_held_for_the_move_and_loses_nothing(engine, sess
     assert move["rows_moved"] >= 20_000 + len(KB_A_DOCS)
 
 
-def test_the_attach_skips_its_validation_scan(engine, session):
-    """The CHECK constraint is what keeps the cutover independent of row count.
+def _move_check_names(session) -> list[str]:
+    try:
+        return [
+            row[0]
+            for row in session.execute(
+                text(
+                    "SELECT conname FROM pg_constraint "
+                    f"WHERE conrelid = '{SCHEMA}.chunks_default'::regclass "
+                    "AND conname LIKE 'bm25\\_move\\_%' ORDER BY conname"
+                )
+            ).all()
+        ]
+    finally:
+        session.rollback()
 
-    Postgres skips ATTACH's scan of the table being attached when that table
-    already has a constraint implying the partition bound. Asserted two ways:
-    the constraint is really there, and the cutover on a 3000-row partition is
-    no slower than the one on a 3-row partition by more than a small margin.
+
+def test_the_attach_scans_neither_the_new_partition_nor_default(engine, session):
+    """What keeps the ATTACH itself short, pinned by Postgres' own debug notices.
+
+    ATTACH PARTITION proves two things before it commits, each by a full scan
+    under ACCESS EXCLUSIVE unless an existing *validated* constraint already
+    implies it: that the new partition holds only its own knowledge base (the
+    CHECK on the clone), and that DEFAULT holds none of it (a temporary
+    ``CHECK (knowledge_base_id <> kb)`` on DEFAULT, validated under the move's
+    SHARE lock). With both in place Postgres says so at DEBUG1 and never logs
+    ``verifying table``. A timing bound could not tell these apart on a test
+    sized DEFAULT; the notice can.
     """
-    _seed(session, KB_A, 20_000)
-    small = pgb.create_partition(engine, KB_B, "chunks")
-    big = pgb.create_partition(engine, KB_A, "chunks")
+    _seed(session, KB_B, 2_000, prefix="rando B")
+    _seed(session, KB_A, 2_000)
+    notices: list[str] = []
+    debug_engine = create_engine(
+        engine.url, connect_args={"options": "-c client_min_messages=debug1"}
+    )
 
+    @event.listens_for(debug_engine, "connect")
+    def _capture(dbapi_connection, _record):
+        dbapi_connection.add_notice_handler(lambda diag: notices.append(diag.message_primary))
+
+    try:
+        move = pgb.create_partition(debug_engine, KB_A, "chunks")
+    finally:
+        debug_engine.dispose()
+
+    partition = pgb.partition_name(KB_A, "chunks")
+    assert move["rows_moved"] == 2_003
+    assert (
+        f'partition constraint for table "{partition}" is implied by existing constraints'
+        in notices
+    ), notices
+    assert (
+        'updated partition constraint for default partition "chunks_default" is implied '
+        "by existing constraints" in notices
+    ), notices
+    # Nothing is scanned by the ATTACH: no "verifying table" after its first notice.
+    attach_notices = notices[
+        notices.index(
+            f'partition constraint for table "{partition}" is implied by existing constraints'
+        ) :
+    ]
+    assert not [n for n in attach_notices if n.startswith("verifying table")], attach_notices
+    # The CHECK on the clone stays; the temporary one on DEFAULT is gone.
     constraints = [
         row[0]
         for row in session.execute(
             text(
                 "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-                f"WHERE conrelid = '{SCHEMA}.{pgb.partition_name(KB_A, 'chunks')}'::regclass "
-                "AND contype = 'c'"
+                f"WHERE conrelid = '{SCHEMA}.{partition}'::regclass AND contype = 'c'"
             )
         ).all()
     ]
     session.rollback()
-    # Postgres re-renders the expression with its own parentheses.
     assert constraints == [f"CHECK ((knowledge_base_id = '{KB_A}'::uuid))"]
+    assert _move_check_names(session) == []
+    # Rows of the knowledge base can be written through the parent again.
+    _seed(session, KB_A, 5)
+    assert _rows_in(session, partition) == 2_008
 
-    assert big["rows_moved"] == 20_003
-    assert small["rows_moved"] == 2
-    # Ten thousand times the rows, nowhere near that much lock time.
-    assert big["writes_blocked_seconds"] >= 0 and small["writes_blocked_seconds"] >= 0
+
+def test_a_failed_move_does_not_leave_the_default_check_behind(engine, session, monkeypatch):
+    """The temporary CHECK refuses this KB's rows in DEFAULT; a failed move
+    must not leave it there, or every later write for the KB would fail."""
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("simulated failure before the attach")
+
+    real_attach = pgb.partition_attach_ddl
+    monkeypatch.setattr(pgb, "partition_attach_ddl", _explode)
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        pgb.create_partition(engine, KB_A, "chunks")
+    monkeypatch.setattr(pgb, "partition_attach_ddl", real_attach)
+
+    assert _move_check_names(session) == []
+    _seed(session, KB_A, 5)
+    assert _rows_in(session, "chunks_default", KB_A) == len(KB_A_DOCS) + 5
+
+
+def test_a_leftover_default_check_from_a_crashed_move_is_cleared_by_the_next_move(engine, session):
+    """A worker killed mid-move cannot run its cleanup. The next move on the
+    table (under the same build lock, so no move is in flight) clears it."""
+    kb_b_hex = uuid.UUID(KB_B).hex
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(
+            text(
+                f"ALTER TABLE {SCHEMA}.chunks_default ADD CONSTRAINT bm25_move_{kb_b_hex} "
+                f"CHECK (knowledge_base_id <> '{KB_B}') NOT VALID"
+            )
+        )
+
+    pgb.create_partition(engine, KB_A, "chunks")
+
+    assert _move_check_names(session) == []
+    _seed(session, KB_B, 5, prefix="rando B")
+    assert _rows_in(session, "chunks_default", KB_B) == len(KB_B_DOCS) + 5
 
 
 def test_a_crashed_move_is_resumed_with_no_row_lost_or_duplicated(engine, session, monkeypatch):

@@ -348,6 +348,64 @@ def partition_check_ddl(knowledge_base_id: Any, item_table: str) -> str:
     )
 
 
+# Prefix of the temporary CHECK a move puts on the DEFAULT partition. Named per
+# knowledge base (``bm25_move_`` + 32 hex = 42 bytes) so a leftover from a
+# crashed move says whose it was.
+_DEFAULT_MOVE_CHECK_PREFIX = "bm25_move_"
+
+
+def default_move_check_name(knowledge_base_id: Any) -> str:
+    return f"{_DEFAULT_MOVE_CHECK_PREFIX}{uuid.UUID(_validated_kb_id(knowledge_base_id)).hex}"
+
+
+def default_move_check_add_ddl(knowledge_base_id: Any, item_table: str) -> str:
+    """``CHECK (knowledge_base_id <> kb) NOT VALID`` on the DEFAULT partition.
+
+    The other half of keeping ATTACH short. Besides the new partition, ATTACH
+    has to prove that DEFAULT holds no row of the new bound, and it does that
+    with a full scan of DEFAULT under ACCESS EXCLUSIVE -- blocking every reader
+    and writer of the item table for a time that grows with the whole DEFAULT
+    partition, not with this knowledge base -- unless a *validated* constraint
+    on DEFAULT already implies it. This is that constraint.
+
+    NOT VALID, so adding it is a catalog change that reads no rows; but from
+    the moment it commits Postgres enforces it on new writes, so an INSERT or
+    UPDATE of this knowledge base's rows routed to DEFAULT would fail with
+    SQLSTATE 23514. ``create_partition`` therefore adds it only while it already
+    holds writers off the parent.
+    """
+    kb_id = _validated_kb_id(knowledge_base_id)
+    return (
+        f"ALTER TABLE {_qualified(default_partition_name(item_table))} "
+        f"ADD CONSTRAINT {default_move_check_name(kb_id)} "
+        f"CHECK (knowledge_base_id <> '{kb_id}') NOT VALID"
+    )
+
+
+def default_move_check_validate_ddl(knowledge_base_id: Any, item_table: str) -> str:
+    """Validate the DEFAULT check: one scan of DEFAULT, readers unaffected.
+
+    VALIDATE CONSTRAINT takes SHARE UPDATE EXCLUSIVE, which does not conflict
+    with the ACCESS SHARE readers hold. It can only succeed once this knowledge
+    base's rows have left DEFAULT, so it runs inside the move, after the
+    DELETE, where the move's SHARE locks are already holding writers off.
+    """
+    return (
+        f"ALTER TABLE {_qualified(default_partition_name(item_table))} "
+        f"VALIDATE CONSTRAINT {default_move_check_name(knowledge_base_id)}"
+    )
+
+
+def default_move_check_drop_ddl(item_table: str, constraint_name: str) -> str:
+    """Drop a temporary DEFAULT check by name (its own or a crashed move's)."""
+    if not re.fullmatch(rf"{_DEFAULT_MOVE_CHECK_PREFIX}[0-9a-f]{{32}}", constraint_name):
+        raise ValueError(f"not a move check constraint name: {constraint_name!r}")
+    return (
+        f"ALTER TABLE {_qualified(default_partition_name(item_table))} "
+        f"DROP CONSTRAINT IF EXISTS {constraint_name}"
+    )
+
+
 class PartitionBuildInProgress(RuntimeError):
     """Another caller is already building a partition of this item table."""
 
@@ -782,62 +840,151 @@ def _prepare_partition(conn, kb_id: str, item_table: str) -> None:
     conn.commit()
 
 
+def _move_check_names(conn, item_table: str) -> list[str]:
+    """Temporary move checks currently on this item table's DEFAULT partition."""
+    return [
+        row[0]
+        for row in conn.execute(
+            text(
+                "SELECT c.conname FROM pg_constraint c "
+                "JOIN pg_class t ON t.oid = c.conrelid "
+                "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                "WHERE n.nspname = :schema AND t.relname = :relname AND c.contype = 'c' "
+                "AND c.conname LIKE :prefix ORDER BY c.conname"
+            ),
+            {
+                "schema": AI_SCHEMA,
+                "relname": default_partition_name(item_table),
+                "prefix": _DEFAULT_MOVE_CHECK_PREFIX.replace("_", "\\_") + "%",
+            },
+        ).all()
+    ]
+
+
+def _drop_move_checks(conn, item_table: str, names: list[str]) -> None:
+    """Drop temporary DEFAULT checks, each in its own short transaction.
+
+    DROP CONSTRAINT takes ACCESS EXCLUSIVE on DEFAULT for a catalog change
+    only, bounded by the same lock timeout as the move.
+    """
+    for name in names:
+        conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+        conn.execute(text(default_move_check_drop_ddl(item_table, name)))
+        conn.commit()
+
+
 def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
     """Move one knowledge base into a partition of its own, atomically.
 
     Returns ``{"rows_moved": int, "writes_blocked_seconds": float}``.
 
-    1. **prepare** (its own transaction) -- clone the DEFAULT partition into an
-       unattached table, give it a CHECK constraint matching the partition
-       bound (so the ATTACH skips its scan of the new partition) and the
-       foreign keys ``LIKE`` does not copy;
-    2. **move** (one transaction) -- take SHARE on the parent and on DEFAULT,
-       copy the KB's rows into the clone, delete them from DEFAULT, ATTACH,
-       mirror ownership/grants/RLS, commit.
+    1. **prepare** (own transaction) -- clone the DEFAULT partition into an
+       unattached table with a CHECK matching the partition bound (so ATTACH
+       skips its scan of the new partition) and the foreign keys ``LIKE`` does
+       not copy. Any temporary DEFAULT check a crashed move left is dropped.
+    2. **move** (one transaction) -- SHARE on the parent; meanwhile, on a
+       second connection, add ``CHECK (knowledge_base_id <> kb) NOT VALID`` to
+       DEFAULT (a catalog change) and commit it; SHARE on DEFAULT; copy the
+       KB's rows into the clone and delete them from DEFAULT; VALIDATE the
+       DEFAULT check (one scan of DEFAULT, readers unaffected); ATTACH, which
+       now needs neither of its scans; mirror ownership, grants, RLS and
+       policies; commit.
+    3. **unfence** (own transaction) -- drop the DEFAULT check.
 
     The bm25 index is built afterwards with CREATE INDEX CONCURRENTLY, outside
     any of this.
 
-    Because step 2 is one transaction, every reader sees either all of the
-    knowledge base's rows in DEFAULT or all of them in the partition, and
-    writers through the parent wait for the commit and then see the new
-    partition (see ``partition_lock_parent_ddl``). The price is that writes to
-    this item table are blocked for the whole of step 2, which grows with the
-    number of rows moved. That is the deliberate choice over the earlier
-    online design, which kept writers going but silently lost their UPDATEs
-    and DELETEs.
+    Who waits, measured on Postgres 15 moving 40 000 rows out of a DEFAULT of
+    540 000 (warm cache): writers through the parent, for every knowledge base
+    on this item table, for all of step 2 -- about 0.2 s, of which the copy
+    and delete are ~0.14 s and the VALIDATE scan ~0.05 s; it grows with the
+    rows moved and with the size of DEFAULT. Readers only for the ATTACH itself
+    (~1 ms, instead of the ~50 ms scan of DEFAULT it ran without the check)
+    and for the catalog-only ADD and DROP of the check.
+
+    Why this order. The DEFAULT check cannot be validated while any of the
+    knowledge base's rows are still in DEFAULT, so VALIDATE has to follow the
+    DELETE inside the move. Adding the check inside the move's own transaction
+    would take ACCESS EXCLUSIVE on DEFAULT there and block readers for the rest
+    of the move. Adding it in a transaction of its own *before* taking the
+    parent lock would leave a gap in which a write of this knowledge base
+    routed to DEFAULT fails the check (SQLSTATE 23514) instead of waiting;
+    adding it on a second connection while the parent lock is already held
+    closes that gap, because no writer can reach DEFAULT through the parent
+    until the move commits.
+
+    Because step 3 is one transaction, every reader sees the knowledge base's
+    rows either all in DEFAULT or all in the partition, and writers through the
+    parent wait for the commit and then plan against the new partition list
+    (see ``partition_lock_parent_ddl``). That is the deliberate choice over the
+    earlier online design, which kept writers going but silently lost their
+    UPDATEs and DELETEs.
 
     Serialised per item table by a session-scoped advisory lock: two
     concurrent moves out of one DEFAULT partition deadlock each other.
 
-    Re-entrant: a failure anywhere in step 2 rolls the whole move back, so a
-    retry starts from a clean DEFAULT and an empty clone.
+    Re-entrant: a failure in step 2 rolls the move back and the check is
+    dropped, so a retry starts from a clean DEFAULT and an empty clone.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     partition = partition_name(kb_id, item_table)
     default = default_partition_name(item_table)
     insert_sql, delete_sql = move_rows_sql(kb_id, item_table)
+    fence = default_move_check_name(kb_id)
 
     with engine.connect() as conn:
         _acquire_partition_build_lock(conn, item_table)
         try:
+            # Under the build lock no other move is in flight, so every move
+            # check still on DEFAULT is a crashed move's leftover -- and one
+            # that refuses some knowledge base's writes until it is gone.
+            _drop_move_checks(conn, item_table, _move_check_names(conn, item_table))
             if _partition_is_attached(conn, kb_id, item_table):
                 return {"rows_moved": 0, "writes_blocked_seconds": 0.0}
 
             _prepare_partition(conn, kb_id, item_table)
 
-            conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
-            conn.execute(text(partition_lock_parent_ddl(item_table)))
-            started = time.monotonic()
-            conn.execute(text(partition_lock_default_ddl(item_table)))
-            moved = conn.execute(text(insert_sql), {"kb": kb_id}).rowcount
-            conn.execute(text(delete_sql), {"kb": kb_id})
-            conn.execute(text(partition_attach_ddl(kb_id, item_table)))
-            conn.execute(
-                text(mirror_relation_settings_sql(_qualified(item_table), _qualified(partition)))
-            )
-            conn.commit()
-            blocked = time.monotonic() - started
+            try:
+                conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+                conn.execute(text(partition_lock_parent_ddl(item_table)))
+                started = time.monotonic()
+                # The fence goes up on a second connection while this one holds
+                # writers off the parent: it has to commit before the move can
+                # validate it, and committing it here would release the lock and
+                # open a gap in which this KB's writes hit it and fail.
+                with engine.connect() as fencer:
+                    fencer.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+                    fencer.execute(text(default_move_check_add_ddl(kb_id, item_table)))
+                    fencer.commit()
+                conn.execute(text(partition_lock_default_ddl(item_table)))
+                moved = conn.execute(text(insert_sql), {"kb": kb_id}).rowcount
+                conn.execute(text(delete_sql), {"kb": kb_id})
+                conn.execute(text(default_move_check_validate_ddl(kb_id, item_table)))
+                conn.execute(text(partition_attach_ddl(kb_id, item_table)))
+                conn.execute(
+                    text(
+                        mirror_relation_settings_sql(_qualified(item_table), _qualified(partition))
+                    )
+                )
+                conn.commit()
+                blocked = time.monotonic() - started
+            finally:
+                conn.rollback()
+                try:
+                    _drop_move_checks(conn, item_table, [fence])
+                except Exception:
+                    # Harmless once the move committed (the KB's rows no longer
+                    # route to DEFAULT); after a failed move it refuses the KB's
+                    # writes until the next move on this table clears it.
+                    conn.rollback()
+                    logger.warning(
+                        "Could not drop the temporary check %s from %s.%s; the next "
+                        "partition build on this table will",
+                        fence,
+                        AI_SCHEMA,
+                        default,
+                        exc_info=True,
+                    )
         finally:
             _release_partition_build_lock(conn, item_table)
 

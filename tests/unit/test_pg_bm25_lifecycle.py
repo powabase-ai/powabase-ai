@@ -227,14 +227,55 @@ def test_ensure_moves_every_row_and_attaches_in_one_transaction():
     # Bounded wait for the locks, parent first (the order writers take them in),
     # then the whole move, then ATTACH and the settings mirror.
     assert timeout < parent_lock < default_lock < insert_at < delete_at < attach_at < mirror_at
-    # One transaction: nothing commits between the timeout and the mirror.
-    assert not [c for c in conn.commits if timeout < c <= mirror_at], conn.commits
+    # One transaction: nothing commits between the timeout and the mirror. The
+    # one exception is the DEFAULT check, committed on a second connection (the
+    # fake engine hands out the same recorder for both).
+    fence_committed = conn.statements.index(pgb.default_move_check_add_ddl(KB, "chunks")) + 1
+    assert not [c for c in conn.commits if timeout < c <= mirror_at and c != fence_committed], (
+        conn.commits
+    )
     assert any(c > mirror_at for c in conn.commits)
     # Exactly one copy and one delete: no batching left over from the online design.
     assert conn.statements.count(insert_sql) == 1
     assert conn.statements.count(delete_sql) == 1
     # The index build is outside it -- CONCURRENTLY cannot run in a transaction.
     assert _ddl(conn) == [pgb.bm25_index_ddl(KB, "chunks", "german")]
+
+
+def test_the_default_partition_is_fenced_so_the_attach_does_not_scan_it():
+    """B2: without a validated ``CHECK (knowledge_base_id <> kb)`` on DEFAULT,
+    ATTACH scans the whole DEFAULT partition under ACCESS EXCLUSIVE.
+
+    The check is added NOT VALID only once the parent lock is held (so no write
+    of this KB can hit it), validated after the rows have left DEFAULT and
+    before the ATTACH, and dropped again after the commit.
+    """
+    conn = _FakeConn(moved=10)
+
+    pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    statements = conn.statements
+    parent_lock = statements.index(pgb.partition_lock_parent_ddl("chunks"))
+    add = statements.index(pgb.default_move_check_add_ddl(KB, "chunks"))
+    delete_at = statements.index(pgb.move_rows_sql(KB, "chunks")[1])
+    validate = statements.index(pgb.default_move_check_validate_ddl(KB, "chunks"))
+    attach = statements.index(pgb.partition_attach_ddl(KB, "chunks"))
+    drop = statements.index(
+        pgb.default_move_check_drop_ddl("chunks", pgb.default_move_check_name(KB))
+    )
+    assert parent_lock < add < delete_at < validate < attach < drop
+    assert "NOT VALID" in statements[add]
+    assert f"CHECK (knowledge_base_id <> '{KB}')" in statements[add]
+    # The move commits before the check is dropped.
+    assert any(attach < c <= drop for c in conn.commits)
+
+
+def test_the_move_check_name_fits_the_identifier_limit_and_is_validated():
+    name = pgb.default_move_check_name(KB)
+    assert name == f"bm25_move_{HEX}"
+    assert len(name) <= 63
+    with pytest.raises(ValueError):
+        pgb.default_move_check_drop_ddl("chunks", "chunks_pkey; DROP TABLE x")
 
 
 def test_ensure_takes_the_build_lock_before_touching_anything():
