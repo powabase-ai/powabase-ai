@@ -17,7 +17,13 @@ from ..services.base_vector_store import (
     get_retrieval_degradations,
     reset_retrieval_degradations,
 )
-from ..services.pg_bm25_index import pg_bm25_status, pg_search_installed
+from ..services.pg_bm25_index import (
+    PARTITIONED_ITEM_TABLES,
+    pg_bm25_item_table,
+    pg_bm25_status,
+    pg_search_installed,
+    table_is_partitioned,
+)
 from ..services.settings_registry import get_setting
 from ..services.sparse_retrieval import (
     SparseIndexStore,
@@ -343,6 +349,60 @@ def _pg_search_available() -> bool:
         return False
 
 
+def _keyword_index_backend(strategy: str | None) -> str | None:
+    """Which keyword index serves a KB with this indexing strategy.
+
+    ``"pg_search"`` -- the KB's own ``USING bm25`` index on its partition: the
+    extension is installed, the strategy maps to an item table, and that table
+    is partitioned by knowledge base (the same checks ``ensure_bm25_index``
+    makes before it does anything).
+    ``"bm25s"`` -- the bm25s file index: everything else with an item table.
+    This is also what the search path reads when pg_search is installed but
+    its index cannot exist yet (an item table not partitioned).
+    ``None`` -- the strategy has no BM25 item table at all.
+
+    A missing strategy means ``chunk_embed``, as everywhere else. Every route
+    that starts an index build branches on this one answer, so they cannot
+    disagree, and never starts both builds.
+    """
+    strategy = strategy or "chunk_embed"
+    if strategy not in _STRATEGY_TO_ITEM_TABLE:
+        return None
+    if not _pg_search_available():
+        return "bm25s"
+    item_table = pg_bm25_item_table(strategy)
+    if item_table is None or item_table not in PARTITIONED_ITEM_TABLES:
+        return "bm25s"
+    try:
+        partitioned = table_is_partitioned(db.session, item_table)
+    except Exception:
+        logger.warning(
+            "Could not tell whether %s.%s is partitioned; treating the keyword index "
+            "as the bm25s file index",
+            AI_SCHEMA,
+            item_table,
+            exc_info=True,
+        )
+        try:
+            db.session.rollback()
+        except Exception:
+            logger.debug("Rollback after the partition probe failed", exc_info=True)
+        return "bm25s"
+    return "pg_search" if partitioned else "bm25s"
+
+
+def _read_kb_strategy(kb_id: str) -> str | None:
+    """The KB's stored ``indexing_config.strategy``, or None."""
+    row = db.session.execute(
+        text(
+            f"SELECT indexing_config->>'strategy' FROM \"{AI_SCHEMA}\".knowledge_bases "
+            "WHERE id = :id"
+        ),
+        {"id": kb_id},
+    ).fetchone()
+    return row[0] if row else None
+
+
 def _pg_bm25_inputs_changed(old_config: dict, new_config: dict) -> bool:
     """Does this retrieval_config edit change the KB's pg_search index?
 
@@ -381,11 +441,19 @@ def _dispatch_ensure_pg_bm25_index(kb_id: str) -> None:
 
 
 def _compute_bm25_status(kb) -> str | None:
-    """Returns 'absent' | 'building' | 'stale' | 'ready', or None if N/A.
+    """The ``bm25_status`` field of the KB detail response, or None to omit it.
 
-    A pg_search index, when there is one, is the authority: it is what the
-    keyword path will actually use, and 'building' is a state only it has.
-    The bm25s file index answers otherwise.
+    Values:
+      - ``"absent"``: no index exists yet;
+      - ``"building"``: the pg_search index exists but cannot answer a query
+        yet (a concurrent build still running, or one that did not finish);
+      - ``"stale"``: the bm25s file index is older than the KB's items
+        (file index only);
+      - ``"ready"``: the index serves keyword queries.
+
+    The index reported is the one the keyword leg actually uses (see
+    ``_keyword_index_backend``): the pg_search index when that is the
+    backend, the bm25s file index otherwise.
 
     Returns None (caller should omit the field) when:
       - the KB's retrieval method does not use BM25, OR
@@ -406,9 +474,10 @@ def _compute_bm25_status(kb) -> str | None:
         return None
 
     strategy = indexing_config.get("strategy")
-    pg_state = pg_bm25_status(kb_id, strategy)
-    if pg_state is not None:
-        return pg_state
+    if _keyword_index_backend(strategy) == "pg_search":
+        pg_state = pg_bm25_status(kb_id, strategy)
+        if pg_state is not None:
+            return pg_state
 
     if get_setting("BM25_AUTO_INDEXING"):
         return None
@@ -572,8 +641,13 @@ def create_knowledge_base():
     )
     db.session.commit()
 
-    if isinstance(retrieval_config, dict) and (
-        retrieval_config.get("method") in _KEYWORD_RETRIEVAL_METHODS
+    # A new KB has no items, so only the pg_search path has work to do now:
+    # giving the KB its partition while it is empty is what keeps the later
+    # move free. The bm25s file index grows per source as items arrive.
+    if (
+        isinstance(retrieval_config, dict)
+        and retrieval_config.get("method") in _KEYWORD_RETRIEVAL_METHODS
+        and _keyword_index_backend(strategy_name) == "pg_search"
     ):
         _dispatch_ensure_pg_bm25_index(kb_id)
 
@@ -705,24 +779,26 @@ def update_knowledge_base(kb_id: str):
         new_retrieval_config = data.get("retrieval_config") or {}
         if not isinstance(new_retrieval_config, dict):
             new_retrieval_config = {}
-        if _pg_bm25_inputs_changed(old_retrieval_config, new_retrieval_config):
-            _dispatch_ensure_pg_bm25_index(kb_id)
-
         new_method = new_retrieval_config.get("method")
-        transitioned_to_bm25 = old_method not in ("hybrid", "full_text") and new_method in (
-            "hybrid",
-            "full_text",
-        )
-        if transitioned_to_bm25 and get_setting("BM25_AUTO_INDEXING"):
-            try:
-                build_bm25_for_kb.delay(kb_id)
-            except Exception:
-                logger.warning(
-                    "Failed to auto-dispatch build_bm25 for KB %s; "
-                    "bm25_status will remain absent until manually triggered",
-                    kb_id,
-                    exc_info=True,
-                )
+        was_keyword = old_method in _KEYWORD_RETRIEVAL_METHODS
+        is_keyword = new_method in _KEYWORD_RETRIEVAL_METHODS
+
+        if is_keyword:
+            # Exactly one index build, for the index the keyword leg will read.
+            backend = _keyword_index_backend(_read_kb_strategy(kb_id))
+            if backend == "pg_search":
+                if _pg_bm25_inputs_changed(old_retrieval_config, new_retrieval_config):
+                    _dispatch_ensure_pg_bm25_index(kb_id)
+            elif backend == "bm25s" and not was_keyword and get_setting("BM25_AUTO_INDEXING"):
+                try:
+                    build_bm25_for_kb.delay(kb_id)
+                except Exception:
+                    logger.warning(
+                        "Failed to auto-dispatch build_bm25 for KB %s; "
+                        "bm25_status will remain absent until manually triggered",
+                        kb_id,
+                        exc_info=True,
+                    )
 
     return get_knowledge_base(kb_id)
 
@@ -881,8 +957,8 @@ def delete_knowledge_base(kb_id: str):
     )
     db.session.commit()
 
-    # The KB row is gone, so nothing else will ever reconcile its BM25 index;
-    # dropping it also frees the item table for another KB's index.
+    # The KB row is gone, so nothing else will ever reconcile its BM25 index
+    # or its partitions: drop both (the task's default for a deleted KB).
     try:
         drop_pg_bm25_index.delay(kb_id)
     except Exception:
@@ -1824,9 +1900,12 @@ def search_knowledge_base_route(kb_id: str):
 def build_bm25_endpoint(kb_id: str):
     """Dispatch a one-shot BM25 rebuild for this KB.
 
-    Manual operator path. With pg_search installed this reconciles the KB's
-    ``USING bm25`` index; without it, it re-tokenizes the entire item table
-    for the KB's strategy and writes a fresh bm25s file index, replacing
+    Manual operator path. It builds the index the KB's keyword leg actually
+    reads (``_keyword_index_backend``): with pg_search installed and the item
+    table partitioned, it reconciles the KB's ``USING bm25`` index (moving its
+    rows into its own partition first if needed, and rebuilding an index whose
+    tokenizer no longer matches); otherwise it re-tokenizes the entire item
+    table for the KB's strategy and writes a fresh bm25s file index, replacing
     whatever was there.
 
     Returns 202 + the Celery task id. Caller can poll ``bm25_status`` on
@@ -1892,7 +1971,11 @@ def build_bm25_endpoint(kb_id: str):
             }
         ), 400
 
-    task = ensure_pg_bm25_index if _pg_search_available() else build_bm25_for_kb
+    task = (
+        ensure_pg_bm25_index
+        if _keyword_index_backend(strategy) == "pg_search"
+        else build_bm25_for_kb
+    )
     try:
         t = task.delay(kb_id)
     except Exception:

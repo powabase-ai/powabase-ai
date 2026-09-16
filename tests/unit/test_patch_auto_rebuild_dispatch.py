@@ -1,17 +1,32 @@
 """Tests that PATCH /knowledge-bases/<id> auto-dispatches build_bm25_for_kb
 when retrieval method transitions from non-BM25 to BM25 (and the
-BM25_AUTO_INDEXING setting is on)."""
+BM25_AUTO_INDEXING setting is on).
+
+These cover a KB whose keyword leg reads the bm25s file index (no pg_search,
+or an item table not partitioned). The pg_search path, where this build must
+not run, is covered in test_routes_keyword_index_dispatch.py.
+"""
 
 from __future__ import annotations
 
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from agentic_project_service.routes import knowledge_bases as kb_route
 
 _FAKE_JWT = "fake.jwt.token"
+
+
+@pytest.fixture(autouse=True)
+def _file_index_backend():
+    with (
+        patch.object(kb_route, "_keyword_index_backend", return_value="bm25s"),
+        patch.object(kb_route, "_read_kb_strategy", return_value="chunk_embed"),
+        patch.object(kb_route, "_pg_search_available", return_value=False),
+    ):
+        yield
 
 
 def _make_test_app():
