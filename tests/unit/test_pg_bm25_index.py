@@ -337,7 +337,7 @@ def test_extension_detection_never_raises_on_a_broken_session():
 
 
 def test_a_failed_extension_probe_is_not_cached_and_is_logged(caplog):
-    """I7: caching "can't tell" as "not installed" hid pg_search for 30 s
+    """Caching "can't tell" as "not installed" hid pg_search for 30 s
     process-wide after one stale connection, and said so only at DEBUG."""
     ok = MagicMock()
     ok.first.return_value = (1,)
@@ -352,7 +352,7 @@ def test_a_failed_extension_probe_is_not_cached_and_is_logged(caplog):
 
 
 def test_the_extension_probe_runs_inside_a_savepoint():
-    """I7: a failing probe must not abort the caller's transaction, or the
+    """A failing probe must not abort the caller's transaction, or the
     keyword fallback that follows dies with InFailedSqlTransaction."""
     session = _session([(1,)])
     pgb.pg_search_installed(session)

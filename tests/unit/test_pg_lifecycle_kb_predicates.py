@@ -1,4 +1,4 @@
-"""I10: statements that find a knowledge base's rows by a narrower key also name the KB.
+"""Statements that find a knowledge base's rows by a narrower key also name the KB.
 
 With the item tables partitioned by knowledge base, a statement that filters
 only by ``indexed_source_id`` or ``toc_id`` cannot be pruned: it plans and

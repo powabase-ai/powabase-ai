@@ -297,7 +297,7 @@ def test_mirror_relation_settings_sql_copies_owner_grants_and_rls():
 
 
 def test_copy_policies_sql_recreates_every_policy_of_the_source_on_the_target():
-    """B5: a new relation starts with RLS policies of its own -- none.
+    """A new relation starts with RLS policies of its own -- none.
 
     With RLS enabled and no policy, a role without BYPASSRLS reads nothing, and
     the search path reads partitions by name. Every clause of each policy is

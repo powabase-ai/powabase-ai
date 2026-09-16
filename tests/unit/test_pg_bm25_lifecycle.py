@@ -229,7 +229,7 @@ def test_ensure_reports_building_while_a_build_is_really_running():
 
 
 def test_ensure_repairs_an_invalid_index_that_no_build_is_working_on(caplog):
-    """B3: a cancelled or killed CREATE INDEX CONCURRENTLY leaves an INVALID index.
+    """A cancelled or killed CREATE INDEX CONCURRENTLY leaves an INVALID index.
 
     It used to be reported as ``building`` for ever: the definition still
     matched, so nothing was rebuilt, and ``IF NOT EXISTS`` made a re-run a
@@ -265,7 +265,7 @@ def test_ensure_reports_building_when_another_ensure_holds_the_index_lock():
 
 
 def test_ensure_moves_every_row_and_attaches_in_one_transaction():
-    """B1: the move is atomic, so no write through the parent can be lost.
+    """The move is atomic, so no write through the parent can be lost.
 
     The earlier online design committed batches into the unattached partition,
     where an UPDATE or DELETE through the parent could not see them -- verified
@@ -308,7 +308,7 @@ def test_ensure_moves_every_row_and_attaches_in_one_transaction():
 
 
 def test_the_default_partition_is_fenced_so_the_attach_does_not_scan_it():
-    """B2: without a validated ``CHECK (knowledge_base_id <> kb)`` on DEFAULT,
+    """Without a validated ``CHECK (knowledge_base_id <> kb)`` on DEFAULT,
     ATTACH scans the whole DEFAULT partition under ACCESS EXCLUSIVE.
 
     The check is added NOT VALID only once the parent lock is held (so no write
@@ -348,7 +348,7 @@ def test_the_move_check_name_fits_the_identifier_limit_and_is_validated():
 
 
 def test_the_new_partition_is_analyzed_after_the_move():
-    """I10: planner statistics for the new partition from the start; autovacuum
+    """Planner statistics for the new partition from the start; autovacuum
     would get there eventually, but the first searches would plan blind."""
     conn = _FakeConn(moved=10)
 
@@ -425,7 +425,7 @@ def test_ensure_resumes_a_partition_that_exists_but_was_never_attached():
 
 
 def test_an_unrelated_check_on_the_clone_does_not_stand_in_for_the_kb_check():
-    """I13: ``LIKE ... INCLUDING CONSTRAINTS`` copies every CHECK on DEFAULT.
+    """``LIKE ... INCLUDING CONSTRAINTS`` copies every CHECK on DEFAULT.
 
     Matching "any CHECK" meant the first CHECK anyone added to the item table
     would silently stop the kb check being added, and ATTACH would go back to
@@ -452,7 +452,7 @@ def _lock_timeout_error():
 def test_a_failed_move_rolls_back_before_releasing_the_build_lock_and_names_the_holders(
     caplog,
 ):
-    """I14: the unlock used to run on the aborted transaction.
+    """The unlock used to run on the aborted transaction.
 
     It logged a misleading "could not release the lock" traceback, threw the
     connection away, and -- worse -- on a move that failed part-way without
@@ -578,7 +578,7 @@ def test_ensure_is_a_no_op_without_the_extension():
 
 
 def test_ensure_and_drop_do_not_trust_a_stale_extension_cache():
-    """I7: the search path caches availability for 30 s; the build must not."""
+    """The search path caches availability for 30 s; the build must not."""
     stale = _FakeConn(extension=False)
     assert pgb.pg_search_installed(stale) is False  # now cached as absent
 
@@ -718,7 +718,7 @@ def test_drop_is_a_no_op_without_the_extension():
 
 
 def test_drop_still_removes_partitions_when_the_extension_is_gone():
-    """I6: after pg_search is dropped (a rollback of the image, say), deleting a
+    """After pg_search is dropped (a rollback of the image, say), deleting a
     KB must still remove its partitions, or each delete leaks three relations."""
     conn = _FakeConn(extension=False, relkinds=_with_partition())
 
@@ -730,7 +730,7 @@ def test_drop_still_removes_partitions_when_the_extension_is_gone():
 
 
 def test_drop_lets_a_contended_partition_drop_raise_so_the_task_retries(monkeypatch):
-    """I6: it used to log a WARNING and report ``dropped``, orphaning the
+    """It used to log a WARNING and report ``dropped``, orphaning the
     deleted KB's partition with nothing left to reconcile it."""
     monkeypatch.setattr(pgb, "PARTITION_BUILD_LOCK_WAIT_SECONDS", 0.0)
     conn = _FakeConn(relkinds=_with_partition(), build_lock=False)
@@ -740,7 +740,7 @@ def test_drop_lets_a_contended_partition_drop_raise_so_the_task_retries(monkeypa
 
 
 def test_drop_partition_bounds_the_wait_for_its_detach_lock():
-    """I2: DETACH takes ACCESS EXCLUSIVE on the parent. Waiting on it unbounded
+    """DETACH takes ACCESS EXCLUSIVE on the parent. Waiting on it unbounded
     behind one long reader (a nightly dump) queues every read and write of the
     item table behind it."""
     conn = _FakeConn(relkinds=_with_partition())
@@ -900,7 +900,7 @@ def drop_retry(monkeypatch):
 
 
 def test_the_ensure_task_retries_while_another_build_holds_the_table(ensure_retry):
-    """I1: ``partition_build_in_progress`` used to be a SUCCESS nobody retried."""
+    """``partition_build_in_progress`` used to be a SUCCESS nobody retried."""
     from celery.exceptions import Retry
 
     task, retry = ensure_retry

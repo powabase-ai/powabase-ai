@@ -383,7 +383,7 @@ def test_the_new_partition_is_reachable_by_the_same_roles_as_the_parent(engine, 
 
 
 def test_a_policy_gated_role_can_read_the_new_partition_by_name(engine, session):
-    """B5: the partition gets the parent's RLS policies, not just the RLS flag.
+    """The partition gets the parent's RLS policies, not just the RLS flag.
 
     Mirrors the self-hosted grant (``FOR SELECT TO authenticated``) with a role
     that has no BYPASSRLS. The search path names the partition, and Postgres
@@ -498,7 +498,7 @@ def _hold_the_move_open(monkeypatch, moving: threading.Event, seconds: float) ->
 def test_updates_and_deletes_through_the_parent_during_a_move_are_honoured(
     engine, session, monkeypatch
 ):
-    """The B1 regression: writes issued mid-move were silently lost.
+    """Regression: writes issued mid-move used to be silently lost.
 
     Written exactly as the app writes -- a per-row ``UPDATE ... WHERE id`` and a
     ``DELETE ... WHERE indexed_source_id`` through the parent -- while the move
@@ -886,7 +886,7 @@ def test_the_attach_scans_neither_the_new_partition_nor_default(engine, session)
 
 
 def test_an_unrelated_check_on_default_does_not_stop_the_kb_check(engine, session):
-    """I13: the clone inherits every CHECK on DEFAULT; its own kb check must
+    """The clone inherits every CHECK on DEFAULT; its own kb check must
     still be added, or the ATTACH would scan the new partition."""
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         conn.execute(
@@ -950,7 +950,7 @@ def test_a_leftover_default_check_from_a_crashed_move_is_cleared_by_the_next_mov
 
 
 def test_the_move_gives_up_on_its_lock_instead_of_stalling_writers(engine, session, monkeypatch):
-    """The move's lock wait is bounded (mutation M04).
+    """The move's lock wait is bounded.
 
     A writer transaction left open on the parent holds ROW EXCLUSIVE, which the
     move's SHARE lock conflicts with. Waiting on it unbounded would queue every
@@ -1030,7 +1030,7 @@ def test_a_crashed_move_is_resumed_with_no_row_lost_or_duplicated(engine, sessio
 
 
 def test_ensure_repairs_an_index_whose_concurrent_build_failed(engine, session, caplog):
-    """B3: an INVALID bm25 index with no build running is dropped and rebuilt.
+    """An INVALID bm25 index with no build running is dropped and rebuilt.
 
     ``indisvalid = false`` is exactly what a cancelled, killed or failed
     CREATE INDEX CONCURRENTLY leaves behind.
@@ -1075,7 +1075,7 @@ def test_a_kb_with_no_strategy_key_is_indexed_as_chunk_embed(engine, session):
 
 
 def test_drop_partition_refuses_to_wait_for_ever_behind_a_long_reader(engine, session, monkeypatch):
-    """I2: DETACH wants ACCESS EXCLUSIVE on the parent; a reader holding its
+    """DETACH wants ACCESS EXCLUSIVE on the parent; a reader holding its
     transaction open must make it give up (retryable), not stall the table."""
     pgb.ensure_bm25_index(KB_A, engine=engine)
     monkeypatch.setattr(pgb, "MOVE_LOCK_TIMEOUT_MS", 200)
@@ -1339,7 +1339,7 @@ def test_full_documents_indexes_the_summary(engine, session):
 
 
 def test_search_returns_scored_rows_ordered_by_score(engine, session):
-    """Best match first, with scores that actually differ (mutation M36).
+    """Best match first, with scores that actually differ.
 
     The seed documents score identically for "Wanderung", so an ascending sort
     passed the old assertion. Here one row repeats the term and must lead.
@@ -1520,7 +1520,7 @@ def test_bm25s_search_uses_the_pg_index_when_it_is_ready(engine, session):
 
 
 def test_a_stale_ready_cache_degrades_to_the_fallback_inside_one_transaction(engine, session):
-    """The savepoint around the scored query is load-bearing (mutation M31).
+    """The savepoint around the scored query is load-bearing.
 
     The readiness cache can say "ready" for up to its TTL after the index is
     gone (dropped by a worker in another process, say). The scored query then

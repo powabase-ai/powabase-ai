@@ -417,7 +417,7 @@ def default_move_check_add_ddl(knowledge_base_id: Any, item_table: str) -> str:
 
 
 def default_move_check_validate_ddl(knowledge_base_id: Any, item_table: str) -> str:
-    """Validate the DEFAULT check: one scan of DEFAULT, readers unaffected.
+    """Validate the DEFAULT check: one scan of DEFAULT, not blocking readers.
 
     VALIDATE CONSTRAINT takes SHARE UPDATE EXCLUSIVE, which does not conflict
     with the ACCESS SHARE readers hold. It can only succeed once this knowledge
@@ -486,10 +486,11 @@ def partition_lock_parent_ddl(item_table: str) -> str:
 
     ``ONLY``: without it, LOCK on a partitioned table recurses into every
     partition. SHARE conflicts with the ROW EXCLUSIVE every INSERT, UPDATE and
-    DELETE takes, and not with the ACCESS SHARE of a reader, so reads through
-    the parent carry on throughout. The cost is that writes to *every*
-    knowledge base on this item table wait for the move, including those that
-    already have partitions of their own.
+    DELETE takes, and not with the ACCESS SHARE of a reader, so readers do not
+    block on this lock. (They can still wait on the move's ACCESS EXCLUSIVE
+    steps on DEFAULT -- see ``create_partition``.) The cost is that writes to
+    *every* knowledge base on this item table wait for the move, including
+    those that already have partitions of their own.
     """
     return f"LOCK TABLE ONLY {_qualified(_validated_partitioned_table(item_table))} IN SHARE MODE"
 
@@ -1479,20 +1480,27 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
     The bm25 index is built afterwards with CREATE INDEX CONCURRENTLY, outside
     any of this.
 
-    Who waits, measured on Postgres 15 (warm cache, 128 MB shared_buffers)
-    moving a 40 000-row knowledge base:
+    Who waits, measured on Postgres 15 in Docker (128 MB shared_buffers, the
+    table far larger but in a warm OS page cache, ~600-byte rows with two
+    btree indexes, parallel query off). Cold caches, slower disks and wider
+    rows are slower.
 
     * **writers** through the parent, for every knowledge base on this item
-      table, for all of step 2: 0.23-0.31 s with a 540 000-row (360 MB)
-      DEFAULT -- copy ~0.14-0.20 s, delete ~0.02 s, VALIDATE ~0.06 s -- and
-      0.48 s with a 2 040 000-row (1.4 GB) DEFAULT, where VALIDATE alone took
-      0.26 s. It grows with the rows moved and with the size of DEFAULT.
-      Without the DEFAULT check the ATTACH ran the same scan instead (0.06 s
-      and 0.30 s), so writers wait about as long either way.
-    * **readers** only for the ATTACH (1-8 ms) and the catalog-only ADD and
-      DROP of the check. Without the check the ATTACH held ACCESS EXCLUSIVE
-      for its whole DEFAULT scan: a reader waited up to 0.07 s at 540 000 rows
-      and 0.64 s at 2 040 000, and on a cold cache that scan is disk-bound.
+      table, for all of step 2. A 40 000-row knowledge base over a 540 000-row
+      (390 MB) DEFAULT: 0.34-0.43 s (copy ~0.25 s, delete ~0.02 s, VALIDATE
+      ~0.06 s). Over a 2.5-2.9 million-row (2.1 GB) DEFAULT: 125 000 rows
+      1.2-1.3 s, 250 000 rows 2.7-3.2 s, 500 000 rows 4.9-5.2 s -- about
+      10 s per million rows moved, plus a VALIDATE of ~0.3 s that grows with
+      DEFAULT. A move that gives up still held writers for as long as it ran:
+      1.8-2.3 s with a long reader in the way.
+    * **readers** do not block on the SHARE locks. They can wait on the
+      ACCESS EXCLUSIVE steps on DEFAULT (the check going up, the ATTACH, the
+      check's drop after a failed move): new readers of DEFAULT, and queries
+      through the parent that cannot prune DEFAULT, queue behind the one
+      queued try each step may make, so they wait at most
+      ``DEFAULT_EXCLUSIVE_QUEUED_TRY_MS`` per step. Measured: 4-8 ms with no
+      long reader (the ATTACH itself takes about 1 ms), 0.20 s with a long
+      reader present, 44-95 ms under 8-32 overlapping readers.
 
     Why this order. The DEFAULT check cannot be validated while any of the
     knowledge base's rows are still in DEFAULT, so VALIDATE has to follow the

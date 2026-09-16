@@ -2645,7 +2645,9 @@ def ensure_pg_bm25_index(self, kb_id: str) -> dict:
     and by the operator build-bm25 endpoint. The first run for a KB moves that
     KB's rows out of the item table's DEFAULT partition into a partition of its
     own, in one transaction: writes to the whole item table (every KB on it)
-    wait for the full move, readers only milliseconds. Later runs are cheap and
+    wait for the full move; readers of the DEFAULT partition wait at most a
+    fraction of a second for each of its ACCESS EXCLUSIVE steps (see
+    ``create_partition``). Later runs are cheap and
     idempotent. Returns the service's own outcome
     dict.
 

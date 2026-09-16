@@ -1,4 +1,4 @@
-"""I12: a write that races a partition move must leave the source claimable.
+"""A write that races a partition move must leave the source claimable.
 
 A write of a knowledge base's rows that Postgres routed to the DEFAULT
 partition just as that knowledge base's partition was attached fails with
