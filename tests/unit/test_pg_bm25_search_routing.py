@@ -32,6 +32,18 @@ class _NodeStore(bvs.BasePgVectorStore):
     SEARCH_TEXT_COL = "text"
 
 
+class _FullDocumentStore(bvs.BasePgVectorStore):
+    TABLE = "full_documents"
+    TEXT_COL = "summary"
+    SEARCH_TEXT_COL = "summary"
+
+
+class _Doc2JsonStore(bvs.BasePgVectorStore):
+    TABLE = "doc2json_documents"
+    TEXT_COL = "summary"
+    SEARCH_TEXT_COL = "summary"
+
+
 @pytest.fixture(autouse=True)
 def _clear_caches():
     pgb.reset_pg_bm25_caches()
@@ -72,11 +84,34 @@ def _capture(store_cls=_ChunkStore, rows=(), **kwargs):
     return session.calls, items
 
 
-def test_search_sql_uses_the_kb_literal_so_the_partial_index_matches():
+def test_search_sql_names_the_kbs_partition_and_nothing_else():
+    """The partition bound is the knowledge-base filter.
+
+    A scored query has to name a relation that carries a bm25 index, and the
+    parent of a partitioned table never does -- pg_search refuses it outright,
+    predicate or no predicate. So the KB is expressed as the relation, and no
+    ``knowledge_base_id`` predicate is needed or wanted.
+    """
     calls, _ = _capture()
     sql, params = calls[-1]
-    assert f"knowledge_base_id = '{KB}'" in sql
+    assert f'FROM "ai".chunks_kb_{uuid.UUID(KB).hex} c' in sql
+    assert "knowledge_base_id" not in sql
     assert "kb_id" not in params
+
+
+def test_search_sql_derives_the_partition_from_a_validated_uuid():
+    """Nothing a caller supplies reaches the relation name unvalidated."""
+    calls, _ = _capture()
+    sql, _ = calls[-1]
+    assert pgb.partition_name(KB, "chunks") in sql
+    assert "-" not in sql.split(" c\n")[0].split("chunks_kb_")[-1][:32]
+
+
+def test_search_sql_for_full_documents_names_its_own_partition():
+    calls, _ = _capture(store_cls=_FullDocumentStore)
+    sql, _ = calls[-1]
+    assert f'FROM "ai".full_documents_kb_{uuid.UUID(KB).hex} c' in sql
+    assert "c.summary ||| :bm25_query" in sql
 
 
 def test_search_sql_uses_the_match_operator_and_score_ordering():
@@ -160,6 +195,37 @@ def test_a_blank_query_returns_empty_without_touching_the_database():
     store = _ChunkStore(db_session=session, knowledge_base_id=KB)
     assert asyncio.run(store.pg_bm25_search("   ", top_k=5)) == []
     assert session.calls == []
+
+
+def test_a_table_with_no_partition_never_reaches_the_database():
+    """``doc2json_documents`` has no partition, so it has no scored query.
+
+    Raising here rather than emitting a query against the bare table is what
+    keeps the routing honest: ``bm25s_search`` catches it and falls back, where
+    a parent-table query would have raised inside Postgres instead.
+    """
+    session = _spy_session()
+    store = _Doc2JsonStore(db_session=session, knowledge_base_id=KB)
+    with pytest.raises(ValueError):
+        asyncio.run(store.pg_bm25_search("Beschwerde", top_k=5))
+    assert session.calls == []
+
+
+def test_a_kb_without_a_partition_falls_back_instead_of_erroring():
+    store = _Doc2JsonStore(db_session=_spy_session(), knowledge_base_id=KB)
+    calls: list[str] = []
+
+    async def fallback(*a, **k):
+        calls.append("tsvector")
+        return []
+
+    store.full_text_search = fallback
+    with (
+        patch.object(bvs.pg_bm25_index, "pg_search_installed", return_value=True),
+        patch.object(bvs.pg_bm25_index, "bm25_index_ready", return_value=False),
+    ):
+        asyncio.run(store.bm25s_search("Beschwerde", top_k=5))
+    assert calls == ["tsvector"]
 
 
 # ---------------------------------------------------------------------------
