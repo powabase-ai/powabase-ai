@@ -73,9 +73,13 @@ def _timeout_503(
     body = resp.get_json()
     assert body["code"] == "keyword_search_timeout"
     assert body["timeout_ms"] == 10000
-    # Every branch must keep saying that nothing self-heals, and never leak a
-    # bare None where a strategy or method name belongs.
-    assert "No build starts on its own" in body["error"]
+    # Every branch must keep saying that retrying does not self-heal, and never
+    # leak a bare None where a strategy or method name belongs. The wording is
+    # about the retry, not about builds in general: with auto-indexing on, the
+    # stored-method remedy does start a build, and a blanket "no build starts on
+    # its own" would contradict it in the same sentence.
+    assert "Retrying the same search does not start a build" in body["error"]
+    assert "No build starts on its own" not in body["error"]
     assert "queued" not in body["error"]
     assert "None" not in body["error"]
     return body

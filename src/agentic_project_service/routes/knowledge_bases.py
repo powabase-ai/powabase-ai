@@ -1713,8 +1713,8 @@ def search_knowledge_base_route(kb_id: str):
                 "error": (
                     "Keyword search timed out: this knowledge base has no BM25 "
                     "index, so the query fell back to a scan that exceeded its "
-                    f"time budget. {_keyword_timeout_remedy(kb_id)} No build "
-                    "starts on its own, so retrying the same search will time "
+                    f"time budget. {_keyword_timeout_remedy(kb_id)} Retrying "
+                    "the same search does not start a build, so it will time "
                     "out again."
                 ),
                 "code": "keyword_search_timeout",
