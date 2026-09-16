@@ -1394,8 +1394,8 @@ def clear_leftover_move_checks_at_start(engine) -> dict[str, list[str] | str]:
     """Start-up sweep of leftover move checks, for every partitioned item table.
 
     Cannot block start-up: the build lock is only tried, DEFAULT's lock gets a
-    single ``NOWAIT`` try, and every other statement runs under a short
-    ``lock_timeout``. Never raises. Per table the outcome is the list of checks
+    single ``NOWAIT`` try (no queued try), and everything else is a catalog
+    read or the DROP CONSTRAINT made under that lock. Never raises. Per table the outcome is the list of checks
     dropped, ``"busy"`` (a move or a reader was in the way; the next
     ``ensure_bm25_index`` on the table clears it), ``"not_partitioned"``, or
     ``"error"``.
@@ -1486,10 +1486,12 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
        and policies; commit.
 
     Every ACCESS EXCLUSIVE lock on DEFAULT (adding the check, the ATTACH) is
-    taken with ``NOWAIT`` tries for up to ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS``
-    rather than by queueing, so a reader in the way makes the *move* give up
-    (SQLSTATE 55P03) instead of stalling new readers or deadlocking a
-    transaction that read DEFAULT and then writes through the parent.
+    taken by ``_lock_default_exclusively``: ``NOWAIT`` tries for up to
+    ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS`` and at most one short queued try,
+    never while a holder of DEFAULT is waiting for a lock. A reader that stays
+    in the way makes the *move* give up (SQLSTATE 55P03), instead of stalling
+    new readers for long or deadlocking a transaction that read DEFAULT and
+    then writes through the parent.
 
     The bm25 index is built afterwards with CREATE INDEX CONCURRENTLY, outside
     any of this.
