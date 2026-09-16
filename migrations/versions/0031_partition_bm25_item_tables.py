@@ -30,9 +30,13 @@ The conversion copies nothing. For each table:
    DEFAULT partition keeps its own policies too, for anything that names it
    directly.
 
-Every step is catalog-only, so the migration's cost does not scale with the
-number of rows. It is idempotent (a table already partitioned is left alone),
-safe on an empty table, and a no-op for a table that does not exist yet.
+Every conversion step is catalog-only, so the migration's cost does not scale
+with the number of rows; the one read of data is the closing ``ANALYZE`` of
+each parent, which samples a bounded number of rows (autovacuum never analyses
+a partitioned parent in Postgres 15, so without it the planner would have no
+statistics for any statement that names the parent). It is idempotent (a
+table already partitioned is left alone), safe on an empty table, and a no-op
+for a table that does not exist yet.
 
 The renames need ACCESS EXCLUSIVE on each table. Migrations run at start-up, so
 every lock wait is bounded by ``LOCK_TIMEOUT_MS``: behind a long reader (a
@@ -245,6 +249,11 @@ def _partition_one(bind, schema: str, table: str) -> None:
     )
     _mirror_settings(bind, schema, default, table)
     _copy_policies(bind, schema, default, table)
+    # Autovacuum never analyses a partitioned parent, and every application
+    # statement names the parent; without this the planner has no statistics
+    # for any of them. Samples the partitions, so it reads data, not just the
+    # catalog -- a bounded sample per table, not a scan.
+    bind.execute(_sql(f'ANALYZE "{schema}"."{table}"'))
     logger.info(
         "Partitioned %s.%s BY LIST (%s); the original table is now its DEFAULT partition",
         schema,
