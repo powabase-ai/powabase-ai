@@ -206,6 +206,85 @@ def test_anything_else_is_not_a_move_check_refusal(exc):
     assert pgb.move_check_refusal_item_table(exc) is None
 
 
+def _check_refusal_without_fields(message):
+    """A refused write from a server that sends no schema, table or constraint
+    field -- as some builds do, depending on the preloaded libraries."""
+    return IntegrityError("INSERT INTO ai.chunks ...", {}, _orig_without_fields(message))
+
+
+def _orig_without_fields(message):
+    from types import SimpleNamespace
+
+    class _Orig(Exception):
+        pass
+
+    orig = _Orig(message)
+    orig.sqlstate = "23514"
+    orig.diag = SimpleNamespace(constraint_name=None, table_name=None, schema_name=None)
+    return orig
+
+
+def test_without_diagnostic_fields_the_refusal_is_traced_by_its_message():
+    exc = _check_refusal_without_fields(
+        f'new row for relation "graph_index_nodes_default" violates check constraint "{FENCE}"'
+    )
+    assert pgb.move_check_refusal_item_table(exc) == "graph_index_nodes"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        'new row for relation "chunks_default" violates partition constraint',
+        'new row for relation "chunks_default" violates check constraint "tokens_positive"',
+        f'new row for relation "chunks" violates check constraint "{FENCE}"',
+        f'new row for relation "doc2json_documents_default" violates check constraint "{FENCE}"',
+    ],
+)
+def test_without_diagnostic_fields_other_refusals_are_still_not_move_checks(message):
+    assert pgb.move_check_refusal_item_table(_check_refusal_without_fields(message)) is None
+
+
+def test_a_refusal_the_self_heal_cannot_trace_is_logged_not_silently_ignored(monkeypatch, caplog):
+    clear = MagicMock()
+    monkeypatch.setattr(pgb, "clear_leftover_move_checks", clear)
+    exc = _check_refusal_without_fields("neue Zeile verletzt Check-Constraint")
+
+    with caplog.at_level("DEBUG", logger=pgb.logger.name):
+        assert pgb.clear_move_check_after_refusal(object(), exc) == []
+
+    clear.assert_not_called()
+    assert "not traced to a move check" in caplog.text
+
+
+def test_a_self_heal_that_finds_the_build_lock_taken_says_so(monkeypatch, caplog):
+    """A move holding the item table owns a live check; the clear declines, and
+    says why, instead of returning an unexplained empty list."""
+
+    class _Conn:
+        def execute(self, statement, params=None):
+            result = MagicMock()
+            result.scalar.return_value = False
+            return result
+
+        def commit(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Engine:
+        def connect(self):
+            return _Conn()
+
+    with caplog.at_level("DEBUG", logger=pgb.logger.name):
+        assert pgb.clear_move_check_after_refusal(_Engine(), _check_refusal()) == []
+
+    assert "build lock" in caplog.text
+
+
 def test_clearing_after_a_refusal_makes_one_non_blocking_try(monkeypatch):
     engine = object()
     calls = []

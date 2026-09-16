@@ -1486,6 +1486,12 @@ def clear_leftover_move_checks(engine, item_table: str, wait_seconds: float) -> 
         acquired = conn.execute(text(partition_build_lock_sql()), {"relation": relation}).scalar()
         conn.commit()
         if not acquired:
+            logger.info(
+                "Leftover move checks on %s.%s not cleared: a move holds the table's build "
+                "lock, so its check is live",
+                AI_SCHEMA,
+                default_partition_name(item_table),
+            )
             return []
         try:
             names = _move_check_names(conn, item_table)
@@ -1550,22 +1556,34 @@ def move_check_refusal_item_table(exc: BaseException) -> str | None:
     """The item table whose DEFAULT refused a write with a move check, or None.
 
     Read from the error's diagnostics -- the constraint, table and schema names
-    Postgres reports -- rather than its message text, so only a write refused
-    by a ``bm25_move_<kb>`` check on one of this schema's DEFAULT partitions
-    matches.
+    Postgres reports -- so only a write refused by a ``bm25_move_<kb>`` check on
+    one of this schema's DEFAULT partitions matches. Not every server sends
+    those fields: a build with ``pg_search`` first in
+    ``shared_preload_libraries`` was seen to send none of them. Then the names
+    are read from the message instead, where Postgres quotes them verbatim (an
+    untranslated message is needed for that; a translated one is not traced).
     """
     orig = getattr(exc, "orig", None)
     if getattr(orig, "sqlstate", None) != "23514":
         return None
     diag = getattr(orig, "diag", None)
     constraint = getattr(diag, "constraint_name", None)
+    table = getattr(diag, "table_name", None)
+    schema = getattr(diag, "schema_name", None)
+    if constraint is None and table is None and schema is None:
+        match = re.search(
+            r'relation "([^"]+)" violates check constraint "([^"]+)"', str(orig).splitlines()[0]
+        )
+        if match is None:
+            return None
+        table, constraint = match.groups()
+        schema = AI_SCHEMA
     if not constraint or not re.fullmatch(
         rf"{_DEFAULT_MOVE_CHECK_PREFIX}[0-9a-f]{{32}}", constraint
     ):
         return None
-    if getattr(diag, "schema_name", None) != AI_SCHEMA:
+    if schema != AI_SCHEMA:
         return None
-    table = getattr(diag, "table_name", None)
     for item_table in sorted(PARTITIONED_ITEM_TABLES):
         if table == default_partition_name(item_table):
             return item_table
@@ -1584,6 +1602,11 @@ def clear_move_check_after_refusal(engine, exc: BaseException) -> list[str]:
     """
     item_table = move_check_refusal_item_table(exc)
     if item_table is None:
+        logger.debug(
+            "A refused write was not traced to a move check on a DEFAULT partition; "
+            "nothing to clear: %s",
+            str(getattr(exc, "orig", exc)).splitlines()[0] if str(exc) else type(exc).__name__,
+        )
         return []
     try:
         dropped = clear_leftover_move_checks(engine, item_table, 0.0)
@@ -1602,6 +1625,13 @@ def clear_move_check_after_refusal(engine, exc: BaseException) -> list[str]:
         logger.warning(
             "Dropped leftover move checks %s from %s.%s after they refused a write",
             dropped,
+            AI_SCHEMA,
+            default_partition_name(item_table),
+        )
+    else:
+        logger.info(
+            "No move check dropped from %s.%s after one refused a write; the write is "
+            "retried later",
             AI_SCHEMA,
             default_partition_name(item_table),
         )
