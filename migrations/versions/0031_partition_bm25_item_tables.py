@@ -34,6 +34,12 @@ Every step is catalog-only, so the migration's cost does not scale with the
 number of rows. It is idempotent (a table already partitioned is left alone),
 safe on an empty table, and a no-op for a table that does not exist yet.
 
+The renames need ACCESS EXCLUSIVE on each table. Migrations run at start-up, so
+every lock wait is bounded by ``LOCK_TIMEOUT_MS``: behind a long reader (a
+nightly ``pg_dump``) the revision fails with ``MigrationLockTimeout``, logs the
+sessions holding the table, rolls the whole transaction back, and runs again on
+the next start instead of hanging the boot.
+
 Any ``USING bm25`` index left on the table by the unpartitioned design is
 dropped first: as an index on the DEFAULT partition it would occupy that
 partition's single BM25 slot while still only answering one knowledge base.
@@ -59,6 +65,17 @@ logger = logging.getLogger("alembic.runtime.migration")
 ITEM_TABLES = ("chunks", "full_documents", "graph_index_nodes")
 
 PARTITION_KEY = "knowledge_base_id"
+
+# How long any one statement of this revision waits for a table lock. The
+# rename needs ACCESS EXCLUSIVE, and migrations run at application start: an
+# unbounded wait behind a long reader (a nightly pg_dump holds ACCESS SHARE on
+# every table for its whole run) would hang the boot, and queue every query of
+# the table behind the waiting rename for just as long.
+LOCK_TIMEOUT_MS = 10_000
+
+
+class MigrationLockTimeout(RuntimeError):
+    """A table lock this revision needs was not granted within LOCK_TIMEOUT_MS."""
 
 
 def _relkind(bind, schema: str, relname: str) -> str | None:
@@ -236,10 +253,69 @@ def _partition_one(bind, schema: str, table: str) -> None:
     )
 
 
+def _lock_holders(bind, schema: str, table: str) -> list[str]:
+    """Best-effort description of the sessions holding a lock on ``table``.
+
+    Read on a separate connection: the migration's own transaction is already
+    aborted by the time this is useful.
+    """
+    try:
+        with bind.engine.connect() as probe:
+            rows = probe.execute(
+                _sql(
+                    "SELECT DISTINCT a.pid, a.state, left(a.query, 120) "
+                    "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+                    "WHERE l.granted AND l.relation = to_regclass(:rel) "
+                    "AND a.pid <> pg_backend_pid()"
+                ),
+                {"rel": f'"{schema}"."{table}"'},
+            ).all()
+    except Exception:  # noqa: BLE001 - diagnostics only, never mask the real error
+        return []
+    return [f"pid {pid} ({state}): {query}" for pid, state, query in rows]
+
+
+def _run_with_lock_timeout(bind, schema: str, tables, step) -> None:
+    """Run ``step(bind, schema, table)`` per table with a bounded lock wait.
+
+    The bound is transaction-local and put back afterwards, so revisions that
+    run after this one in the same transaction keep the server's setting. A
+    timeout rolls back the whole migration transaction; nothing is half-done,
+    and the next start runs this revision again.
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    previous = bind.execute(_sql("SELECT current_setting('lock_timeout')")).scalar()
+    bind.execute(
+        _sql("SELECT set_config('lock_timeout', :value, true)"),
+        {"value": f"{LOCK_TIMEOUT_MS}ms"},
+    )
+    for table in tables:
+        try:
+            step(bind, schema, table)
+        except DBAPIError as exc:
+            if getattr(exc.orig, "sqlstate", None) != "55P03":
+                raise
+            holders = _lock_holders(bind, schema, table)
+            message = (
+                f"Timed out after {LOCK_TIMEOUT_MS} ms waiting for a lock on "
+                f"{schema}.{table}: another session holds it (a long-running read "
+                "or a pg_dump, typically). The migration transaction is rolled back "
+                "and nothing was changed; this revision runs again on the next start."
+            )
+            logger.error(
+                "%s Sessions holding a lock on it: %s", message, "; ".join(holders) or "unknown"
+            )
+            raise MigrationLockTimeout(message) from exc
+    bind.execute(
+        _sql("SELECT set_config('lock_timeout', :value, true)"),
+        {"value": previous},
+    )
+
+
 def partition_item_tables(bind, schema: str = "ai", tables=ITEM_TABLES) -> None:
     """Convert each item table into a partitioned parent over its own rows."""
-    for table in tables:
-        _partition_one(bind, schema, table)
+    _run_with_lock_timeout(bind, schema, tables, _partition_one)
 
 
 def _unpartition_one(bind, schema: str, table: str) -> None:
@@ -286,8 +362,7 @@ def _unpartition_one(bind, schema: str, table: str) -> None:
 
 def unpartition_item_tables(bind, schema: str = "ai", tables=ITEM_TABLES) -> None:
     """Fold every partition back into one plain table, keeping every row."""
-    for table in tables:
-        _unpartition_one(bind, schema, table)
+    _run_with_lock_timeout(bind, schema, tables, _unpartition_one)
 
 
 def upgrade():
