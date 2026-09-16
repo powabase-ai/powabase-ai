@@ -27,6 +27,7 @@ from ..services.knowledge_store import PgVectorKnowledgeStore
 from ..services.doc2json_store import Doc2JSONStore
 from ..services.full_document_store import FullDocumentStore
 from ..services.graph_index_store import GraphIndexStore
+from ..services import pg_bm25_index
 from ..services.page_index_store import PageIndexStore
 from ..services.storage import StorageError, SupabaseStorage, get_storage
 from ..services.settings_registry import get_setting
@@ -96,17 +97,52 @@ def _get_kb_retrieval_method(kb_id: str) -> str | None:
     return row[0] if row else None
 
 
+def _get_kb_indexing_strategy(kb_id: str) -> str:
+    """indexing_config.strategy for a KB, defaulting to chunk_embed as search does."""
+    row = db.session.execute(
+        text(
+            f"SELECT COALESCE(indexing_config->>'strategy', 'chunk_embed') "
+            f'FROM "{AI_SCHEMA}".knowledge_bases WHERE id = :id'
+        ),
+        {"id": kb_id},
+    ).fetchone()
+    return row[0] if row else "chunk_embed"
+
+
+def _kb_served_by_pg_search(kb_id: str) -> bool:
+    """Is this KB's keyword leg answered by its pg_search index, not the file index?
+
+    False when that cannot be determined: skipping the file-index append on a
+    guess could leave a KB with no keyword index at all.
+    """
+    try:
+        strategy = _get_kb_indexing_strategy(kb_id)
+        return pg_bm25_index.keyword_index_backend(db.session, strategy) == "pg_search"
+    except Exception:
+        logger.warning(
+            "Could not tell whether pg_search serves KB %s; keeping the bm25s file index "
+            "up to date",
+            kb_id,
+            exc_info=True,
+        )
+        return False
+
+
 def _should_build_bm25_now(kb_id: str) -> bool:
     """Decide whether `sparse_store.add_and_save(...)` should run for this KB.
 
     Returns False when:
       - the KB's retrieval method does not use BM25 (vector_search, None, unknown), OR
-      - the project-level BM25_AUTO_INDEXING setting is disabled.
+      - the project-level BM25_AUTO_INDEXING setting is disabled, OR
+      - pg_search serves this KB's keyword leg, so nothing reads the file index
+        and appending every source to it is wasted tokenising.
     """
     method = _get_kb_retrieval_method(kb_id)
     if method not in ("hybrid", "full_text"):
         return False
     if not get_setting("BM25_AUTO_INDEXING"):
+        return False
+    if _kb_served_by_pg_search(kb_id):
         return False
     return True
 
