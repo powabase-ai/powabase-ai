@@ -524,6 +524,20 @@ def move_rows_sql(knowledge_base_id: Any, item_table: str) -> tuple[str, str]:
     points at items polymorphically by ``item_id``), which is what makes the
     DELETE safe: an FK to the parent is impossible without a parent primary
     key, and one to the DEFAULT partition would cascade on this delete.
+
+    Foreign keys *from* these tables (to ``knowledge_bases``, ``sources``,
+    ``indexed_sources``) do cascade into them while a move runs: Postgres'
+    referential triggers delete from DEFAULT and from the new partition by
+    name, never through the parent, so they wait on the move's SHARE lock on
+    DEFAULT (or the move waits on them) instead of on the parent. Such a
+    cascade and a move can deadlock; Postgres detects it and rolls one side
+    back whole, so no row is lost -- the move is one transaction and its task
+    retries, a re-index that loses re-queues its source. The move's ACCESS
+    EXCLUSIVE tries on DEFAULT never queue, but its SHARE lock on DEFAULT and
+    the ATTACH's lock on the new partition still do, so the cascade is not
+    guaranteed to be the side that survives. In the measured case (a source
+    deleted while the move was about to ATTACH) the delete waited 1.0 s and
+    both committed with no orphaned rows.
     """
     partition = partition_name(knowledge_base_id, item_table)
     default = default_partition_name(item_table)
