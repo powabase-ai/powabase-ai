@@ -988,14 +988,14 @@ _FAKE_JWT = patch(
 
 
 @patch(
-    "agentic_project_service.routes.knowledge_bases.table_is_partitioned",
+    "agentic_project_service.services.pg_bm25_index._item_table_is_partitioned",
     new=MagicMock(return_value=True),
 )
 @patch("agentic_project_service.routes.knowledge_bases.db", new=MagicMock())
 @_FAKE_JWT
 @patch("agentic_project_service.routes.knowledge_bases.ensure_pg_bm25_index")
 @patch("agentic_project_service.routes.knowledge_bases.build_bm25_for_kb")
-@patch("agentic_project_service.routes.knowledge_bases._pg_search_available", return_value=True)
+@patch("agentic_project_service.services.pg_bm25_index.pg_search_installed", return_value=True)
 @patch("agentic_project_service.routes.knowledge_bases._fetch_kb_or_404")
 def test_build_endpoint_ensures_the_pg_index_when_available(
     mock_fetch, _avail, mock_bm25s, mock_ensure, _jwt
@@ -1018,10 +1018,11 @@ def test_build_endpoint_ensures_the_pg_index_when_available(
     mock_bm25s.delay.assert_not_called()
 
 
+@patch("agentic_project_service.routes.knowledge_bases.db", new=MagicMock())
 @_FAKE_JWT
 @patch("agentic_project_service.routes.knowledge_bases.ensure_pg_bm25_index")
 @patch("agentic_project_service.routes.knowledge_bases.build_bm25_for_kb")
-@patch("agentic_project_service.routes.knowledge_bases._pg_search_available", return_value=False)
+@patch("agentic_project_service.services.pg_bm25_index.pg_search_installed", return_value=False)
 @patch("agentic_project_service.routes.knowledge_bases._fetch_kb_or_404")
 def test_build_endpoint_keeps_the_file_index_path_without_the_extension(
     mock_fetch, _avail, mock_bm25s, mock_ensure, _jwt

@@ -779,6 +779,21 @@ def bm25_index_ready(session, knowledge_base_id: str, item_table: str) -> bool:
     return ready
 
 
+def _item_table_is_partitioned(session, item_table: str) -> bool:
+    """``table_is_partitioned`` for the read paths: the probe runs in a savepoint.
+
+    Raises on a failed probe; ``keyword_index_backend`` decides what that means.
+    """
+    row = _probe(
+        session,
+        "SELECT c.relkind FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = :schema AND c.relname = :relname",
+        {"schema": AI_SCHEMA, "relname": item_table},
+    )
+    return row is not None and row[0] == "p"
+
+
 def keyword_index_backend(session, strategy: str | None) -> str | None:
     """Which keyword index serves a KB with this indexing strategy.
 
@@ -788,6 +803,10 @@ def keyword_index_backend(session, strategy: str | None) -> str | None:
     before doing anything). ``"bm25s"`` -- the bm25s file index: every other
     strategy with an item table, including when a probe fails. ``None`` -- the
     strategy has no BM25 item table. A missing strategy means chunk_embed.
+
+    This is the one rule: the knowledge-base routes (create, PATCH,
+    ``/build-bm25``, ``bm25_status``) and the per-source indexing gate all ask
+    it, so they cannot disagree about which index a KB reads.
 
     Never raises, and probes in a savepoint, so it is safe mid-transaction.
     """
@@ -800,13 +819,7 @@ def keyword_index_backend(session, strategy: str | None) -> str | None:
     if item_table is None or item_table not in PARTITIONED_ITEM_TABLES:
         return "bm25s"
     try:
-        row = _probe(
-            session,
-            "SELECT c.relkind FROM pg_class c "
-            "JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE n.nspname = :schema AND c.relname = :relname",
-            {"schema": AI_SCHEMA, "relname": item_table},
-        )
+        partitioned = _item_table_is_partitioned(session, item_table)
     except Exception as exc:
         logger.warning(
             "Could not tell whether %s.%s is partitioned (%s); treating its keyword index "
@@ -816,7 +829,7 @@ def keyword_index_backend(session, strategy: str | None) -> str | None:
             str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
         )
         return "bm25s"
-    return "pg_search" if row is not None and row[0] == "p" else "bm25s"
+    return "pg_search" if partitioned else "bm25s"
 
 
 def pg_bm25_status(knowledge_base_id: str, strategy: str | None, session=None) -> str | None:

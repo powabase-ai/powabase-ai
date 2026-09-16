@@ -18,6 +18,8 @@ import pytest
 from agentic_project_service.routes import knowledge_bases as kb_route
 
 R = "agentic_project_service.routes.knowledge_bases"
+# The rule itself lives in the service; the route helper delegates to it.
+S = "agentic_project_service.services.pg_bm25_index"
 
 _AUTH = patch(
     "agentic_project_service.auth.decode_jwt",
@@ -62,51 +64,51 @@ class TestKeywordIndexBackend:
 
     def test_pg_search_when_installed_mapped_and_partitioned(self):
         with (
-            patch(f"{R}._pg_search_available", return_value=True),
-            patch(f"{R}.table_is_partitioned", return_value=True) as partitioned,
+            patch(f"{S}.pg_search_installed", return_value=True),
+            patch(f"{S}._item_table_is_partitioned", return_value=True) as partitioned,
         ):
             assert kb_route._keyword_index_backend("chunk_embed") == "pg_search"
         assert partitioned.call_args.args[1] == "chunks"
 
     def test_bm25s_without_the_extension(self):
         with (
-            patch(f"{R}._pg_search_available", return_value=False),
-            patch(f"{R}.table_is_partitioned") as partitioned,
+            patch(f"{S}.pg_search_installed", return_value=False),
+            patch(f"{S}._item_table_is_partitioned") as partitioned,
         ):
             assert kb_route._keyword_index_backend("chunk_embed") == "bm25s"
         partitioned.assert_not_called()
 
     def test_bm25s_when_the_item_table_is_not_partitioned_yet(self):
         with (
-            patch(f"{R}._pg_search_available", return_value=True),
-            patch(f"{R}.table_is_partitioned", return_value=False),
+            patch(f"{S}.pg_search_installed", return_value=True),
+            patch(f"{S}._item_table_is_partitioned", return_value=False),
         ):
             assert kb_route._keyword_index_backend("full_document") == "bm25s"
 
     def test_bm25s_when_the_item_table_is_never_partitioned(self):
         with (
-            patch(f"{R}._pg_search_available", return_value=True),
-            patch(f"{R}.PARTITIONED_ITEM_TABLES", frozenset({"full_documents"})),
-            patch(f"{R}.table_is_partitioned", return_value=True) as partitioned,
+            patch(f"{S}.pg_search_installed", return_value=True),
+            patch(f"{S}.PARTITIONED_ITEM_TABLES", frozenset({"full_documents"})),
+            patch(f"{S}._item_table_is_partitioned", return_value=True) as partitioned,
         ):
             assert kb_route._keyword_index_backend("chunk_embed") == "bm25s"
         partitioned.assert_not_called()
 
     @pytest.mark.parametrize("strategy", ["page_index", "doc2json", "no_such_strategy"])
     def test_none_for_a_strategy_without_an_item_table(self, strategy):
-        with patch(f"{R}._pg_search_available", return_value=True):
+        with patch(f"{S}.pg_search_installed", return_value=True):
             assert kb_route._keyword_index_backend(strategy) is None
 
     def test_a_missing_strategy_means_chunk_embed(self):
         with (
-            patch(f"{R}._pg_search_available", return_value=False),
+            patch(f"{S}.pg_search_installed", return_value=False),
         ):
             assert kb_route._keyword_index_backend(None) == "bm25s"
 
     def test_an_unreadable_catalog_falls_back_to_the_file_index(self):
         with (
-            patch(f"{R}._pg_search_available", return_value=True),
-            patch(f"{R}.table_is_partitioned", side_effect=RuntimeError("connection lost")),
+            patch(f"{S}.pg_search_installed", return_value=True),
+            patch(f"{S}._item_table_is_partitioned", side_effect=RuntimeError("connection lost")),
         ):
             assert kb_route._keyword_index_backend("chunk_embed") == "bm25s"
 
@@ -257,8 +259,8 @@ class TestBuildEndpoint:
 
     def test_pg_search_path_dispatches_only_the_pg_index(self, tasks):
         with (
-            patch(f"{R}._pg_search_available", return_value=True),
-            patch(f"{R}.table_is_partitioned", return_value=True),
+            patch(f"{S}.pg_search_installed", return_value=True),
+            patch(f"{S}._item_table_is_partitioned", return_value=True),
         ):
             kb_id, resp = self._post()
         assert resp.status_code == 202
@@ -267,7 +269,7 @@ class TestBuildEndpoint:
         tasks["build"].delay.assert_not_called()
 
     def test_without_the_extension_dispatches_only_the_file_build(self, tasks):
-        with patch(f"{R}._pg_search_available", return_value=False):
+        with patch(f"{S}.pg_search_installed", return_value=False):
             kb_id, resp = self._post()
         assert resp.status_code == 202
         tasks["build"].delay.assert_called_once_with(kb_id)
@@ -277,8 +279,8 @@ class TestBuildEndpoint:
         """The pg task would skip with table_not_partitioned and leave the status
         absent forever; the search path reads the file index here, so build it."""
         with (
-            patch(f"{R}._pg_search_available", return_value=True),
-            patch(f"{R}.table_is_partitioned", return_value=False),
+            patch(f"{S}.pg_search_installed", return_value=True),
+            patch(f"{S}._item_table_is_partitioned", return_value=False),
         ):
             kb_id, resp = self._post()
         assert resp.status_code == 202
@@ -288,9 +290,9 @@ class TestBuildEndpoint:
 
     def test_a_never_partitioned_item_table_builds_the_file_index(self, tasks):
         with (
-            patch(f"{R}._pg_search_available", return_value=True),
-            patch(f"{R}.PARTITIONED_ITEM_TABLES", frozenset()),
-            patch(f"{R}.table_is_partitioned", return_value=True),
+            patch(f"{S}.pg_search_installed", return_value=True),
+            patch(f"{S}.PARTITIONED_ITEM_TABLES", frozenset()),
+            patch(f"{S}._item_table_is_partitioned", return_value=True),
         ):
             kb_id, resp = self._post()
         assert resp.status_code == 202
@@ -299,8 +301,8 @@ class TestBuildEndpoint:
 
     def test_an_unmapped_strategy_is_a_400_on_pg_search_too(self, tasks):
         with (
-            patch(f"{R}._pg_search_available", return_value=True),
-            patch(f"{R}.table_is_partitioned", return_value=True),
+            patch(f"{S}.pg_search_installed", return_value=True),
+            patch(f"{S}._item_table_is_partitioned", return_value=True),
         ):
             _, resp = self._post(strategy="page_index")
         assert resp.status_code == 400

@@ -18,11 +18,9 @@ from ..services.base_vector_store import (
     reset_retrieval_degradations,
 )
 from ..services.pg_bm25_index import (
-    PARTITIONED_ITEM_TABLES,
-    pg_bm25_item_table,
+    keyword_index_backend,
     pg_bm25_status,
     pg_search_installed,
-    table_is_partitioned,
 )
 from ..services.settings_registry import get_setting
 from ..services.sparse_retrieval import (
@@ -352,43 +350,13 @@ def _pg_search_available() -> bool:
 def _keyword_index_backend(strategy: str | None) -> str | None:
     """Which keyword index serves a KB with this indexing strategy.
 
-    ``"pg_search"`` -- the KB's own ``USING bm25`` index on its partition: the
-    extension is installed, the strategy maps to an item table, and that table
-    is partitioned by knowledge base (the same checks ``ensure_bm25_index``
-    makes before it does anything).
-    ``"bm25s"`` -- the bm25s file index: everything else with an item table.
-    This is also what the search path reads when pg_search is installed but
-    its index cannot exist yet (an item table not partitioned).
-    ``None`` -- the strategy has no BM25 item table at all.
-
-    A missing strategy means ``chunk_embed``, as everywhere else. Every route
-    that starts an index build branches on this one answer, so they cannot
-    disagree, and never starts both builds.
+    ``"pg_search"``, ``"bm25s"`` or ``None`` (no BM25 item table), decided by
+    ``pg_bm25_index.keyword_index_backend`` -- the same rule the per-source
+    indexing gate uses, so a route and a worker cannot pick different indexes.
+    A missing strategy means ``chunk_embed``. Every route that starts an index
+    build branches on this one answer, and never starts both builds.
     """
-    strategy = strategy or "chunk_embed"
-    if strategy not in _STRATEGY_TO_ITEM_TABLE:
-        return None
-    if not _pg_search_available():
-        return "bm25s"
-    item_table = pg_bm25_item_table(strategy)
-    if item_table is None or item_table not in PARTITIONED_ITEM_TABLES:
-        return "bm25s"
-    try:
-        partitioned = table_is_partitioned(db.session, item_table)
-    except Exception:
-        logger.warning(
-            "Could not tell whether %s.%s is partitioned; treating the keyword index "
-            "as the bm25s file index",
-            AI_SCHEMA,
-            item_table,
-            exc_info=True,
-        )
-        try:
-            db.session.rollback()
-        except Exception:
-            logger.debug("Rollback after the partition probe failed", exc_info=True)
-        return "bm25s"
-    return "pg_search" if partitioned else "bm25s"
+    return keyword_index_backend(db.session, strategy)
 
 
 def _read_kb_strategy(kb_id: str) -> str | None:
