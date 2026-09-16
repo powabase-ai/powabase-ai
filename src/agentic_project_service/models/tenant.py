@@ -193,9 +193,7 @@ class IndexedSource(db.Model):
     last_dispatched_at: Mapped[datetime | None] = mapped_column(
         db.DateTime(timezone=True), server_default=sa_text("now()")
     )
-    attempts: Mapped[int] = mapped_column(
-        db.Integer, nullable=False, server_default="0"
-    )
+    attempts: Mapped[int] = mapped_column(db.Integer, nullable=False, server_default="0")
 
 
 class Chunk(db.Model):
@@ -1348,5 +1346,37 @@ class ToolCallEvent(db.Model):
     error: Mapped[str | None] = mapped_column(db.Text, nullable=True)
     step: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
     occurred_at: Mapped[datetime | None] = mapped_column(
+        db.DateTime(timezone=True), server_default=sa_text("now()")
+    )
+
+
+class BM25IndexBuild(db.Model):
+    """Latest persisted outcome of a knowledge base's BM25 move/build.
+
+    Table: ai.bm25_index_builds
+
+    One row per (knowledge_base_id, item_table), upserted by the pg tasks so
+    a KB's ``bm25_status`` can be reported even after a worker restart.
+    """
+
+    __tablename__ = "bm25_index_builds"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued', 'moving', 'building', 'ready', 'retrying', 'failed')",
+            name="bm25_index_builds_status_check",
+        ),
+        {"schema": "ai"},
+    )
+
+    knowledge_base_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ai.knowledge_bases.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    item_table: Mapped[str] = mapped_column(db.Text, primary_key=True)
+    status: Mapped[str] = mapped_column(db.Text, nullable=False)
+    reason: Mapped[str | None] = mapped_column(db.Text, nullable=True)
+    attempts: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
+    updated_at: Mapped[datetime | None] = mapped_column(
         db.DateTime(timezone=True), server_default=sa_text("now()")
     )
