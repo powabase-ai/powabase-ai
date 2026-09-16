@@ -307,6 +307,89 @@ def test_a_check_left_by_a_failed_move_is_cleared_by_the_next_ensure_first(
     assert _rows_in(session, "chunks_default", KB_A) == len(KB_A_DOCS) + 1
 
 
+def test_an_indexing_write_refused_by_a_leftover_check_clears_it_and_lands_on_retry(
+    engine, session, monkeypatch
+):
+    """A long read that starts mid-move outlives the move's cleanup and leaves
+    its check on DEFAULT. Indexing of that knowledge base does not wait for the
+    next index build to clear it: the refused write clears it (one try, which
+    gives up at once while the reader is still there) and the requeued attempt
+    lands -- well inside the attempts bound."""
+    from unittest.mock import MagicMock
+
+    from agentic_project_service.tasks import indexing
+
+    monkeypatch.setattr(pgb, "DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS", 0.3)
+    monkeypatch.setattr(pgb, "MOVE_CHECK_CLEANUP_WAIT_SECONDS", 0.5, raising=False)
+    moving = threading.Event()
+    _hold_the_move_open(monkeypatch, moving, 0.2)
+    reader_done = threading.Event()
+
+    def long_read():
+        moving.wait(timeout=30)
+        conn = _read_default_and_hold(engine, KB_C)
+        reader_done.wait(timeout=30)
+        conn.rollback()
+        conn.close()
+
+    reader = threading.Thread(target=long_read, daemon=True)
+    reader.start()
+    try:
+        with pytest.raises(Exception) as caught:
+            pgb.create_partition(engine, KB_A, "chunks")
+        assert pgb.is_transient_db_error(caught.value), _first_line(caught.value)
+        assert _move_check_names(session) == [pgb.default_move_check_name(KB_A)]
+
+        with pytest.raises(Exception) as refused:
+            with engine.begin() as conn:
+                _insert(conn, KB_A, "Wanderung gegen den Zaun")
+        started = time.monotonic()
+        assert pgb.clear_move_check_after_refusal(engine, refused.value) == []
+        assert time.monotonic() - started < 0.5
+        assert _move_check_names(session) == [pgb.default_move_check_name(KB_A)]
+    finally:
+        reader_done.set()
+        reader.join(timeout=30)
+
+    # index_source with its bookkeeping faked and its write real.
+    fake_db = MagicMock()
+    fake_db.engine = engine
+    monkeypatch.setattr(indexing, "db", fake_db)
+    monkeypatch.setattr(indexing, "get_knowledge_base", lambda _id: {"indexing_config": {}})
+    monkeypatch.setattr(indexing, "get_source", lambda _id: {"extraction_status": "extracted"})
+    attempts = {"n": 0}
+    monkeypatch.setattr(indexing, "_claim_indexed_source", lambda *_a: attempts["n"])
+    failed = MagicMock()
+    monkeypatch.setattr(indexing, "_fenced_mark_failed", failed)
+    outcomes: list = []
+
+    def write(**_kwargs):
+        with engine.begin() as conn:
+            _insert(conn, KB_A, "Wanderung nach dem Zaun")
+        return {"status": "success"}
+
+    def attempt():
+        attempts["n"] += 1
+        return indexing.index_source.run(KB_A, SOURCE_1, indexed_source_id=str(uuid.uuid4()))
+
+    def requeue(**kwargs):
+        if attempts["n"] >= indexing.MAX_ATTEMPTS:
+            outcomes.append("attempts exhausted")
+        else:
+            outcomes.append(attempt())
+
+    monkeypatch.setattr(indexing, "_run_index_body", write)
+    monkeypatch.setattr(indexing, "_handle_storage_error", requeue)
+
+    attempt()
+
+    assert outcomes == [{"status": "success"}]
+    assert attempts["n"] == 2
+    failed.assert_not_called()
+    assert _move_check_names(session) == []
+    assert _rows_in(session, "chunks_default", KB_A) == len(KB_A_DOCS) + 1
+
+
 def test_ensure_leaves_a_check_alone_while_a_move_holds_the_table(engine, session):
     """The per-table build lock says a move is running, and its check is live."""
     assert pgb.ensure_bm25_index(KB_B, engine=engine)["status"] == "ready"

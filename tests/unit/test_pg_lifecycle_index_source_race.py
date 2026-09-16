@@ -157,3 +157,133 @@ def test_a_lock_conflict_before_the_claim_is_not_requeued(harness):
 
     requeue.assert_not_called()
     failed.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# A move check left behind on DEFAULT, met by an indexing write
+# ---------------------------------------------------------------------------
+
+FENCE = pgb.default_move_check_name(KB)
+
+
+def _check_refusal(constraint=FENCE, table="chunks_default", schema="ai", sqlstate="23514"):
+    """A refused write as psycopg reports it: the names come from the diagnostics."""
+    from types import SimpleNamespace
+
+    class _Orig(Exception):
+        pass
+
+    orig = _Orig(f'new row for relation "{table}" violates check constraint "{constraint}"')
+    orig.sqlstate = sqlstate
+    orig.diag = SimpleNamespace(constraint_name=constraint, table_name=table, schema_name=schema)
+    return IntegrityError("INSERT INTO ai.chunks ...", {}, orig)
+
+
+def test_a_move_check_refusal_is_traced_to_its_item_table_by_the_diagnostics():
+    assert pgb.move_check_refusal_item_table(_check_refusal()) == "chunks"
+    assert (
+        pgb.move_check_refusal_item_table(_check_refusal(table="graph_index_nodes_default"))
+        == "graph_index_nodes"
+    )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        # Postgres' own partition constraint: nothing on DEFAULT to clear.
+        _check_refusal(constraint=None),
+        # The message names a move check, but the diagnostics name another one.
+        _check_refusal(constraint="tokens_positive"),
+        _check_refusal(constraint="bm25_move_not_a_uuid"),
+        _check_refusal(table="chunks"),
+        _check_refusal(table="doc2json_documents_default"),
+        _check_refusal(schema="elsewhere"),
+        _check_refusal(sqlstate="23505"),
+        RuntimeError(f'violates check constraint "{FENCE}"'),
+    ],
+)
+def test_anything_else_is_not_a_move_check_refusal(exc):
+    assert pgb.move_check_refusal_item_table(exc) is None
+
+
+def test_clearing_after_a_refusal_makes_one_non_blocking_try(monkeypatch):
+    engine = object()
+    calls = []
+    monkeypatch.setattr(
+        pgb,
+        "clear_leftover_move_checks",
+        lambda eng, item_table, wait_seconds: (
+            calls.append((eng, item_table, wait_seconds)) or [FENCE]
+        ),
+    )
+
+    assert pgb.clear_move_check_after_refusal(engine, _check_refusal()) == [FENCE]
+    assert calls == [(engine, "chunks", 0.0)]
+
+    calls.clear()
+    assert pgb.clear_move_check_after_refusal(engine, _check_refusal(constraint=None)) == []
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [_operational("55P03", "could not obtain lock"), RuntimeError("connection refused")],
+)
+def test_clearing_after_a_refusal_never_raises(monkeypatch, error):
+    def _raise(*_args):
+        raise error
+
+    monkeypatch.setattr(pgb, "clear_leftover_move_checks", _raise)
+
+    assert pgb.clear_move_check_after_refusal(object(), _check_refusal()) == []
+
+
+def test_index_source_clears_the_check_that_refused_its_write_before_requeueing(harness):
+    """Otherwise a check whose move could not drop it refuses every attempt, and
+    the source fails once the attempts run out."""
+    monkeypatch, requeue, failed = harness
+    order: list[str] = []
+    refusal = _check_refusal()
+    indexing.db.session.rollback.side_effect = lambda: order.append("rollback")
+    clear = MagicMock(side_effect=lambda *_a: order.append("clear") or [FENCE])
+    monkeypatch.setattr(pgb, "clear_move_check_after_refusal", clear)
+    requeue.side_effect = lambda **_kw: order.append("requeue")
+
+    def _raise(**_kwargs):
+        raise refusal
+
+    monkeypatch.setattr(indexing, "_run_index_body", _raise)
+
+    indexing.index_source.run(KB, SRC, indexed_source_id=IS_ID)
+
+    clear.assert_called_once_with(indexing.db.engine, refusal)
+    # Its own failed transaction still holds a lock on DEFAULT until rolled back.
+    assert order.index("rollback") < order.index("clear") < order.index("requeue")
+    failed.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [_check_refusal(), _operational("40P01", "deadlock detected")],
+)
+def test_index_source_requeues_a_lock_conflict_or_move_race_after_a_short_delay(harness, exc):
+    monkeypatch, requeue, _failed = harness
+    monkeypatch.setattr(pgb, "clear_move_check_after_refusal", MagicMock(return_value=[]))
+
+    def _raise(**_kwargs):
+        raise exc
+
+    monkeypatch.setattr(indexing, "_run_index_body", _raise)
+
+    indexing.index_source.run(KB, SRC, indexed_source_id=IS_ID)
+
+    assert requeue.call_args.kwargs["countdown"] == indexing.MOVE_CONFLICT_REQUEUE_COUNTDOWN_SECONDS
+
+
+def test_the_requeue_delay_outlasts_a_moves_own_cleanup_but_not_an_index_build_retry():
+    """Long enough that a failed move has finished trying to drop its check, so
+    a retry is not spent on a check about to go; short next to the first
+    retry of the index build task, so indexing is not held back for long."""
+    countdown = indexing.MOVE_CONFLICT_REQUEUE_COUNTDOWN_SECONDS
+    assert countdown > pgb.MOVE_CHECK_CLEANUP_WAIT_SECONDS + pgb.DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS
+    assert countdown < indexing._pg_bm25_retry_countdown(0)

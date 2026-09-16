@@ -1452,6 +1452,68 @@ def clear_leftover_move_checks_at_start(engine) -> dict[str, list[str] | str]:
     return outcomes
 
 
+def move_check_refusal_item_table(exc: BaseException) -> str | None:
+    """The item table whose DEFAULT refused a write with a move check, or None.
+
+    Read from the error's diagnostics -- the constraint, table and schema names
+    Postgres reports -- rather than its message text, so only a write refused
+    by a ``bm25_move_<kb>`` check on one of this schema's DEFAULT partitions
+    matches.
+    """
+    orig = getattr(exc, "orig", None)
+    if getattr(orig, "sqlstate", None) != "23514":
+        return None
+    diag = getattr(orig, "diag", None)
+    constraint = getattr(diag, "constraint_name", None)
+    if not constraint or not re.fullmatch(
+        rf"{_DEFAULT_MOVE_CHECK_PREFIX}[0-9a-f]{{32}}", constraint
+    ):
+        return None
+    if getattr(diag, "schema_name", None) != AI_SCHEMA:
+        return None
+    table = getattr(diag, "table_name", None)
+    for item_table in sorted(PARTITIONED_ITEM_TABLES):
+        if table == default_partition_name(item_table):
+            return item_table
+    return None
+
+
+def clear_move_check_after_refusal(engine, exc: BaseException) -> list[str]:
+    """After a write was refused by a move check, try once to clear leftover checks.
+
+    For the indexing path, so a check a failed move could not drop does not
+    refuse every retry of that knowledge base's indexing until the next index
+    build. Cannot block and never raises: the build lock is only tried (a move
+    holding it owns a live check, which is left alone), DEFAULT's lock gets a
+    single ``NOWAIT`` try, and any failure is logged and swallowed -- the
+    caller requeues either way. Returns the names dropped.
+    """
+    item_table = move_check_refusal_item_table(exc)
+    if item_table is None:
+        return []
+    try:
+        dropped = clear_leftover_move_checks(engine, item_table, 0.0)
+    except Exception as clear_exc:
+        logger.info(
+            "Could not clear the move check that refused a write on %s.%s (%s); the "
+            "write is retried later",
+            AI_SCHEMA,
+            default_partition_name(item_table),
+            str(getattr(clear_exc, "orig", clear_exc)).splitlines()[0]
+            if str(clear_exc)
+            else type(clear_exc).__name__,
+        )
+        return []
+    if dropped:
+        logger.warning(
+            "Dropped leftover move checks %s from %s.%s after they refused a write",
+            dropped,
+            AI_SCHEMA,
+            default_partition_name(item_table),
+        )
+    return dropped
+
+
 def _drop_failed_move_check(conn, kb_id: str, item_table: str) -> None:
     """After a failed move, keep trying to drop its check for a bounded time.
 

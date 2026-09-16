@@ -47,6 +47,14 @@ logger = logging.getLogger(__name__)
 # it.
 MAX_ATTEMPTS = int(os.getenv("INDEXING_MAX_ATTEMPTS", "3"))
 
+# How long a source waits before it is re-queued after a lock conflict or a
+# partition move race. Re-queued at once, an attempt would meet the same
+# conflict and spend the attempts bound in a tight loop. 10 s outlasts a failed
+# move's own give-up and check cleanup (up to about 2 s for its locks plus 5 s
+# of cleanup tries), yet stays short of the 30 s the BM25 index build waits
+# before its first retry.
+MOVE_CONFLICT_REQUEUE_COUNTDOWN_SECONDS = 10
+
 # Indexing strategy -> billing action, per the credits catalog seeded in
 # migration 0006_credit_ledger. ``full_document`` is not in the catalog as a
 # distinct action; it bills as ``indexing_chunkembed`` (the closest match —
@@ -464,13 +472,15 @@ def _handle_storage_error(
     idempotency_action: str | None = None,
     idempotency_parts: list | None = None,
     cause: str = "persistent storage error",
+    countdown: float | None = None,
 ) -> None:
     """Transient-error recovery (StorageError, or a write that raced a
     partition move), folded into the single attempts bound.
 
     Under the bound: reset to 'pending' and re-dispatch (the re-dispatch
-    re-claims, incrementing attempts). At/over the bound: mark 'failed'. No
-    Celery self.retry -- that would run a second, uncomposed counter.
+    re-claims, incrementing attempts), after ``countdown`` seconds when given.
+    At/over the bound: mark 'failed'. No Celery self.retry -- that would run a
+    second, uncomposed counter.
     """
     db.session.rollback()  # discard partial indexing data
     row = db.session.execute(
@@ -491,14 +501,20 @@ def _handle_storage_error(
         # Only re-dispatch if we still owned the row (fence). A superseded task
         # matched 0 rows and must NOT spawn a spurious duplicate.
         if result.rowcount:
-            index_source.delay(
-                knowledge_base_id,
-                source_id,
-                indexed_source_id=indexed_source_id,
-                provider_keys=provider_keys,
-                idempotency_action=idempotency_action,
-                idempotency_parts=idempotency_parts,
-            )
+            requeue_kwargs = {
+                "indexed_source_id": indexed_source_id,
+                "provider_keys": provider_keys,
+                "idempotency_action": idempotency_action,
+                "idempotency_parts": idempotency_parts,
+            }
+            if countdown is None:
+                index_source.delay(knowledge_base_id, source_id, **requeue_kwargs)
+            else:
+                index_source.apply_async(
+                    args=[knowledge_base_id, source_id],
+                    kwargs=requeue_kwargs,
+                    countdown=countdown,
+                )
     else:
         # Cause is known here (a persistent storage error), so name it -- unlike
         # the reconciler path where the cause is not observable. FENCED: a
@@ -2125,6 +2141,12 @@ def index_source(
                 knowledge_base_id,
                 str(exc).splitlines()[0],
             )
+            if pg_bm25_index.is_partition_move_race(exc):
+                # A move check left on DEFAULT by a move that could not drop
+                # it would refuse every retry too. Roll back first: this
+                # session's failed write still holds a lock on DEFAULT.
+                db.session.rollback()
+                pg_bm25_index.clear_move_check_after_refusal(db.engine, exc)
             _handle_storage_error(
                 knowledge_base_id=knowledge_base_id,
                 source_id=source_id,
@@ -2134,6 +2156,7 @@ def index_source(
                 idempotency_action=idempotency_action,
                 idempotency_parts=idempotency_parts,
                 cause="writes kept racing a partition move or losing a lock conflict",
+                countdown=MOVE_CONFLICT_REQUEUE_COUNTDOWN_SECONDS,
             )
             return {"status": "retrying_or_failed", "source_id": source_id}
         logger.error(f"Indexing failed for source {source_id}", exc_info=True)
