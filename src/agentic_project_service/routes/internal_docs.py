@@ -201,10 +201,7 @@ def docs_search():
     meta_by_source: dict[str, dict] = {}
     if source_ids:
         rows = db.session.execute(
-            text(
-                f'SELECT id, auto_metadata FROM "{AI_SCHEMA}".sources '
-                "WHERE id::text = ANY(:ids)"
-            ),
+            text(f'SELECT id, auto_metadata FROM "{AI_SCHEMA}".sources WHERE id::text = ANY(:ids)'),
             {"ids": source_ids},
         ).fetchall()
         meta_by_source = {str(r[0]): (r[1] or {}) for r in rows}

@@ -233,8 +233,8 @@ def _ingest_markdown_source(session: Session, storage, kb_id: str, doc: DocRecor
 
     existing = session.execute(
         text(
-            f'SELECT s.id, s.content_hash, s.extraction_status, '
-            f"  EXISTS(SELECT 1 FROM \"{AI_SCHEMA}\".indexed_sources i "
+            f"SELECT s.id, s.content_hash, s.extraction_status, "
+            f'  EXISTS(SELECT 1 FROM "{AI_SCHEMA}".indexed_sources i '
             f"         WHERE i.source_id = s.id AND i.knowledge_base_id = :kb "
             f"           AND i.index_status = 'indexed') "
             f'FROM "{AI_SCHEMA}".sources s WHERE s.name = :n'

@@ -1749,8 +1749,7 @@ def _run_index_body(
             "and graph_index/full_document write their sparse entries there too",
             indexed_source_id,
         )
-        return {"status": "skipped", "reason": "superseded",
-                "indexed_source_id": indexed_source_id}
+        return {"status": "skipped", "reason": "superseded", "indexed_source_id": indexed_source_id}
     db.session.commit()
 
     # --- side effects: owner only, and only once a result is durably committed.
@@ -2010,8 +2009,11 @@ def index_source(
                 "index_source: %s not claimable (superseded or terminal); skipping",
                 indexed_source_id,
             )
-            return {"status": "skipped", "reason": "not_claimable",
-                    "indexed_source_id": indexed_source_id}
+            return {
+                "status": "skipped",
+                "reason": "not_claimable",
+                "indexed_source_id": indexed_source_id,
+            }
         claimed = True
 
         return _run_index_body(
@@ -2429,7 +2431,8 @@ def reenrich_graph_references(
                 WHERE knowledge_base_id = :kb_id
                   AND index_status = 'indexing'
                   AND celery_task_id = :tid
-            """ + (" AND id = :id" if indexed_source_id else ""),
+            """
+            + (" AND id = :id" if indexed_source_id else ""),
             (
                 {
                     "kb_id": knowledge_base_id,
@@ -2550,13 +2553,15 @@ def build_bm25_for_kb(self, kb_id: str) -> dict:
 @celery_app.task(max_retries=2, default_retry_delay=300)
 @billing.no_billing_context
 def ensure_pg_bm25_index(kb_id: str) -> dict:
-    """Create or rebuild this KB's pg_search BM25 index.
+    """Give this KB its own partition and pg_search BM25 index.
 
     Dispatched whenever the index's inputs change — a new KB, a switch to a
     keyword retrieval method, a ts_language change (which the service handles
     by dropping and recreating, since the tokenizer is baked into the index) —
-    and by the operator build-bm25 endpoint. Cheap and idempotent when there
-    is nothing to do; returns the service's own outcome dict.
+    and by the operator build-bm25 endpoint. The first run for a KB moves that
+    KB's rows out of the item table's DEFAULT partition into a partition of its
+    own; later runs are cheap and idempotent. Returns the service's own outcome
+    dict.
     """
     from ..services import pg_bm25_index
 
@@ -2566,7 +2571,12 @@ def ensure_pg_bm25_index(kb_id: str) -> dict:
 @celery_app.task(max_retries=2, default_retry_delay=300)
 @billing.no_billing_context
 def drop_pg_bm25_index(kb_id: str) -> dict:
-    """Drop every pg_search BM25 index this KB owns (dispatched on KB delete)."""
+    """Drop this KB's BM25 indexes and its partitions (dispatched on KB delete).
+
+    The partitions go too: a relation named after a knowledge base that no
+    longer exists has nothing to hold. Any row still in one is returned to the
+    DEFAULT partition first.
+    """
     from ..services import pg_bm25_index
 
-    return pg_bm25_index.drop_bm25_index(kb_id)
+    return pg_bm25_index.drop_bm25_index(kb_id, drop_partitions=True)

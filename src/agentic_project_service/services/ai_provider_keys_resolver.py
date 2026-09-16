@@ -158,9 +158,9 @@ def resolve_api_key_for_model(model: str, provider_keys: dict[str, str]) -> str 
     except Exception:
         return None
     byok_key = _BYOK_PROVIDER_ALIAS.get(provider, provider)
-    return provider_keys.get(byok_key) or os.environ.get(
-        _PROVIDER_ENV.get(provider, ""), ""
-    ) or None
+    return (
+        provider_keys.get(byok_key) or os.environ.get(_PROVIDER_ENV.get(provider, ""), "") or None
+    )
 
 
 def project_has_byok_for_model(model: str) -> bool:

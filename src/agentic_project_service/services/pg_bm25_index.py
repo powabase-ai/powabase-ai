@@ -455,20 +455,29 @@ def pg_search_installed(session) -> bool:
 def bm25_index_state(session, knowledge_base_id: str, item_table: str) -> str:
     """``absent`` | ``building`` | ``ready`` for one KB's BM25 index.
 
+    The index has to be the one on *this KB's partition*: that is the relation
+    the search path names, so an index of the same name sitting anywhere else
+    (a leftover from the unpartitioned design, say) must not read as ready.
+
     ``building`` is an index row with ``indisvalid = false`` -- what a
     CREATE INDEX CONCURRENTLY still in flight (or one that failed) leaves
     behind. Such an index cannot answer a query, so it is not ready.
     """
+    if item_table not in PARTITIONED_ITEM_TABLES:
+        return "absent"
     name = bm25_index_name(knowledge_base_id, item_table)
     try:
+        partition = partition_name(knowledge_base_id, item_table)
         row = session.execute(
             text(
                 "SELECT i.indisvalid FROM pg_index i "
                 "JOIN pg_class c ON c.oid = i.indexrelid "
                 "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE n.nspname = :schema AND c.relname = :name"
+                "JOIN pg_class t ON t.oid = i.indrelid "
+                "WHERE n.nspname = :schema AND c.relname = :name "
+                "AND t.relname = :partition"
             ),
-            {"schema": AI_SCHEMA, "name": name},
+            {"schema": AI_SCHEMA, "name": name, "partition": partition},
         ).first()
     except Exception as exc:
         logger.debug("Could not read BM25 index state for %s: %s", name, exc)
@@ -518,39 +527,8 @@ def pg_bm25_status(knowledge_base_id: str, strategy: str | None, session=None) -
 
 
 # ---------------------------------------------------------------------------
-# Index lifecycle
+# Partition and index lifecycle
 # ---------------------------------------------------------------------------
-
-# pg_search supports exactly one bm25 index per relation, so only the first
-# knowledge base to claim an item table gets one; every other KB on that table
-# keeps the existing keyword path.
-#
-# The limit has to be enforced here because pg_search only half-enforces it,
-# and the half it misses is the damaging one. Verified against 0.25.9: a plain
-# CREATE INDEX on a table that already has a bm25 index is refused with the
-# message below, but CREATE INDEX CONCURRENTLY -- which is what a concurrent
-# build has to use -- creates it. With two present, unscored matching still
-# works for both KBs while a *scored* query against the older index fails with
-# "Unsupported query shape". So building a second index does not just fail to
-# help the second KB, it breaks keyword search for the first one.
-_ONE_INDEX_PER_RELATION = "only have one ParadeDB index"
-
-
-def _other_bm25_index_on_table(conn, item_table: str, own_index: str) -> str | None:
-    """Name of a bm25 index on this item table that is not ``own_index``."""
-    row = conn.execute(
-        text(
-            "SELECT ic.relname FROM pg_class ic "
-            "JOIN pg_index i ON i.indexrelid = ic.oid "
-            "JOIN pg_am am ON am.oid = ic.relam "
-            "JOIN pg_class tc ON tc.oid = i.indrelid "
-            "JOIN pg_namespace tn ON tn.oid = tc.relnamespace "
-            "WHERE tn.nspname = :schema AND tc.relname = :item_table "
-            "AND am.amname = 'bm25' AND ic.relname <> :own LIMIT 1"
-        ),
-        {"schema": AI_SCHEMA, "item_table": item_table, "own": own_index},
-    ).first()
-    return row[0] if row else None
 
 
 def _kb_config_sql() -> str:
@@ -561,6 +539,141 @@ def _kb_config_sql() -> str:
         "retrieval_config->>'ts_language' "
         f'FROM "{AI_SCHEMA}".knowledge_bases WHERE id = :id'
     )
+
+
+def _relkind(conn, relname: str) -> str | None:
+    """``pg_class.relkind`` for a relation in the ai schema, or None if absent.
+
+    ``'p'`` is a partitioned parent, ``'r'`` an ordinary table (which a
+    partition is).
+    """
+    row = conn.execute(
+        text(
+            "SELECT c.relkind FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = :schema AND c.relname = :relname"
+        ),
+        {"schema": AI_SCHEMA, "relname": relname},
+    ).first()
+    return row[0] if row else None
+
+
+def table_is_partitioned(conn, item_table: str) -> bool:
+    """Has the conversion migration reached this item table yet?"""
+    return _relkind(conn, _validated_partitioned_table(item_table)) == "p"
+
+
+def partition_exists(conn, knowledge_base_id: Any, item_table: str) -> bool:
+    return _relkind(conn, partition_name(knowledge_base_id, item_table)) is not None
+
+
+def _partition_is_attached(conn, knowledge_base_id: Any, item_table: str) -> bool:
+    row = conn.execute(
+        text(
+            "SELECT 1 FROM pg_inherits i "
+            "JOIN pg_class c ON c.oid = i.inhrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "JOIN pg_class p ON p.oid = i.inhparent "
+            "WHERE n.nspname = :schema AND c.relname = :partition AND p.relname = :parent"
+        ),
+        {
+            "schema": AI_SCHEMA,
+            "partition": partition_name(knowledge_base_id, item_table),
+            "parent": item_table,
+        },
+    ).first()
+    return row is not None
+
+
+def _foreign_key_defs(conn, relname: str) -> list[str]:
+    """``FOREIGN KEY ...`` clauses of a relation, in constraint-name order."""
+    return [
+        row[0]
+        for row in conn.execute(
+            text(
+                "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
+                "JOIN pg_class t ON t.oid = c.conrelid "
+                "JOIN pg_namespace n ON n.oid = t.relnamespace "
+                "WHERE n.nspname = :schema AND t.relname = :relname AND c.contype = 'f' "
+                "ORDER BY c.conname"
+            ),
+            {"schema": AI_SCHEMA, "relname": relname},
+        ).all()
+    ]
+
+
+def create_partition(engine, knowledge_base_id: Any, item_table: str) -> int:
+    """Give one knowledge base a partition of its own, and return rows moved.
+
+    One transaction, because a reader must never see this KB's rows missing:
+    the rows leave the DEFAULT partition and arrive in the new one within the
+    same statement, and the whole sequence commits or none of it does. The
+    evacuation is batched so a large knowledge base does not become one
+    unbounded ``DELETE ... RETURNING``.
+
+    The order is forced by Postgres: a partition cannot be attached while the
+    DEFAULT partition still holds a row that would belong to it, so the rows
+    move into an unattached clone first and the ATTACH comes last.
+    """
+    kb_id = _validated_kb_id(knowledge_base_id)
+    partition = partition_name(kb_id, item_table)
+    default = default_partition_name(item_table)
+    moved = 0
+
+    with engine.begin() as tx:
+        tx.execute(text(partition_create_ddl(kb_id, item_table)))
+        for definition in _foreign_key_defs(tx, default):
+            tx.execute(text(f'ALTER TABLE "{AI_SCHEMA}".{partition} ADD {definition}'))
+
+        evacuate = text(evacuate_batch_sql(kb_id, item_table))
+        for _ in range(_MAX_EVACUATION_BATCHES):
+            result = tx.execute(evacuate, {"kb": kb_id, "batch": EVACUATION_BATCH_ROWS})
+            if not result.rowcount:
+                break
+            moved += result.rowcount
+        else:
+            raise RuntimeError(
+                f'the DEFAULT partition of "{AI_SCHEMA}".{item_table} did not drain for '
+                f"knowledge base {kb_id} after {_MAX_EVACUATION_BATCHES} batches"
+            )
+
+        tx.execute(text(partition_attach_ddl(kb_id, item_table)))
+        tx.execute(
+            text(mirror_relation_settings_sql(_qualified(item_table), _qualified(partition)))
+        )
+
+    logger.info(
+        "Created partition %s.%s and moved %d rows into it from %s",
+        AI_SCHEMA,
+        partition,
+        moved,
+        default,
+    )
+    return moved
+
+
+def drop_partition(engine, knowledge_base_id: Any, item_table: str) -> bool:
+    """Detach and drop one KB's partition, returning any rows to DEFAULT first.
+
+    Rescuing the rows makes this safe to call on a knowledge base that still
+    exists: the worst case is that the KB goes back to the fallback keyword
+    path, never that a row is lost. After a KB delete the partition is already
+    empty (its rows went with the cascade), so the rescue costs nothing.
+    """
+    kb_id = _validated_kb_id(knowledge_base_id)
+    partition = partition_name(kb_id, item_table)
+    default = default_partition_name(item_table)
+
+    with engine.begin() as tx:
+        if _relkind(tx, partition) is None:
+            return False
+        if _partition_is_attached(tx, kb_id, item_table):
+            tx.execute(text(partition_detach_ddl(kb_id, item_table)))
+        tx.execute(text(f"INSERT INTO {_qualified(default)} SELECT * FROM {_qualified(partition)}"))
+        tx.execute(text(partition_drop_ddl(kb_id, item_table)))
+
+    logger.info("Dropped partition %s.%s; its rows are back in %s", AI_SCHEMA, partition, default)
+    return True
 
 
 def _autocommit_connection(engine):
@@ -577,17 +690,20 @@ def _engine(engine=None):
 
 
 def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
-    """Create (or rebuild) this KB's BM25 index, reporting what happened.
+    """Give this KB a partition and a BM25 index on it, reporting what happened.
 
-    Idempotent, and a no-op whenever a BM25 index is not the right answer:
-    no extension, no such KB, a retrieval method that never runs a keyword
-    leg, or a strategy with no keyword item table. A tokenizer that no longer
-    matches the KB's ``ts_language`` is dropped and recreated -- the tokenizer
-    is baked into the index, so a language change cannot be applied in place.
+    Idempotent, and a no-op whenever a BM25 index is not the right answer: no
+    extension, no such KB, a retrieval method that never runs a keyword leg, a
+    strategy with no keyword item table, an item table that is never
+    partitioned, or one the conversion migration has not reached. A tokenizer
+    that no longer matches the KB's ``ts_language`` is dropped and recreated --
+    the tokenizer is baked into the index, so a language change cannot be
+    applied in place.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
+    engine = _engine(engine)
 
-    with _autocommit_connection(_engine(engine)) as conn:
+    with _autocommit_connection(engine) as conn:
         if not pg_search_installed(conn):
             return {"status": "skipped", "reason": "extension_absent"}
 
@@ -601,10 +717,48 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
         item_table = pg_bm25_item_table(strategy)
         if item_table is None:
             return {"status": "skipped", "reason": "strategy"}
+        if item_table not in PARTITIONED_ITEM_TABLES:
+            return {
+                "status": "skipped",
+                "reason": "table_not_partitionable",
+                "item_table": item_table,
+            }
+        if not table_is_partitioned(conn, item_table):
+            logger.warning(
+                "Not building a BM25 index for KB %s: %s.%s is not partitioned by "
+                "knowledge base yet, and a scored query cannot be answered by a "
+                "partitioned parent. This KB keeps the existing keyword path",
+                kb_id,
+                AI_SCHEMA,
+                item_table,
+            )
+            return {
+                "status": "skipped",
+                "reason": "table_not_partitioned",
+                "item_table": item_table,
+            }
 
         name = bm25_index_name(kb_id, item_table)
+        partition = partition_name(kb_id, item_table)
         cast = bm25_tokenizer_cast(item_table, ts_language)
-        outcome = {"index": name, "item_table": item_table}
+        outcome: dict = {"index": name, "item_table": item_table, "partition": partition}
+
+        if not partition_exists(conn, kb_id, item_table):
+            if _relkind(conn, default_partition_name(item_table)) is None:
+                logger.warning(
+                    "Not building a BM25 index for KB %s: %s.%s has no DEFAULT partition "
+                    "to take its rows from",
+                    kb_id,
+                    AI_SCHEMA,
+                    item_table,
+                )
+                return {
+                    **outcome,
+                    "status": "skipped",
+                    "reason": "default_partition_absent",
+                }
+            outcome["rows_moved"] = create_partition(engine, kb_id, item_table)
+            outcome["partition_created"] = True
 
         existing = conn.execute(
             text(
@@ -619,56 +773,32 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
         if existing_def and indexdef_matches_tokenizer(existing_def, cast):
             return {**outcome, "status": bm25_index_state(conn, kb_id, item_table)}
 
-        occupant = _other_bm25_index_on_table(conn, item_table, name)
-        if occupant:
-            logger.warning(
-                "Not building BM25 index %s: %s.%s already carries %s and pg_search "
-                "supports one bm25 index per table; building a second one would break "
-                "scored queries against the first. This KB keeps the existing keyword path",
-                name,
-                AI_SCHEMA,
-                item_table,
-                occupant,
-            )
-            return {**outcome, "status": "skipped", "reason": "table_index_conflict"}
-
-        try:
-            if existing_def:
-                logger.info("Rebuilding BM25 index %s: tokenizer changed to %s", name, cast)
-                conn.execute(text(bm25_drop_ddl(kb_id, item_table)))
-            conn.execute(text(bm25_index_ddl(kb_id, item_table, ts_language)))
-        except Exception as exc:
-            invalidate_bm25_index_cache(kb_id)
-            if _ONE_INDEX_PER_RELATION in str(exc):
-                logger.warning(
-                    "Not building BM25 index %s: %s.%s already carries another "
-                    "knowledge base's pg_search index; this KB keeps the existing "
-                    "keyword path",
-                    name,
-                    AI_SCHEMA,
-                    item_table,
-                )
-                return {**outcome, "status": "skipped", "reason": "table_index_conflict"}
-            raise
+        if existing_def:
+            logger.info("Rebuilding BM25 index %s: tokenizer changed to %s", name, cast)
+            conn.execute(text(bm25_drop_ddl(kb_id, item_table)))
+        conn.execute(text(bm25_index_ddl(kb_id, item_table, ts_language)))
 
         invalidate_bm25_index_cache(kb_id)
         return {**outcome, "status": bm25_index_state(conn, kb_id, item_table)}
 
 
-def drop_bm25_index(knowledge_base_id: str, engine=None) -> dict:
-    """Drop every BM25 index this KB could own.
+def drop_bm25_index(knowledge_base_id: str, engine=None, drop_partitions: bool = False) -> dict:
+    """Drop every BM25 index this KB could own, and optionally its partitions.
 
     Every candidate table, not just the one its current strategy uses: the
     strategy may have changed since the index was built, and by the time a KB
-    is deleted its row is gone anyway.
+    is deleted its row is gone anyway. ``drop_partitions`` is what a deleted KB
+    needs -- leaving a partition behind would leave a relation named after a
+    knowledge base that no longer exists.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
+    engine = _engine(engine)
 
-    with _autocommit_connection(_engine(engine)) as conn:
+    dropped: list[str] = []
+    with _autocommit_connection(engine) as conn:
         if not pg_search_installed(conn):
             return {"status": "skipped", "reason": "extension_absent"}
 
-        dropped: list[str] = []
         for item_table in sorted(BM25_ITEM_TABLES):
             try:
                 conn.execute(text(bm25_drop_ddl(kb_id, item_table)))
@@ -681,5 +811,19 @@ def drop_bm25_index(knowledge_base_id: str, engine=None) -> dict:
                     exc_info=True,
                 )
 
+    removed: list[str] = []
+    if drop_partitions:
+        for item_table in sorted(PARTITIONED_ITEM_TABLES):
+            try:
+                if drop_partition(engine, kb_id, item_table):
+                    removed.append(partition_name(kb_id, item_table))
+            except Exception:
+                logger.warning(
+                    "Could not drop the partition of %s for KB %s",
+                    item_table,
+                    kb_id,
+                    exc_info=True,
+                )
+
     invalidate_bm25_index_cache(kb_id)
-    return {"status": "dropped", "indexes": dropped}
+    return {"status": "dropped", "indexes": dropped, "partitions": removed}

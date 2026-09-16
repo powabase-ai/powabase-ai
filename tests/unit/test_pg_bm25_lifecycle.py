@@ -6,6 +6,7 @@ endpoint, the KB create/patch/delete dispatch points and the bm25_status field.
 
 from __future__ import annotations
 
+import re
 import uuid
 from unittest.mock import MagicMock, patch
 
@@ -90,6 +91,8 @@ class _FakeConn:
             row = (1,) if self.extension else None
         elif "knowledge_bases" in sql and "pg_class" not in sql:
             row = self.kb_row
+        elif "pg_get_indexdef" in sql:
+            row = (self.indexdef,) if self.indexdef else None
         elif "relkind" in sql:
             kind = self.relkinds.get((params or {}).get("relname"))
             row = (kind,) if kind else None
@@ -97,8 +100,6 @@ class _FakeConn:
             row = (1,) if self.attached else None
         elif "pg_get_constraintdef" in sql:
             rows = [(fk,) for fk in self.foreign_keys]
-        elif "pg_get_indexdef" in sql:
-            row = (self.indexdef,) if self.indexdef else None
         elif "indisvalid" in sql:
             row = (self.indisvalid,)
         elif "moved AS" in sql:
@@ -125,11 +126,19 @@ class _FakeEngine:
 
 
 def _ddl(conn) -> list[str]:
-    return [s for s in conn.statements if "INDEX" in s and ("CREATE" in s or "DROP" in s)]
+    """Index DDL only -- `INCLUDING INDEXES` in the clone is not index DDL."""
+    return [
+        s for s in conn.statements if re.match(r"\s*(CREATE|DROP) INDEX\b", s, flags=re.IGNORECASE)
+    ]
+
+
+#: Statement shapes that only appear while a partition is being built or torn
+#: down: the clone, the row moves, ATTACH/DETACH, the settings mirror, the drop.
+_PARTITION_WORK = ("PARTITION", "moved AS", "(LIKE ", "INSERT INTO", "DROP TABLE", "DO $$")
 
 
 def _partition_ddl(conn) -> list[str]:
-    return [s for s in conn.statements if "PARTITION" in s or "moved AS" in s]
+    return [s for s in conn.statements if any(marker in s for marker in _PARTITION_WORK)]
 
 
 # ---------------------------------------------------------------------------
