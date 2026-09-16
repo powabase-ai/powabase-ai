@@ -82,3 +82,28 @@ def test_create_app_sweeps_leftover_move_checks_and_survives_a_failing_sweep(
 
     assert app is not None
     assert len(calls) == 1
+
+
+def test_the_service_connections_do_not_emit_pg_search_planner_warnings(
+    scratch_engine, monkeypatch
+):
+    """pg_search logs "Aggregate Scan not used" as a WARNING for ordinary
+    aggregates (a count grouped by source, say) over any relation carrying a
+    bm25 index. The service runs those constantly, so its own connections turn
+    the warning off; nobody else's are touched."""
+    from agentic_project_service.db import db
+    from agentic_project_service.main import create_app
+
+    monkeypatch.setenv("DATABASE_URL", scratch_engine.url.render_as_string(hide_password=False))
+
+    app = create_app()
+    with app.app_context():
+        try:
+            setting = db.session.execute(text("SHOW paradedb.planner_warnings")).scalar()
+            db.session.rollback()
+        finally:
+            db.engine.dispose()
+
+    assert str(setting).lower() == "off"
+    with scratch_engine.connect() as other:
+        assert str(other.execute(text("SHOW paradedb.planner_warnings")).scalar()).lower() != "off"

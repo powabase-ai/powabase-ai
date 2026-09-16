@@ -16,7 +16,7 @@ from sqlalchemy import text
 from flask_cors import CORS
 from sqlalchemy import inspect
 
-from ._pg_search_extension import ensure_pg_search_extension
+from ._pg_search_extension import ensure_pg_search_extension, quiet_pg_search_planner_warnings
 from .celery import init_celery
 from .db import db, get_database_url
 from .migrate import migrate
@@ -248,6 +248,9 @@ def create_app(testing: bool = False):
         # suites that need a real DB call create_app() without testing=True.
         app.config["JWT_SECRET"] = os.getenv("JWT_SECRET")
         return app
+
+    with app.app_context():
+        quiet_pg_search_planner_warnings(db.engine)
 
     # Migrate CHECK constraint for existing projects to allow 'completed_with_errors'
     with app.app_context():

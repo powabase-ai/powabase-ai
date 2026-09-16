@@ -61,3 +61,39 @@ def ensure_pg_search_extension(engine) -> str:
         return "failed"
     logger.info("Created the %s extension", EXTENSION)
     return "created"
+
+
+def _set_planner_warnings_off(dbapi_connection, _connection_record) -> None:
+    try:
+        with dbapi_connection.cursor() as cursor:
+            cursor.execute("SET paradedb.planner_warnings = 'off'")
+        dbapi_connection.commit()
+    except Exception:  # noqa: BLE001 - a connection must not fail over a log setting
+        try:
+            dbapi_connection.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        logger.debug("Could not turn off pg_search planner warnings", exc_info=True)
+
+
+def quiet_pg_search_planner_warnings(engine) -> None:
+    """Turn off pg_search's planner warnings on every connection this engine opens.
+
+    pg_search emits "Aggregate Scan not used ... To disable this warning: SET
+    paradedb.planner_warnings = 'off'" at WARNING for ordinary aggregates -- a
+    count grouped by source, say -- over any relation that carries a bm25
+    index, and this service runs such aggregates on every knowledge-base page.
+    They are advice about an optimisation, not an error, and would bury real
+    warnings in the database log.
+
+    Per connection of the service's own engine rather than ``ALTER DATABASE``:
+    that would also silence them for everyone else's SQL against the project,
+    and needs ownership of a database this service does not own. Nor only
+    around the scored query: that query is not what triggers them. Harmless
+    without the extension -- Postgres accepts a namespaced setting it does not
+    know -- and a failure is logged at DEBUG and ignored.
+    """
+    from sqlalchemy import event
+
+    if not event.contains(engine, "connect", _set_planner_warnings_off):
+        event.listen(engine, "connect", _set_planner_warnings_off)
