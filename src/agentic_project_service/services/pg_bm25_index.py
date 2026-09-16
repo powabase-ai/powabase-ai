@@ -825,9 +825,13 @@ def keyword_index_backend(session, strategy: str | None) -> str | None:
     strategy with an item table, including when a probe fails. ``None`` -- the
     strategy has no BM25 item table. A missing strategy means chunk_embed.
 
-    This is the one rule: the knowledge-base routes (create, PATCH,
-    ``/build-bm25``, ``bm25_status``) and the per-source indexing gate all ask
-    it, so they cannot disagree about which index a KB reads.
+    This is a rule about the *item table*, and it decides which build to
+    start: the knowledge-base routes (create, PATCH, ``/build-bm25``) ask it,
+    so they cannot disagree about which index a KB should get. Whether a given
+    KB is *already* served by its pg_search index is a per-KB question --
+    ``pg_search_serves_kb`` -- because a KB that predates the extension keeps
+    its rows in DEFAULT, and search keeps reading its bm25s file index, until
+    it is given its own index.
 
     Never raises, and probes in a savepoint, so it is safe mid-transaction.
     """
@@ -851,6 +855,38 @@ def keyword_index_backend(session, strategy: str | None) -> str | None:
         )
         return "bm25s"
     return "pg_search" if partitioned else "bm25s"
+
+
+def pg_search_serves_kb(session, knowledge_base_id: str, strategy: str | None) -> bool:
+    """Is this KB's keyword leg answered by its own pg_search index right now?
+
+    True only when the item table's backend is pg_search *and* this KB's
+    partition carries a ready index -- the same test the search path makes
+    before it reads the index. Until then search reads the KB's bm25s file
+    index, so per-source maintenance of that file index must go on: a KB that
+    existed before the extension, whose rows are still in DEFAULT, keeps it
+    until an operator builds its index (``POST /build-bm25``).
+
+    Not cached, unlike ``bm25_index_ready``: a cached "ready" can outlive an
+    index dropped by another process for the cache's TTL, and stopping
+    maintenance on it would silently freeze the file index search falls back
+    to. One catalog lookup per call. Never raises; "can't tell" is False.
+    """
+    try:
+        if keyword_index_backend(session, strategy) != "pg_search":
+            return False
+        item_table = pg_bm25_item_table(strategy or "chunk_embed")
+        if item_table is None:
+            return False
+        return _read_index_state(session, knowledge_base_id, item_table) == "ready"
+    except Exception as exc:
+        logger.warning(
+            "Could not tell whether pg_search serves KB %s (%s); treating its keyword index "
+            "as the bm25s file index",
+            knowledge_base_id,
+            str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+        )
+        return False
 
 
 def pg_bm25_status(knowledge_base_id: str, strategy: str | None, session=None) -> str | None:
@@ -1566,7 +1602,16 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
     partitioned, or one the conversion migration has not reached. A tokenizer
     that no longer matches the KB's ``ts_language`` is dropped and recreated --
     the tokenizer is baked into the index, so a language change cannot be
-    applied in place.
+    applied in place. This KB's index on any *other* item table -- left by a
+    strategy change -- is dropped.
+
+    A knowledge base that existed before the extension (or before its item
+    table was partitioned) is not given its partition by anything automatic:
+    its rows sit in DEFAULT, search keeps reading its bm25s file index, and
+    indexing keeps that file index current (``pg_search_serves_kb``). Moving
+    it blocks writes to the whole item table for the length of the move (see
+    ``create_partition``), so it is an operator step, scheduled per knowledge
+    base: ``POST /knowledge-bases/<id>/build-bm25`` dispatches this.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
@@ -1609,6 +1654,9 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
         name = bm25_index_name(kb_id, item_table)
         partition = partition_name(kb_id, item_table)
         outcome: dict = {"index": name, "item_table": item_table, "partition": partition}
+        dropped = _drop_indexes_on_other_item_tables(conn, kb_id, item_table)
+        if dropped:
+            outcome["dropped_indexes"] = dropped
 
         # An unattached partition is a move that did not finish -- a crash, or a
         # move that timed out waiting for its locks. Resuming it is the same call.
@@ -1666,6 +1714,42 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
             return _ensure_index_locked(conn, outcome, kb_id, item_table, ts_language)
         finally:
             _release_advisory_lock(conn, index_lock)
+
+
+def _drop_indexes_on_other_item_tables(conn, kb_id: str, item_table: str) -> list[str]:
+    """Drop this KB's bm25 indexes on every item table but ``item_table``.
+
+    What a strategy change leaves behind: nothing reads that index any more,
+    and Postgres would keep maintaining it on every write. The partition stays
+    (moving its rows back is real work, and a switch back needs it).
+    """
+    others = {
+        bm25_index_name(kb_id, other): other for other in sorted(BM25_ITEM_TABLES - {item_table})
+    }
+    present = [
+        row[0]
+        for row in conn.execute(
+            text(
+                "SELECT c.relname FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = :schema AND c.relkind = 'i' AND c.relname = ANY(:names) "
+                "ORDER BY c.relname"
+            ),
+            {"schema": AI_SCHEMA, "names": list(others)},
+        ).all()
+    ]
+    for name in present:
+        logger.info(
+            "Dropping BM25 index %s.%s: KB %s now keeps its keyword text in %s",
+            AI_SCHEMA,
+            name,
+            kb_id,
+            item_table,
+        )
+        conn.execute(text(bm25_drop_ddl(kb_id, others[name])))
+    if present:
+        invalidate_bm25_index_cache(kb_id)
+    return present
 
 
 def bm25_index_lock_relation(knowledge_base_id: Any, item_table: str) -> str:

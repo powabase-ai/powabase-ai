@@ -1541,3 +1541,55 @@ def test_a_stale_ready_cache_degrades_to_the_fallback_inside_one_transaction(eng
     assert len(items) >= 1
     assert session.execute(text("SELECT 1")).scalar() == 1
     session.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Which keyword index a knowledge base is served by, per knowledge base
+# ---------------------------------------------------------------------------
+
+
+def test_a_kb_is_served_by_pg_search_only_once_its_own_index_is_ready(engine, session):
+    """Extension installed and table partitioned is not enough: a knowledge base
+    whose rows are still in DEFAULT keeps its file index until it has an index
+    of its own -- and stops being served the moment that index is gone, whatever
+    the search path's readiness cache still says."""
+    assert pgb.keyword_index_backend(session, "chunk_embed") == "pg_search"
+    assert pgb.pg_search_serves_kb(session, KB_A, "chunk_embed") is False
+    session.rollback()
+
+    pgb.ensure_bm25_index(KB_A, engine=engine)
+    assert pgb.pg_search_serves_kb(session, KB_A, "chunk_embed") is True
+    assert pgb.pg_search_serves_kb(session, KB_B, "chunk_embed") is False
+    assert pgb.bm25_index_ready(session, KB_A, "chunks") is True  # now cached
+    session.rollback()
+
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(pgb.bm25_drop_ddl(KB_A, "chunks")))
+    assert pgb.pg_search_serves_kb(session, KB_A, "chunk_embed") is False
+    session.rollback()
+
+
+def test_ensure_drops_the_kbs_index_on_the_item_table_it_no_longer_uses(engine, session):
+    """A strategy change moves the keyword text to another item table; the
+    index left on the old one would be maintained on every write for nothing."""
+    session.execute(
+        text(
+            f"INSERT INTO {SCHEMA}.full_documents (knowledge_base_id, source_id, summary) "
+            "VALUES (CAST(:kb AS uuid), CAST(:src AS uuid), 'Zusammenfassung der Wanderung')"
+        ),
+        {"kb": KB_A, "src": SOURCE_1},
+    )
+    session.commit()
+    assert pgb.ensure_bm25_index(KB_A, engine=engine)["status"] == "ready"
+    assert _indexdef(session, KB_A, "chunks") is not None
+
+    _set_strategy(session, KB_A, "full_document")
+    outcome = pgb.ensure_bm25_index(KB_A, engine=engine)
+
+    assert outcome["status"] == "ready"
+    assert outcome["item_table"] == "full_documents"
+    assert _indexdef(session, KB_A, "full_documents") is not None
+    assert _indexdef(session, KB_A, "chunks") is None
+    assert outcome["dropped_indexes"] == [pgb.bm25_index_name(KB_A, "chunks")]
+    # The partition stays: moving rows back is real work, and nothing was lost.
+    assert _rows_in(session, pgb.partition_name(KB_A, "chunks")) == len(KB_A_DOCS)

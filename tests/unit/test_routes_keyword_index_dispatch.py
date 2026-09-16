@@ -240,6 +240,91 @@ class TestUpdate:
         self._patch({"method": "hybrid"}, {"method": "vector_search"}, "pg_search")
 
 
+class TestUpdateStrategy:
+    """A PATCH that changes ``indexing_config.strategy`` moves the keyword text
+    to another item table, so the KB needs its index there -- and the one on
+    the old table is dead weight."""
+
+    def _patch(self, body, *, old_strategy, new_backend, method="hybrid", pg_available=True):
+        kb_id = str(uuid.uuid4())
+        with (
+            _AUTH,
+            patch(f"{R}.db"),
+            patch(f"{R}._read_existing_retrieval_config", return_value={"method": method}),
+            patch(f"{R}._read_kb_strategy", return_value=old_strategy),
+            patch(f"{R}._keyword_index_backend", return_value=new_backend) as backend,
+            patch(f"{R}._pg_search_available", return_value=pg_available),
+            patch(f"{R}.get_setting", return_value=True),
+            patch(f"{R}.get_knowledge_base", return_value=({"id": kb_id}, 200)),
+        ):
+            resp = _client().patch(f"/api/knowledge-bases/{kb_id}", json=body, headers=_headers())
+        assert resp.status_code == 200
+        return kb_id, backend
+
+    @pytest.mark.parametrize("method", ["hybrid", "full_text"])
+    def test_strategy_only_change_on_pg_search_dispatches_the_ensure(self, tasks, method):
+        kb_id, backend = self._patch(
+            {"indexing_config": {"strategy": "full_document"}},
+            old_strategy="chunk_embed",
+            new_backend="pg_search",
+            method=method,
+        )
+        tasks["ensure"].delay.assert_called_once_with(kb_id)
+        tasks["drop"].delay.assert_not_called()
+        tasks["build"].delay.assert_not_called()
+        assert backend.call_args.args[0] == "full_document"
+
+    def test_strategy_change_to_one_without_an_item_table_drops_the_index(self, tasks):
+        kb_id, _ = self._patch(
+            {"indexing_config": {"strategy": "page_index"}},
+            old_strategy="chunk_embed",
+            new_backend=None,
+        )
+        tasks["drop"].delay.assert_called_once_with(kb_id, drop_partitions=False)
+        tasks["ensure"].delay.assert_not_called()
+
+    def test_unchanged_strategy_dispatches_nothing(self, tasks):
+        self._patch(
+            {"indexing_config": {"strategy": "chunk_embed", "chunk_size": 900}},
+            old_strategy="chunk_embed",
+            new_backend="pg_search",
+        )
+        tasks["ensure"].delay.assert_not_called()
+        tasks["drop"].delay.assert_not_called()
+
+    def test_strategy_change_on_a_vector_kb_dispatches_nothing(self, tasks):
+        self._patch(
+            {"indexing_config": {"strategy": "full_document"}},
+            old_strategy="chunk_embed",
+            new_backend="pg_search",
+            method="vector_search",
+        )
+        tasks["ensure"].delay.assert_not_called()
+        tasks["drop"].delay.assert_not_called()
+
+    def test_strategy_change_without_pg_search_dispatches_nothing(self, tasks):
+        self._patch(
+            {"indexing_config": {"strategy": "full_document"}},
+            old_strategy="chunk_embed",
+            new_backend="bm25s",
+            pg_available=False,
+        )
+        tasks["ensure"].delay.assert_not_called()
+        tasks["drop"].delay.assert_not_called()
+
+    def test_strategy_and_retrieval_change_together_dispatch_one_ensure(self, tasks):
+        kb_id, _ = self._patch(
+            {
+                "indexing_config": {"strategy": "full_document"},
+                "retrieval_config": {"method": "hybrid"},
+            },
+            old_strategy="chunk_embed",
+            new_backend="pg_search",
+        )
+        tasks["ensure"].delay.assert_called_once_with(kb_id)
+        tasks["drop"].delay.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # POST /knowledge-bases/<id>/build-bm25
 # ---------------------------------------------------------------------------
@@ -329,6 +414,31 @@ class TestStatus:
             patch(f"{R}.pg_bm25_status", return_value="building"),
         ):
             assert kb_route._compute_bm25_status(self.KB) == "building"
+
+    def test_a_kb_still_on_its_file_index_reports_that_index_not_absent(self):
+        """A KB from before pg_search has no partition of its own, and its
+        keyword leg reads its bm25s file index until an operator builds its
+        pg_search index. Its status is that file index's, not "absent"."""
+        with (
+            patch(f"{R}._keyword_index_backend", return_value="pg_search"),
+            patch(f"{R}.pg_bm25_status", return_value="absent"),
+            patch(f"{R}.get_setting", return_value=False),
+            patch(f"{R}.SparseIndexStore") as store_cls,
+            patch(f"{R}._count_items_for_kb_bm25", return_value=3),
+        ):
+            store_cls.return_value.index_exists.return_value = True
+            store_cls.return_value.read_metadata.return_value = {"item_count": 3}
+            assert kb_route._compute_bm25_status(self.KB) == "ready"
+
+    def test_a_kb_with_no_index_at_all_is_absent(self):
+        with (
+            patch(f"{R}._keyword_index_backend", return_value="pg_search"),
+            patch(f"{R}.pg_bm25_status", return_value="absent"),
+            patch(f"{R}.get_setting", return_value=True),
+            patch(f"{R}.SparseIndexStore") as store_cls,
+        ):
+            store_cls.return_value.index_exists.return_value = False
+            assert kb_route._compute_bm25_status(self.KB) == "absent"
 
     def test_file_index_backend_ignores_the_pg_answer(self):
         """With the extension installed but the table unpartitioned, the pg

@@ -110,14 +110,18 @@ def _get_kb_indexing_strategy(kb_id: str) -> str:
 
 
 def _kb_served_by_pg_search(kb_id: str) -> bool:
-    """Is this KB's keyword leg answered by its pg_search index, not the file index?
+    """Is this KB's keyword leg answered by its own pg_search index, not the file index?
+
+    Per knowledge base, not per item table: a KB that predates the extension
+    keeps its rows in DEFAULT and is searched through its bm25s file index
+    until its own index is ready, so that file index has to stay current.
 
     False when that cannot be determined: skipping the file-index append on a
     guess could leave a KB with no keyword index at all.
     """
     try:
         strategy = _get_kb_indexing_strategy(kb_id)
-        return pg_bm25_index.keyword_index_backend(db.session, strategy) == "pg_search"
+        return pg_bm25_index.pg_search_serves_kb(db.session, kb_id, strategy)
     except Exception:
         logger.warning(
             "Could not tell whether pg_search serves KB %s; keeping the bm25s file index "
@@ -134,8 +138,9 @@ def _should_build_bm25_now(kb_id: str) -> bool:
     Returns False when:
       - the KB's retrieval method does not use BM25 (vector_search, None, unknown), OR
       - the project-level BM25_AUTO_INDEXING setting is disabled, OR
-      - pg_search serves this KB's keyword leg, so nothing reads the file index
-        and appending every source to it is wasted tokenising.
+      - this KB's own pg_search index is ready and serves its keyword leg, so
+        nothing reads the file index and appending every source to it is
+        wasted tokenising.
     """
     method = _get_kb_retrieval_method(kb_id)
     if method not in ("hybrid", "full_text"):
@@ -2643,6 +2648,11 @@ def ensure_pg_bm25_index(self, kb_id: str) -> dict:
     wait for the full move, readers only milliseconds. Later runs are cheap and
     idempotent. Returns the service's own outcome
     dict.
+
+    Nothing dispatches this for a knowledge base that predates the extension:
+    its move blocks writes to the whole item table, so an operator schedules it
+    per KB with ``POST /knowledge-bases/<id>/build-bm25``. Until then the KB is
+    searched, and kept indexed, through its bm25s file index.
 
     Retries (with backoff, up to ``PG_BM25_TASK_MAX_RETRIES``) when another
     build holds the item table or the move lost a lock race; any other error

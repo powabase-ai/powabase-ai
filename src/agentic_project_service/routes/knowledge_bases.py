@@ -433,7 +433,8 @@ def _compute_bm25_status(kb) -> str | None:
     """The ``bm25_status`` field of the KB detail response, or None to omit it.
 
     Values:
-      - ``"absent"``: no index exists yet;
+      - ``"absent"``: no index exists yet -- neither a pg_search index nor,
+        for a KB that predates the extension, a bm25s file index;
       - ``"building"``: the pg_search index exists but cannot answer a query
         yet (a concurrent build still running, or one that did not finish);
       - ``"stale"``: the bm25s file index is older than the KB's items
@@ -442,7 +443,9 @@ def _compute_bm25_status(kb) -> str | None:
 
     The index reported is the one the keyword leg actually uses (see
     ``_keyword_index_backend``): the pg_search index when that is the
-    backend, the bm25s file index otherwise.
+    backend and the KB has one, the bm25s file index otherwise -- including a
+    KB that predates the extension and has not been given its own index yet
+    (``POST /build-bm25`` does that).
 
     Returns None (caller should omit the field) when:
       - the KB's retrieval method does not use BM25, OR
@@ -463,15 +466,25 @@ def _compute_bm25_status(kb) -> str | None:
         return None
 
     strategy = indexing_config.get("strategy")
+    item_table = _STRATEGY_TO_ITEM_TABLE.get(strategy)
     if _keyword_index_backend(strategy) == "pg_search":
         pg_state = pg_bm25_status(kb_id, strategy)
-        if pg_state is not None:
+        if pg_state is not None and pg_state != "absent":
             return pg_state
+        if pg_state == "absent":
+            # No pg_search index of its own yet. A KB from before the extension
+            # still has its bm25s file index, and its keyword leg reads that
+            # until POST /build-bm25 gives it its own index: report that index,
+            # as before. With no file index either, it is plainly absent.
+            file_table = _STRATEGY_TO_ITEM_TABLE.get(strategy or "chunk_embed")
+            if file_table is None or not SparseIndexStore(knowledge_base_id=kb_id).index_exists(
+                file_table
+            ):
+                return "absent"
 
     if get_setting("BM25_AUTO_INDEXING"):
         return None
 
-    item_table = _STRATEGY_TO_ITEM_TABLE.get(strategy)
     if item_table is None:
         return None
 
@@ -732,6 +745,12 @@ def update_knowledge_base(kb_id: str):
     if "retrieval_config" in data:
         old_retrieval_config = _read_existing_retrieval_config(kb_id)
         old_method = old_retrieval_config.get("method")
+    # A strategy change moves the KB's keyword text to another item table.
+    strategy_changed = False
+    new_strategy = None
+    if "indexing_config" in data:
+        new_strategy = (data.get("indexing_config") or {}).get("strategy") or "chunk_embed"
+        strategy_changed = (_read_kb_strategy(kb_id) or "chunk_embed") != new_strategy
 
     updates = []
     params = {"id": kb_id}
@@ -774,22 +793,38 @@ def update_knowledge_base(kb_id: str):
 
         if is_keyword:
             # Exactly one index build, for the index the keyword leg will read.
-            backend = _keyword_index_backend(_read_kb_strategy(kb_id))
+            backend = _keyword_index_backend(new_strategy or _read_kb_strategy(kb_id))
             if backend == "pg_search":
-                if _pg_bm25_inputs_changed(old_retrieval_config, new_retrieval_config):
+                if strategy_changed or _pg_bm25_inputs_changed(
+                    old_retrieval_config, new_retrieval_config
+                ):
                     _dispatch_ensure_pg_bm25_index(kb_id)
-            elif backend == "bm25s" and not was_keyword and get_setting("BM25_AUTO_INDEXING"):
-                try:
-                    build_bm25_for_kb.delay(kb_id)
-                except Exception:
-                    logger.warning(
-                        "Failed to auto-dispatch build_bm25 for KB %s; "
-                        "bm25_status will remain absent until manually triggered",
-                        kb_id,
-                        exc_info=True,
-                    )
+            else:
+                if backend == "bm25s" and not was_keyword and get_setting("BM25_AUTO_INDEXING"):
+                    try:
+                        build_bm25_for_kb.delay(kb_id)
+                    except Exception:
+                        logger.warning(
+                            "Failed to auto-dispatch build_bm25 for KB %s; "
+                            "bm25_status will remain absent until manually triggered",
+                            kb_id,
+                            exc_info=True,
+                        )
+                if strategy_changed and _pg_search_available():
+                    _dispatch_drop_pg_bm25_index(kb_id)
         elif was_keyword and _pg_search_available():
             _dispatch_drop_pg_bm25_index(kb_id)
+    elif strategy_changed:
+        # Strategy only: the KB's keyword method is unchanged, but its keyword
+        # text now lives in another item table. The ensure builds the index
+        # there and drops this KB's index on the table it left; a strategy with
+        # no pg_search index to build just loses the old one.
+        method = _read_existing_retrieval_config(kb_id).get("method")
+        if method in _KEYWORD_RETRIEVAL_METHODS and _pg_search_available():
+            if _keyword_index_backend(new_strategy) == "pg_search":
+                _dispatch_ensure_pg_bm25_index(kb_id)
+            else:
+                _dispatch_drop_pg_bm25_index(kb_id)
 
     return get_knowledge_base(kb_id)
 
