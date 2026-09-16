@@ -1340,3 +1340,16 @@ def test_bm25_status_is_still_none_for_a_vector_only_kb(mock_pg):
     }
     assert kb_route._compute_bm25_status(kb) is None
     mock_pg.assert_not_called()
+
+
+def test_a_failed_lock_attempt_costs_writers_well_under_a_second_but_keeps_its_queued_try():
+    """Each ACCESS EXCLUSIVE step runs while writers are held off the parent, so
+    its bound is what a failed attempt costs them (it was 2 s). It still has to
+    leave room for the one queued try, without which overlapping short reads of
+    DEFAULT starve the move."""
+    wait = pgb.DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS
+    assert wait <= 0.5
+    queued_try_ends = (
+        pgb._EXCLUSIVE_LOCK_QUEUED_TRY_AFTER_SECONDS + pgb.DEFAULT_EXCLUSIVE_QUEUED_TRY_MS / 1000
+    )
+    assert queued_try_ends < wait

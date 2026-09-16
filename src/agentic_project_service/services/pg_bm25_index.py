@@ -105,7 +105,17 @@ MOVE_LOCK_TIMEOUT_MS = 5_000
 # the error. Closing it precisely would mean skipping the queued try whenever
 # any session waits on the move, and under steady writes one always does --
 # for the whole copy of a large move -- so large moves would starve.
-DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS = 2.0
+#
+# The bound is short because each of these steps but the last cleanup runs
+# while writers are held off the parent: it is what a failed attempt costs
+# them on top of the copy. Measured on the production schema (a 40 000-row
+# knowledge base over a 2.5 million-row DEFAULT, 4 attempts per value): with
+# 6-8 threads of 50-150 ms reads of DEFAULT every attempt succeeded at 0.4 s,
+# as at 2.0 s; at 0.3 s the queued try no longer fits and every attempt
+# failed. A long reader arriving mid-move cost writers 2.4-2.6 s per failed
+# attempt at 2.0 s and 1.0-1.3 s at 0.4 s (the rest is the copy and the
+# VALIDATE scan of DEFAULT).
+DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS = 0.4
 DEFAULT_EXCLUSIVE_QUEUED_TRY_MS = 200
 _EXCLUSIVE_LOCK_QUEUED_TRY_AFTER_SECONDS = 0.1
 _EXCLUSIVE_LOCK_FIRST_SLEEP_SECONDS = 0.01
