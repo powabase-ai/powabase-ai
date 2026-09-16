@@ -38,6 +38,39 @@ statistics for any statement that names the parent). It is idempotent (a
 table already partitioned is left alone), safe on an empty table, and a no-op
 for a table that does not exist yet.
 
+**This revision runs on every database, with or without pg_search.** That is
+a decision, not an oversight, and it means a database without the extension
+is *not* unaffected: its three item tables become partitioned parents too. The
+reasons:
+
+* one schema shape everywhere -- every query, test and operator runbook sees
+  the same relations whether or not the extension is installed, and installing
+  it later needs no second conversion;
+* a knowledge base created once the extension is available gets its own
+  partition before it has any rows, which is what keeps the per-KB move free;
+  deferring the conversion to that moment would do it on a full table instead.
+
+What changes for such a database: the parent has no primary key (each
+partition keeps its own), so ``INSERT ... ON CONFLICT (id)`` through the parent
+is no longer accepted; the policies, grants and RLS flag carry over (see step
+4), so readers see exactly what they saw before.
+
+The schema bootstrap SQL (for self-hosting and for new hosted projects) still
+creates the three tables unpartitioned, on purpose: a freshly bootstrapped
+database is stamped at the baseline and migrated to head on its first start,
+so it reaches the same final shape through this revision, and there is only
+one conversion path to keep correct.
+
+Lock headroom: a statement that names a parent locks every partition it cannot
+prune, and a generic prepared plan locks all of them -- about 218 lock-table
+entries for one parent-wide statement at 35 partitions. With the default
+``max_locks_per_transaction = 64``, 120 partitions, one transaction holding
+~2000 locks and nine concurrent transactions at ~1000 each all succeeded in a
+measurement -- the shared lock table is sized for all connections together, so
+this is headroom rather than a limit already hit. Raise it
+(for example to 256) on a database expected to hold hundreds of knowledge
+bases.
+
 The renames need ACCESS EXCLUSIVE on each table. Migrations run at start-up, so
 every lock wait is bounded by ``LOCK_TIMEOUT_MS``: behind a long reader (a
 nightly ``pg_dump``) the revision fails with ``MigrationLockTimeout``, logs the
