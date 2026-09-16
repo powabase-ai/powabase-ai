@@ -376,6 +376,18 @@ def create_app(testing: bool = False):
                     # gains pg_search later still gets it enabled here. Idempotent
                     # and never raises; a failure is logged at ERROR.
                     ensure_pg_search_extension(db.engine)
+                    # A partition move killed part-way can leave its temporary
+                    # check on a DEFAULT partition, refusing one knowledge base's
+                    # writes. Clear it without ever waiting for a lock.
+                    try:
+                        from .services import pg_bm25_index
+
+                        pg_bm25_index.clear_leftover_move_checks_at_start(db.engine)
+                    except Exception:
+                        logger.warning(
+                            "Start-up sweep for leftover partition move checks failed",
+                            exc_info=True,
+                        )
                 finally:
                     db.session.execute(text("SELECT pg_advisory_unlock(43)"))
                     db.session.commit()

@@ -56,3 +56,29 @@ def test_create_app_starts_when_the_extension_cannot_be_created(scratch_engine, 
         db.engine.dispose()
     assert app is not None
     assert "pg_search" not in _installed(scratch_engine)
+
+
+def test_create_app_sweeps_leftover_move_checks_and_survives_a_failing_sweep(
+    scratch_engine, monkeypatch
+):
+    """Start-up clears checks a killed partition move left on DEFAULT, and a
+    sweep that blows up anyway must not stop the service starting."""
+    from agentic_project_service.db import db
+    from agentic_project_service.main import create_app
+    from agentic_project_service.services import pg_bm25_index
+
+    calls: list = []
+
+    def _sweep(engine):
+        calls.append(engine)
+        raise RuntimeError("sweep failed")
+
+    monkeypatch.setattr(pg_bm25_index, "clear_leftover_move_checks_at_start", _sweep)
+    monkeypatch.setenv("DATABASE_URL", scratch_engine.url.render_as_string(hide_password=False))
+
+    app = create_app()
+    with app.app_context():
+        db.engine.dispose()
+
+    assert app is not None
+    assert len(calls) == 1

@@ -313,7 +313,8 @@ def test_the_default_partition_is_fenced_so_the_attach_does_not_scan_it():
 
     The check is added NOT VALID only once the parent lock is held (so no write
     of this KB can hit it), validated after the rows have left DEFAULT and
-    before the ATTACH, and dropped again after the commit.
+    before the ATTACH, and dropped again inside the move, under the lock the
+    ATTACH already holds, so a successful move cannot leave it behind.
     """
     conn = _FakeConn(moved=10)
 
@@ -328,11 +329,14 @@ def test_the_default_partition_is_fenced_so_the_attach_does_not_scan_it():
     drop = statements.index(
         pgb.default_move_check_drop_ddl("chunks", pgb.default_move_check_name(KB))
     )
-    assert parent_lock < add < delete_at < validate < attach < drop
+    mirror = max(i for i, s in enumerate(statements) if s.strip().startswith("DO $$"))
+    assert parent_lock < add < delete_at < validate < attach < drop < mirror
     assert "NOT VALID" in statements[add]
     assert f"CHECK (knowledge_base_id <> '{KB}')" in statements[add]
-    # The move commits before the check is dropped.
-    assert any(attach < c <= drop for c in conn.commits)
+    # Dropped in the move's own transaction: nothing commits between the
+    # ATTACH and the settings mirror, and it is dropped exactly once.
+    assert not [c for c in conn.commits if attach < c <= mirror]
+    assert statements.count(statements[drop]) == 1
 
 
 def test_the_move_check_name_fits_the_identifier_limit_and_is_validated():

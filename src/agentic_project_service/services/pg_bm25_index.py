@@ -88,6 +88,13 @@ DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS = 2.0
 _EXCLUSIVE_LOCK_FIRST_SLEEP_SECONDS = 0.01
 _EXCLUSIVE_LOCK_MAX_SLEEP_SECONDS = 0.25
 
+# How long a failed move keeps trying to drop the temporary check it put on
+# DEFAULT. Whatever broke the move is usually a reader still holding DEFAULT,
+# and until the check is gone every write of that knowledge base routed to
+# DEFAULT fails its check. A check that outlives this is cleared by the next
+# ``ensure_bm25_index`` on the item table, or at start-up.
+MOVE_CHECK_CLEANUP_WAIT_SECONDS = 5.0
+
 # Alias pg_search records for an indexed expression, so the query's expression
 # can be matched back to the indexed one.
 _EXPRESSION_ALIAS = "bm25_text"
@@ -1203,17 +1210,125 @@ def _lock_default_exclusively(conn, item_table: str, wait_seconds: float) -> Non
         return
 
 
-def _drop_move_checks(conn, item_table: str, names: list[str]) -> None:
+def _drop_move_checks(
+    conn, item_table: str, names: list[str], wait_seconds: float | None = None
+) -> None:
     """Drop temporary DEFAULT checks, each in its own short transaction.
 
     DROP CONSTRAINT takes ACCESS EXCLUSIVE on DEFAULT for a catalog change
-    only; the lock is taken without queueing, within
-    ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS``.
+    only; the lock is taken without queueing, within ``wait_seconds``
+    (default ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS``).
     """
+    if wait_seconds is None:
+        wait_seconds = DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS
     for name in names:
-        _lock_default_exclusively(conn, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
+        _lock_default_exclusively(conn, item_table, wait_seconds)
         conn.execute(text(default_move_check_drop_ddl(item_table, name)))
         conn.commit()
+
+
+def clear_leftover_move_checks(engine, item_table: str, wait_seconds: float) -> list[str]:
+    """Drop every temporary move check on this table's DEFAULT that no move is using.
+
+    A move's check is only in use while that move holds the item table's
+    build lock, so this takes the lock -- without waiting: if a move holds it,
+    its check is live and nothing is dropped. A check found under the lock was
+    left by a move that failed to drop it (a reader outlived its cleanup) or
+    never got the chance (its worker was killed), and it refuses every write of
+    its knowledge base routed to DEFAULT until it is gone.
+
+    Returns the names dropped. Raises SQLSTATE 55P03 if DEFAULT's lock is not
+    free within ``wait_seconds``.
+    """
+    relation = partition_build_lock_relation(item_table)
+    with engine.connect() as conn:
+        acquired = conn.execute(text(partition_build_lock_sql()), {"relation": relation}).scalar()
+        conn.commit()
+        if not acquired:
+            return []
+        try:
+            names = _move_check_names(conn, item_table)
+            conn.commit()
+            _drop_move_checks(conn, item_table, names, wait_seconds)
+            return names
+        finally:
+            _release_partition_build_lock(conn, item_table)
+
+
+def clear_leftover_move_checks_at_start(engine) -> dict[str, list[str] | str]:
+    """Start-up sweep of leftover move checks, for every partitioned item table.
+
+    Cannot block start-up: the build lock is only tried, DEFAULT's lock gets a
+    single ``NOWAIT`` try, and every other statement runs under a short
+    ``lock_timeout``. Never raises. Per table the outcome is the list of checks
+    dropped, ``"busy"`` (a move or a reader was in the way; the next
+    ``ensure_bm25_index`` on the table clears it), ``"not_partitioned"``, or
+    ``"error"``.
+    """
+    outcomes: dict[str, list[str] | str] = {}
+    for item_table in sorted(PARTITIONED_ITEM_TABLES):
+        try:
+            with engine.connect() as conn:
+                partitioned = table_is_partitioned(conn, item_table) and (
+                    _relkind(conn, default_partition_name(item_table)) is not None
+                )
+                conn.rollback()
+            if not partitioned:
+                outcomes[item_table] = "not_partitioned"
+                continue
+            outcomes[item_table] = clear_leftover_move_checks(engine, item_table, 0.0)
+        except Exception as exc:
+            if is_lock_conflict(exc):
+                outcomes[item_table] = "busy"
+                logger.info(
+                    "A leftover move check on %s.%s could not be dropped at start-up: DEFAULT "
+                    "is in use. The next BM25 index build on the table will drop it",
+                    AI_SCHEMA,
+                    default_partition_name(item_table),
+                )
+            else:
+                outcomes[item_table] = "error"
+                logger.warning(
+                    "Could not check %s.%s for leftover move checks at start-up: %s",
+                    AI_SCHEMA,
+                    item_table,
+                    str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+                )
+            continue
+        if outcomes[item_table]:
+            logger.warning(
+                "Dropped leftover move checks %s from %s.%s at start-up",
+                outcomes[item_table],
+                AI_SCHEMA,
+                default_partition_name(item_table),
+            )
+    return outcomes
+
+
+def _drop_failed_move_check(conn, kb_id: str, item_table: str) -> None:
+    """After a failed move, keep trying to drop its check for a bounded time.
+
+    Never raises: the move's own error is the one the caller needs. A check
+    that cannot be dropped refuses this knowledge base's writes routed to
+    DEFAULT until ``clear_leftover_move_checks`` runs -- at the next
+    ``ensure_bm25_index`` on the item table, or at start-up.
+    """
+    fence = default_move_check_name(kb_id)
+    try:
+        _drop_move_checks(conn, item_table, [fence], MOVE_CHECK_CLEANUP_WAIT_SECONDS)
+    except Exception as exc:
+        conn.rollback()
+        logger.warning(
+            "Could not drop the temporary check %s from %s.%s within %.1f s (%s). Writes of "
+            "KB %s routed to it fail until it is dropped: by the next BM25 index build on "
+            "this table, or at start-up",
+            fence,
+            AI_SCHEMA,
+            default_partition_name(item_table),
+            MOVE_CHECK_CLEANUP_WAIT_SECONDS,
+            str(getattr(exc, "orig", exc)).splitlines()[0],
+            kb_id,
+        )
 
 
 def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
@@ -1224,15 +1339,22 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
     1. **prepare** (own transaction) -- clone the DEFAULT partition into an
        unattached table with a CHECK matching the partition bound (so ATTACH
        skips its scan of the new partition) and the foreign keys ``LIKE`` does
-       not copy. Any temporary DEFAULT check a crashed move left is dropped.
+       not copy. Any temporary DEFAULT check a failed or killed move left is
+       dropped.
     2. **move** (one transaction) -- SHARE on the parent; meanwhile, on a
        second connection, add ``CHECK (knowledge_base_id <> kb) NOT VALID`` to
        DEFAULT (a catalog change) and commit it; SHARE on DEFAULT; copy the
        KB's rows into the clone and delete them from DEFAULT; VALIDATE the
-       DEFAULT check (one scan of DEFAULT, readers unaffected); ATTACH, which
-       now needs neither of its scans; mirror ownership, grants, RLS and
-       policies; commit.
-    3. **unfence** (own transaction) -- drop the DEFAULT check.
+       DEFAULT check (one scan of DEFAULT, which does not block readers);
+       ATTACH, which now needs neither of its scans; drop the DEFAULT check
+       under the lock the ATTACH already holds; mirror ownership, grants, RLS
+       and policies; commit.
+
+    Every ACCESS EXCLUSIVE lock on DEFAULT (adding the check, the ATTACH) is
+    taken with ``NOWAIT`` tries for up to ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS``
+    rather than by queueing, so a reader in the way makes the *move* give up
+    (SQLSTATE 55P03) instead of stalling new readers or deadlocking a
+    transaction that read DEFAULT and then writes through the parent.
 
     The bm25 index is built afterwards with CREATE INDEX CONCURRENTLY, outside
     any of this.
@@ -1273,8 +1395,15 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
     Serialised per item table by a session-scoped advisory lock: two
     concurrent moves out of one DEFAULT partition deadlock each other.
 
-    Re-entrant: a failure in step 2 rolls the move back and the check is
-    dropped, so a retry starts from a clean DEFAULT and an empty clone.
+    Re-entrant: a failure in step 2 rolls the move back, leaving the clone
+    empty. If the check had already been committed, the move keeps trying to
+    drop it for up to ``MOVE_CHECK_CLEANUP_WAIT_SECONDS`` -- until then this
+    KB's writes routed to DEFAULT fail it (SQLSTATE 23514, which indexing
+    re-queues). The check is *not* always gone when the call returns: a reader
+    that outlives that wait, or a worker killed between the check's commit and
+    the move's, leaves it behind, and ``clear_leftover_move_checks`` drops it at
+    the next ``ensure_bm25_index`` on this item table, the next move, or
+    start-up.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     partition = partition_name(kb_id, item_table)
@@ -1294,6 +1423,7 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
 
             _prepare_partition(conn, kb_id, item_table)
 
+            fence_committed = False
             try:
                 conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
                 conn.execute(text(partition_lock_parent_ddl(item_table)))
@@ -1308,6 +1438,7 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                     )
                     fencer.execute(text(default_move_check_add_ddl(kb_id, item_table)))
                     fencer.commit()
+                fence_committed = True
                 conn.execute(text(partition_lock_default_ddl(item_table)))
                 moved = conn.execute(text(insert_sql), {"kb": kb_id}).rowcount
                 conn.execute(text(delete_sql), {"kb": kb_id})
@@ -1315,6 +1446,10 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                 attach_sql = partition_attach_ddl(kb_id, item_table)
                 _lock_default_exclusively(conn, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
                 conn.execute(text(attach_sql))
+                # Inside the move, under the ACCESS EXCLUSIVE the ATTACH already
+                # holds: dropping the check costs no further lock wait, and it
+                # commits with the move, so a success never leaves it behind.
+                conn.execute(text(default_move_check_drop_ddl(item_table, fence)))
                 conn.execute(
                     text(
                         mirror_relation_settings_sql(_qualified(item_table), _qualified(partition))
@@ -1325,24 +1460,11 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
             except Exception as exc:
                 conn.rollback()
                 _log_move_failure(conn, kb_id, item_table, exc)
+                # Only a check that was committed needs dropping; trying anyway
+                # would take DEFAULT's lock again for nothing.
+                if fence_committed:
+                    _drop_failed_move_check(conn, kb_id, item_table)
                 raise
-            finally:
-                conn.rollback()
-                try:
-                    _drop_move_checks(conn, item_table, [fence])
-                except Exception:
-                    # Harmless once the move committed (the KB's rows no longer
-                    # route to DEFAULT); after a failed move it refuses the KB's
-                    # writes until the next move on this table clears it.
-                    conn.rollback()
-                    logger.warning(
-                        "Could not drop the temporary check %s from %s.%s; the next "
-                        "partition build on this table will",
-                        fence,
-                        AI_SCHEMA,
-                        default,
-                        exc_info=True,
-                    )
         finally:
             _release_partition_build_lock(conn, item_table)
 
@@ -1490,9 +1612,23 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
 
         # An unattached partition is a move that did not finish -- a crash, or a
         # move that timed out waiting for its locks. Resuming it is the same call.
-        if not partition_exists(conn, kb_id, item_table) or not _partition_is_attached(
+        needs_move = not partition_exists(conn, kb_id, item_table) or not _partition_is_attached(
             conn, kb_id, item_table
-        ):
+        )
+        if not needs_move:
+            # A move clears leftover checks itself; with no move to run, this
+            # is where a check a failed or killed move left on DEFAULT goes.
+            try:
+                clear_leftover_move_checks(engine, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
+            except Exception as exc:
+                logger.warning(
+                    "Could not clear leftover move checks from %s.%s (%s); retrying at the "
+                    "next BM25 index build on this table",
+                    AI_SCHEMA,
+                    default_partition_name(item_table),
+                    str(getattr(exc, "orig", exc)).splitlines()[0],
+                )
+        else:
             if _relkind(conn, default_partition_name(item_table)) is None:
                 logger.warning(
                     "Not building a BM25 index for KB %s: %s.%s has no DEFAULT partition "
