@@ -150,3 +150,69 @@ def test_build_bm25_treats_a_missing_strategy_as_chunk_embed(mock_task, mock_fet
         resp = client.post(f"/api/knowledge-bases/{kb_id}/build-bm25", headers=_auth_headers())
     assert resp.status_code == 202
     mock_task.delay.assert_called_once_with(kb_id)
+
+
+# ---------------------------------------------------------------------------
+# Legacy rows can hold a config column as a JSON string. The keyword-timeout
+# 503 sends such a KB here, so this endpoint must answer JSON, never an HTML 500.
+# ---------------------------------------------------------------------------
+
+
+@_FAKE_JWT
+@patch("agentic_project_service.routes.knowledge_bases._fetch_kb_or_404")
+@patch("agentic_project_service.routes.knowledge_bases.build_bm25_for_kb")
+def test_build_bm25_parses_a_string_retrieval_config(mock_task, mock_fetch, _jwt):
+    kb_id = str(uuid.uuid4())
+    mock_fetch.return_value = {
+        "id": kb_id,
+        "retrieval_config": '{"method": "hybrid"}',
+        "indexing_config": {"strategy": "chunk_embed"},
+    }
+    mock_task.delay.return_value = MagicMock(id="task-str")
+
+    with _make_test_app().test_client() as client:
+        resp = client.post(f"/api/knowledge-bases/{kb_id}/build-bm25", headers=_auth_headers())
+    assert resp.status_code == 202
+    assert resp.get_json() == {"task_id": "task-str", "knowledge_base_id": kb_id}
+    mock_task.delay.assert_called_once_with(kb_id)
+
+
+@_FAKE_JWT
+@patch("agentic_project_service.routes.knowledge_bases._fetch_kb_or_404")
+@patch("agentic_project_service.routes.knowledge_bases.build_bm25_for_kb")
+def test_build_bm25_rejects_an_unparseable_retrieval_config_as_json(mock_task, mock_fetch, _jwt):
+    kb_id = str(uuid.uuid4())
+    mock_fetch.return_value = {
+        "id": kb_id,
+        "retrieval_config": "{not json",
+        "indexing_config": {"strategy": "chunk_embed"},
+    }
+
+    with _make_test_app().test_client() as client:
+        resp = client.post(f"/api/knowledge-bases/{kb_id}/build-bm25", headers=_auth_headers())
+    assert resp.status_code == 400
+    assert resp.is_json, resp.data[:200]
+    assert "retrieval_config" in resp.get_json()["error"]
+    mock_task.delay.assert_not_called()
+
+
+@_FAKE_JWT
+@patch("agentic_project_service.routes.knowledge_bases._fetch_kb_or_404")
+@patch("agentic_project_service.routes.knowledge_bases.build_bm25_for_kb")
+def test_build_bm25_refuses_a_string_indexing_config_as_json(mock_task, mock_fetch, _jwt):
+    # The build task reads indexing_config as an object and the search path
+    # already rejects a string one, so it is refused here rather than parsed —
+    # parsing would only move the crash into the task after a 202.
+    kb_id = str(uuid.uuid4())
+    mock_fetch.return_value = {
+        "id": kb_id,
+        "retrieval_config": {"method": "hybrid"},
+        "indexing_config": '{"strategy": "chunk_embed"}',
+    }
+
+    with _make_test_app().test_client() as client:
+        resp = client.post(f"/api/knowledge-bases/{kb_id}/build-bm25", headers=_auth_headers())
+    assert resp.status_code == 400
+    assert resp.is_json, resp.data[:200]
+    assert "indexing_config" in resp.get_json()["error"]
+    mock_task.delay.assert_not_called()
