@@ -188,12 +188,14 @@ class TestUpdate:
         kb_id = self._patch({"method": "vector_search"}, {"method": method}, "pg_search")
         tasks["ensure"].delay.assert_called_once_with(kb_id)
         tasks["build"].delay.assert_not_called()
+        tasks["drop"].delay.assert_not_called()
 
     @pytest.mark.parametrize("method", ["hybrid", "full_text"])
     def test_to_keyword_on_the_file_index_dispatches_only_the_file_build(self, tasks, method):
         kb_id = self._patch({"method": "vector_search"}, {"method": method}, "bm25s")
         tasks["build"].delay.assert_called_once_with(kb_id)
         tasks["ensure"].delay.assert_not_called()
+        tasks["drop"].delay.assert_not_called()
 
     def test_file_build_still_respects_auto_indexing_off(self, tasks):
         self._patch({"method": "vector_search"}, {"method": "hybrid"}, "bm25s", auto_indexing=False)
@@ -213,6 +215,27 @@ class TestUpdate:
         self._patch({"method": "hybrid"}, {"method": "full_text"}, "bm25s")
         tasks["build"].delay.assert_not_called()
         tasks["ensure"].delay.assert_not_called()
+
+    @pytest.mark.parametrize("method", ["vector_search", "tree_search"])
+    def test_off_keyword_on_pg_search_drops_the_index_and_keeps_the_partitions(self, tasks, method):
+        kb_id = self._patch({"method": "hybrid"}, {"method": method}, "pg_search")
+        tasks["drop"].delay.assert_called_once_with(kb_id, drop_partitions=False)
+        tasks["ensure"].delay.assert_not_called()
+        tasks["build"].delay.assert_not_called()
+
+    def test_off_keyword_without_pg_search_dispatches_no_drop(self, tasks):
+        self._patch({"method": "full_text"}, {"method": "vector_search"}, "bm25s")
+        tasks["drop"].delay.assert_not_called()
+
+    def test_vector_to_tree_dispatches_nothing(self, tasks):
+        self._patch({"method": "vector_search"}, {"method": "tree_search"}, "pg_search")
+        tasks["drop"].delay.assert_not_called()
+        tasks["ensure"].delay.assert_not_called()
+        tasks["build"].delay.assert_not_called()
+
+    def test_a_broker_failure_on_the_drop_does_not_fail_the_patch(self, tasks):
+        tasks["drop"].delay.side_effect = Exception("broker unreachable")
+        self._patch({"method": "hybrid"}, {"method": "vector_search"}, "pg_search")
 
 
 # ---------------------------------------------------------------------------

@@ -440,6 +440,25 @@ def _dispatch_ensure_pg_bm25_index(kb_id: str) -> None:
         )
 
 
+def _dispatch_drop_pg_bm25_index(kb_id: str) -> None:
+    """Drop this KB's pg_search index after it stops using a keyword method.
+
+    Postgres would otherwise keep maintaining an index nothing reads, and
+    ``bm25_status`` is omitted for a non-keyword method, so it would be
+    invisible. The partitions stay: moving the rows back is real work, and a
+    KB that switches back needs them again.
+    """
+    try:
+        drop_pg_bm25_index.delay(kb_id, drop_partitions=False)
+    except Exception:
+        logger.warning(
+            "Failed to dispatch the pg_search BM25 index drop for KB %s; the index "
+            "stays in place (unused) until the KB is deleted or switched back",
+            kb_id,
+            exc_info=True,
+        )
+
+
 def _compute_bm25_status(kb) -> str | None:
     """The ``bm25_status`` field of the KB detail response, or None to omit it.
 
@@ -799,6 +818,8 @@ def update_knowledge_base(kb_id: str):
                         kb_id,
                         exc_info=True,
                     )
+        elif was_keyword and _pg_search_available():
+            _dispatch_drop_pg_bm25_index(kb_id)
 
     return get_knowledge_base(kb_id)
 
