@@ -127,7 +127,8 @@ DEFAULT_PREFLIGHT_WAIT_SECONDS = 0.25
 # DEFAULT. Whatever broke the move is usually a reader still holding DEFAULT,
 # and until the check is gone every write of that knowledge base routed to
 # DEFAULT fails its check. A check that outlives this is cleared by the next
-# ``ensure_bm25_index`` on the item table, or at start-up.
+# indexing write it refuses, the next ``ensure_bm25_index`` on the item table,
+# or at start-up.
 MOVE_CHECK_CLEANUP_WAIT_SECONDS = 5.0
 
 # Alias pg_search records for an indexed expression, so the query's expression
@@ -1612,8 +1613,9 @@ def _drop_failed_move_check(conn, kb_id: str, item_table: str) -> None:
 
     Never raises: the move's own error is the one the caller needs. A check
     that cannot be dropped refuses this knowledge base's writes routed to
-    DEFAULT until ``clear_leftover_move_checks`` runs -- at the next
-    ``ensure_bm25_index`` on the item table, or at start-up.
+    DEFAULT until ``clear_leftover_move_checks`` runs -- after the next
+    indexing write it refuses, at the next ``ensure_bm25_index`` on the item
+    table, or at start-up.
     """
     fence = default_move_check_name(kb_id)
     try:
@@ -1622,8 +1624,8 @@ def _drop_failed_move_check(conn, kb_id: str, item_table: str) -> None:
         conn.rollback()
         logger.warning(
             "Could not drop the temporary check %s from %s.%s within %.1f s (%s). Writes of "
-            "KB %s routed to it fail until it is dropped: by the next BM25 index build on "
-            "this table, or at start-up",
+            "KB %s routed to it fail until it is dropped: after the next indexing write it "
+            "refuses, by the next BM25 index build on this table, or at start-up",
             fence,
             AI_SCHEMA,
             default_partition_name(item_table),
@@ -1718,9 +1720,9 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
     KB's writes routed to DEFAULT fail it (SQLSTATE 23514, which indexing
     re-queues). The check is *not* always gone when the call returns: a reader
     that outlives that wait, or a worker killed between the check's commit and
-    the move's, leaves it behind, and ``clear_leftover_move_checks`` drops it at
-    the next ``ensure_bm25_index`` on this item table, the next move, or
-    start-up.
+    the move's, leaves it behind, and ``clear_leftover_move_checks`` drops it
+    after the next indexing write it refuses, at the next ``ensure_bm25_index``
+    on this item table, the next move, or start-up.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     partition = partition_name(kb_id, item_table)
