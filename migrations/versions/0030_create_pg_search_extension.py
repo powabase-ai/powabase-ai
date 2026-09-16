@@ -6,6 +6,10 @@ all, and a keyword search works without it (bm25s file index, else the
 tsvector fallback). So this revision must never fail the boot over it.
 Idempotent via IF NOT EXISTS.
 
+This revision alone changes nothing on a server without pg_search. The next
+one does: revision 0031 partitions the item tables on every database, with or
+without the extension (its docstring says why).
+
 ``pg_search`` requires the ``vector`` extension. ``CASCADE`` creates it when a
 bootstrap has not already done so (and does nothing when it has).
 
