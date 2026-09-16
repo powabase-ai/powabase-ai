@@ -1072,6 +1072,27 @@ def _build_registry() -> dict[str, SettingDef]:
             advanced=True,
             description="Max characters for dropped-item preview text in diagnostics.",
         ),
+        SettingDef(
+            key="BM25_FALLBACK_TIMEOUT_MS",
+            category=cat,
+            label="Keyword Search Fallback Timeout (ms)",
+            type="int",
+            default=10000,
+            min=1000,
+            max=30000,
+            advanced=True,
+            description=(
+                "Upper bound for the SQL keyword search used while a knowledge "
+                "base has no BM25 index. On a large knowledge base that query "
+                "can run for minutes; past this limit it is cancelled. A hybrid "
+                "search then returns its vector results alone; a full_text "
+                "search returns 503. Keep this below the HTTP timeout of "
+                "whatever is calling the search: above it the caller gives up "
+                "while the query keeps running, which is the pile-up this "
+                "bound exists to prevent. Note it bounds the keyword leg only, "
+                "not the whole request."
+            ),
+        ),
     ]
 
     # =========================================================================

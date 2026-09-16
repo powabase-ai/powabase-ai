@@ -1741,8 +1741,7 @@ def _run_index_body(
             "and graph_index/full_document write their sparse entries there too",
             indexed_source_id,
         )
-        return {"status": "skipped", "reason": "superseded",
-                "indexed_source_id": indexed_source_id}
+        return {"status": "skipped", "reason": "superseded", "indexed_source_id": indexed_source_id}
     db.session.commit()
 
     # --- side effects: owner only, and only once a result is durably committed.
@@ -2002,8 +2001,11 @@ def index_source(
                 "index_source: %s not claimable (superseded or terminal); skipping",
                 indexed_source_id,
             )
-            return {"status": "skipped", "reason": "not_claimable",
-                    "indexed_source_id": indexed_source_id}
+            return {
+                "status": "skipped",
+                "reason": "not_claimable",
+                "indexed_source_id": indexed_source_id,
+            }
         claimed = True
 
         return _run_index_body(
@@ -2421,7 +2423,8 @@ def reenrich_graph_references(
                 WHERE knowledge_base_id = :kb_id
                   AND index_status = 'indexing'
                   AND celery_task_id = :tid
-            """ + (" AND id = :id" if indexed_source_id else ""),
+            """
+            + (" AND id = :id" if indexed_source_id else ""),
             (
                 {
                     "kb_id": knowledge_base_id,
@@ -2509,7 +2512,9 @@ def build_bm25_for_kb(self, kb_id: str) -> dict:
     be needed (tracked separately).
     """
     kb = _fetch_kb_for_bm25_build(kb_id)
-    strategy = kb["indexing_config"].get("strategy")
+    # Deliberately the same default as search_knowledge_base: a config with no
+    # "strategy" key is searched as chunk_embed, so it is built as one.
+    strategy = kb["indexing_config"].get("strategy", "chunk_embed")
     item_table = _STRATEGY_TO_ITEM_TABLE.get(strategy)
     if item_table is None:
         raise ValueError(

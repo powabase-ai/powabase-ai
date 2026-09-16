@@ -502,14 +502,13 @@ def _run_hybrid_search(
         )
     )
 
-    # Run bm25s search (falls back to tsvector if no index)
+    # bm25s search (tsvector fallback if no index; empty if that times out)
     text_results = asyncio.run(
-        store.bm25s_search(
-            query=search_text,
+        store.keyword_search_for_hybrid(
+            search_text,
             top_k=fetch_count,
             filter_metadata=filter_metadata,
             item_ids=item_ids,
-            _resolve=False,
             source_ids=source_ids,
         )
     )
@@ -627,12 +626,11 @@ async def _arun_hybrid_search(
         source_ids=source_ids,
     )
 
-    text_results = await store.bm25s_search(
-        query=search_text,
+    text_results = await store.keyword_search_for_hybrid(
+        search_text,
         top_k=fetch_count,
         filter_metadata=filter_metadata,
         item_ids=item_ids,
-        _resolve=False,
         source_ids=source_ids,
     )
 
