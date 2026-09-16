@@ -101,6 +101,24 @@ def test_search_runs_inside_savepoint_with_timeout_then_restores(_ms):
 
 
 @patch.object(bvs, "_bm25_fallback_timeout_ms", return_value=4321)
+def test_corpus_stats_is_materialized(_ms):
+    """Inlined, corpus_stats lands inside the per-row Nested Loop and re-runs.
+
+    For a two-term query such as "weather weather" (what the route's query
+    builder produces) the planner estimates one matching row and puts the
+    whole-KB aggregate on the inner side of the join, so it is re-executed once
+    per matching row: quadratic, 39 s at 5,000 rows. MATERIALIZED evaluates it
+    once. doc_freqs is deliberately left alone: it already runs once, as an
+    InitPlan.
+    """
+    session, log = _spy_session()
+    _run(session, query="weather weather")
+
+    search_sql = next(s for s, _ in log if "corpus_stats" in s)
+    assert "WITH corpus_stats AS MATERIALIZED (" in " ".join(search_sql.split())
+
+
+@patch.object(bvs, "_bm25_fallback_timeout_ms", return_value=4321)
 def test_query_canceled_becomes_keyword_search_timeout(_ms):
     err = OperationalError("SELECT ...", {}, _Canceled())
     session, log = _spy_session(search_error=err)

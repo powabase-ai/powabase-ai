@@ -581,8 +581,14 @@ class BasePgVectorStore:
                 f"Invalid ts_language '{ts_language}'. Must be one of: {sorted(VALID_TS_LANGUAGES)}"
             )
 
+        # corpus_stats is MATERIALIZED on purpose. Inlined (the default for a
+        # CTE referenced once), a multi-term query gets a one-row estimate and
+        # the planner puts this whole-KB aggregate on the inner side of the
+        # per-row Nested Loop, re-running it once per matching row: quadratic,
+        # about 39 s at 5,000 rows versus about 1 s materialized. doc_freqs needs
+        # no hint -- it is read through a scalar subquery and runs once.
         search_query = f"""
-            WITH corpus_stats AS (
+            WITH corpus_stats AS MATERIALIZED (
                 SELECT
                     COUNT(*) AS total_docs,
                     COALESCE(AVG(LENGTH({self.SEARCH_TEXT_COL})), 0) AS avg_doc_len

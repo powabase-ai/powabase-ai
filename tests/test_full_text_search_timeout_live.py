@@ -140,6 +140,30 @@ def test_a_non_timeout_database_error_also_leaves_the_session_usable(
         db.session.rollback()
 
 
+def test_two_term_query_on_thousands_of_rows_fits_the_default_budget(
+    app, test_source, test_knowledge_base
+):
+    """The fallback must not be quadratic in the number of matching rows.
+
+    With corpus_stats inlined, a two-term query over 5,000 matching chunks ran
+    for about 39 s and tripped the default 10 s budget on every search; with it
+    materialized it takes about 1 s. No wall-clock number is asserted -- the
+    property is that the real statement, under the real default budget,
+    returns results instead of timing out.
+    """
+    kb_id = test_knowledge_base["id"]
+    with app.app_context():
+        _insert_chunks(kb_id, test_source["id"], 5000)
+        db.session.execute(text('ANALYZE "ai".chunks'))
+        db.session.commit()
+        assert bvs._bm25_fallback_timeout_ms() == 10000
+
+        store = PgVectorKnowledgeStore(db_session=db.session, knowledge_base_id=kb_id)
+        results = asyncio.run(store.full_text_search("weather weather", top_k=5))
+
+        assert len(results) == 5
+
+
 def test_fallback_within_budget_returns_results_and_restores_timeout(
     app, test_source, test_knowledge_base
 ):
