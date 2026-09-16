@@ -188,3 +188,37 @@ def test_timeout_helper_reads_the_setting():
     with patch.object(bvs, "get_setting", return_value=2500) as gs:
         assert bvs._bm25_fallback_timeout_ms() == 2500
     gs.assert_called_once_with("BM25_FALLBACK_TIMEOUT_MS")
+
+
+@pytest.mark.parametrize(
+    "stored,expected",
+    [
+        (0, 1000),  # a stored 0 means "no timeout" to Postgres: it would disarm the bound
+        (500, 1000),
+        (-5, 1000),
+        (999999, 30000),
+        (1000, 1000),
+        (30000, 30000),
+        (7500, 7500),
+    ],
+)
+def test_timeout_helper_clamps_to_the_registry_range(stored, expected, caplog):
+    """get_setting applies no range check -- bounds live on the PUT path only.
+
+    A row written before this setting existed, or by anything other than the
+    settings endpoint, can therefore carry any integer.
+    """
+    with caplog.at_level(logging.WARNING, logger=bvs.logger.name):
+        with patch.object(bvs, "get_setting", return_value=stored):
+            assert bvs._bm25_fallback_timeout_ms() == expected
+
+    out_of_range = stored != expected
+    assert bool([r for r in caplog.records if r.levelname == "WARNING"]) is out_of_range
+
+
+def test_timeout_helper_falls_back_to_the_default_on_a_non_numeric_value(caplog):
+    """The helper runs on the search path, so it must never raise."""
+    with caplog.at_level(logging.WARNING, logger=bvs.logger.name):
+        with patch.object(bvs, "get_setting", return_value="not-a-number"):
+            assert bvs._bm25_fallback_timeout_ms() == 10000
+    assert [r for r in caplog.records if r.levelname == "WARNING"]

@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from ..db import AI_SCHEMA
 from .kb_search_config import HNSW_ITERATIVE_SCAN_MODE
-from .settings_registry import get_setting
+from .settings_registry import SETTINGS_REGISTRY, get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ _TIMEOUT_ELAPSED_TOLERANCE = 0.9
 
 
 class KeywordSearchTimeout(RuntimeError):
-    """The SQL keyword-search fallback exceeded BM25_FALLBACK_TIMEOUT_MS.
+    """The SQL keyword-search fallback outran the BM25_FALLBACK_TIMEOUT_MS setting.
 
     Nothing builds an index in response: the message names the two remedies a
     caller actually has, so a client cannot read it as "retry in a moment".
@@ -130,7 +130,48 @@ class KeywordSearchTimeout(RuntimeError):
 
 
 def _bm25_fallback_timeout_ms() -> int:
-    return int(get_setting("BM25_FALLBACK_TIMEOUT_MS"))
+    """Read the keyword-fallback budget, clamped to the registry's bounds.
+
+    get_setting coerces a stored override but does not range-check it — bounds
+    are enforced by validate_setting, i.e. on the settings PUT path only. For
+    this one setting an out-of-range value is not merely odd: Postgres reads
+    statement_timeout 0 as "no timeout", so a stored 0 would disarm the bound
+    this whole path exists to provide. Clamping at read time makes the bound
+    hold whatever is in ai.project_settings.
+
+    There is no environment-variable fallback, matching every other registry
+    setting: the value is the project setting or the registry default. (The
+    only env-read settings in this service are operator-provided platform
+    secrets, which are deliberately not tenant-managed.)
+    """
+    defn = SETTINGS_REGISTRY["BM25_FALLBACK_TIMEOUT_MS"]
+    raw = get_setting("BM25_FALLBACK_TIMEOUT_MS")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        # This runs on the search path, so a malformed row must not raise.
+        logger.warning(
+            "BM25_FALLBACK_TIMEOUT_MS is not an integer (%r); using the default %d ms",
+            raw,
+            defn.default,
+        )
+        return int(defn.default)
+
+    clamped = value
+    if defn.min is not None:
+        clamped = max(clamped, defn.min)
+    if defn.max is not None:
+        clamped = min(clamped, defn.max)
+    if clamped != value:
+        logger.warning(
+            "BM25_FALLBACK_TIMEOUT_MS=%d is outside the allowed range %s-%s; "
+            "using %d ms instead",
+            value,
+            defn.min,
+            defn.max,
+            clamped,
+        )
+    return clamped
 
 
 # Reasons a retrieval answered with less than it was asked for.
