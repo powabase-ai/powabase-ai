@@ -744,6 +744,12 @@ class BasePgVectorStore:
         reaches SQL as an identifier. Every other value, the query text
         included, is bound. Requires the partition's index to exist and be valid
         — see ``pg_bm25_index.bm25_index_ready``.
+
+        Matching differs from the tsvector fallback: ``|||`` matches a row
+        containing ANY of the query's terms and lets the BM25 score rank rows
+        with more of them higher (like the bm25s file index), while the
+        fallback's ``websearch_to_tsquery`` requires ALL terms. So a multi-word
+        query can return rows here that the fallback would not.
         """
         partition = pg_bm25_index.partition_name(self.kb_id, self.TABLE)
         normalized = pg_bm25_index.normalize_bm25_query(query)
