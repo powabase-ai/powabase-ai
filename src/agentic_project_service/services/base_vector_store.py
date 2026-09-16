@@ -161,18 +161,10 @@ def _bm25_fallback_timeout_ms() -> int:
     secrets, which are deliberately not tenant-managed.)
     """
     defn = SETTINGS_REGISTRY["BM25_FALLBACK_TIMEOUT_MS"]
-    raw = get_setting("BM25_FALLBACK_TIMEOUT_MS")
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        # This runs on the search path, so a malformed row must not raise.
-        _warn_once_per_bad_value(
-            f"type:{raw!r}",
-            "BM25_FALLBACK_TIMEOUT_MS is not an integer (%r); using the default %d ms",
-            raw,
-            defn.default,
-        )
-        return int(defn.default)
+    # get_setting has already coerced the stored override to an int, or logged
+    # its own warning and returned the registry default, so only the range can
+    # still be wrong here.
+    value = int(get_setting("BM25_FALLBACK_TIMEOUT_MS"))
 
     clamped = value
     if defn.min is not None:

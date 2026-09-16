@@ -258,15 +258,7 @@ def test_timeout_helper_clamps_to_the_registry_range(stored, expected, caplog):
     assert bool([r for r in caplog.records if r.levelname == "WARNING"]) is out_of_range
 
 
-def test_timeout_helper_falls_back_to_the_default_on_a_non_numeric_value(caplog):
-    """The helper runs on the search path, so it must never raise."""
-    with caplog.at_level(logging.WARNING, logger=bvs.logger.name):
-        with patch.object(bvs, "get_setting", return_value="not-a-number"):
-            assert bvs._bm25_fallback_timeout_ms() == 10000
-    assert [r for r in caplog.records if r.levelname == "WARNING"]
-
-
-@pytest.mark.parametrize("stored", [0, "not-a-number"])
+@pytest.mark.parametrize("stored", [0, 999999])
 def test_a_bad_stored_value_warns_once_per_process(stored, caplog):
     """This helper runs on every keyword search.
 
