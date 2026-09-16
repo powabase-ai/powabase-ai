@@ -382,6 +382,68 @@ def test_the_new_partition_is_reachable_by_the_same_roles_as_the_parent(engine, 
         session.rollback()
 
 
+def test_a_policy_gated_role_can_read_the_new_partition_by_name(engine, session):
+    """B5: the partition gets the parent's RLS policies, not just the RLS flag.
+
+    Mirrors the self-hosted grant (``FOR SELECT TO authenticated``) with a role
+    that has no BYPASSRLS. The search path names the partition, and Postgres
+    applies only the queried relation's policies -- so with the flag copied and
+    no policy, this role would read zero rows.
+    """
+    role = "bm25_live_authenticated"
+    partition = pgb.partition_name(KB_A, "chunks")
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(
+            text(
+                f"DO $$ BEGIN CREATE ROLE {role} NOLOGIN NOBYPASSRLS; "
+                "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+            )
+        )
+        conn.execute(text(f"GRANT USAGE ON SCHEMA {SCHEMA} TO {role}"))
+        conn.execute(text(f"GRANT SELECT ON {SCHEMA}.chunks TO {role}"))
+        conn.execute(text(f"ALTER TABLE {SCHEMA}.chunks ENABLE ROW LEVEL SECURITY"))
+        conn.execute(
+            text(
+                f"CREATE POLICY auth_read_chunks ON {SCHEMA}.chunks "
+                f"FOR SELECT TO {role} USING (true)"
+            )
+        )
+        conn.execute(
+            text(
+                f"CREATE POLICY no_foreign_kb ON {SCHEMA}.chunks AS RESTRICTIVE "
+                f"FOR SELECT TO {role} USING (knowledge_base_id <> '{KB_B}'::uuid)"
+            )
+        )
+
+    pgb.create_partition(engine, KB_A, "chunks")
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(f"SET ROLE {role}"))
+            assert conn.execute(text(f"SELECT count(*) FROM {SCHEMA}.{partition}")).scalar() == 3
+            conn.rollback()
+        policies = {
+            (row[0], row[1], row[2])
+            for row in session.execute(
+                text(
+                    "SELECT policyname, permissive, cmd FROM pg_policies "
+                    "WHERE schemaname = :s AND tablename = :t"
+                ),
+                {"s": SCHEMA, "t": partition},
+            ).all()
+        }
+        session.rollback()
+        assert policies == {
+            ("auth_read_chunks", "PERMISSIVE", "SELECT"),
+            ("no_foreign_kb", "RESTRICTIVE", "SELECT"),
+        }
+    finally:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
+            conn.execute(text(f"DROP OWNED BY {role}"))
+            conn.execute(text(f"DROP ROLE IF EXISTS {role}"))
+
+
 def _seed(session, kb_id, count, prefix="Wanderung Nummer"):
     """Bulk-insert ``count`` rows for one KB. One statement, so tests stay quick."""
     session.execute(

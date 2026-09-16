@@ -294,3 +294,27 @@ def test_mirror_relation_settings_sql_copies_owner_grants_and_rls():
     assert "ROW LEVEL SECURITY" in sql
     assert '"ai".chunks' in sql
     assert '"ai".chunks_kb_x' in sql
+
+
+def test_copy_policies_sql_recreates_every_policy_of_the_source_on_the_target():
+    """B5: a new relation starts with RLS policies of its own -- none.
+
+    With RLS enabled and no policy, a role without BYPASSRLS reads nothing, and
+    the search path reads partitions by name. Every clause of each policy is
+    carried: permissive or restrictive, command, roles, USING, WITH CHECK.
+    """
+    sql = pgb.copy_policies_sql('"ai".chunks', '"ai".chunks_kb_x')
+
+    assert "pg_policy" in sql
+    assert "'\"ai\".chunks'::regclass" in sql
+    assert 'CREATE POLICY %I ON "ai".chunks_kb_x' in sql
+    # A policy already on the target by that name is left alone.
+    assert "'\"ai\".chunks_kb_x'::regclass" in sql
+    assert "NOT EXISTS" in sql
+    for clause in ("polpermissive", "polcmd", "polroles", "polqual", "polwithcheck"):
+        assert clause in sql, clause
+
+
+def test_mirroring_a_relation_also_copies_its_policies():
+    sql = pgb.mirror_relation_settings_sql('"ai".chunks', '"ai".chunks_kb_x')
+    assert pgb.copy_policies_sql('"ai".chunks', '"ai".chunks_kb_x') in sql

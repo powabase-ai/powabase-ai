@@ -499,17 +499,81 @@ def move_rows_sql(knowledge_base_id: Any, item_table: str) -> tuple[str, str]:
     )
 
 
-def mirror_relation_settings_sql(source: str, target: str) -> str:
-    """Copy ownership, GRANTs and the RLS flag from one relation to another.
+def copy_policies_sql(source: str, target: str) -> str:
+    """Recreate every row-level security policy of ``source`` on ``target``.
 
-    A new partition starts with no privileges and RLS off, so without this a
-    partition is either unreachable by the roles that can read the parent, or
-    (if it were granted blindly) readable past the parent's row-level rules.
-    Emitted as a server-side block so every identifier is quoted by
-    ``format(%I/%s)`` rather than by string building here. Policies are
-    deliberately *not* copied: a direct read of a partition by a policy-gated
-    role stays denied, while reads through the parent keep applying the
-    parent's policies unchanged.
+    ``source`` and ``target`` are schema-qualified relation names as they
+    appear in SQL (``'"ai".chunks'``), built by this module from validated
+    parts, never from caller input. Each policy keeps its name, PERMISSIVE or
+    RESTRICTIVE, command, roles, USING and WITH CHECK expressions. A policy
+    whose name already exists on ``target`` is left alone. Same semantics as
+    ``_copy_policies`` in migration 0031, which does this for the parents.
+
+    Why it is needed: Postgres applies only the policies of the relation a
+    query names. A new partition or partitioned parent starts with none, so
+    once RLS is enabled on it a role without BYPASSRLS reads nothing -- and
+    the search path reads each knowledge base's partition by name. The
+    self-hosted schema grants ``FOR SELECT TO authenticated`` on these tables.
+    """
+    return f"""
+        DO $$
+        DECLARE
+            src oid := '{source}'::regclass;
+            tgt oid := '{target}'::regclass;
+            p record;
+            roles text;
+            statement text;
+        BEGIN
+            FOR p IN
+                SELECT pol.polname, pol.polpermissive, pol.polcmd, pol.polroles,
+                       pg_get_expr(pol.polqual, pol.polrelid) AS qual,
+                       pg_get_expr(pol.polwithcheck, pol.polrelid) AS with_check
+                FROM pg_policy pol
+                WHERE pol.polrelid = src
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pg_policy existing
+                      WHERE existing.polrelid = tgt AND existing.polname = pol.polname
+                  )
+                ORDER BY pol.polname
+            LOOP
+                SELECT string_agg(
+                           CASE WHEN r = 0 THEN 'PUBLIC'
+                                ELSE quote_ident(pg_get_userbyid(r)) END,
+                           ', ')
+                  INTO roles
+                  FROM unnest(p.polroles) AS r;
+                statement := format(
+                    'CREATE POLICY %I ON {target} AS %s FOR %s TO %s',
+                    p.polname,
+                    CASE WHEN p.polpermissive THEN 'PERMISSIVE' ELSE 'RESTRICTIVE' END,
+                    CASE p.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT'
+                                  WHEN 'w' THEN 'UPDATE' WHEN 'd' THEN 'DELETE'
+                                  ELSE 'ALL' END,
+                    roles
+                );
+                IF p.qual IS NOT NULL THEN
+                    statement := statement || ' USING (' || p.qual || ')';
+                END IF;
+                IF p.with_check IS NOT NULL THEN
+                    statement := statement || ' WITH CHECK (' || p.with_check || ')';
+                END IF;
+                EXECUTE statement;
+            END LOOP;
+        END $$;
+    """
+
+
+def mirror_relation_settings_sql(source: str, target: str) -> str:
+    """Copy ownership, GRANTs, the RLS flag and RLS policies from one relation.
+
+    A new partition starts with no privileges, RLS off and no policies, so
+    without this a partition is either unreachable by the roles that can read
+    the parent, or (if it were granted blindly) readable past the parent's
+    row-level rules. Emitted as server-side blocks so every identifier is
+    quoted by ``format(%I/%s)`` rather than by string building here. The
+    policies matter because the search path reads a partition *by name*, and a
+    query is filtered by the policies of the relation it names -- see
+    ``copy_policies_sql``.
     """
     return f"""
         DO $$
@@ -534,7 +598,7 @@ def mirror_relation_settings_sql(source: str, target: str) -> str:
                                g.privileges, g.role);
             END LOOP;
         END $$;
-    """
+    """ + copy_policies_sql(source, target)
 
 
 # ---------------------------------------------------------------------------
