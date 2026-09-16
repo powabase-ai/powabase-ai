@@ -16,6 +16,7 @@ from sqlalchemy import text
 from flask_cors import CORS
 from sqlalchemy import inspect
 
+from ._pg_search_extension import ensure_pg_search_extension
 from .celery import init_celery
 from .db import db, get_database_url
 from .migrate import migrate
@@ -369,6 +370,12 @@ def create_app(testing: bool = False):
                             "No ai schema tables found — skipping migrations "
                             "(db-init Job will create them)"
                         )
+
+                    # After the migrations, and on every start rather than once:
+                    # revision 0030 only runs once per database, so a server that
+                    # gains pg_search later still gets it enabled here. Idempotent
+                    # and never raises; a failure is logged at ERROR.
+                    ensure_pg_search_extension(db.engine)
                 finally:
                     db.session.execute(text("SELECT pg_advisory_unlock(43)"))
                     db.session.commit()

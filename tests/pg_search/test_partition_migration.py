@@ -7,6 +7,10 @@ posture is to run it against a real Postgres and look.
 
 Runs against ``PG_SEARCH_TEST_DATABASE_URL`` if set, otherwise ``DATABASE_URL``.
 Everything happens in a scratch schema, so the ``ai`` schema is never touched.
+
+With ``PG_SEARCH_REQUIRED=1`` (as CI sets it) a missing database or a missing
+pg_search extension fails the test instead of skipping it, so a job meant to
+exercise pg_search cannot go green by skipping everything.
 """
 
 from __future__ import annotations
@@ -25,26 +29,54 @@ KB_B = "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
 SOURCE = "11111111-1111-4111-8111-111111111111"
 
 
-@pytest.fixture(scope="module")
-def migration():
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "migrations"
-        / "versions"
-        / "0031_partition_bm25_item_tables.py"
-    )
-    spec = importlib.util.spec_from_file_location("mig_0031", path)
+def load_revision(filename: str, module_name: str):
+    """Import one Alembic revision file as a module."""
+    path = Path(__file__).resolve().parents[2] / "migrations" / "versions" / filename
+    spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-@pytest.fixture(scope="module")
-def engine():
+def skip_unless_required(reason: str) -> None:
+    """Skip -- or fail, when ``PG_SEARCH_REQUIRED=1`` says this run must not skip."""
+    if os.environ.get("PG_SEARCH_REQUIRED") == "1":
+        pytest.fail(f"PG_SEARCH_REQUIRED=1 but {reason}")
+    pytest.skip(reason)
+
+
+def database_url_or_skip() -> str:
     dsn = os.environ.get("PG_SEARCH_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
     if not dsn:
-        pytest.skip("no PG_SEARCH_TEST_DATABASE_URL or DATABASE_URL to test against")
-    eng = create_engine(dsn)
+        skip_unless_required("no PG_SEARCH_TEST_DATABASE_URL or DATABASE_URL to test against")
+    return dsn
+
+
+def create_pg_search_extension(conn) -> None:
+    """Create pg_search, and ``vector`` before it: pg_search requires it."""
+    try:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_search"))
+    except Exception as exc:  # pragma: no cover - server without the extension
+        skip_unless_required(f"pg_search unavailable: {str(exc).splitlines()[0]}")
+
+
+@pytest.mark.parametrize("required, outcome", [("1", "Failed"), ("", "Skipped")])
+def test_pg_search_required_turns_a_skip_into_a_failure(monkeypatch, required, outcome):
+    monkeypatch.setenv("PG_SEARCH_REQUIRED", required)
+    with pytest.raises(BaseException) as excinfo:
+        skip_unless_required("the extension is missing")
+    assert type(excinfo.value).__name__ == outcome
+
+
+@pytest.fixture(scope="module")
+def migration():
+    return load_revision("0031_partition_bm25_item_tables.py", "mig_0031")
+
+
+@pytest.fixture(scope="module")
+def engine():
+    eng = create_engine(database_url_or_skip())
     yield eng
     eng.dispose()
 
@@ -385,10 +417,7 @@ def test_conversion_drops_a_leftover_bm25_index_from_the_unpartitioned_design(
     still answer only one knowledge base.
     """
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        try:
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_search"))
-        except Exception as exc:  # pragma: no cover - server without the extension
-            pytest.skip(f"pg_search unavailable: {str(exc).splitlines()[0]}")
+        create_pg_search_extension(conn)
         conn.execute(
             text(
                 f"CREATE INDEX bm25_chunks_legacy ON {SCHEMA}.chunks "
