@@ -12,7 +12,7 @@ from ..auth import require_auth
 from ..celery import celery_app
 from ..db import db, AI_SCHEMA
 from ..services.ai_provider_keys_resolver import get_all_user_provider_keys
-from ..services.base_vector_store import KeywordSearchTimeout
+from ..services.base_vector_store import KeywordSearchTimeout, get_retrieval_degradations
 from ..services.settings_registry import get_setting
 from ..services.sparse_retrieval import (
     SparseIndexStore,
@@ -1584,23 +1584,31 @@ def search_knowledge_base_route(kb_id: str):
             source_ids=source_ids,
         )
 
-        return jsonify(
-            {
-                "results": [
-                    {
-                        "chunk_id": r.item_id,
-                        "text": r.text,
-                        "score": r.score,
-                        "source_id": r.source_id,
-                        "meta": r.meta,
-                    }
-                    for r in results
-                ],
-                "query": query,
-                "retrieval_method": method or "auto",
-                "total_results": len(results),
-            }
-        )
+        response_body = {
+            "results": [
+                {
+                    "chunk_id": r.item_id,
+                    "text": r.text,
+                    "score": r.score,
+                    "source_id": r.source_id,
+                    "meta": r.meta,
+                }
+                for r in results
+            ],
+            "query": query,
+            "retrieval_method": method or "auto",
+            "total_results": len(results),
+        }
+
+        # A hybrid search whose keyword leg timed out still ran as hybrid and
+        # still returns its vector results, so retrieval_method is unchanged;
+        # this is the only signal that the answer is built from less than the
+        # method implies. Omitted entirely when nothing was dropped.
+        degraded = get_retrieval_degradations()
+        if degraded:
+            response_body["degraded"] = degraded
+
+        return jsonify(response_body)
 
     except KeywordSearchTimeout as e:
         return jsonify(

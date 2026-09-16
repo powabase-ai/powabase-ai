@@ -73,6 +73,36 @@ def test_keyword_search_for_hybrid_propagates_other_errors():
         )
 
 
+def test_keyword_search_for_hybrid_records_the_degradation_on_the_request():
+    """The dropped leg is recorded where the route can read it back."""
+    from flask import Flask
+
+    store = _store_with_timeout()
+    app = Flask(__name__)
+    with app.test_request_context("/"):
+        asyncio.run(
+            store.keyword_search_for_hybrid(
+                "q", top_k=4, filter_metadata=None, item_ids=None, source_ids=None
+            )
+        )
+        assert bvs.get_retrieval_degradations() == ["keyword_search_timeout"]
+
+
+def test_keyword_search_for_hybrid_records_each_reason_once():
+    from flask import Flask
+
+    store = _store_with_timeout()
+    app = Flask(__name__)
+    with app.test_request_context("/"):
+        for _ in range(3):
+            asyncio.run(
+                store.keyword_search_for_hybrid(
+                    "q", top_k=4, filter_metadata=None, item_ids=None, source_ids=None
+                )
+            )
+        assert bvs.get_retrieval_degradations() == ["keyword_search_timeout"]
+
+
 def test_keyword_search_for_hybrid_does_not_re_warn(caplog):
     """_fetch_with_timeout already warned; a second WARNING double-counts.
 

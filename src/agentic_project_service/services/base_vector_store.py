@@ -12,6 +12,7 @@ from typing import Any
 
 from agentic.knowledge.model_config import HYBRID_DEFAULT_VECTOR_WEIGHT
 from agentic.knowledge.models import RetrievedItem
+from flask import g, has_request_context
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -130,6 +131,38 @@ class KeywordSearchTimeout(RuntimeError):
 
 def _bm25_fallback_timeout_ms() -> int:
     return int(get_setting("BM25_FALLBACK_TIMEOUT_MS"))
+
+
+# Reasons a retrieval answered with less than it was asked for.
+KEYWORD_SEARCH_TIMEOUT = "keyword_search_timeout"
+
+_DEGRADED_ATTR = "retrieval_degraded"
+
+
+def record_retrieval_degradation(reason: str) -> None:
+    """Note that this request's retrieval dropped a leg.
+
+    A hybrid search that loses its keyword leg still returns items stamped
+    ``retrieval_method="hybrid"``, so without this the caller cannot tell a
+    degraded answer from a healthy one. Recorded on the Flask request context,
+    read back by the search route; celery tasks and bare threads have no
+    request to write to and get the log line only.
+    """
+    if not has_request_context():
+        return
+    reasons = getattr(g, _DEGRADED_ATTR, None)
+    if reasons is None:
+        reasons = []
+        setattr(g, _DEGRADED_ATTR, reasons)
+    if reason not in reasons:
+        reasons.append(reason)
+
+
+def get_retrieval_degradations() -> list[str]:
+    """Reasons recorded for the current request, in the order they occurred."""
+    if not has_request_context():
+        return []
+    return list(getattr(g, _DEGRADED_ATTR, ()))
 
 
 class BasePgVectorStore:
@@ -757,6 +790,7 @@ class BasePgVectorStore:
                 source_ids=source_ids,
             )
         except KeywordSearchTimeout:
+            record_retrieval_degradation(KEYWORD_SEARCH_TIMEOUT)
             # _fetch_with_timeout already warned once, with the budget and the
             # table; debug here keeps the vector-only answer traceable without
             # logging one event twice.
