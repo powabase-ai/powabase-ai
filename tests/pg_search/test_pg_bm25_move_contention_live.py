@@ -189,6 +189,45 @@ class _ReaderLoop:
         return False
 
 
+class _WriterLoop:
+    """Short writes through the parent (routed to DEFAULT), recording each wait."""
+
+    def __init__(self, engine, kb_id=KB_C, pause=0.02, hold=0.0):
+        self.engine = engine
+        self.kb_id = kb_id
+        self.pause = pause
+        self.hold = hold
+        self.latencies: list[float] = []
+        self.errors: list[str] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        n = 0
+        while not self._stop.is_set():
+            issued = time.monotonic()
+            try:
+                with self.engine.begin() as conn:
+                    _insert(conn, self.kb_id, f"Schreiber {n}")
+                    if self.hold:
+                        conn.execute(text("SELECT pg_sleep(:s)"), {"s": self.hold})
+            except Exception as exc:
+                self.errors.append(_first_line(exc))
+            self.latencies.append(time.monotonic() - issued)
+            n += 1
+            if self.pause:
+                time.sleep(self.pause)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=30)
+        return False
+
+
 def _add_move_check(engine, kb_id):
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         conn.execute(text(pgb.default_move_check_add_ddl(kb_id, "chunks")))
@@ -228,6 +267,67 @@ def test_a_move_whose_check_never_went_up_does_not_touch_default_again(
         holder.close()
 
     assert pgb.create_partition(engine, KB_A, "chunks")["rows_moved"] == 2_000 + len(KB_A_DOCS) + 1
+
+
+def test_a_long_reader_makes_the_move_give_up_without_stalling_writers(
+    engine, session, monkeypatch
+):
+    """A reader idle in its transaction on DEFAULT would refuse every lock try
+    the move makes on DEFAULT, so an attempt is bound to fail -- and it used to
+    hold every writer of the item table off for those ~2 s of tries first. The
+    pre-flight probe sees the reader and gives up before the parent lock."""
+    _seed(session, KB_A, 2_000)
+    parent_locks: list[str] = []
+    real_parent_lock = pgb.partition_lock_parent_ddl
+
+    def _recorded(item_table):
+        parent_locks.append(item_table)
+        return real_parent_lock(item_table)
+
+    monkeypatch.setattr(pgb, "partition_lock_parent_ddl", _recorded)
+    holder = _read_default_and_hold(engine)
+    try:
+        with _WriterLoop(engine) as writers:
+            time.sleep(0.2)
+            started = time.monotonic()
+            with pytest.raises(Exception) as caught:
+                pgb.create_partition(engine, KB_A, "chunks")
+            elapsed = time.monotonic() - started
+            time.sleep(0.2)
+        assert pgb.is_lock_conflict(caught.value), _first_line(caught.value)
+        assert writers.errors == []
+        assert len(writers.latencies) >= 5
+        assert max(writers.latencies) < 0.3, max(writers.latencies)
+        assert parent_locks == []
+        assert elapsed < pgb.DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS, elapsed
+        assert _move_check_names(session) == []
+    finally:
+        holder.rollback()
+        holder.close()
+
+    with _WriterLoop(engine) as writers:
+        move = pgb.create_partition(engine, KB_A, "chunks")
+    assert move["rows_moved"] == 2_000 + len(KB_A_DOCS)
+    assert writers.errors == []
+
+
+def test_the_move_is_not_starved_by_a_steady_stream_of_short_writes(engine, session):
+    """Overlapping short writes to DEFAULT refuse the pre-flight probe just as
+    overlapping reads do; none of them is a long holder, so the move goes ahead
+    and the parent lock drains them."""
+    _seed(session, KB_A, 2_000)
+    loops = [_WriterLoop(engine, pause=0.0, hold=0.03) for _ in range(8)]
+    for loop in loops:
+        loop.__enter__()
+    try:
+        time.sleep(0.3)
+        move = pgb.create_partition(engine, KB_A, "chunks")
+    finally:
+        for loop in loops:
+            loop.__exit__()
+
+    assert move["rows_moved"] == 2_000 + len(KB_A_DOCS)
+    assert [e for loop in loops for e in loop.errors] == []
 
 
 def test_a_failed_move_retries_dropping_its_check_until_the_reader_is_gone(

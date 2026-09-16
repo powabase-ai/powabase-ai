@@ -504,6 +504,54 @@ def test_a_fence_whose_commit_errors_on_the_client_is_still_dropped(monkeypatch)
     assert drop in conn.statements[add:]
 
 
+class _LongHolderConn(_FakeConn):
+    """DEFAULT refuses every ``NOWAIT`` try, and whether a long transaction holds it."""
+
+    def __init__(self, *, long_holder, **kwargs):
+        super().__init__(**kwargs)
+        self.long_holder = long_holder
+        self.fail_on = (pgb.partition_lock_default_exclusive_ddl("chunks"), _lock_timeout_error())
+
+    def execute(self, statement, params=None):
+        sql = getattr(statement, "text", str(statement))
+        if "xact_start" in sql and "SELECT EXISTS" in sql:
+            self.statements.append(sql)
+            result = MagicMock()
+            result.scalar.return_value = self.long_holder
+            return result
+        return super().execute(statement, params)
+
+
+def test_a_long_holder_of_default_makes_the_move_give_up_before_it_holds_writers_off(
+    monkeypatch,
+):
+    """Refused at the pre-flight probe while a transaction that began before the
+    probe still holds DEFAULT, the move is bound to fail its lock tries on
+    DEFAULT -- so it gives up at once, with the same retryable lock error,
+    without ever taking the parent lock that would stall every writer."""
+    monkeypatch.setattr(pgb, "DEFAULT_PREFLIGHT_WAIT_SECONDS", 0.0)
+    conn = _LongHolderConn(long_holder=True, moved=5)
+
+    with pytest.raises(Exception) as caught:
+        pgb.create_partition(_FakeEngine(conn), KB, "chunks")
+
+    assert pgb.is_lock_conflict(caught.value)
+    assert pgb.partition_lock_parent_ddl("chunks") not in conn.statements
+    assert pgb.default_move_check_add_ddl(KB, "chunks") not in conn.statements
+    assert any("pg_advisory_unlock" in s for s in conn.statements)
+
+
+def test_the_pre_flight_probe_releases_default_before_the_move_takes_its_locks():
+    conn = _FakeConn(moved=5)
+
+    pgb.create_partition(_FakeEngine(conn), KB, "chunks")
+
+    probe = conn.statements.index(pgb.partition_lock_default_exclusive_ddl("chunks"))
+    parent_lock = conn.statements.index(pgb.partition_lock_parent_ddl("chunks"))
+    assert probe < parent_lock
+    assert any(probe < r < parent_lock for r in conn.rollbacks)
+
+
 def test_transient_database_errors_are_recognised_by_sqlstate():
     from sqlalchemy.exc import OperationalError
 

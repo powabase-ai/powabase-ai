@@ -99,6 +99,18 @@ _EXCLUSIVE_LOCK_QUEUED_TRY_AFTER_SECONDS = 0.1
 _EXCLUSIVE_LOCK_FIRST_SLEEP_SECONDS = 0.01
 _EXCLUSIVE_LOCK_MAX_SLEEP_SECONDS = 0.25
 
+# Before it takes the parent lock, the move checks that DEFAULT can be locked
+# at all: ``NOWAIT`` tries of ACCESS EXCLUSIVE, each released at once, for up to
+# this long. A transaction that began before the first try and still holds
+# DEFAULT after the last -- a reader idle in its transaction, typically --
+# would refuse every lock try the move makes on DEFAULT, so the move gives up
+# there (SQLSTATE 55P03) instead of holding writers off the parent for those
+# tries first. Overlapping short transactions refuse the tries too, but none
+# of them outlasts the window, so the move goes ahead. Only a heuristic: a long
+# reader can still arrive after the probe, and the bounded tries remain the
+# guard for that.
+DEFAULT_PREFLIGHT_WAIT_SECONDS = 0.25
+
 # How long a failed move keeps trying to drop the temporary check it put on
 # DEFAULT. Whatever broke the move is usually a reader still holding DEFAULT,
 # and until the check is gone every write of that knowledge base routed to
@@ -1137,7 +1149,8 @@ def _log_move_failure(
         logger.debug("Could not list lock holders", exc_info=True)
     logger.warning(
         "%s KB %s on %s.%s gave up on a lock (lock_timeout %d ms, ACCESS EXCLUSIVE on "
-        "DEFAULT not free within %.1f s, or a deadlock); rolled back, retryable. Sessions "
+        "DEFAULT not free within %.1f s or held by a long transaction when the move began, "
+        "or a deadlock); rolled back, retryable. Sessions "
         "holding or awaiting locks on the table: %s",
         action,
         knowledge_base_id,
@@ -1276,6 +1289,64 @@ def _default_holder_is_waiting(conn, item_table: str) -> bool:
             {"default": _qualified(default_partition_name(item_table))},
         ).scalar()
     )
+
+
+def _default_has_a_long_holder(conn, item_table: str, held_for_seconds: float) -> bool:
+    """Does a transaction that began at least ``held_for_seconds`` ago hold DEFAULT?
+
+    A lock of a prepared transaction has no backend, and counts as long.
+    """
+    this_database = "(SELECT oid FROM pg_database WHERE datname = current_database())"
+    return bool(
+        conn.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks l "
+                "LEFT JOIN pg_stat_activity a ON a.pid = l.pid "
+                "WHERE l.locktype = 'relation' "
+                f"AND l.database = {this_database} "
+                "AND l.relation = to_regclass(:default) AND l.granted "
+                "AND l.pid IS DISTINCT FROM pg_backend_pid() "
+                "AND (l.pid IS NULL OR a.xact_start <= "
+                "clock_timestamp() - make_interval(secs => :seconds)))"
+            ),
+            {
+                "default": _qualified(default_partition_name(item_table)),
+                "seconds": held_for_seconds,
+            },
+        ).scalar()
+    )
+
+
+def _probe_default_before_moving(conn, item_table: str) -> None:
+    """Raise SQLSTATE 55P03 if a long transaction holds DEFAULT; else return.
+
+    See ``DEFAULT_PREFLIGHT_WAIT_SECONDS``. Runs on a connection holding no
+    lock, each try in a transaction of its own that is rolled back straight
+    away, so a granted try blocks nobody for longer than the round trip and a
+    refused one blocks nobody at all.
+    """
+    started = time.monotonic()
+    deadline = started + DEFAULT_PREFLIGHT_WAIT_SECONDS
+    sleep = _EXCLUSIVE_LOCK_FIRST_SLEEP_SECONDS
+    while True:
+        try:
+            conn.execute(text(partition_lock_default_exclusive_ddl(item_table)))
+        except Exception as exc:
+            conn.rollback()
+            if not is_lock_conflict(exc):
+                raise
+            refusal = exc
+        else:
+            conn.rollback()
+            return
+        if time.monotonic() + sleep > deadline:
+            break
+        time.sleep(sleep)
+        sleep = min(sleep * 2, _EXCLUSIVE_LOCK_MAX_SLEEP_SECONDS)
+    long_holder = _default_has_a_long_holder(conn, item_table, time.monotonic() - started)
+    conn.rollback()
+    if long_holder:
+        raise refusal
 
 
 def _queued_try_ms(conn) -> int:
@@ -1565,7 +1636,10 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
     never while a holder of DEFAULT is waiting for a lock. A reader that stays
     in the way makes the *move* give up (SQLSTATE 55P03), instead of stalling
     new readers for long or deadlocking a transaction that read DEFAULT and
-    then writes through the parent.
+    then writes through the parent. And before step 2 takes the parent lock,
+    ``_probe_default_before_moving`` checks for a transaction that already
+    holds DEFAULT and would refuse all of those tries: with one there, the move
+    gives up the same way without holding writers off at all.
 
     The bm25 index is built afterwards with CREATE INDEX CONCURRENTLY, outside
     any of this.
@@ -1582,7 +1656,9 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
       1.2-1.3 s, 250 000 rows 2.7-3.2 s, 500 000 rows 4.9-5.2 s -- about
       10 s per million rows moved, plus a VALIDATE of ~0.3 s that grows with
       DEFAULT. A move that gives up still held writers for as long as it ran:
-      1.8-2.3 s with a long reader in the way.
+      1.8-2.3 s with a long reader in the way. A long reader already there
+      when the move starts costs them nothing: the move gives up before
+      taking the parent lock.
     * **readers** do not block on the SHARE locks. They can wait on the
       ACCESS EXCLUSIVE steps on DEFAULT (the check going up, the ATTACH, the
       check's drop after a failed move): new readers of DEFAULT, and queries
@@ -1643,6 +1719,7 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
 
             fence_committed = False
             try:
+                _probe_default_before_moving(conn, item_table)
                 conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
                 conn.execute(text(partition_lock_parent_ddl(item_table)))
                 started = time.monotonic()
