@@ -205,3 +205,58 @@ def test_the_long_holder_threshold_is_the_registry_setting(monkeypatch):
     monkeypatch.setattr(pgb, "_has_app_context", lambda: True)
     monkeypatch.setattr(settings_registry, "get_setting", lambda key: 42)
     assert pgb._long_holder_seconds() == 42
+
+
+# ---------------------------------------------------------------------------
+# A statement_timeout set on the role or database
+# ---------------------------------------------------------------------------
+
+
+def _engine_with_statement_timeout(engine, ms):
+    from sqlalchemy import create_engine
+
+    return create_engine(engine.url, connect_args={"options": f"-c statement_timeout={int(ms)}"})
+
+
+def test_a_role_statement_timeout_does_not_cancel_the_move(engine, session, monkeypatch):
+    """The service role carries no statement_timeout today, but anon and
+    authenticated do on the production image, and one set later would kill a
+    large move half-way with nothing to retry it."""
+    slow = _engine_with_statement_timeout(engine, 200)
+    real = pgb.partition_lock_default_ddl
+    monkeypatch.setattr(
+        pgb, "partition_lock_default_ddl", lambda t: f"{real(t)}; SELECT pg_sleep(0.5)"
+    )
+    try:
+        moved = pgb.create_partition(slow, KB_A, "chunks")
+    finally:
+        slow.dispose()
+    assert moved["rows_moved"] == len(KB_A_DOCS)
+
+
+def test_the_concurrent_index_builds_run_without_a_statement_timeout(engine, session):
+    slow = _engine_with_statement_timeout(engine, 200)
+    seen: list = []
+
+    def before_execute(conn, cursor, statement, parameters, context, executemany):
+        if "INDEX CONCURRENTLY" in statement and statement.startswith("CREATE"):
+            seen.append(cursor.connection.execute("SHOW statement_timeout").fetchone()[0])
+
+    from sqlalchemy import event
+
+    event.listen(slow, "before_cursor_execute", before_execute)
+    try:
+        with slow.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(
+                text(f"CREATE INDEX chunks_src_idx ON {SCHEMA}.chunks_default (source_id)")
+            )
+        outcome = pgb.ensure_bm25_index(KB_A, engine=slow)
+        with slow.connect() as conn:
+            after = conn.execute(text("SHOW statement_timeout")).scalar()
+    finally:
+        event.remove(slow, "before_cursor_execute", before_execute)
+        slow.dispose()
+
+    assert outcome["status"] == "ready"
+    assert len(seen) >= 2 and set(seen) == {"0"}, seen
+    assert after == "200ms"

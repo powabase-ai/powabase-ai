@@ -1353,3 +1353,15 @@ def test_a_failed_lock_attempt_costs_writers_well_under_a_second_but_keeps_its_q
         pgb._EXCLUSIVE_LOCK_QUEUED_TRY_AFTER_SECONDS + pgb.DEFAULT_EXCLUSIVE_QUEUED_TRY_MS / 1000
     )
     assert queued_try_ends < wait
+
+
+def test_an_internal_error_from_the_concurrent_bm25_build_is_raised_as_retryable():
+    conn = _FakeConn(relkinds=_with_partition())
+    conn.fail_on = ("USING bm25", _sqlstate_error("XX000"))
+
+    with pytest.raises(pgb.Bm25IndexBuildFailed) as caught:
+        pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    assert pgb.is_transient_db_error(caught.value)
+    # The session-level timeout override does not outlive the build.
+    assert "RESET statement_timeout" in conn.statements

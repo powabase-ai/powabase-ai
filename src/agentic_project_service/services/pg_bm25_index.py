@@ -1219,20 +1219,61 @@ def _check_constraint_exists(conn, partition: str) -> bool:
 
 
 # SQLSTATEs worth retrying a partition or index build for: nothing about the
-# request is wrong, another transaction was simply in the way.
+# request is wrong. Another transaction was in the way, a server-side timeout
+# cancelled the statement, or the connection went away. The move is one
+# transaction and the index build is re-entrant, so a retry is always safe.
 _TRANSIENT_SQLSTATES = frozenset(
     {
         "55P03",  # lock_not_available (lock_timeout)
         "40P01",  # deadlock_detected
         "40001",  # serialization_failure
+        "57014",  # query_canceled (a role's or database's statement_timeout)
+        "57P01",  # admin_shutdown
+        "57P02",  # crash_shutdown
+        "57P03",  # cannot_connect_now (the server is starting up)
     }
 )
+# Class 08: connection exceptions.
+_TRANSIENT_SQLSTATE_CLASSES = frozenset({"08"})
+_LOCK_CONFLICT_SQLSTATES = frozenset({"40P01", "55P03"})
+
+
+class Bm25IndexBuildFailed(RuntimeError):
+    """pg_search's own ``CREATE INDEX CONCURRENTLY`` failed with an internal error.
+
+    Seen with pg_search 0.25.9 under concurrent writes (``XX000: buffer ... is
+    not owned by resource owner``). It leaves an INVALID index that the next
+    ``ensure_bm25_index`` drops and rebuilds, so it is retried.
+    """
+
+
+def _first_line(exc: BaseException) -> str:
+    """The first line of an error's message, or its type name when it has none."""
+    message = str(getattr(exc, "orig", None) or exc)
+    lines = message.splitlines()
+    return lines[0] if lines and lines[0] else type(exc).__name__
+
+
+def _sqlstate(exc: BaseException) -> str | None:
+    """The SQLSTATE of a SQLAlchemy-wrapped or bare driver error, if any."""
+    return getattr(getattr(exc, "orig", exc), "sqlstate", None)
 
 
 def is_transient_db_error(exc: BaseException) -> bool:
-    """Did this fail only because another transaction was in the way?"""
-    orig = getattr(exc, "orig", exc)
-    return getattr(orig, "sqlstate", None) in _TRANSIENT_SQLSTATES
+    """Did this fail for a reason a retry of the same request can get past?
+
+    Contention, a cancelled statement, a lost connection (reported with no
+    SQLSTATE by the driver, which SQLAlchemy marks ``connection_invalidated``),
+    or a failed concurrent bm25 build.
+    """
+    if isinstance(exc, Bm25IndexBuildFailed):
+        return True
+    if getattr(exc, "connection_invalidated", False):
+        return True
+    sqlstate = _sqlstate(exc)
+    if sqlstate is None:
+        return False
+    return sqlstate in _TRANSIENT_SQLSTATES or sqlstate[:2] in _TRANSIENT_SQLSTATE_CLASSES
 
 
 def is_lock_conflict(exc: BaseException) -> bool:
@@ -1240,8 +1281,9 @@ def is_lock_conflict(exc: BaseException) -> bool:
 
     Either means another transaction held what this one needed -- a partition
     move holding the item table, typically -- not that the statement was wrong.
+    Unwraps a SQLAlchemy error the same way ``is_transient_db_error`` does.
     """
-    return getattr(getattr(exc, "orig", None), "sqlstate", None) in {"40P01", "55P03"}
+    return _sqlstate(exc) in _LOCK_CONFLICT_SQLSTATES
 
 
 def is_partition_move_race(exc: BaseException) -> bool:
@@ -2149,6 +2191,7 @@ def _attach_empty_partition(engine, conn, kb_id: str, item_table: str) -> dict |
 
         step = "validate"
         conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+        conn.execute(text("SET LOCAL statement_timeout = 0"))
         try:
             conn.execute(text(default_move_check_validate_ddl(kb_id, item_table)))
         except Exception as exc:
@@ -2327,6 +2370,9 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                 gate_held = True
                 _probe_default_before_moving(conn, item_table)
                 conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+                # A role's or database's statement_timeout must not cancel a
+                # large copy half-way; every wait in here is bounded already.
+                conn.execute(text("SET LOCAL statement_timeout = 0"))
                 conn.execute(text(partition_lock_parent_ddl(item_table)))
                 started = time.monotonic()
                 # The fence goes up on a second connection while this one holds
@@ -2692,7 +2738,20 @@ def _ensure_index_locked(conn, outcome: dict, kb_id: str, item_table: str, ts_la
     if existing_def:
         logger.info("Rebuilding BM25 index %s: tokenizer changed to %s", name, cast)
         conn.execute(text(bm25_drop_ddl(kb_id, item_table)))
-    conn.execute(text(bm25_index_ddl(kb_id, item_table, ts_language)))
+    # Session-level on this AUTOCOMMIT connection (CONCURRENTLY refuses a
+    # transaction), so put back before the connection returns to the pool.
+    conn.execute(text("SET statement_timeout = 0"))
+    try:
+        conn.execute(text(bm25_index_ddl(kb_id, item_table, ts_language)))
+    except Exception as exc:
+        if _sqlstate(exc) == "XX000":
+            raise Bm25IndexBuildFailed(
+                f"the concurrent build of {AI_SCHEMA}.{name} failed inside pg_search "
+                f"({_first_line(exc)}); the next ensure rebuilds it"
+            ) from exc
+        raise
+    finally:
+        conn.execute(text("RESET statement_timeout"))
 
     invalidate_bm25_index_cache(kb_id)
     return {**outcome, "status": bm25_index_state(conn, kb_id, item_table)}
