@@ -33,9 +33,10 @@ def test_the_three_bm25_backed_tables_are_partitioned():
     )
 
 
-def test_doc2json_documents_can_carry_bm25_text_but_is_not_partitioned():
-    """It keeps the fallback keyword path, so it is never given a partition."""
-    assert "doc2json_documents" in pgb.BM25_ITEM_TABLES
+def test_doc2json_documents_is_neither_indexed_nor_partitioned():
+    """It keeps the tsvector fallback keyword path, so it is never given a
+    bm25 index or a partition."""
+    assert "doc2json_documents" not in pgb.BM25_ITEM_TABLES
     assert "doc2json_documents" not in pgb.PARTITIONED_ITEM_TABLES
 
 

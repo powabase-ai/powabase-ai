@@ -77,11 +77,19 @@ def test_page_index_has_no_bm25_item_table():
         ("chunk_embed", "chunks"),
         ("full_document", "full_documents"),
         ("graph_index", "graph_index_nodes"),
-        ("doc2json", "doc2json_documents"),
     ],
 )
 def test_pg_bm25_item_table_per_strategy(strategy, item_table):
     assert pgb.pg_bm25_item_table(strategy) == item_table
+
+
+def test_doc2json_has_no_pg_bm25_item_table():
+    """doc2json has no per-source keyword-index maintenance, so it stays on
+    the tsvector fallback and never gets a BM25 item table."""
+    from agentic_project_service.services.sparse_retrieval import STRATEGY_TO_BM25_ITEM_TABLE
+
+    assert "doc2json" not in STRATEGY_TO_BM25_ITEM_TABLE
+    assert pgb.pg_bm25_item_table("doc2json") is None
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +153,6 @@ def test_expression_index_alias_survives_the_no_stemmer_case():
     [
         ("chunks", "text"),
         ("full_documents", "summary"),
-        ("doc2json_documents", "summary"),
         ("graph_index_nodes", "(COALESCE(title, '') || ' ' || COALESCE(text, ''))"),
     ],
 )

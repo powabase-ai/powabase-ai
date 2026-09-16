@@ -48,7 +48,6 @@ logger = logging.getLogger(__name__)
 _TEXT_EXPRESSIONS: dict[str, str] = {
     "chunks": "text",
     "full_documents": "summary",
-    "doc2json_documents": "summary",
     "graph_index_nodes": "(COALESCE({a}title, '') || ' ' || COALESCE({a}text, ''))",
 }
 
@@ -56,8 +55,8 @@ BM25_ITEM_TABLES: frozenset[str] = frozenset(_TEXT_EXPRESSIONS)
 
 # Item tables partitioned ``BY LIST (knowledge_base_id)``, so that each
 # knowledge base owns a relation of its own and can therefore own a bm25 index
-# of its own. ``doc2json_documents`` is deliberately left unpartitioned: it
-# keeps the bm25s/tsvector keyword path.
+# of its own. ``doc2json_documents`` is deliberately absent from both sets: it
+# has no BM25 item table and stays on the tsvector keyword fallback.
 PARTITIONED_ITEM_TABLES: frozenset[str] = frozenset(
     {"chunks", "full_documents", "graph_index_nodes"}
 )

@@ -386,15 +386,15 @@ def test_ensure_skips_a_table_the_migration_has_not_partitioned_yet():
     assert _partition_ddl(conn) == []
 
 
-def test_ensure_skips_a_strategy_whose_table_is_never_partitioned():
+def test_ensure_skips_doc2json_which_has_no_keyword_table():
     conn = _FakeConn(kb_row=("doc2json", "hybrid", "english"))
 
     out = pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
 
     assert out["status"] == "skipped"
-    assert out["reason"] == "table_not_partitionable"
-    assert out["item_table"] == "doc2json_documents"
+    assert out["reason"] == "strategy"
     assert _ddl(conn) == []
+    assert _partition_ddl(conn) == []
 
 
 def test_ensure_skips_when_the_default_partition_is_missing():
@@ -579,9 +579,10 @@ def test_status_reflects_index_validity(indisvalid, expected):
     assert pgb.pg_bm25_status(KB, "chunk_embed", session=conn) == expected
 
 
-def test_status_is_absent_for_a_strategy_whose_table_is_never_partitioned():
-    """doc2json keeps the fallback keyword path, so it never has a pg index."""
-    assert pgb.pg_bm25_status(KB, "doc2json", session=_FakeConn()) == "absent"
+def test_status_is_none_for_doc2json():
+    """doc2json keeps the fallback keyword path, so there is no pg index to
+    report on and the caller's own status is not masked."""
+    assert pgb.pg_bm25_status(KB, "doc2json", session=_FakeConn()) is None
 
 
 def test_readiness_is_false_for_a_table_that_is_never_partitioned():
