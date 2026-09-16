@@ -104,7 +104,9 @@ class _FakeConn:
             kind = self.relkinds.get((params or {}).get("relname"))
             row = (kind,) if kind else None
         elif "pg_inherits" in sql:
-            row = (1,) if self.attached else None
+            # A partition that does not exist cannot be attached.
+            present = (params or {}).get("partition") in self.relkinds
+            row = (1,) if (self.attached and present) else None
         elif "pg_try_advisory_lock" in sql:
             row = (self.build_lock,)
         elif "pg_advisory_unlock" in sql:
