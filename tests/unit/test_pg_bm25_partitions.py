@@ -159,8 +159,7 @@ def test_attach_partition_ddl_binds_exactly_this_kb():
     ddl = pgb.partition_attach_ddl(KB, "chunks")
 
     assert ddl == (
-        f'ALTER TABLE "ai".chunks ATTACH PARTITION "ai".chunks_kb_{KB_HEX} '
-        f"FOR VALUES IN ('{KB}')"
+        f'ALTER TABLE "ai".chunks ATTACH PARTITION "ai".chunks_kb_{KB_HEX} FOR VALUES IN (\'{KB}\')'
     )
 
 

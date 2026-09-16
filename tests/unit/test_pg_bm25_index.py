@@ -7,6 +7,7 @@ detection, query normalisation and the index state machine.
 
 from __future__ import annotations
 
+import re
 import uuid
 from unittest.mock import MagicMock
 
@@ -134,7 +135,9 @@ def test_expression_indexes_get_an_alias_argument():
 
 
 def test_expression_index_alias_survives_the_no_stemmer_case():
-    assert pgb.bm25_tokenizer_cast("graph_index_nodes", "hindi") == "::pdb.simple('alias=bm25_text')"
+    assert (
+        pgb.bm25_tokenizer_cast("graph_index_nodes", "hindi") == "::pdb.simple('alias=bm25_text')"
+    )
 
 
 @pytest.mark.parametrize(
@@ -180,7 +183,8 @@ def test_create_ddl_scopes_the_kb_by_relation_not_by_predicate():
     """
     ddl = pgb.bm25_index_ddl(KB, "chunks", "german")
     assert "WHERE" not in ddl
-    assert ":" not in ddl
+    # No bind parameter -- the `::` in the tokenizer cast is the only colon.
+    assert not re.search(r"(?<!:):[a-z_]", ddl)
     assert uuid.UUID(KB).hex in ddl
 
 

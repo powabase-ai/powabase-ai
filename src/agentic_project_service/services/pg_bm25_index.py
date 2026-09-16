@@ -49,6 +49,22 @@ _TEXT_EXPRESSIONS: dict[str, str] = {
 
 BM25_ITEM_TABLES: frozenset[str] = frozenset(_TEXT_EXPRESSIONS)
 
+# Item tables partitioned ``BY LIST (knowledge_base_id)``, so that each
+# knowledge base owns a relation of its own and can therefore own a bm25 index
+# of its own. ``doc2json_documents`` is deliberately left unpartitioned: it
+# keeps the bm25s/tsvector keyword path.
+PARTITIONED_ITEM_TABLES: frozenset[str] = frozenset(
+    {"chunks", "full_documents", "graph_index_nodes"}
+)
+
+# Rows moved out of the DEFAULT partition per statement, so one huge knowledge
+# base cannot turn the move into a single unbounded DELETE ... RETURNING.
+EVACUATION_BATCH_ROWS = 10_000
+
+# Guard against an evacuation loop that never drains (a concurrent writer
+# inserting into DEFAULT faster than the batches move rows out).
+_MAX_EVACUATION_BATCHES = 10_000
+
 # Alias pg_search records for an indexed expression, so the query's expression
 # can be matched back to the indexed one.
 _EXPRESSION_ALIAS = "bm25_text"
@@ -117,6 +133,32 @@ def _validated_item_table(item_table: str) -> str:
             f"Unknown BM25 item table {item_table!r}; expected one of {sorted(BM25_ITEM_TABLES)}"
         )
     return item_table
+
+
+def _validated_partitioned_table(item_table: str) -> str:
+    if item_table not in PARTITIONED_ITEM_TABLES:
+        raise ValueError(
+            f"{item_table!r} is not partitioned by knowledge base; expected one of "
+            f"{sorted(PARTITIONED_ITEM_TABLES)}"
+        )
+    return item_table
+
+
+def partition_name(knowledge_base_id: Any, item_table: str) -> str:
+    """Relation name of one knowledge base's partition of an item table.
+
+    Derived from the UUID's hex form, so the name is a bare lowercase
+    identifier that needs no quoting and fits Postgres' 63-byte limit for
+    every partitioned table (the longest is
+    ``graph_index_nodes_kb_`` + 32 hex characters = 53 bytes).
+    """
+    kb_hex = uuid.UUID(_validated_kb_id(knowledge_base_id)).hex
+    return f"{_validated_partitioned_table(item_table)}_kb_{kb_hex}"
+
+
+def default_partition_name(item_table: str) -> str:
+    """Relation name of the DEFAULT partition -- every KB without one of its own."""
+    return f"{_validated_partitioned_table(item_table)}_default"
 
 
 def bm25_index_name(knowledge_base_id: str, item_table: str) -> str:
@@ -200,24 +242,143 @@ def indexdef_matches_tokenizer(indexdef: str | None, tokenizer_cast: str) -> boo
 
 
 def bm25_index_ddl(knowledge_base_id: str, item_table: str, ts_language: str | None) -> str:
-    """CREATE statement for one KB's partial BM25 index."""
+    """CREATE statement for one KB's BM25 index, on that KB's partition.
+
+    No ``WHERE`` predicate: the partition's LIST bound already restricts the
+    index to this knowledge base's rows, and a non-partial index is the shape
+    that plans as ``Custom Scan (ParadeDB Base Scan) / TopKScanExecState``.
+    """
     kb_id = _validated_kb_id(knowledge_base_id)
     name = bm25_index_name(kb_id, item_table)
+    partition = partition_name(kb_id, item_table)
     expression = bm25_text_expression(item_table)
     cast = bm25_tokenizer_cast(item_table, ts_language)
     return (
         f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} "
-        f'ON "{AI_SCHEMA}".{item_table} '
+        f'ON "{AI_SCHEMA}".{partition} '
         f"USING bm25 (id, ({expression}{cast}), source_id, meta) "
-        f"WITH (key_field = 'id') "
-        f"WHERE knowledge_base_id = '{kb_id}'"
+        f"WITH (key_field = 'id')"
     )
 
 
 def bm25_drop_ddl(knowledge_base_id: str, item_table: str) -> str:
-    """DROP statement for one KB's partial BM25 index."""
+    """DROP statement for one KB's BM25 index."""
     name = bm25_index_name(knowledge_base_id, item_table)
     return f'DROP INDEX CONCURRENTLY IF EXISTS "{AI_SCHEMA}".{name}'
+
+
+# ---------------------------------------------------------------------------
+# Partition DDL
+# ---------------------------------------------------------------------------
+
+
+def _qualified(relation: str) -> str:
+    return f'"{AI_SCHEMA}".{relation}'
+
+
+def partition_create_ddl(knowledge_base_id: Any, item_table: str) -> str:
+    """Create the KB's partition as an unattached clone of DEFAULT.
+
+    Cloning the DEFAULT partition rather than the partitioned parent is what
+    carries the column defaults, the CHECK/UNIQUE constraints and the ordinary
+    indexes across -- including the local ``PRIMARY KEY (id)``, which only the
+    partitions have (the parent deliberately declares none, so a bare ``id``
+    key stays legal). ``LIKE`` never copies foreign keys; those are added
+    separately from the DEFAULT partition's catalog entries.
+    """
+    partition = partition_name(knowledge_base_id, item_table)
+    return (
+        f"CREATE TABLE IF NOT EXISTS {_qualified(partition)} "
+        f"(LIKE {_qualified(default_partition_name(item_table))} "
+        "INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES "
+        "INCLUDING STORAGE INCLUDING COMMENTS)"
+    )
+
+
+def partition_attach_ddl(knowledge_base_id: Any, item_table: str) -> str:
+    """Attach the KB's partition, bound to exactly that one knowledge base."""
+    kb_id = _validated_kb_id(knowledge_base_id)
+    partition = partition_name(kb_id, item_table)
+    return (
+        f"ALTER TABLE {_qualified(_validated_partitioned_table(item_table))} "
+        f"ATTACH PARTITION {_qualified(partition)} FOR VALUES IN ('{kb_id}')"
+    )
+
+
+def partition_detach_ddl(knowledge_base_id: Any, item_table: str) -> str:
+    """Detach the KB's partition.
+
+    Not ``CONCURRENTLY``: Postgres refuses a concurrent detach while a DEFAULT
+    partition exists, and this schema always has one.
+    """
+    partition = partition_name(knowledge_base_id, item_table)
+    return (
+        f"ALTER TABLE {_qualified(_validated_partitioned_table(item_table))} "
+        f"DETACH PARTITION {_qualified(partition)}"
+    )
+
+
+def partition_drop_ddl(knowledge_base_id: Any, item_table: str) -> str:
+    """Drop the KB's (already detached) partition."""
+    return f"DROP TABLE IF EXISTS {_qualified(partition_name(knowledge_base_id, item_table))}"
+
+
+def evacuate_batch_sql(knowledge_base_id: Any, item_table: str) -> str:
+    """Move one bounded batch of a KB's rows out of DEFAULT into its partition.
+
+    A partition cannot be attached while the DEFAULT partition still holds a
+    row that belongs to it, so the rows have to move first. One statement, so
+    a row is never missing from both relations, and ``LIMIT :batch`` keeps each
+    statement's WAL and memory bounded however large the knowledge base is.
+    """
+    partition = partition_name(knowledge_base_id, item_table)
+    default = default_partition_name(item_table)
+    return (
+        "WITH moved AS ("
+        f"  DELETE FROM {_qualified(default)}"
+        f"  WHERE id IN (SELECT id FROM {_qualified(default)}"
+        "               WHERE knowledge_base_id = CAST(:kb AS uuid) LIMIT :batch)"
+        "  RETURNING *"
+        f") INSERT INTO {_qualified(partition)} SELECT * FROM moved"
+    )
+
+
+def mirror_relation_settings_sql(source: str, target: str) -> str:
+    """Copy ownership, GRANTs and the RLS flag from one relation to another.
+
+    A new partition starts with no privileges and RLS off, so without this a
+    partition is either unreachable by the roles that can read the parent, or
+    (if it were granted blindly) readable past the parent's row-level rules.
+    Emitted as a server-side block so every identifier is quoted by
+    ``format(%I/%s)`` rather than by string building here. Policies are
+    deliberately *not* copied: a direct read of a partition by a policy-gated
+    role stays denied, while reads through the parent keep applying the
+    parent's policies unchanged.
+    """
+    return f"""
+        DO $$
+        DECLARE
+            src oid := '{source}'::regclass;
+            owner text := (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = src);
+            rls boolean := (SELECT relrowsecurity FROM pg_class WHERE oid = src);
+            g record;
+        BEGIN
+            EXECUTE format('ALTER TABLE {target} OWNER TO %I', owner);
+            IF rls THEN
+                EXECUTE 'ALTER TABLE {target} ENABLE ROW LEVEL SECURITY';
+            END IF;
+            FOR g IN
+                SELECT a.grantee::regrole AS role,
+                       string_agg(a.privilege_type, ', ') AS privileges
+                FROM pg_class c, aclexplode(c.relacl) a
+                WHERE c.oid = src AND a.grantee <> 0
+                GROUP BY a.grantee
+            LOOP
+                EXECUTE format('GRANT %s ON TABLE {target} TO %s',
+                               g.privileges, g.role);
+            END LOOP;
+        END $$;
+    """
 
 
 # ---------------------------------------------------------------------------
