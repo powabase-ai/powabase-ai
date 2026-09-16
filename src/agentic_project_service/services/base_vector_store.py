@@ -7,6 +7,7 @@ attributes and add their own storage methods.
 
 import json
 import logging
+import time
 from typing import Any
 
 from agentic.knowledge.model_config import HYBRID_DEFAULT_VECTOR_WEIGHT
@@ -102,6 +103,11 @@ def ensure_embedding_index(session: Session, schema: str, dims: int) -> None:
 
 
 _QUERY_CANCELED = "57014"
+
+# Fraction of the budget that must have elapsed before a cancellation can be
+# ours. Postgres measures the timeout from a slightly later instant than the
+# client does, so an exact comparison would misfile genuine timeouts.
+_TIMEOUT_ELAPSED_TOLERANCE = 0.9
 
 
 class KeywordSearchTimeout(RuntimeError):
@@ -200,13 +206,18 @@ class BasePgVectorStore:
                 e,
             )
 
-    def _fetch_with_timeout(self, sql: str, params: dict[str, Any], timeout_ms: int) -> list:
+    def _fetch_with_timeout(
+        self, sql: str, params: dict[str, Any], timeout_ms: int, *, query: str
+    ) -> list:
         """Run one query under a statement_timeout scoped to a savepoint.
 
         Rolling back to the savepoint on cancellation reverts the timeout and
         clears the aborted-transaction state, so the caller's session stays
         usable; on success the previous timeout is put back explicitly.
+
+        ``query`` is the user's search text, used only for the log line.
         """
+        started = time.monotonic()
         try:
             with self.session.begin_nested():
                 previous = self.session.execute(
@@ -223,14 +234,34 @@ class BasePgVectorStore:
                 )
                 return rows
         except OperationalError as e:
-            if getattr(e.orig, "sqlstate", None) == _QUERY_CANCELED:
-                logger.warning(
-                    "Keyword search fallback cancelled after %d ms (kb=%s)",
-                    timeout_ms,
-                    self.kb_id,
-                )
-                raise KeywordSearchTimeout(self.kb_id, timeout_ms) from e
-            raise
+            if getattr(e.orig, "sqlstate", None) != _QUERY_CANCELED:
+                raise
+
+            # 57014 is "query canceled" — our statement_timeout, but equally a
+            # pg_cancel_backend from anywhere else. Our own bound cannot fire
+            # before the budget is spent, so a cancellation that arrives well
+            # inside it belongs to someone else and must keep its identity
+            # rather than be reported as "exceeded N ms". Postgres can cancel a
+            # hair early, hence the tolerance. Never match on message text: it
+            # is localised by the server's lc_messages.
+            elapsed_ms = (time.monotonic() - started) * 1000
+            if elapsed_ms < timeout_ms * _TIMEOUT_ELAPSED_TOLERANCE:
+                raise
+
+            # The one log line for this event. full_text_search re-raises the
+            # KeywordSearchTimeout past its generic handler and the hybrid leg
+            # logs at debug, so a designed degradation never pages as ERROR and
+            # is counted once.
+            logger.warning(
+                "Keyword search fallback cancelled after %.0f ms of a %d ms budget "
+                "(kb=%s table=%s query_len=%d); no BM25 index for this knowledge base",
+                elapsed_ms,
+                timeout_ms,
+                self.kb_id,
+                self.TABLE,
+                len(query),
+            )
+            raise KeywordSearchTimeout(self.kb_id, timeout_ms) from e
 
     async def vector_search(
         self,
@@ -493,7 +524,7 @@ class BasePgVectorStore:
 
         timeout_ms = _bm25_fallback_timeout_ms()
         try:
-            rows = self._fetch_with_timeout(search_query, params, timeout_ms)
+            rows = self._fetch_with_timeout(search_query, params, timeout_ms, query=query)
 
             if not rows:
                 return []
@@ -540,6 +571,11 @@ class BasePgVectorStore:
             top_items = scored_items[:top_k]
             return self._resolve_results(top_items) if _resolve else top_items
 
+        except KeywordSearchTimeout:
+            # A bounded, expected degradation, already warned about once in
+            # _fetch_with_timeout. Falling into the handler below would log it
+            # as ERROR on every request an un-indexed KB serves.
+            raise
         except Exception as e:
             logger.error(f"Full-text search failed: {e}")
             raise
@@ -721,7 +757,10 @@ class BasePgVectorStore:
                 source_ids=source_ids,
             )
         except KeywordSearchTimeout:
-            logger.warning(
+            # _fetch_with_timeout already warned once, with the budget and the
+            # table; debug here keeps the vector-only answer traceable without
+            # logging one event twice.
+            logger.debug(
                 "Hybrid search on KB %s is returning vector results only: keyword fallback timed out",
                 self.kb_id,
             )

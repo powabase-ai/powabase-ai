@@ -1,6 +1,7 @@
 """A keyword-leg timeout leaves hybrid search with its vector results."""
 
 import asyncio
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -47,6 +48,47 @@ def test_keyword_search_for_hybrid_swallows_timeout():
         store.keyword_search_for_hybrid("q", top_k=4, filter_metadata=None, item_ids=None, source_ids=None)
     )
     assert out == []
+
+
+def test_keyword_search_for_hybrid_propagates_other_errors():
+    """Only the designed timeout may be swallowed.
+
+    Widening the except to Exception would turn any keyword-leg bug -- a bad
+    ts_language, a broken connection, a programming error -- into a silently
+    vector-only answer that nobody can tell apart from a healthy one.
+    """
+    store = _store_with_timeout()
+
+    async def boom(*a, **k):
+        raise RuntimeError("keyword leg is broken")
+
+    store.bm25s_search = boom
+    store.full_text_search = boom
+
+    with pytest.raises(RuntimeError, match="keyword leg is broken"):
+        asyncio.run(
+            store.keyword_search_for_hybrid(
+                "q", top_k=4, filter_metadata=None, item_ids=None, source_ids=None
+            )
+        )
+
+
+def test_keyword_search_for_hybrid_does_not_re_warn(caplog):
+    """_fetch_with_timeout already warned; a second WARNING double-counts.
+
+    The hybrid leg keeps a debug line so the vector-only answer is traceable
+    without paging twice for one event.
+    """
+    store = _store_with_timeout()
+    with caplog.at_level(logging.DEBUG, logger=bvs.logger.name):
+        asyncio.run(
+            store.keyword_search_for_hybrid(
+                "q", top_k=4, filter_metadata=None, item_ids=None, source_ids=None
+            )
+        )
+
+    assert [r.levelname for r in caplog.records if r.levelname in ("WARNING", "ERROR")] == []
+    assert any("vector results only" in r.getMessage() for r in caplog.records)
 
 
 def test_sync_hybrid_returns_vector_results_on_keyword_timeout():

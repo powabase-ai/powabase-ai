@@ -2,10 +2,13 @@
 cancelled statement into KeywordSearchTimeout."""
 
 import asyncio
+import logging
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
 from agentic_project_service.services import base_vector_store as bvs
@@ -56,9 +59,22 @@ def _spy_session(search_error: Exception | None = None):
     return session, log
 
 
-def _run(session):
+def _run(session, query: str = "anything"):
     store = _FakeStore(db_session=session, knowledge_base_id="kb-1")
-    return asyncio.run(store.full_text_search("anything", top_k=5))
+    return asyncio.run(store.full_text_search(query, top_k=5))
+
+
+@contextmanager
+def _elapsed(seconds: float):
+    """Pin the fetch's measured duration.
+
+    Replaces the module's own ``time`` binding rather than time.monotonic
+    itself, which asyncio also reads. _fetch_with_timeout reads the clock once
+    before the query and once when mapping an error, so two values are enough.
+    """
+    ticks = iter((0.0, seconds))
+    with patch.object(bvs, "time", SimpleNamespace(monotonic=lambda: next(ticks))):
+        yield
 
 
 @patch.object(bvs, "_bm25_fallback_timeout_ms", return_value=4321)
@@ -78,13 +94,19 @@ def test_search_runs_inside_savepoint_with_timeout_then_restores(_ms):
     assert set_p == {"ms": "4321"}
     assert restore_p == {"ms": "0"}
 
+    # Both set_config calls must pass is_local=true: a session-wide timeout
+    # would outlive the savepoint and bound unrelated later statements on the
+    # same pooled connection.
+    for i, _p in set_calls:
+        assert log[i][0].strip().endswith(", true)"), log[i][0]
+
 
 @patch.object(bvs, "_bm25_fallback_timeout_ms", return_value=4321)
 def test_query_canceled_becomes_keyword_search_timeout(_ms):
     err = OperationalError("SELECT ...", {}, _Canceled())
     session, log = _spy_session(search_error=err)
 
-    with pytest.raises(bvs.KeywordSearchTimeout) as exc_info:
+    with _elapsed(4.321), pytest.raises(bvs.KeywordSearchTimeout) as exc_info:
         _run(session)
 
     assert exc_info.value.knowledge_base_id == "kb-1"
@@ -94,12 +116,72 @@ def test_query_canceled_becomes_keyword_search_timeout(_ms):
 
 
 @patch.object(bvs, "_bm25_fallback_timeout_ms", return_value=4321)
-def test_other_operational_errors_propagate_unchanged(_ms):
-    err = OperationalError("SELECT ...", {}, _OtherPgError())
+def test_query_canceled_well_inside_the_budget_propagates(_ms):
+    """57014 is also what another session's pg_cancel_backend produces.
+
+    Half a second into a 4321 ms budget our own statement_timeout cannot have
+    fired, so calling it a timeout would mislabel a foreign cancellation and
+    hybrid would silently swallow it.
+    """
+    err = OperationalError("SELECT ...", {}, _Canceled())
+    session, log = _spy_session(search_error=err)
+
+    with _elapsed(0.5), pytest.raises(OperationalError) as exc_info:
+        _run(session)
+
+    assert not isinstance(exc_info.value, bvs.KeywordSearchTimeout)
+    assert ("ROLLBACK TO SAVEPOINT", None) in log
+
+
+@patch.object(bvs, "_bm25_fallback_timeout_ms", return_value=4321)
+def test_query_canceled_just_under_the_budget_is_a_timeout(_ms):
+    """Postgres can cancel a hair early; the tolerance must cover that."""
+    err = OperationalError("SELECT ...", {}, _Canceled())
     session, _ = _spy_session(search_error=err)
 
-    with pytest.raises(OperationalError):
+    with _elapsed(4.1), pytest.raises(bvs.KeywordSearchTimeout):
         _run(session)
+
+
+@patch.object(bvs, "_bm25_fallback_timeout_ms", return_value=4321)
+def test_other_operational_errors_propagate_unchanged(_ms):
+    err = OperationalError("SELECT ...", {}, _OtherPgError())
+    session, log = _spy_session(search_error=err)
+
+    with pytest.raises(OperationalError) as exc_info:
+        _run(session)
+
+    assert not isinstance(exc_info.value, bvs.KeywordSearchTimeout)
+    # The savepoint was rolled back, so the aborted state is cleared and the
+    # caller's session is still usable for the statements that follow.
+    assert ("ROLLBACK TO SAVEPOINT", None) in log
+    assert session.execute(text("SELECT 1")) is not None
+
+
+@patch.object(bvs, "_bm25_fallback_timeout_ms", return_value=4321)
+def test_timeout_logs_one_warning_and_no_error(_ms, caplog):
+    """A designed degradation must not page as ERROR, and must say so once.
+
+    full_text_search's generic handler used to log ERROR on the way past, so
+    every request against an un-indexed KB produced an error line for expected
+    behaviour.
+    """
+    err = OperationalError("SELECT ...", {}, _Canceled())
+    session, _ = _spy_session(search_error=err)
+
+    with caplog.at_level(logging.DEBUG, logger=bvs.logger.name):
+        with _elapsed(4.321), pytest.raises(bvs.KeywordSearchTimeout):
+            _run(session, query="a moderately long hiking query")
+
+    assert [r.levelname for r in caplog.records if r.levelname == "ERROR"] == []
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+
+    message = warnings[0].getMessage()
+    assert "kb-1" in message
+    assert "chunks" in message  # _FakeStore.TABLE
+    assert "4321" in message
+    assert str(len("a moderately long hiking query")) in message
 
 
 def test_timeout_helper_reads_the_setting():
