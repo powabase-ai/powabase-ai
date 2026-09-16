@@ -12,7 +12,11 @@ from ..auth import require_auth
 from ..celery import celery_app
 from ..db import db, AI_SCHEMA
 from ..services.ai_provider_keys_resolver import get_all_user_provider_keys
-from ..services.base_vector_store import KeywordSearchTimeout
+from ..services.base_vector_store import (
+    KeywordSearchTimeout,
+    get_retrieval_degradations,
+    reset_retrieval_degradations,
+)
 from ..services.pg_bm25_index import pg_bm25_status, pg_search_installed
 from ..services.settings_registry import get_setting
 from ..services.sparse_retrieval import (
@@ -1646,6 +1650,95 @@ def get_items_by_sources(kb_id: str):
     )
 
 
+def _kb_config_as_dict(raw: Any) -> dict | None:
+    """A KB config column as a dict, or None when its shape cannot be trusted.
+
+    Legacy rows can hold a JSON string where an object belongs, so a string is
+    parsed rather than discarded: throwing its contents away would read a
+    doc2json KB as chunk_embed and advise it to build an index it cannot have.
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _keyword_timeout_remedy(kb_id: str) -> str:
+    """Name a remedy this KB's caller can actually carry out.
+
+    POST /build-bm25 only helps a KB whose strategy has an item table AND whose
+    STORED retrieval method is hybrid or full_text. It refuses an unmapped
+    strategy with a 400, and a stored method that does not use BM25 with a 400,
+    so a per-request retrieval_method override cannot reach it either. The one
+    unmapped strategy that can produce this 503 is doc2json, which sits on the
+    tsvector fallback permanently (page_index is rejected for full_text and
+    hybrid by validate_retriever before any query runs).
+
+    Runs inside the route's ``except KeywordSearchTimeout`` handler, where
+    nothing else would catch a raise, so every read of the KB row is guarded
+    and any doubt falls back to the generic two-remedy wording. A strategy name
+    or method is only ever interpolated when it is a real string.
+    """
+    generic = (
+        f"Build the index with POST /api/knowledge-bases/{kb_id}/build-bm25, or "
+        "switch this knowledge base's retrieval method to vector_search."
+    )
+    try:
+        kb = _fetch_kb_or_404(kb_id)
+        if isinstance(kb, tuple):  # 404 response tuple
+            return generic
+        indexing_config = _kb_config_as_dict(kb.get("indexing_config"))
+        if indexing_config is None:
+            return generic
+        # Same default as search_knowledge_base and build_bm25_for_kb: a config
+        # with no "strategy" key is searched, and built, as chunk_embed.
+        strategy = indexing_config.get("strategy", "chunk_embed")
+        if not isinstance(strategy, str):
+            return generic
+        stored_method = (_kb_config_as_dict(kb.get("retrieval_config")) or {}).get("method")
+        auto_indexing = bool(get_setting("BM25_AUTO_INDEXING"))
+    except Exception as exc:
+        logger.warning(
+            "Could not read KB %s to tailor the keyword-timeout remedy: %s",
+            kb_id,
+            exc,
+            exc_info=True,
+        )
+        return generic
+
+    if strategy not in _STRATEGY_TO_ITEM_TABLE:
+        return (
+            f"This knowledge base's indexing strategy ({strategy}) has no BM25 "
+            "index, so keyword search always uses the SQL fallback; a build "
+            "cannot change that. Switch this knowledge base's retrieval method "
+            "to vector_search."
+        )
+
+    if stored_method not in ("hybrid", "full_text"):
+        if auto_indexing:
+            # The PATCH that moves the stored method onto hybrid/full_text
+            # dispatches build_bm25_for_kb itself; a second request would start
+            # a concurrent rebuild of the same index files.
+            return (
+                "Set this knowledge base's stored retrieval method to hybrid or "
+                "full_text; with automatic BM25 indexing on, that change builds "
+                "the index automatically. A per-request retrieval_method does not. "
+                "Or query with vector_search instead."
+            )
+        return (
+            "Set this knowledge base's stored retrieval method to hybrid or "
+            f"full_text, then build the index with POST /api/knowledge-bases/{kb_id}"
+            "/build-bm25 — a per-request retrieval_method is not enough for that "
+            "endpoint. Or query with vector_search instead."
+        )
+
+    return generic
+
+
 @knowledge_bases_bp.route("/<kb_id>/search", methods=["POST"])
 @require_auth
 def search_knowledge_base_route(kb_id: str):
@@ -1669,6 +1762,10 @@ def search_knowledge_base_route(kb_id: str):
         if not isinstance(source_ids, list):
             return jsonify({"error": "source_ids must be a list of UUID strings"}), 400
 
+    # flask.g is app-context-scoped, so without this a request served under a
+    # long-lived outer app context would inherit the previous one's record.
+    reset_retrieval_degradations()
+
     try:
         results = do_search(
             db_session=db.session,
@@ -1681,30 +1778,41 @@ def search_knowledge_base_route(kb_id: str):
             source_ids=source_ids,
         )
 
-        return jsonify(
-            {
-                "results": [
-                    {
-                        "chunk_id": r.item_id,
-                        "text": r.text,
-                        "score": r.score,
-                        "source_id": r.source_id,
-                        "meta": r.meta,
-                    }
-                    for r in results
-                ],
-                "query": query,
-                "retrieval_method": method or "auto",
-                "total_results": len(results),
-            }
-        )
+        response_body = {
+            "results": [
+                {
+                    "chunk_id": r.item_id,
+                    "text": r.text,
+                    "score": r.score,
+                    "source_id": r.source_id,
+                    "meta": r.meta,
+                }
+                for r in results
+            ],
+            "query": query,
+            "retrieval_method": method or "auto",
+            "total_results": len(results),
+        }
+
+        # A hybrid search whose keyword leg timed out still ran as hybrid and
+        # still returns its vector results, so retrieval_method is unchanged;
+        # this is the only signal that the answer is built from less than the
+        # method implies. Omitted entirely when nothing was dropped.
+        degraded = get_retrieval_degradations()
+        if degraded:
+            response_body["degraded"] = degraded
+
+        return jsonify(response_body)
 
     except KeywordSearchTimeout as e:
         return jsonify(
             {
                 "error": (
                     "Keyword search timed out: this knowledge base has no BM25 "
-                    "index yet. A build has been queued; retry shortly."
+                    "index, so the query fell back to a scan that exceeded its "
+                    f"time budget. {_keyword_timeout_remedy(kb_id)} Retrying "
+                    "the same search does not start a build, so it will time "
+                    "out again."
                 ),
                 "code": "keyword_search_timeout",
                 "timeout_ms": e.timeout_ms,
@@ -1738,13 +1846,54 @@ def build_bm25_endpoint(kb_id: str):
     if isinstance(kb, tuple):  # _fetch_kb_or_404 returns a response tuple on 404
         return kb
 
-    method = (kb.get("retrieval_config") or {}).get("method")
+    # Legacy rows can hold a config column as a JSON string, and the
+    # keyword-timeout 503 points exactly those KBs here, so read it the same
+    # way the remedy did rather than 500 on a str.
+    retrieval_config = _kb_config_as_dict(kb.get("retrieval_config"))
+    if retrieval_config is None:
+        return jsonify(
+            {
+                "error": (
+                    "This knowledge base's retrieval_config is not a JSON object; "
+                    "save it again before building a BM25 index."
+                )
+            }
+        ), 400
+    method = retrieval_config.get("method")
     if method not in ("hybrid", "full_text"):
         return jsonify(
             {
                 "error": (
                     f"KB retrieval method '{method}' does not use BM25; "
                     "this endpoint is only valid for hybrid or full_text KBs."
+                )
+            }
+        ), 400
+
+    # Refuse up front what build_bm25_for_kb would refuse after a 202: a
+    # strategy with no BM25 item table. Same map and same chunk_embed default
+    # as the task, so the two cannot disagree.
+    # indexing_config is refused rather than parsed when it is not an object:
+    # the build task reads it as one, and search already rejects a string
+    # indexing_config, so a 202 here would only move the crash into the task.
+    indexing_config = kb.get("indexing_config")
+    if indexing_config is not None and not isinstance(indexing_config, dict):
+        return jsonify(
+            {
+                "error": (
+                    "This knowledge base's indexing_config is not a JSON object; "
+                    "save it again before building a BM25 index."
+                )
+            }
+        ), 400
+    strategy = (indexing_config or {}).get("strategy", "chunk_embed")
+    if strategy not in _STRATEGY_TO_ITEM_TABLE:
+        return jsonify(
+            {
+                "error": (
+                    f"Indexing strategy '{strategy}' has no BM25 index to build; "
+                    "keyword search on this knowledge base always uses the SQL "
+                    "fallback. Use vector_search instead."
                 )
             }
         ), 400

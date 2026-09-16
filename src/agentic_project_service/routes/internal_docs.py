@@ -27,6 +27,7 @@ from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 
 from ..db import AI_SCHEMA, db
+from ..services.base_vector_store import KeywordSearchTimeout
 from ..services.knowledge_search import EmptyKnowledgeBaseError, search_knowledge_base
 
 logger = logging.getLogger(__name__)
@@ -185,6 +186,22 @@ def docs_search():
         # matched nothing) so search_docs can surface a grounding-degraded
         # notice instead of silently answering from parametric knowledge.
         return jsonify({"results": [], "kb_not_ready": True})
+    except KeywordSearchTimeout as e:
+        # The keyword fallback hit its time budget: a designed, temporary
+        # degradation, not a broken index. The store has already logged the
+        # details once; one warning here, and a 503 that search_docs reports as
+        # temporarily unavailable, keeps it from paging as an ERROR.
+        logger.warning(
+            "docs_search keyword fallback timed out after %d ms for kb=%s",
+            e.timeout_ms,
+            kb_id,
+        )
+        return jsonify(
+            {
+                "error": "docs search timed out; try again later",
+                "code": "keyword_search_timeout",
+            }
+        ), 503
     except ValueError:
         # A *different* ValueError (bad retrieval_config, embedding-dim mismatch,
         # pgvector parse failure): the RAG subsystem is broken, not empty. Don't

@@ -7,10 +7,12 @@ attributes and add their own storage methods.
 
 import json
 import logging
+import time
 from typing import Any
 
 from agentic.knowledge.model_config import HYBRID_DEFAULT_VECTOR_WEIGHT
 from agentic.knowledge.models import RetrievedItem
+from flask import g, has_request_context
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -18,7 +20,7 @@ from sqlalchemy.orm import Session
 from ..db import AI_SCHEMA
 from . import pg_bm25_index
 from .kb_search_config import HNSW_ITERATIVE_SCAN_MODE
-from .settings_registry import get_setting
+from .settings_registry import SETTINGS_REGISTRY, get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -106,19 +108,135 @@ _QUERY_CANCELED = "57014"
 
 
 class KeywordSearchTimeout(RuntimeError):
-    """The SQL keyword-search fallback exceeded BM25_FALLBACK_TIMEOUT_MS."""
+    """The SQL keyword-search fallback outran the BM25_FALLBACK_TIMEOUT_MS setting.
+
+    Nothing builds an index in response, so the message names the remedies a
+    caller actually has rather than letting it read as "retry in a moment". It
+    hedges the build remedy because this layer cannot see the KB's strategy: a
+    strategy with no BM25 item table cannot be helped by a build at all. The
+    search route resolves the strategy and states one definite remedy.
+    """
 
     def __init__(self, knowledge_base_id: str, timeout_ms: int):
         super().__init__(
             f"Keyword search on knowledge base {knowledge_base_id} exceeded "
-            f"{timeout_ms} ms (no BM25 index; one is being built)"
+            f"{timeout_ms} ms because the knowledge base has no BM25 index. "
+            f"Switch the knowledge base's retrieval method to vector_search, or, "
+            f"if its indexing strategy supports a BM25 index, build one with "
+            f"POST /api/knowledge-bases/{knowledge_base_id}/build-bm25."
         )
         self.knowledge_base_id = knowledge_base_id
         self.timeout_ms = timeout_ms
 
 
+# Bad BM25_FALLBACK_TIMEOUT_MS values already reported at WARNING by this
+# process. The read helper runs on every keyword search, so without this a
+# single bad row would emit one warning per search for as long as it sits in
+# project_settings — burying the first one. Bounded by the number of distinct
+# bad values, which is bounded by how often someone writes the setting.
+_WARNED_TIMEOUT_OVERRIDES: set[str] = set()
+
+
+def _warn_once_per_bad_value(key: str, message: str, *args: Any) -> None:
+    """WARNING the first time this exact bad value is seen, DEBUG afterwards."""
+    if key in _WARNED_TIMEOUT_OVERRIDES:
+        logger.debug(message, *args)
+        return
+    _WARNED_TIMEOUT_OVERRIDES.add(key)
+    logger.warning(message, *args)
+
+
 def _bm25_fallback_timeout_ms() -> int:
-    return int(get_setting("BM25_FALLBACK_TIMEOUT_MS"))
+    """Read the keyword-fallback budget, clamped to the registry's bounds.
+
+    get_setting coerces a stored override but does not range-check it — bounds
+    are enforced by validate_setting, i.e. on the settings PUT path only. For
+    this one setting an out-of-range value is not merely odd: Postgres reads
+    statement_timeout 0 as "no timeout", so a stored 0 would disarm the bound
+    this whole path exists to provide. Clamping at read time makes the bound
+    hold whatever is in ai.project_settings.
+
+    There is no environment-variable fallback, matching every other registry
+    setting: the value is the project setting or the registry default. (The
+    only env-read settings in this service are operator-provided platform
+    secrets, which are deliberately not tenant-managed.)
+    """
+    defn = SETTINGS_REGISTRY["BM25_FALLBACK_TIMEOUT_MS"]
+    # get_setting has already coerced the stored override to an int, or logged
+    # its own warning and returned the registry default, so only the range can
+    # still be wrong here.
+    value = int(get_setting("BM25_FALLBACK_TIMEOUT_MS"))
+
+    clamped = value
+    if defn.min is not None:
+        clamped = max(clamped, defn.min)
+    if defn.max is not None:
+        clamped = min(clamped, defn.max)
+    if clamped != value:
+        _warn_once_per_bad_value(
+            f"range:{value}",
+            "BM25_FALLBACK_TIMEOUT_MS=%d is outside the allowed range %s-%s; using %d ms instead",
+            value,
+            defn.min,
+            defn.max,
+            clamped,
+        )
+    return clamped
+
+
+# Reasons a retrieval answered with less than it was asked for.
+KEYWORD_SEARCH_TIMEOUT = "keyword_search_timeout"
+
+_DEGRADED_ATTR = "retrieval_degraded"
+
+
+def record_retrieval_degradation(reason: str) -> None:
+    """Note that this request's retrieval dropped a leg.
+
+    A hybrid search that loses its keyword leg still returns items stamped
+    ``retrieval_method="hybrid"``, so without this the caller cannot tell a
+    degraded answer from a healthy one. Recorded on the Flask request context,
+    read back by the search route; celery tasks and bare threads have no
+    request to write to and get the log line only.
+
+    Deliberately appends without checking for duplicates. Retrieval can run in
+    a ThreadPoolExecutor over a copied context, so several worker threads share
+    one ``g`` and neither the getattr/setattr pair nor a membership test and an
+    append are atomic. Reads deduplicate instead, so a duplicated append cannot
+    change what a caller sees.
+
+    The first write is still check-then-act: two threads can each find no list,
+    build one, and have the later ``setattr`` drop the earlier thread's list and
+    its reason with it. Harmless while ``KEYWORD_SEARCH_TIMEOUT`` is the only
+    reason — the surviving list holds the same string — but a second reason
+    would make the loss observable. Give this a lock or a context-local
+    structure before adding one.
+    """
+    if not has_request_context():
+        return
+    reasons = getattr(g, _DEGRADED_ATTR, None)
+    if reasons is None:
+        reasons = []
+        setattr(g, _DEGRADED_ATTR, reasons)
+    reasons.append(reason)
+
+
+def get_retrieval_degradations() -> list[str]:
+    """Distinct reasons recorded for the current request, sorted."""
+    if not has_request_context():
+        return []
+    return sorted(set(getattr(g, _DEGRADED_ATTR, ())))
+
+
+def reset_retrieval_degradations() -> None:
+    """Drop any reasons carried over from earlier work on this context.
+
+    ``flask.g`` is scoped to the *app* context, not the request, so under a
+    long-lived outer app context one request would otherwise read the previous
+    request's degradations. The search route calls this before dispatching.
+    """
+    if has_request_context():
+        g.pop(_DEGRADED_ATTR, None)
 
 
 class BasePgVectorStore:
@@ -195,13 +313,36 @@ class BasePgVectorStore:
                 e,
             )
 
-    def _fetch_with_timeout(self, sql: str, params: dict[str, Any], timeout_ms: int) -> list:
+    def _fetch_with_timeout(
+        self, sql: str, params: dict[str, Any], timeout_ms: int, *, query: str
+    ) -> list:
         """Run one query under a statement_timeout scoped to a savepoint.
 
         Rolling back to the savepoint on cancellation reverts the timeout and
         clears the aborted-transaction state, so the caller's session stays
-        usable; on success the previous timeout is put back explicitly.
+        usable.
+
+        Two details are load-bearing:
+
+        - The timeout is set with ``set_config('statement_timeout', :ms, true)``
+          rather than ``SET LOCAL``, because ``SET LOCAL`` cannot take a bind
+          parameter; the third argument ``true`` is what makes it
+          transaction-local.
+        - On success the previous value is restored explicitly before the
+          savepoint is released. ``RELEASE SAVEPOINT`` does not revert a
+          transaction-local setting made inside the savepoint, so without that
+          restore the budget would go on bounding every later statement in the
+          caller's transaction.
+
+        ``query`` is the user's search text, used only for the log line.
+
+        Raises:
+            KeywordSearchTimeout: the statement was cancelled (SQLSTATE 57014)
+                and at least ``timeout_ms`` had elapsed on the client clock. A
+                57014 that arrives sooner cannot be this bound firing, so it is
+                re-raised as the original error.
         """
+        started = time.monotonic()
         try:
             with self.session.begin_nested():
                 previous = self.session.execute(
@@ -218,14 +359,41 @@ class BasePgVectorStore:
                 )
                 return rows
         except OperationalError as e:
-            if getattr(e.orig, "sqlstate", None) == _QUERY_CANCELED:
-                logger.warning(
-                    "Keyword search fallback cancelled after %d ms (kb=%s)",
-                    timeout_ms,
-                    self.kb_id,
-                )
-                raise KeywordSearchTimeout(self.kb_id, timeout_ms) from e
-            raise
+            if getattr(e.orig, "sqlstate", None) != _QUERY_CANCELED:
+                raise
+
+            # 57014 is "query canceled" — our statement_timeout, but equally a
+            # pg_cancel_backend from anywhere else. Our own bound cannot fire
+            # before the budget is spent, so a cancellation that arrives inside
+            # it belongs to someone else and must keep its identity rather than
+            # be reported as "exceeded N ms".
+            #
+            # The comparison is exact. The clock starts before begin_nested and
+            # two further round trips, and stops after the error has travelled
+            # back, so client-measured elapsed strictly exceeds the server's own
+            # statement time — a genuine statement_timeout always satisfies
+            # this. A tolerance factor would only widen the window in which a
+            # foreign cancellation gets mislabelled.
+            #
+            # Never match on message text: it is localised by lc_messages.
+            elapsed_ms = (time.monotonic() - started) * 1000
+            if elapsed_ms < timeout_ms:
+                raise
+
+            # The one log line for this event. full_text_search re-raises the
+            # KeywordSearchTimeout past its generic handler and the hybrid leg
+            # logs at debug, so a designed degradation never pages as ERROR and
+            # is counted once.
+            logger.warning(
+                "Keyword search fallback cancelled after %.0f ms of a %d ms budget "
+                "(kb=%s table=%s query_len=%d); no BM25 index for this knowledge base",
+                elapsed_ms,
+                timeout_ms,
+                self.kb_id,
+                self.TABLE,
+                len(query),
+            )
+            raise KeywordSearchTimeout(self.kb_id, timeout_ms) from e
 
     async def vector_search(
         self,
@@ -424,8 +592,14 @@ class BasePgVectorStore:
                 f"Invalid ts_language '{ts_language}'. Must be one of: {sorted(VALID_TS_LANGUAGES)}"
             )
 
+        # corpus_stats is MATERIALIZED on purpose. Inlined (the default for a
+        # CTE referenced once), a multi-term query gets a one-row estimate and
+        # the planner puts this whole-KB aggregate on the inner side of the
+        # per-row Nested Loop, re-running it once per matching row: quadratic,
+        # about 39 s at 5,000 rows versus about 1 s materialized. doc_freqs needs
+        # no hint -- it is read through a scalar subquery and runs once.
         search_query = f"""
-            WITH corpus_stats AS (
+            WITH corpus_stats AS MATERIALIZED (
                 SELECT
                     COUNT(*) AS total_docs,
                     COALESCE(AVG(LENGTH({self.SEARCH_TEXT_COL})), 0) AS avg_doc_len
@@ -488,7 +662,7 @@ class BasePgVectorStore:
 
         timeout_ms = _bm25_fallback_timeout_ms()
         try:
-            rows = self._fetch_with_timeout(search_query, params, timeout_ms)
+            rows = self._fetch_with_timeout(search_query, params, timeout_ms, query=query)
 
             if not rows:
                 return []
@@ -535,6 +709,11 @@ class BasePgVectorStore:
             top_items = scored_items[:top_k]
             return self._resolve_results(top_items) if _resolve else top_items
 
+        except KeywordSearchTimeout:
+            # A bounded, expected degradation, already warned about once in
+            # _fetch_with_timeout. Falling into the handler below would log it
+            # as ERROR on every request an un-indexed KB serves.
+            raise
         except Exception as e:
             logger.error(f"Full-text search failed: {e}")
             raise
@@ -808,9 +987,9 @@ class BasePgVectorStore:
         self,
         query: str,
         top_k: int,
-        filter_metadata: dict | None,
-        item_ids: set[str] | None,
-        source_ids: list[str] | None,
+        filter_metadata: dict | None = None,
+        item_ids: set[str] | None = None,
+        source_ids: list[str] | None = None,
         ts_language: str = "english",
         use_bm25s: bool = True,
     ) -> list[RetrievedItem]:
@@ -839,7 +1018,11 @@ class BasePgVectorStore:
                 source_ids=source_ids,
             )
         except KeywordSearchTimeout:
-            logger.warning(
+            record_retrieval_degradation(KEYWORD_SEARCH_TIMEOUT)
+            # _fetch_with_timeout already warned once, with the budget and the
+            # table; debug here keeps the vector-only answer traceable without
+            # logging one event twice.
+            logger.debug(
                 "Hybrid search on KB %s is returning vector results only: keyword fallback timed out",
                 self.kb_id,
             )

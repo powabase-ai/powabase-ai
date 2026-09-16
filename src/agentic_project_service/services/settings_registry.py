@@ -851,13 +851,12 @@ def _build_registry() -> dict[str, SettingDef]:
             default=True,
             advanced=True,
             description=(
-                "When enabled (default), the BM25 index is rebuilt from the "
-                "database shortly after sources are added, re-indexed or "
-                "removed (changes close together share one rebuild), and once "
-                "when a KB's retrieval method changes to hybrid or full_text. "
-                "Disable to stop these automatic rebuilds and trigger them from "
-                "the KB detail page instead. Either way, a hybrid or full_text "
-                "search on a KB whose index is absent queues one build."
+                "When enabled (default), the platform keeps the BM25 sparse "
+                "index up to date automatically: per-source updates during "
+                "indexing, and a one-shot rebuild when a KB's retrieval method "
+                "changes to hybrid or full_text. Disable for very large KBs "
+                "where the per-source BM25 rebuild dominates indexing time; "
+                "you'll then trigger rebuilds manually from the KB detail page."
             ),
         ),
     ]
@@ -1076,18 +1075,22 @@ def _build_registry() -> dict[str, SettingDef]:
         SettingDef(
             key="BM25_FALLBACK_TIMEOUT_MS",
             category=cat,
-            label="Keyword search fallback timeout (ms)",
+            label="Keyword Search Fallback Timeout (ms)",
             type="int",
             default=10000,
             min=1000,
-            max=120000,
+            max=30000,
             advanced=True,
             description=(
                 "Upper bound for the SQL keyword search used while a knowledge "
                 "base has no BM25 index. On a large knowledge base that query "
                 "can run for minutes; past this limit it is cancelled. A hybrid "
                 "search then returns its vector results alone; a full_text "
-                "search returns 503."
+                "search returns 503. Keep this below the HTTP timeout of "
+                "whatever is calling the search: above it the caller gives up "
+                "while the query keeps running, which is the pile-up this "
+                "bound exists to prevent. Note it bounds the keyword leg only, "
+                "not the whole request."
             ),
         ),
     ]

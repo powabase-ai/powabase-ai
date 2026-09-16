@@ -105,6 +105,65 @@ def test_build_raises_for_unknown_strategy(mock_kb_lookup, mock_iter_items, mock
         build_bm25_for_kb.run("kb-4")
 
 
+def test_build_treats_a_missing_strategy_as_chunk_embed(
+    mock_kb_lookup, mock_iter_items, mock_sparse_store_cls
+):
+    """Deliberately the same default as search_knowledge_base.
+
+    A KB whose indexing_config has no "strategy" key is searched as chunk_embed,
+    so its index must be built from chunks, not refused.
+    """
+    from agentic_project_service.tasks.indexing import build_bm25_for_kb
+
+    mock_kb_lookup.return_value = {"id": "kb-8", "indexing_config": {"chunk_size": 800}}
+    mock_iter_items.return_value = iter([[{"id": "c1", "text": "trail notes"}]])
+
+    result = build_bm25_for_kb.run("kb-8")
+
+    mock_iter_items.assert_called_once_with("kb-8", "chunks", batch_size=10_000)
+    assert result["item_table"] == "chunks"
+
+
+def test_build_rejects_page_index(mock_kb_lookup, mock_iter_items, mock_sparse_store_cls):
+    """page_index is tree_search-only and keeps its text in page_index_* tables.
+
+    It has no BM25 item table, so the build must refuse rather than index the
+    wrong table.
+    """
+    from agentic_project_service.tasks.indexing import build_bm25_for_kb
+
+    mock_kb_lookup.return_value = {
+        "id": "kb-6",
+        "indexing_config": {"strategy": "page_index"},
+    }
+
+    with pytest.raises(ValueError, match="page_index"):
+        build_bm25_for_kb.run("kb-6")
+    mock_iter_items.assert_not_called()
+
+
+def test_build_rejects_doc2json(mock_kb_lookup, mock_iter_items, mock_sparse_store_cls):
+    """doc2json has no sparse-index maintenance, so it must stay on the fallback.
+
+    run_doc2json_indexing never calls SparseIndexStore and the removal block in
+    index_source does not cover doc2json_documents. Letting a build succeed
+    would freeze the index at build time: documents added afterwards would be
+    invisible to keyword search and deleted ones would keep scoring, with
+    bm25_status showing nothing. Until that maintenance exists, a doc2json KB
+    deliberately uses the slow-but-correct tsvector fallback.
+    """
+    from agentic_project_service.tasks.indexing import build_bm25_for_kb
+
+    mock_kb_lookup.return_value = {
+        "id": "kb-7",
+        "indexing_config": {"strategy": "doc2json"},
+    }
+
+    with pytest.raises(ValueError, match="doc2json"):
+        build_bm25_for_kb.run("kb-7")
+    mock_iter_items.assert_not_called()
+
+
 def test_build_with_multiple_batches_accumulates(
     mock_kb_lookup, mock_iter_items, mock_sparse_store_cls
 ):

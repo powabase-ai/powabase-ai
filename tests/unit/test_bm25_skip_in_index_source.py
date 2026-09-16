@@ -31,8 +31,8 @@ def test_all_add_and_save_callsites_are_guarded():
         and not line.lstrip().startswith(("#", '"""', "'''"))
     ]
     assert len(add_callsite_lines) >= 3, (
-        "expected at least 3 add_and_save callsites (chunk_embed, page_index, "
-        f"graph_index); found {len(add_callsite_lines)}"
+        "expected at least 3 add_and_save callsites (full_document, graph_index, "
+        f"and chunks in index_source); found {len(add_callsite_lines)}"
     )
     for line_idx in add_callsite_lines:
         # Walk back up to 10 lines; expect to find the guard
