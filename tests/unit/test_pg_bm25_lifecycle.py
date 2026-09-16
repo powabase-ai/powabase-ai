@@ -1107,7 +1107,11 @@ def test_build_endpoint_ensures_the_pg_index_when_available(
         )
 
     assert resp.status_code == 202
-    assert resp.get_json() == {"task_id": "task-pg", "knowledge_base_id": KB}
+    body = resp.get_json()
+    assert {k: body[k] for k in ("task_id", "knowledge_base_id")} == {
+        "task_id": "task-pg",
+        "knowledge_base_id": KB,
+    }
     mock_ensure.delay.assert_called_once_with(KB)
     mock_bm25s.delay.assert_not_called()
 
@@ -1174,6 +1178,13 @@ def test_creating_a_vector_only_kb_dispatches_nothing(mock_db, mock_ensure, _jwt
     mock_ensure.delay.assert_not_called()
 
 
+# PATCH dispatches only through the gate that no rows would move (covered on
+# its own by the route tests); these pin what happens once it lets it through.
+@patch(
+    "agentic_project_service.routes.knowledge_bases._pg_ensure_cannot_move_rows",
+    new=MagicMock(return_value=True),
+    create=True,
+)
 @patch(
     "agentic_project_service.routes.knowledge_bases._keyword_index_backend",
     new=MagicMock(return_value="pg_search"),
@@ -1199,6 +1210,13 @@ def test_changing_ts_language_dispatches_a_rebuild(
     mock_ensure.delay.assert_called_once_with(KB)
 
 
+# PATCH dispatches only through the gate that no rows would move (covered on
+# its own by the route tests); these pin what happens once it lets it through.
+@patch(
+    "agentic_project_service.routes.knowledge_bases._pg_ensure_cannot_move_rows",
+    new=MagicMock(return_value=True),
+    create=True,
+)
 @patch(
     "agentic_project_service.routes.knowledge_bases._keyword_index_backend",
     new=MagicMock(return_value="pg_search"),
