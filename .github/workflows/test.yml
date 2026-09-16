@@ -83,3 +83,64 @@ jobs:
       # ORM tables itself, so no migration step is needed here.
       - name: Run store tests
         run: uv run --no-sync pytest tests/test_graph_index_store.py tests/test_full_text_search_timeout_live.py -q
+
+  # tests/pg_search exercises the Postgres-native BM25 path for real: the
+  # partitioning and extension migrations, row-level security through the
+  # partitioned parents, and pg_search index builds and queries. It needs a
+  # server with pg_search preloaded (shared_preload_libraries) and vector
+  # available, which the store job's image does not have.
+  #
+  # PG_SEARCH_REQUIRED=1 turns every "pg_search is unavailable" skip into a
+  # failure, and the run step also fails on any skip at all: a job whose only
+  # purpose is this extension must not go green by skipping it.
+  pg_search:
+    name: pytest tests/pg_search (Postgres 15 + pg_search 0.25.9)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: paradedb/paradedb:0.25.9-pg15
+        env:
+          POSTGRES_USER: supabase_admin
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U supabase_admin -d postgres_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://supabase_admin:postgres@localhost:5432/pg_search_test
+      PG_SEARCH_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      # A fresh database from template0, so no extension comes pre-created
+      # from the image's template1; vector first, because pg_search requires it.
+      - name: Create the test database
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U supabase_admin -d postgres_test -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE pg_search_test TEMPLATE template0"
+          psql -h localhost -U supabase_admin -d pg_search_test -v ON_ERROR_STOP=1 \
+            -c "CREATE EXTENSION vector" \
+            -c "CREATE EXTENSION pg_search"
+
+      - name: Run pg_search tests
+        run: |
+          set -o pipefail
+          uv run --no-sync pytest tests/pg_search -q -rs | tee pytest-pg-search.log
+          if grep -Eq "[0-9]+ skipped" pytest-pg-search.log; then
+            echo "::error::tests/pg_search skipped tests; this job must run all of them"
+            exit 1
+          fi
