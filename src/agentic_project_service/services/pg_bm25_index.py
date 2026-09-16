@@ -960,6 +960,24 @@ def is_transient_db_error(exc: BaseException) -> bool:
     return getattr(orig, "sqlstate", None) in _TRANSIENT_SQLSTATES
 
 
+def is_partition_move_race(exc: BaseException) -> bool:
+    """Did a write fail only because it raced a knowledge base's partition move?
+
+    SQLSTATE 23514 from either of the two checks a move can trip: Postgres'
+    own "violates partition constraint" (a row routed to DEFAULT by a statement
+    planned before the ATTACH), or the move's temporary ``bm25_move_<kb>``
+    check on DEFAULT. An ordinary CHECK violation is a real error and is not
+    matched.
+    """
+    orig = getattr(exc, "orig", None)
+    if getattr(orig, "sqlstate", None) != "23514":
+        return False
+    message = str(orig)
+    return "violates partition constraint" in message or (
+        f'violates check constraint "{_DEFAULT_MOVE_CHECK_PREFIX}' in message
+    )
+
+
 def _lock_holders_sql() -> str:
     return (
         "SELECT l.pid, l.mode, l.granted, pg_blocking_pids(l.pid) AS blocked_by, "

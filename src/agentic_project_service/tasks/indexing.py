@@ -458,8 +458,10 @@ def _handle_storage_error(
     provider_keys: dict[str, str] | None,
     idempotency_action: str | None = None,
     idempotency_parts: list | None = None,
+    cause: str = "persistent storage error",
 ) -> None:
-    """Transient StorageError recovery, folded into the single attempts bound.
+    """Transient-error recovery (StorageError, or a write that raced a
+    partition move), folded into the single attempts bound.
 
     Under the bound: reset to 'pending' and re-dispatch (the re-dispatch
     re-claims, incrementing attempts). At/over the bound: mark 'failed'. No
@@ -499,7 +501,7 @@ def _handle_storage_error(
         _fenced_mark_failed(
             indexed_source_id,
             task_id,
-            f"Indexing failed after {attempts} attempts (persistent storage error).",
+            f"Indexing failed after {attempts} attempts ({cause}).",
         )
 
 
@@ -2095,7 +2097,29 @@ def index_source(
         )
         return {"status": "retrying_or_failed", "source_id": source_id}
 
-    except Exception:
+    except Exception as exc:
+        if claimed and indexed_source_id and pg_bm25_index.is_partition_move_race(exc):
+            # This KB's rows were being moved into its own partition while this
+            # run wrote them (SQLSTATE 23514 from the partition constraint or
+            # the move's temporary check). Nothing is wrong with the source:
+            # re-queue it within the attempts bound instead of failing it.
+            logger.warning(
+                "Indexing of source %s raced a partition move of KB %s; re-queueing: %s",
+                source_id,
+                knowledge_base_id,
+                str(exc).splitlines()[0],
+            )
+            _handle_storage_error(
+                knowledge_base_id=knowledge_base_id,
+                source_id=source_id,
+                indexed_source_id=indexed_source_id,
+                task_id=task_id,
+                provider_keys=provider_keys,
+                idempotency_action=idempotency_action,
+                idempotency_parts=idempotency_parts,
+                cause="writes kept racing a partition move",
+            )
+            return {"status": "retrying_or_failed", "source_id": source_id}
         logger.error(f"Indexing failed for source {source_id}", exc_info=True)
         db.session.rollback()  # Discard partial indexing data
         if indexed_source_id:
