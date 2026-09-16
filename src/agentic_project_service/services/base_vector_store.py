@@ -209,8 +209,15 @@ def record_retrieval_degradation(reason: str) -> None:
     Deliberately appends without checking for duplicates. Retrieval can run in
     a ThreadPoolExecutor over a copied context, so several worker threads share
     one ``g`` and neither the getattr/setattr pair nor a membership test and an
-    append are atomic. Reads deduplicate instead, which makes a lost update or
-    a duplicated append unable to change what a caller sees.
+    append are atomic. Reads deduplicate instead, so a duplicated append cannot
+    change what a caller sees.
+
+    The first write is still check-then-act: two threads can each find no list,
+    build one, and have the later ``setattr`` drop the earlier thread's list and
+    its reason with it. Harmless while ``KEYWORD_SEARCH_TIMEOUT`` is the only
+    reason — the surviving list holds the same string — but a second reason
+    would make the loss observable. Give this a lock or a context-local
+    structure before adding one.
     """
     if not has_request_context():
         return
