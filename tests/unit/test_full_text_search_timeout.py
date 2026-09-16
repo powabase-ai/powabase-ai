@@ -134,12 +134,28 @@ def test_query_canceled_well_inside_the_budget_propagates(_ms):
 
 
 @patch.object(bvs, "_bm25_fallback_timeout_ms", return_value=4321)
-def test_query_canceled_just_under_the_budget_is_a_timeout(_ms):
-    """Postgres can cancel a hair early; the tolerance must cover that."""
+def test_query_canceled_just_under_the_budget_propagates(_ms):
+    """The comparison is exact, with no tolerance widening the blind spot.
+
+    The client clock starts before begin_nested and two extra round trips, so
+    measured elapsed strictly exceeds the server's statement time: a genuine
+    statement_timeout can never land below the budget.
+    """
     err = OperationalError("SELECT ...", {}, _Canceled())
     session, _ = _spy_session(search_error=err)
 
-    with _elapsed(4.1), pytest.raises(bvs.KeywordSearchTimeout):
+    with _elapsed(4.320), pytest.raises(OperationalError) as exc_info:
+        _run(session)
+
+    assert not isinstance(exc_info.value, bvs.KeywordSearchTimeout)
+
+
+@patch.object(bvs, "_bm25_fallback_timeout_ms", return_value=4321)
+def test_query_canceled_exactly_at_the_budget_is_a_timeout(_ms):
+    err = OperationalError("SELECT ...", {}, _Canceled())
+    session, _ = _spy_session(search_error=err)
+
+    with _elapsed(4.321), pytest.raises(bvs.KeywordSearchTimeout):
         _run(session)
 
 

@@ -105,11 +105,6 @@ def ensure_embedding_index(session: Session, schema: str, dims: int) -> None:
 
 _QUERY_CANCELED = "57014"
 
-# Fraction of the budget that must have elapsed before a cancellation can be
-# ours. Postgres measures the timeout from a slightly later instant than the
-# client does, so an exact comparison would misfile genuine timeouts.
-_TIMEOUT_ELAPSED_TOLERANCE = 0.9
-
 
 class KeywordSearchTimeout(RuntimeError):
     """The SQL keyword-search fallback outran the BM25_FALLBACK_TIMEOUT_MS setting.
@@ -316,13 +311,20 @@ class BasePgVectorStore:
 
             # 57014 is "query canceled" — our statement_timeout, but equally a
             # pg_cancel_backend from anywhere else. Our own bound cannot fire
-            # before the budget is spent, so a cancellation that arrives well
-            # inside it belongs to someone else and must keep its identity
-            # rather than be reported as "exceeded N ms". Postgres can cancel a
-            # hair early, hence the tolerance. Never match on message text: it
-            # is localised by the server's lc_messages.
+            # before the budget is spent, so a cancellation that arrives inside
+            # it belongs to someone else and must keep its identity rather than
+            # be reported as "exceeded N ms".
+            #
+            # The comparison is exact. The clock starts before begin_nested and
+            # two further round trips, and stops after the error has travelled
+            # back, so client-measured elapsed strictly exceeds the server's own
+            # statement time — a genuine statement_timeout always satisfies
+            # this. A tolerance factor would only widen the window in which a
+            # foreign cancellation gets mislabelled.
+            #
+            # Never match on message text: it is localised by lc_messages.
             elapsed_ms = (time.monotonic() - started) * 1000
-            if elapsed_ms < timeout_ms * _TIMEOUT_ELAPSED_TOLERANCE:
+            if elapsed_ms < timeout_ms:
                 raise
 
             # The one log line for this event. full_text_search re-raises the
