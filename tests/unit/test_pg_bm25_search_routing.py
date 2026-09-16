@@ -354,3 +354,34 @@ def test_hybrid_keyword_leg_uses_the_pg_path_when_available():
             )
         )
     assert calls == ["pg"]
+
+
+def test_a_failing_pg_query_warns_once_with_its_cause_and_no_traceback(caplog, monkeypatch):
+    """The fallback runs on every search while the pg path keeps failing, so a
+    traceback per search would flood the log. One WARNING names the cause; the
+    repeats go to DEBUG."""
+    monkeypatch.setattr(bvs, "_WARNED_TIMEOUT_OVERRIDES", set())
+    store = _ChunkStore(db_session=_spy_session(), knowledge_base_id=KB)
+
+    async def pg(*a, **k):
+        raise RuntimeError("`chunks_kb_x` does not contain a `USING bm25` index")
+
+    async def fallback(*a, **k):
+        return []
+
+    store.pg_bm25_search = pg
+    store.full_text_search = fallback
+    with (
+        caplog.at_level("DEBUG", logger=bvs.logger.name),
+        patch.object(bvs.pg_bm25_index, "pg_search_installed", return_value=True),
+        patch.object(bvs.pg_bm25_index, "bm25_index_ready", return_value=True),
+    ):
+        for _ in range(3):
+            asyncio.run(store.bm25s_search("q", top_k=5))
+
+    records = [r for r in caplog.records if "pg_search keyword search failed" in r.getMessage()]
+    warnings = [r for r in records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "does not contain a `USING bm25` index" in warnings[0].getMessage()
+    assert warnings[0].exc_info is None
+    assert len(records) == 3
