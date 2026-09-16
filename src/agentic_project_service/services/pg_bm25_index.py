@@ -1312,9 +1312,17 @@ def _release_advisory_lock(conn, relation: str) -> None:
 
 
 def _prepare_partition(conn, kb_id: str, item_table: str) -> None:
-    """Create the clone, its CHECK constraint and its foreign keys. Idempotent."""
+    """Create the clone, its CHECK constraint and its foreign keys. Idempotent.
+
+    Bounded by ``MOVE_LOCK_TIMEOUT_MS`` from its first statement: adding a
+    foreign key takes SHARE ROW EXCLUSIVE on the table it references, which
+    waits for -- and then blocks -- every write there (``indexed_sources`` is
+    written by every indexing run), all while this caller holds the item
+    table's build lock. A timeout raises SQLSTATE 55P03, which is retried.
+    """
     partition = partition_name(kb_id, item_table)
     default = default_partition_name(item_table)
+    conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
     conn.execute(text(partition_create_ddl(kb_id, item_table)))
     if not _check_constraint_exists(conn, partition):
         conn.execute(text(partition_check_ddl(kb_id, item_table)))

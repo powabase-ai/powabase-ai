@@ -282,8 +282,14 @@ def test_ensure_moves_every_row_and_attaches_in_one_transaction():
     assert out["rows_moved"] == 14_000
     assert out["writes_blocked_seconds"] >= 0
     insert_sql, delete_sql = pgb.move_rows_sql(KB, "chunks")
-    timeout = next(i for i, s in enumerate(conn.statements) if "SET LOCAL lock_timeout" in s)
     parent_lock = conn.statements.index(pgb.partition_lock_parent_ddl("chunks"))
+    # The move's own timeout: the last one set before the parent lock (preparing
+    # the clone sets one of its own, in the transaction before).
+    timeout = max(
+        i
+        for i, s in enumerate(conn.statements)
+        if "SET LOCAL lock_timeout" in s and i < parent_lock
+    )
     default_lock = conn.statements.index(pgb.partition_lock_default_ddl("chunks"))
     insert_at = conn.statements.index(insert_sql)
     delete_at = conn.statements.index(delete_sql)
