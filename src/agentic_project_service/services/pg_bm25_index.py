@@ -93,6 +93,18 @@ MOVE_LOCK_TIMEOUT_MS = 5_000
 # close a cycle; a transaction that only starts waiting after the request starts
 # its deadlock check after the queued try has already timed out. A move that
 # cannot get the lock in time rolls back (SQLSTATE 55P03) and its task retries.
+#
+# One cycle is left open, and has been reproduced. A session already blocked on
+# the move (a write through the parent) runs its one-time deadlock check
+# ``deadlock_timeout`` after it began waiting. If a holder of DEFAULT starts
+# waiting on that session -- for a row it has locked, say -- after the holder
+# check but within the queued try's window, the check finds move -> holder ->
+# session -> move, and Postgres aborts one of the three with SQLSTATE 40P01.
+# No row is lost: the aborted transaction rolls back whole, a move that loses
+# rolls back and retries, ``index_source`` requeues, and an API writer receives
+# the error. Closing it precisely would mean skipping the queued try whenever
+# any session waits on the move, and under steady writes one always does --
+# for the whole copy of a large move -- so large moves would starve.
 DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS = 2.0
 DEFAULT_EXCLUSIVE_QUEUED_TRY_MS = 200
 _EXCLUSIVE_LOCK_QUEUED_TRY_AFTER_SECONDS = 0.1
@@ -1407,6 +1419,16 @@ def _queued_lock_try(conn, item_table: str, lock_timeout_ms: int) -> bool:
 
     The timeout is set in a savepoint and put back afterwards, so the caller's
     transaction keeps its own. Returns whether the lock was taken.
+
+    Not deadlock-free. A session blocked on the caller's parent lock can have
+    its one-time deadlock check fire while this request waits, and a holder of
+    DEFAULT that began waiting on that session after ``_default_holder_is_waiting``
+    looked closes a three-party cycle within this window: Postgres aborts one
+    party with SQLSTATE 40P01. No row is lost -- ``index_source`` requeues, an
+    API writer receives the error, a move that loses rolls back and retries.
+    It is left open because the precise guard, no queued try while anything
+    waits on the move, would starve large moves under steady writes (see
+    ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS``).
     """
     previous = conn.execute(text("SELECT current_setting('lock_timeout')")).scalar()
     conn.execute(text("SAVEPOINT bm25_default_lock"))
