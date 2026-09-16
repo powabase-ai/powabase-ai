@@ -309,27 +309,21 @@ def _read_existing_retrieval_config(kb_id: str) -> dict:
 
 
 def _count_items_for_kb_bm25(kb_id: str, item_table: str) -> int:
-    """COUNT(*) of items in the right table for this KB, used for stale detection."""
-    if item_table == "chunks":
-        sql = (
-            f'SELECT COUNT(*) FROM "{AI_SCHEMA}".chunks c '
-            f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = c.indexed_source_id '
-            f"WHERE i.knowledge_base_id = :kb"
-        )
-    elif item_table == "full_documents":
-        sql = (
-            f'SELECT COUNT(*) FROM "{AI_SCHEMA}".full_documents d '
-            f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = d.indexed_source_id '
-            f"WHERE i.knowledge_base_id = :kb"
-        )
-    elif item_table == "graph_index_nodes":
-        sql = (
-            f'SELECT COUNT(*) FROM "{AI_SCHEMA}".graph_index_nodes n '
-            f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = n.indexed_source_id '
-            f"WHERE i.knowledge_base_id = :kb"
-        )
-    else:
+    """COUNT(*) of items in the right table for this KB, used for stale detection.
+
+    Filters on the item table's own ``knowledge_base_id`` as well as through
+    ``indexed_sources``: that column is the partition key, so the count scans
+    only the KB's partition (or DEFAULT), not every KB's.
+    """
+    aliases = {"chunks": "c", "full_documents": "d", "graph_index_nodes": "n"}
+    alias = aliases.get(item_table)
+    if alias is None:
         return 0
+    sql = (
+        f'SELECT COUNT(*) FROM "{AI_SCHEMA}".{item_table} {alias} '
+        f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = {alias}.indexed_source_id '
+        f"WHERE {alias}.knowledge_base_id = :kb AND i.knowledge_base_id = :kb"
+    )
     row = db.session.execute(text(sql), {"kb": kb_id}).fetchone()
     return int(row[0]) if row else 0
 
