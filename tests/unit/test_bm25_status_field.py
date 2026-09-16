@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agentic_project_service.routes import knowledge_bases as kb_route
 
 _FAKE_JWT = "fake.jwt.token"
@@ -120,6 +122,30 @@ def test_compute_status_returns_none_when_auto_indexing_on(mock_setting, mock_st
         "indexing_config": {"strategy": "chunk_embed"},
     }
     assert _compute_bm25_status(kb) is None
+
+
+@pytest.mark.parametrize("strategy", ["page_index", "doc2json"])
+@patch("agentic_project_service.routes.knowledge_bases.SparseIndexStore")
+@patch("agentic_project_service.routes.knowledge_bases.get_setting")
+def test_compute_status_returns_none_for_strategies_without_an_item_table(
+    mock_setting, mock_store_cls, strategy
+):
+    """Strategies absent from STRATEGY_TO_BM25_ITEM_TABLE have no status to report.
+
+    page_index keeps its text in page_index_*; doc2json has no sparse-index
+    maintenance, so it deliberately stays on the tsvector fallback. Neither can
+    have an index, so the field must be omitted rather than read as "absent".
+    """
+    from agentic_project_service.routes.knowledge_bases import _compute_bm25_status
+
+    mock_setting.return_value = False  # manual mode: past the auto-indexing short-circuit
+    kb = {
+        "id": "kb",
+        "retrieval_config": {"method": "hybrid"},
+        "indexing_config": {"strategy": strategy},
+    }
+    assert _compute_bm25_status(kb) is None
+    mock_store_cls.assert_not_called()
 
 
 @patch("agentic_project_service.routes.knowledge_bases._count_items_for_kb_bm25")

@@ -314,12 +314,6 @@ def _count_items_for_kb_bm25(kb_id: str, item_table: str) -> int:
             f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = n.indexed_source_id '
             f"WHERE i.knowledge_base_id = :kb"
         )
-    elif item_table == "doc2json_documents":
-        sql = (
-            f'SELECT COUNT(*) FROM "{AI_SCHEMA}".doc2json_documents d '
-            f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = d.indexed_source_id '
-            f"WHERE i.knowledge_base_id = :kb"
-        )
     else:
         return 0
     row = db.session.execute(text(sql), {"kb": kb_id}).fetchone()
