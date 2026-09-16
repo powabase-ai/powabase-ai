@@ -1714,6 +1714,21 @@ def build_bm25_endpoint(kb_id: str):
             }
         ), 400
 
+    # Refuse up front what build_bm25_for_kb would refuse after a 202: a
+    # strategy with no BM25 item table. Same map and same chunk_embed default
+    # as the task, so the two cannot disagree.
+    strategy = (kb.get("indexing_config") or {}).get("strategy", "chunk_embed")
+    if strategy not in _STRATEGY_TO_ITEM_TABLE:
+        return jsonify(
+            {
+                "error": (
+                    f"Indexing strategy '{strategy}' has no BM25 index to build; "
+                    "keyword search on this knowledge base always uses the SQL "
+                    "fallback. Use vector_search instead."
+                )
+            }
+        ), 400
+
     try:
         t = build_bm25_for_kb.delay(kb_id)
     except Exception:

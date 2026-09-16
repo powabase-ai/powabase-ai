@@ -109,3 +109,44 @@ def test_build_bm25_returns_503_on_broker_failure(mock_task, mock_fetch, _jwt):
         resp = client.post(f"/api/knowledge-bases/{kb_id}/build-bm25", headers=_auth_headers())
     assert resp.status_code == 503
     assert "Failed to start" in resp.get_json()["error"]
+
+
+@_FAKE_JWT
+@patch("agentic_project_service.routes.knowledge_bases._fetch_kb_or_404")
+@patch("agentic_project_service.routes.knowledge_bases.build_bm25_for_kb")
+def test_build_bm25_rejects_a_strategy_with_no_item_table(mock_task, mock_fetch, _jwt):
+    """Answering 202 here was a false promise: the task then failed once.
+
+    doc2json has no BM25 item table, so refuse it up front, from the same map
+    the task reads.
+    """
+    kb_id = str(uuid.uuid4())
+    mock_fetch.return_value = {
+        "id": kb_id,
+        "retrieval_config": {"method": "hybrid"},
+        "indexing_config": {"strategy": "doc2json"},
+    }
+
+    with _make_test_app().test_client() as client:
+        resp = client.post(f"/api/knowledge-bases/{kb_id}/build-bm25", headers=_auth_headers())
+    assert resp.status_code == 400
+    assert "doc2json" in resp.get_json()["error"]
+    mock_task.delay.assert_not_called()
+
+
+@_FAKE_JWT
+@patch("agentic_project_service.routes.knowledge_bases._fetch_kb_or_404")
+@patch("agentic_project_service.routes.knowledge_bases.build_bm25_for_kb")
+def test_build_bm25_treats_a_missing_strategy_as_chunk_embed(mock_task, mock_fetch, _jwt):
+    kb_id = str(uuid.uuid4())
+    mock_fetch.return_value = {
+        "id": kb_id,
+        "retrieval_config": {"method": "hybrid"},
+        "indexing_config": {"chunk_size": 800},
+    }
+    mock_task.delay.return_value = MagicMock(id="task-default")
+
+    with _make_test_app().test_client() as client:
+        resp = client.post(f"/api/knowledge-bases/{kb_id}/build-bm25", headers=_auth_headers())
+    assert resp.status_code == 202
+    mock_task.delay.assert_called_once_with(kb_id)

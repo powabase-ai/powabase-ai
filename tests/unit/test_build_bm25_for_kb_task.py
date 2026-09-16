@@ -105,6 +105,25 @@ def test_build_raises_for_unknown_strategy(mock_kb_lookup, mock_iter_items, mock
         build_bm25_for_kb.run("kb-4")
 
 
+def test_build_treats_a_missing_strategy_as_chunk_embed(
+    mock_kb_lookup, mock_iter_items, mock_sparse_store_cls
+):
+    """Deliberately the same default as search_knowledge_base.
+
+    A KB whose indexing_config has no "strategy" key is searched as chunk_embed,
+    so its index must be built from chunks, not refused.
+    """
+    from agentic_project_service.tasks.indexing import build_bm25_for_kb
+
+    mock_kb_lookup.return_value = {"id": "kb-8", "indexing_config": {"chunk_size": 800}}
+    mock_iter_items.return_value = iter([[{"id": "c1", "text": "trail notes"}]])
+
+    result = build_bm25_for_kb.run("kb-8")
+
+    mock_iter_items.assert_called_once_with("kb-8", "chunks", batch_size=10_000)
+    assert result["item_table"] == "chunks"
+
+
 def test_build_rejects_page_index(mock_kb_lookup, mock_iter_items, mock_sparse_store_cls):
     """page_index is tree_search-only and keeps its text in page_index_* tables.
 
