@@ -23,8 +23,6 @@ from tests.pg_search.test_partition_migration import (
     skip_unless_required,
 )
 
-PROBE_ROLE = "bm25_ext_probe"
-
 
 @pytest.fixture(scope="module")
 def revision():
@@ -117,27 +115,26 @@ def test_upgrade_is_a_logged_no_op_where_the_extension_is_not_available(
 def test_a_failed_create_is_logged_as_an_error_and_leaves_the_transaction_usable(
     revision, scratch_engine, monkeypatch, caplog
 ):
-    with scratch_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(
-            text(
-                f"DO $$ BEGIN CREATE ROLE {PROBE_ROLE} NOLOGIN; "
-                "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
-            )
-        )
+    """The "available but creation fails" branch, on any server.
 
+    The failure is injected by a read-only transaction rather than by an
+    unprivileged role: a server that lets ordinary roles create privileged
+    extensions (supautils does, for pg_search) would otherwise create it and
+    leave this branch untested. The availability probe is a plain SELECT, so
+    only the CREATE fails, exactly as a missing preload or privilege does.
+    """
     with caplog.at_level(logging.INFO, logger="alembic.runtime.migration"):
         with scratch_engine.begin() as conn:
-            # pg_search is not a trusted extension: a role without superuser
-            # cannot create it, which is exactly the "available but creation
-            # fails" case a restricted bootstrap role hits.
-            conn.execute(text(f"SET LOCAL ROLE {PROBE_ROLE}"))
+            conn.execute(text("SET TRANSACTION READ ONLY"))
             _upgrade(revision, conn, monkeypatch)
             # The next revision runs in this same transaction.
             assert conn.execute(text("SELECT 1")).scalar() == 1
 
     assert "pg_search" not in _extensions(scratch_engine)
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert any("pg_search" in m and "permission denied" in m for m in errors), errors
+    assert any(
+        "pg_search" in m and "provides it" in m and "read-only transaction" in m for m in errors
+    ), errors
 
 
 # ---------------------------------------------------------------------------
@@ -158,28 +155,22 @@ def test_startup_hook_creates_the_extension_and_is_idempotent(scratch_engine, ca
 
 
 def test_startup_hook_reports_a_failure_as_an_error_and_never_raises(scratch_engine, caplog):
+    """Creation failure injected server-independently: every connection of this
+    engine opens read-only transactions, so the probes succeed and only the
+    CREATE fails (see the revision test above for why not a restricted role)."""
     from agentic_project_service._pg_search_extension import ensure_pg_search_extension
 
-    with scratch_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(
-            text(
-                f"DO $$ BEGIN CREATE ROLE {PROBE_ROLE} NOLOGIN; "
-                "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
-            )
-        )
-        conn.execute(
-            text(f'GRANT CONNECT ON DATABASE "{scratch_engine.url.database}" TO {PROBE_ROLE}')
-        )
-
-    # Every connection of this engine runs as the unprivileged role.
-    restricted = create_engine(
-        scratch_engine.url, connect_args={"options": f"-c role={PROBE_ROLE}"}
+    read_only = create_engine(
+        scratch_engine.url, connect_args={"options": "-c default_transaction_read_only=on"}
     )
+    try:
+        with caplog.at_level(logging.INFO):
+            assert ensure_pg_search_extension(read_only) == "failed"
+    finally:
+        read_only.dispose()
 
-    with caplog.at_level(logging.INFO):
-        assert ensure_pg_search_extension(restricted) == "failed"
-
-    restricted.dispose()
     assert "pg_search" not in _extensions(scratch_engine)
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert any("pg_search" in m and "permission denied" in m for m in errors), errors
+    assert any(
+        "pg_search" in m and "provides it" in m and "read-only transaction" in m for m in errors
+    ), errors
