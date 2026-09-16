@@ -19,6 +19,7 @@ import uuid
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.pool import NullPool
 
 from agentic_project_service.services import pg_bm25_index as pgb
 from tests.pg_search import test_pg_bm25_live as live
@@ -472,6 +473,103 @@ def test_a_queued_try_is_never_made_while_a_holder_of_default_waits_for_a_lock(e
         waiter.join(timeout=10)
         holder.rollback()
     assert waiting is True
+
+
+def test_a_holder_of_default_waiting_on_a_row_lock_counts_as_waiting(engine, session):
+    """A row lock is waited for as a transaction id, a lock with no database:
+    the database filter must not hide it."""
+    with engine.connect() as holder, engine.connect() as blocker, engine.connect() as probe:
+        blocker.execute(
+            text(f"UPDATE {SCHEMA}.chunks_default SET text = text WHERE knowledge_base_id = :kb"),
+            {"kb": KB_C},
+        )
+        holder.execute(text(f"SELECT count(*) FROM {SCHEMA}.chunks_default")).scalar()
+        waiter = threading.Thread(
+            target=lambda: holder.execute(
+                text(
+                    f"UPDATE {SCHEMA}.chunks_default SET text = text WHERE knowledge_base_id = :kb"
+                ),
+                {"kb": KB_C},
+            ),
+            daemon=True,
+        )
+        waiter.start()
+        deadline = time.monotonic() + 10
+        waiting = False
+        while time.monotonic() < deadline and not waiting:
+            waiting = pgb._default_holder_is_waiting(probe, "chunks")
+            probe.rollback()
+            time.sleep(0.02)
+        blocker.rollback()
+        waiter.join(timeout=10)
+        holder.rollback()
+    assert waiting is True
+
+
+def test_a_waiting_holder_of_a_same_oid_table_in_another_database_does_not_count(engine):
+    """``pg_locks`` spans the cluster, and a database copied from a template has
+    the template's relation OIDs. A session in the copy that holds its own
+    ``chunks_default`` and waits for a lock is no reason to skip the queued try
+    in the original: nothing there can be waiting on this session."""
+    suffix = uuid.uuid4().hex[:8]
+    original, twin = f"bm25_oid_{suffix}", f"bm25_oid_twin_{suffix}"
+    admin = engine.execution_options(isolation_level="AUTOCOMMIT")
+
+    def _engine_for(name):
+        from sqlalchemy import create_engine
+
+        return create_engine(engine.url.set(database=name), poolclass=NullPool)
+
+    with admin.connect() as conn:
+        conn.execute(text(f"CREATE DATABASE {original} TEMPLATE template0"))
+    try:
+        seeded = _engine_for(original)
+        with seeded.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text(f"CREATE SCHEMA {SCHEMA}"))
+            conn.execute(text(f"CREATE TABLE {SCHEMA}.chunks_default (id int)"))
+            conn.execute(text(f"CREATE TABLE {SCHEMA}.knowledge_bases (id int)"))
+            conn.execute(text(f"INSERT INTO {SCHEMA}.knowledge_bases VALUES (1)"))
+        seeded.dispose()
+        with admin.connect() as conn:
+            conn.execute(text(f"CREATE DATABASE {twin} TEMPLATE {original}"))
+        copied = _engine_for(twin)
+        seeded = _engine_for(original)
+        oid_sql = text(f"SELECT to_regclass('{SCHEMA}.chunks_default')::oid")
+        with seeded.connect() as a, copied.connect() as b:
+            assert a.execute(oid_sql).scalar() == b.execute(oid_sql).scalar()
+        with (
+            copied.connect() as holder,
+            copied.connect() as blocker,
+            copied.connect() as twin_probe,
+            seeded.connect() as probe,
+        ):
+            # Waiting on a row lock -- a transaction id, which has no database --
+            # so only the DEFAULT lock's own database tells the two apart.
+            update = text(f"UPDATE {SCHEMA}.knowledge_bases SET id = id")
+            blocker.execute(update)
+            holder.execute(text(f"SELECT count(*) FROM {SCHEMA}.chunks_default")).scalar()
+            waiter = threading.Thread(target=lambda: holder.execute(update), daemon=True)
+            waiter.start()
+            deadline = time.monotonic() + 10
+            twin_waiting = False
+            while time.monotonic() < deadline and not twin_waiting:
+                twin_waiting = pgb._default_holder_is_waiting(twin_probe, "chunks")
+                twin_probe.rollback()
+                time.sleep(0.02)
+            seen_from_original = pgb._default_holder_is_waiting(probe, "chunks")
+            probe.rollback()
+            blocker.rollback()
+            waiter.join(timeout=10)
+            holder.rollback()
+        copied.dispose()
+        seeded.dispose()
+    finally:
+        with admin.connect() as conn:
+            conn.execute(text(f"DROP DATABASE IF EXISTS {twin} WITH (FORCE)"))
+            conn.execute(text(f"DROP DATABASE IF EXISTS {original} WITH (FORCE)"))
+
+    assert twin_waiting is True
+    assert seen_from_original is False
 
 
 def test_the_queued_try_is_skipped_when_it_would_land_on_a_waiting_transactions_deadlock_check(

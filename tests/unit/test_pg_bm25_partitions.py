@@ -324,3 +324,35 @@ def test_every_bm25_item_table_is_partitioned():
     """A bm25 index needs a relation per knowledge base; ensure_bm25_index no
     longer has a "not partitionable" branch to fall back on."""
     assert pgb.BM25_ITEM_TABLES <= pgb.PARTITIONED_ITEM_TABLES
+
+
+class _SqlRecorder:
+    def __init__(self):
+        self.sql: list[str] = []
+
+    def execute(self, statement, params=None):
+        from unittest.mock import MagicMock
+
+        self.sql.append(" ".join(getattr(statement, "text", str(statement)).split()))
+        result = MagicMock()
+        result.scalar.return_value = False
+        return result
+
+
+def test_the_waiting_holder_check_only_counts_locks_in_this_database():
+    """``pg_locks`` covers the whole cluster, and relation OIDs are only unique
+    within one database: a database copied from a template shares its OIDs.
+    So the DEFAULT lock is matched as a relation lock of *this* database, and
+    the waiting row, found through the same backend, is either a lock with no
+    database (a transaction id, say) or one of this database or a shared
+    catalog -- never another database's relation that happens to share the OID.
+    """
+    conn = _SqlRecorder()
+
+    assert pgb._default_holder_is_waiting(conn, "chunks") is False
+
+    (sql,) = conn.sql
+    this_database = "(SELECT oid FROM pg_database WHERE datname = current_database())"
+    assert "held.locktype = 'relation'" in sql
+    assert f"held.database = {this_database}" in sql
+    assert f"waiting.database IS NULL OR waiting.database IN (0, {this_database})" in sql

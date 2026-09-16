@@ -1252,13 +1252,25 @@ def _default_holder_is_waiting(conn, item_table: str) -> bool:
 
     Such a session may be waiting -- directly or through others -- on the
     caller, and then a queued request for DEFAULT would close a lock cycle.
+
+    ``pg_locks`` covers the whole cluster, and a relation OID is only unique
+    within one database (a database copied from a template keeps the
+    template's), so the DEFAULT lock must be a relation lock of this database.
+    The waiting lock belongs to the same backend; it is matched on the database
+    too where it has one -- this database, or 0 for a shared catalog -- while a
+    lock with no database (a transaction id, a virtual transaction id) is
+    matched by the backend alone.
     """
+    this_database = "(SELECT oid FROM pg_database WHERE datname = current_database())"
     return bool(
         conn.execute(
             text(
                 "SELECT EXISTS (SELECT 1 FROM pg_locks held "
                 "JOIN pg_locks waiting ON waiting.pid = held.pid AND NOT waiting.granted "
-                "WHERE held.relation = to_regclass(:default) AND held.granted "
+                f"AND (waiting.database IS NULL OR waiting.database IN (0, {this_database})) "
+                "WHERE held.locktype = 'relation' "
+                f"AND held.database = {this_database} "
+                "AND held.relation = to_regclass(:default) AND held.granted "
                 "AND held.pid <> pg_backend_pid())"
             ),
             {"default": _qualified(default_partition_name(item_table))},
