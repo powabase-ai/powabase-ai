@@ -105,12 +105,18 @@ _QUERY_CANCELED = "57014"
 
 
 class KeywordSearchTimeout(RuntimeError):
-    """The SQL keyword-search fallback exceeded BM25_FALLBACK_TIMEOUT_MS."""
+    """The SQL keyword-search fallback exceeded BM25_FALLBACK_TIMEOUT_MS.
+
+    Nothing builds an index in response: the message names the two remedies a
+    caller actually has, so a client cannot read it as "retry in a moment".
+    """
 
     def __init__(self, knowledge_base_id: str, timeout_ms: int):
         super().__init__(
             f"Keyword search on knowledge base {knowledge_base_id} exceeded "
-            f"{timeout_ms} ms (no BM25 index; one is being built)"
+            f"{timeout_ms} ms because the knowledge base has no BM25 index. "
+            f"Build one with POST /api/knowledge-bases/{knowledge_base_id}/build-bm25, "
+            f"or switch the knowledge base's retrieval method to vector_search."
         )
         self.knowledge_base_id = knowledge_base_id
         self.timeout_ms = timeout_ms

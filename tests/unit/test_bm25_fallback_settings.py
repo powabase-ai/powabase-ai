@@ -1,7 +1,6 @@
-"""BM25 fallback timeout setting, rebuild debounce config, auto-indexing wording."""
+"""BM25 fallback timeout setting definition and its range validation."""
 
 from agentic_project_service.services.settings_registry import SETTINGS_REGISTRY
-from agentic_project_service.services.sparse_retrieval import config
 
 
 def test_bm25_fallback_timeout_setting():
@@ -12,14 +11,3 @@ def test_bm25_fallback_timeout_setting():
     assert d.min == 1000
     assert d.max == 120000
     assert d.category == "knowledge-retrieval"
-
-
-def test_rebuild_debounce_default():
-    assert config.BM25_REBUILD_DEBOUNCE_SECONDS == 120
-
-
-def test_auto_indexing_description_matches_coalesced_rebuilds():
-    text = SETTINGS_REGISTRY.get("BM25_AUTO_INDEXING").description.lower()
-    assert "rebuilt" in text
-    assert "removed" in text
-    assert "absent" in text

@@ -20,6 +20,3 @@ USE_LLM_ENRICHMENT_DEFAULT = os.environ.get("USE_LLM_ENRICHMENT", "false").lower
 
 # Message truncation (avoid noise from very long messages)
 MAX_MESSAGE_CHARS = int(os.environ.get("SPARSE_MAX_MESSAGE_CHARS", "500"))
-
-# Rebuild coalescing: changes to a KB within this window share one rebuild
-BM25_REBUILD_DEBOUNCE_SECONDS = int(os.environ.get("BM25_REBUILD_DEBOUNCE_SECONDS", "120"))

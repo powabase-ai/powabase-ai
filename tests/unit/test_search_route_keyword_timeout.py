@@ -31,4 +31,8 @@ def test_keyword_timeout_is_503(mock_search, _db, _jwt):
     body = resp.get_json()
     assert body["code"] == "keyword_search_timeout"
     assert body["timeout_ms"] == 10000
-    assert "BM25 index" in body["error"]
+    # Nothing self-heals here, so the body must name the two real remedies
+    # rather than promise a build that no code path queues.
+    assert "build-bm25" in body["error"]
+    assert "vector_search" in body["error"]
+    assert "queued" not in body["error"]
