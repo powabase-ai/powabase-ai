@@ -2497,7 +2497,9 @@ def reenrich_graph_references(
         }
 
 
-@celery_app.task(bind=True, max_retries=2, default_retry_delay=300)
+# No max_retries/default_retry_delay: this task never calls self.retry, so
+# they only suggested a retry policy that does not exist.
+@celery_app.task(bind=True)
 @billing.no_billing_context
 def build_bm25_for_kb(self, kb_id: str) -> dict:
     """One-shot BM25 rebuild for a KB.
@@ -2544,9 +2546,21 @@ def build_bm25_for_kb(self, kb_id: str) -> dict:
     return {"item_table": item_table, "item_count": len(item_ids)}
 
 
-@celery_app.task(max_retries=2, default_retry_delay=300)
+# Retry budget for the pg_search index tasks. Their only retryable failures
+# are contention -- another move holding the item table's build lock, a
+# lock_timeout, a deadlock -- so a few spaced-out attempts cover a burst of
+# builds (a rollout dispatches one per KB) without retrying for ever.
+PG_BM25_TASK_MAX_RETRIES = 6
+
+
+def _pg_bm25_retry_countdown(retries: int) -> int:
+    """30 s, 60 s, 120 s ... capped at 10 min: long enough for a move to finish."""
+    return min(30 * (2**retries), 600)
+
+
+@celery_app.task(bind=True, max_retries=PG_BM25_TASK_MAX_RETRIES)
 @billing.no_billing_context
-def ensure_pg_bm25_index(kb_id: str) -> dict:
+def ensure_pg_bm25_index(self, kb_id: str) -> dict:
     """Give this KB its own partition and pg_search BM25 index.
 
     Dispatched whenever the index's inputs change — a new KB, a switch to a
@@ -2556,15 +2570,39 @@ def ensure_pg_bm25_index(kb_id: str) -> dict:
     KB's rows out of the item table's DEFAULT partition into a partition of its
     own; later runs are cheap and idempotent. Returns the service's own outcome
     dict.
+
+    Retries (with backoff, up to ``PG_BM25_TASK_MAX_RETRIES``) when another
+    build holds the item table or the move lost a lock race; any other error
+    fails the task.
     """
     from ..services import pg_bm25_index
 
-    return pg_bm25_index.ensure_bm25_index(kb_id)
+    countdown = _pg_bm25_retry_countdown(self.request.retries)
+    try:
+        outcome = pg_bm25_index.ensure_bm25_index(kb_id)
+    except Exception as exc:
+        if pg_bm25_index.is_transient_db_error(exc):
+            logger.info(
+                "Retrying the BM25 index build for KB %s in %d s: %s", kb_id, countdown, exc
+            )
+            raise self.retry(exc=exc, countdown=countdown) from exc
+        raise
+    if outcome.get("reason") == "partition_build_in_progress":
+        if self.request.retries >= self.max_retries:
+            logger.warning(
+                "Giving up on the BM25 index build for KB %s after %d retries: another "
+                "partition build kept the item table busy. POST /build-bm25 to try again",
+                kb_id,
+                self.request.retries,
+            )
+            return outcome
+        raise self.retry(countdown=countdown)
+    return outcome
 
 
-@celery_app.task(max_retries=2, default_retry_delay=300)
+@celery_app.task(bind=True, max_retries=PG_BM25_TASK_MAX_RETRIES)
 @billing.no_billing_context
-def drop_pg_bm25_index(kb_id: str, drop_partitions: bool = True) -> dict:
+def drop_pg_bm25_index(self, kb_id: str, drop_partitions: bool = True) -> dict:
     """Drop this KB's BM25 indexes, and by default its partitions.
 
     KB delete relies on the default: a relation named after a knowledge base
@@ -2572,7 +2610,18 @@ def drop_pg_bm25_index(kb_id: str, drop_partitions: bool = True) -> dict:
     returned to the DEFAULT partition first. A KB leaving hybrid/full_text
     passes ``drop_partitions=False``: it keeps its partition, only the index
     (which Postgres would otherwise keep maintaining) goes.
+
+    Retries on contention, so a partition is not orphaned by a busy table.
     """
     from ..services import pg_bm25_index
 
-    return pg_bm25_index.drop_bm25_index(kb_id, drop_partitions=drop_partitions)
+    try:
+        return pg_bm25_index.drop_bm25_index(kb_id, drop_partitions=drop_partitions)
+    except Exception as exc:
+        if isinstance(exc, pg_bm25_index.PartitionBuildInProgress) or (
+            pg_bm25_index.is_transient_db_error(exc)
+        ):
+            raise self.retry(
+                exc=exc, countdown=_pg_bm25_retry_countdown(self.request.retries)
+            ) from exc
+        raise

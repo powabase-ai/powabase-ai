@@ -852,6 +852,110 @@ def test_drop_task_also_removes_the_partition():
     drop.assert_called_once_with(KB, drop_partitions=True)
 
 
+def _sqlstate_error(code):
+    from sqlalchemy.exc import OperationalError
+
+    class _Orig(Exception):
+        sqlstate = code
+
+    return OperationalError("stmt", {}, _Orig(f"sqlstate {code}"))
+
+
+@pytest.fixture
+def ensure_retry(monkeypatch):
+    from celery.exceptions import Retry
+
+    from agentic_project_service.tasks.indexing import ensure_pg_bm25_index
+
+    spy = MagicMock(side_effect=Retry("retry"))
+    monkeypatch.setattr(ensure_pg_bm25_index, "retry", spy)
+    return ensure_pg_bm25_index, spy
+
+
+@pytest.fixture
+def drop_retry(monkeypatch):
+    from celery.exceptions import Retry
+
+    from agentic_project_service.tasks.indexing import drop_pg_bm25_index
+
+    spy = MagicMock(side_effect=Retry("retry"))
+    monkeypatch.setattr(drop_pg_bm25_index, "retry", spy)
+    return drop_pg_bm25_index, spy
+
+
+def test_the_ensure_task_retries_while_another_build_holds_the_table(ensure_retry):
+    """I1: ``partition_build_in_progress`` used to be a SUCCESS nobody retried."""
+    from celery.exceptions import Retry
+
+    task, retry = ensure_retry
+    with patch(
+        "agentic_project_service.services.pg_bm25_index.ensure_bm25_index",
+        return_value={"status": "skipped", "reason": "partition_build_in_progress"},
+    ):
+        with pytest.raises(Retry):
+            task.run(KB)
+    assert retry.call_args.kwargs["countdown"] > 0
+
+
+@pytest.mark.parametrize("code", ["55P03", "40P01", "40001"])
+def test_the_ensure_task_retries_a_transient_database_error(ensure_retry, code):
+    from celery.exceptions import Retry
+
+    task, retry = ensure_retry
+    error = _sqlstate_error(code)
+    with patch(
+        "agentic_project_service.services.pg_bm25_index.ensure_bm25_index", side_effect=error
+    ):
+        with pytest.raises(Retry):
+            task.run(KB)
+    assert retry.call_args.kwargs["exc"] is error
+    assert retry.call_args.kwargs["countdown"] > 0
+
+
+def test_the_ensure_task_does_not_retry_a_real_failure(ensure_retry):
+    task, retry = ensure_retry
+    with patch(
+        "agentic_project_service.services.pg_bm25_index.ensure_bm25_index",
+        side_effect=_sqlstate_error("42P01"),
+    ):
+        with pytest.raises(Exception, match="42P01"):
+            task.run(KB)
+    retry.assert_not_called()
+
+
+def test_the_ensure_task_gives_up_quietly_once_its_retries_are_spent(ensure_retry, monkeypatch):
+    task, retry = ensure_retry
+    monkeypatch.setattr(task, "max_retries", 0)
+    outcome = {"status": "skipped", "reason": "partition_build_in_progress"}
+    with patch(
+        "agentic_project_service.services.pg_bm25_index.ensure_bm25_index", return_value=outcome
+    ):
+        assert task.run(KB) == outcome
+    retry.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [pgb.PartitionBuildInProgress("busy"), _sqlstate_error("55P03"), _sqlstate_error("40P01")],
+    ids=["build_in_progress", "lock_timeout", "deadlock"],
+)
+def test_the_drop_task_retries_contention(drop_retry, error):
+    from celery.exceptions import Retry
+
+    task, retry = drop_retry
+    with patch("agentic_project_service.services.pg_bm25_index.drop_bm25_index", side_effect=error):
+        with pytest.raises(Retry):
+            task.run(KB)
+    assert retry.call_args.kwargs["countdown"] > 0
+
+
+def test_the_pg_tasks_have_a_bounded_retry_budget():
+    from agentic_project_service.tasks.indexing import drop_pg_bm25_index, ensure_pg_bm25_index
+
+    for task in (ensure_pg_bm25_index, drop_pg_bm25_index):
+        assert 0 < task.max_retries <= 10
+
+
 # ---------------------------------------------------------------------------
 # Route wiring
 # ---------------------------------------------------------------------------
