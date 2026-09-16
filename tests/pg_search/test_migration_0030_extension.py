@@ -17,7 +17,11 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import create_engine, text
 
-from tests.pg_search.test_partition_migration import database_url_or_skip, load_revision
+from tests.pg_search.test_partition_migration import (
+    database_url_or_skip,
+    load_revision,
+    skip_unless_required,
+)
 
 PROBE_ROLE = "bm25_ext_probe"
 
@@ -36,7 +40,7 @@ def server_engine_or_skip():
         ).first()
     if available is None:
         eng.dispose()
-        pytest.skip("pg_search is not available on this server")
+        skip_unless_required("pg_search is not available on this server")
     return eng
 
 
