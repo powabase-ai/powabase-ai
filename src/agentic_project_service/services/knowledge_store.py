@@ -12,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import AI_SCHEMA
+from . import pg_bm25_index
 from agentic.knowledge.models import RetrievedItem  # noqa: F401 – re-export
 from .base_vector_store import VALID_TS_LANGUAGES, BasePgVectorStore  # noqa: F401 – re-export
 
@@ -48,6 +49,8 @@ class PgVectorKnowledgeStore(BasePgVectorStore):
         if not chunks:
             return 0, []
 
+        # First, before any row: a partition move and this write take turns.
+        pg_bm25_index.hold_move_gate_shared(self.session)
         inserted = 0
         chunk_ids: list[str] = []
         for chunk in chunks:
@@ -115,6 +118,7 @@ class PgVectorKnowledgeStore(BasePgVectorStore):
 
         Does NOT commit — see ``store_chunks``.
         """
+        pg_bm25_index.hold_move_gate_shared(self.session)
         result = self.session.execute(
             text(f"""
                 DELETE FROM "{self.schema}".chunks

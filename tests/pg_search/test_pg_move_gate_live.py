@@ -1,0 +1,206 @@
+"""Indexing transactions and the move take turns instead of racing.
+
+A re-index reads a knowledge base's chunk ids through the parent (ACCESS SHARE
+on DEFAULT) and then deletes and inserts through it. Against a move that holds
+SHARE on the parent and needs ACCESS EXCLUSIVE on DEFAULT, such a transaction
+kept DEFAULT held into the move's lock tries, and the move gave up every
+time. So indexing takes a per-item-table advisory lock *shared* at the start
+of each such transaction, and the move takes it *exclusively* before it
+checks DEFAULT or takes any table lock: every indexing transaction runs
+entirely before the move or entirely after it.
+
+Same database and scratch schema as ``test_pg_bm25_live``.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+import uuid
+
+from sqlalchemy import text
+
+from agentic_project_service.services import pg_bm25_index as pgb
+from tests.pg_search import test_pg_bm25_live as live
+from tests.pg_search.test_pg_bm25_live import (
+    KB_A,
+    KB_A_DOCS,
+    KB_B,
+    KB_B_DOCS,
+    SCHEMA,
+    SOURCE_1,
+    _rows_in,
+    _seed,
+)
+
+migration = live.migration
+engine = live.engine
+scratch_schema = live.scratch_schema
+session = live.session
+
+
+def _reindex_shaped_transaction(
+    engine, kb_id, hold_seconds, errors, body="neu indexiert", source=SOURCE_1
+):
+    """What index_source's cleanup and write do, in one transaction."""
+    with engine.connect() as conn:
+        try:
+            pgb.hold_move_gate_shared(conn)
+            ids = conn.execute(
+                text(
+                    f"SELECT id FROM {SCHEMA}.chunks WHERE knowledge_base_id = CAST(:kb AS uuid) "
+                    "AND source_id = CAST(:src AS uuid)"
+                ),
+                {"kb": kb_id, "src": source},
+            ).all()
+            time.sleep(hold_seconds)
+            conn.execute(
+                text(
+                    f"DELETE FROM {SCHEMA}.chunks WHERE knowledge_base_id = CAST(:kb AS uuid) "
+                    "AND id = ANY(:ids)"
+                ),
+                {"kb": kb_id, "ids": [row[0] for row in ids]},
+            )
+            conn.execute(
+                text(
+                    f"INSERT INTO {SCHEMA}.chunks (knowledge_base_id, source_id, text) "
+                    "SELECT CAST(:kb AS uuid), CAST(:src AS uuid), :body FROM generate_series(1, :n)"
+                ),
+                {"kb": kb_id, "src": source, "body": body, "n": len(ids)},
+            )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            errors.append(exc)
+
+
+def test_a_reindex_transaction_that_holds_default_does_not_make_the_move_give_up(
+    engine, session, monkeypatch
+):
+    """Without the gate this is the reviewer's failure: the transaction holds
+    DEFAULT while its DELETE waits on the move's parent lock, and every lock try
+    the move makes on DEFAULT is refused until it gives up."""
+    monkeypatch.setattr(pgb, "DEFAULT_PREFLIGHT_WAIT_SECONDS", 0.0)
+    _seed(session, KB_A, 2_000)
+    errors: list = []
+    started = threading.Event()
+    real_hold = pgb.hold_move_gate_shared
+
+    def hold_and_signal(conn):
+        real_hold(conn)
+        started.set()
+
+    monkeypatch.setattr(pgb, "hold_move_gate_shared", hold_and_signal)
+    worker = threading.Thread(
+        target=_reindex_shaped_transaction, args=(engine, KB_B, 1.0, errors), daemon=True
+    )
+    worker.start()
+    assert started.wait(timeout=10)
+
+    moved = pgb.create_partition(engine, KB_A, "chunks")
+    worker.join(timeout=30)
+
+    assert errors == []
+    assert moved["rows_moved"] == 2_000 + len(KB_A_DOCS)
+    assert _rows_in(session, "chunks", KB_B) == len(KB_B_DOCS)
+
+
+def test_a_waiting_move_is_not_starved_by_overlapping_indexing_transactions(
+    engine, session, monkeypatch
+):
+    """Shared holders overlap without a gap, so a move that only *tried* for the
+    lock would never get it. Queued, it is served once the holders ahead of it
+    finish, and later indexing transactions queue behind it."""
+    _seed(session, KB_A, 2_000)
+    stop = threading.Event()
+    errors: list = []
+    sources = [str(uuid.uuid4()) for _ in range(3)]
+    for source in sources:
+        session.execute(
+            text(
+                f"INSERT INTO {SCHEMA}.chunks (knowledge_base_id, source_id, text) "
+                "SELECT CAST(:kb AS uuid), CAST(:src AS uuid), 'eigene Quelle' "
+                "FROM generate_series(1, 2)"
+            ),
+            {"kb": KB_B, "src": source},
+        )
+    session.commit()
+
+    def stream(source):
+        while not stop.is_set():
+            _reindex_shaped_transaction(engine, KB_B, 0.3, errors, source=source)
+
+    workers = [threading.Thread(target=stream, args=(source,), daemon=True) for source in sources]
+    for index, worker in enumerate(workers):
+        worker.start()
+        time.sleep(0.1 * (index + 1))
+    try:
+        started = time.monotonic()
+        moved = pgb.create_partition(engine, KB_A, "chunks")
+        took = time.monotonic() - started
+    finally:
+        stop.set()
+        for worker in workers:
+            worker.join(timeout=30)
+
+    assert errors == []
+    assert moved["rows_moved"] == 2_000 + len(KB_A_DOCS)
+    assert took < 5.0
+    assert _rows_in(session, "chunks", KB_B) == len(KB_B_DOCS) + 2 * len(sources)
+
+
+def test_the_move_gives_up_on_the_gate_after_its_bound_without_locking_the_table(
+    engine, session, monkeypatch
+):
+    monkeypatch.setattr(pgb, "MOVE_GATE_WAIT_SECONDS", 0.5)
+    parent_locks: list = []
+    real_parent_lock = pgb.partition_lock_parent_ddl
+    monkeypatch.setattr(
+        pgb,
+        "partition_lock_parent_ddl",
+        lambda *a, **k: parent_locks.append(1) or real_parent_lock(*a, **k),
+    )
+    holder = engine.connect()
+    pgb.hold_move_gate_shared(holder)
+    try:
+        started = time.monotonic()
+        try:
+            pgb.create_partition(engine, KB_A, "chunks")
+        except Exception as exc:
+            error = exc
+        else:
+            error = None
+        took = time.monotonic() - started
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert error is not None and pgb.is_transient_db_error(error)
+    assert took < 3.0
+    assert parent_locks == []
+    assert _rows_in(session, "chunks_default", KB_A) == len(KB_A_DOCS)
+    # The gate is released: the next attempt goes through.
+    assert pgb.create_partition(engine, KB_A, "chunks")["rows_moved"] == len(KB_A_DOCS)
+
+
+def test_indexing_waits_for_the_move_instead_of_failing(engine, session, monkeypatch):
+    """An indexing transaction that starts during a move waits at the gate,
+    holding nothing, and then writes into the new partition."""
+    _seed(session, KB_A, 2_000)
+    moving = threading.Event()
+    live._hold_the_move_open(monkeypatch, moving, 1.0)
+    errors: list = []
+
+    def index_during_the_move():
+        moving.wait(timeout=30)
+        _reindex_shaped_transaction(engine, KB_A, 0.0, errors, body="nach dem Umzug")
+
+    worker = threading.Thread(target=index_during_the_move, daemon=True)
+    worker.start()
+    pgb.create_partition(engine, KB_A, "chunks")
+    worker.join(timeout=30)
+
+    assert errors == []
+    partition = pgb.partition_name(KB_A, "chunks")
+    assert _rows_in(session, "chunks_default", KB_A) == 0
+    assert _rows_in(session, partition) == 2_000 + len(KB_A_DOCS)

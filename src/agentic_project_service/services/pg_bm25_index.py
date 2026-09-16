@@ -498,6 +498,58 @@ def partition_build_unlock_sql() -> str:
     return "SELECT pg_advisory_unlock(hashtextextended(:relation, 0))"
 
 
+# How long a move waits, queued, for the move gate (below) before giving up.
+MOVE_GATE_WAIT_SECONDS = 30.0
+
+
+def move_gate_relation(item_table: str) -> str:
+    """The move gate's subject for one item table.
+
+    Two advisory locks guard a move, on distinct keys:
+
+    * the **build lock** (``partition_build_lock_relation``: ``ai.chunks``),
+      session-scoped and only ever *tried*, serialises moves -- and partition
+      drops -- on one item table with each other;
+    * the **move gate** (this: ``ai.chunks#move``) serialises a move with
+      indexing. Indexing takes it shared, transaction-scoped
+      (``hold_move_gate_shared``), as the first statement of each transaction
+      it opens on an item table; the move takes it exclusively
+      (``_acquire_move_gate``) before it checks DEFAULT or takes any table
+      lock, and holds it until it commits. So an indexing transaction runs
+      entirely before a move or entirely after it, and never holds DEFAULT
+      into the move's lock tries. A queued exclusive request makes later
+      shared requests queue behind it, so a stream of overlapping indexing
+      transactions cannot starve a move once it is waiting.
+
+    Other writers (API writes, enrichment, graph updates) do not take the gate;
+    the parent SHARE lock and the ``NOWAIT`` tries remain their protection.
+    """
+    return f"{partition_build_lock_relation(item_table)}#move"
+
+
+def move_gate_shared_sql() -> tuple[str, dict]:
+    """The statement that takes the move gate shared for every item table."""
+    return (
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended(r.relation, 0)) "
+        "FROM unnest(CAST(:relations AS text[])) WITH ORDINALITY AS r(relation, position) "
+        "ORDER BY r.position",
+        {"relations": [move_gate_relation(t) for t in sorted(PARTITIONED_ITEM_TABLES)]},
+    )
+
+
+def hold_move_gate_shared(session) -> None:
+    """Take the move gate shared until the caller's transaction ends.
+
+    For indexing: call it as the first statement of every transaction that
+    reads or writes an item table (taking it again in the same transaction is
+    harmless). It waits while a move holds the gate -- holding no table lock
+    meanwhile -- and raises whatever the wait raises (a lock timeout the caller
+    set, typically), which indexing requeues as a lock conflict.
+    """
+    sql, params = move_gate_shared_sql()
+    session.execute(text(sql), params)
+
+
 def partition_lock_parent_ddl(item_table: str) -> str:
     """Hold writers off the partitioned parent for the length of a move.
 
@@ -1283,6 +1335,32 @@ def _acquire_partition_build_lock(conn, item_table: str) -> None:
                 f"another partition build is in progress for {relation}; retry"
             )
         time.sleep(_PARTITION_BUILD_LOCK_POLL_SECONDS)
+
+
+def _acquire_move_gate(conn, item_table: str) -> None:
+    """Take the move gate exclusively, queued, for at most ``MOVE_GATE_WAIT_SECONDS``.
+
+    Session-scoped, like the build lock: it has to outlive the transactions
+    before the move's. A timeout raises SQLSTATE 55P03 (retried) having taken
+    no table lock at all.
+    """
+    conn.execute(text(f"SET LOCAL lock_timeout = '{int(MOVE_GATE_WAIT_SECONDS * 1000)}ms'"))
+    try:
+        conn.execute(
+            text("SELECT pg_advisory_lock(hashtextextended(:relation, 0))"),
+            {"relation": move_gate_relation(item_table)},
+        )
+    except Exception:
+        conn.rollback()
+        logger.warning(
+            "A move on %s.%s could not take the move gate within %.0f s: indexing "
+            "transactions on the table kept it; retryable",
+            AI_SCHEMA,
+            item_table,
+            MOVE_GATE_WAIT_SECONDS,
+        )
+        raise
+    conn.commit()
 
 
 def _release_partition_build_lock(conn, item_table: str) -> None:
@@ -2203,7 +2281,10 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
             conn.commit()
 
             fence_committed = False
+            gate_held = False
             try:
+                _acquire_move_gate(conn, item_table)
+                gate_held = True
                 _probe_default_before_moving(conn, item_table)
                 conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
                 conn.execute(text(partition_lock_parent_ddl(item_table)))
@@ -2249,6 +2330,9 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                 if fence_committed:
                     _drop_failed_move_check(conn, kb_id, item_table)
                 raise
+            finally:
+                if gate_held:
+                    _release_advisory_lock(conn, move_gate_relation(item_table))
         finally:
             _release_partition_build_lock(conn, item_table)
 

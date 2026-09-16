@@ -1,0 +1,142 @@
+"""Indexing takes the move gate before it touches an item table.
+
+The gate is a per-item-table advisory lock: indexing takes it shared and
+transaction-scoped, a partition move takes it exclusively. For it to keep a
+re-index from holding DEFAULT into a move's lock tries, it has to come *first*
+in every transaction indexing opens on the item tables -- before the read of
+the ids it is about to delete, and before the rows a store writes.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from agentic_project_service.services import pg_bm25_index as pgb
+from agentic_project_service.services.full_document_store import FullDocumentStore
+from agentic_project_service.services.graph_index_store import GraphIndexStore
+from agentic_project_service.services.knowledge_store import PgVectorKnowledgeStore
+from agentic_project_service.tasks import indexing
+
+KB = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+SRC = "11111111-1111-4111-8111-111111111111"
+IS_ID = "22222222-2222-4222-8222-222222222222"
+
+_ITEM_TABLE = re.compile(r"\.(chunks|full_documents|graph_index_nodes|graph_index_toc)\b")
+_GATE = "pg_advisory_xact_lock_shared"
+
+
+def _recording_session():
+    session = MagicMock()
+    session.log = []
+
+    def execute(statement, params=None):
+        session.log.append(getattr(statement, "text", str(statement)))
+        result = MagicMock()
+        result.rowcount = 0
+        result.fetchall.return_value = []
+        result.fetchone.return_value = None
+        result.scalar.return_value = None
+        result.__iter__.return_value = iter([])
+        return result
+
+    session.execute.side_effect = execute
+    session.commit.side_effect = lambda: session.log.append("COMMIT")
+    session.rollback.side_effect = lambda: session.log.append("ROLLBACK")
+    return session
+
+
+def _assert_gate_opens_every_transaction_on_an_item_table(log):
+    """Each run of statements between commits that touches an item table starts
+    with the gate, before its first item-table statement."""
+    transaction: list[str] = []
+    checked = 0
+    for entry in [*log, "COMMIT"]:
+        if entry in ("COMMIT", "ROLLBACK"):
+            touching = [i for i, sql in enumerate(transaction) if _ITEM_TABLE.search(sql)]
+            if touching:
+                gates = [i for i, sql in enumerate(transaction) if _GATE in sql]
+                assert gates and gates[0] < touching[0], transaction
+                checked += 1
+            transaction = []
+        else:
+            transaction.append(entry)
+    assert checked, log
+
+
+def test_the_gate_names_every_partitioned_item_table():
+    sql, params = pgb.move_gate_shared_sql()
+    assert _GATE in sql
+    assert sorted(params["relations"]) == sorted(
+        pgb.move_gate_relation(t) for t in pgb.PARTITIONED_ITEM_TABLES
+    )
+    # Its own key: never the build lock that serialises moves with each other.
+    for table in pgb.PARTITIONED_ITEM_TABLES:
+        assert pgb.move_gate_relation(table) != pgb.partition_build_lock_relation(table)
+
+
+def test_chunk_writes_take_the_gate_first():
+    session = _recording_session()
+    store = PgVectorKnowledgeStore(db_session=session, knowledge_base_id=KB)
+    asyncio.run(store.delete_chunks(IS_ID))
+    session.log.append("COMMIT")
+    asyncio.run(store.store_chunks(IS_ID, [{"text": "t", "source_id": SRC}]))
+    _assert_gate_opens_every_transaction_on_an_item_table(session.log)
+
+
+def test_full_document_writes_take_the_gate_first():
+    session = _recording_session()
+    store = FullDocumentStore(db_session=session, knowledge_base_id=KB, storage=MagicMock())
+    store.delete_by_indexed_source(IS_ID)
+    _assert_gate_opens_every_transaction_on_an_item_table(session.log)
+
+
+def test_graph_writes_take_the_gate_first():
+    session = _recording_session()
+    store = GraphIndexStore(db_session=session, knowledge_base_id=KB)
+    store.delete_by_indexed_source(IS_ID)
+    store.store_toc(indexed_source_id=IS_ID, source_id=SRC, structure=[], doc_name="d")
+    store.store_nodes(
+        "toc-1",
+        IS_ID,
+        SRC,
+        [{"node_id": "n1", "title": "t", "text": "x", "depth": 1, "meta": {}}],
+    )
+    _assert_gate_opens_every_transaction_on_an_item_table(session.log)
+
+
+@pytest.fixture
+def run_body(monkeypatch):
+    session = _recording_session()
+    monkeypatch.setattr(indexing, "db", MagicMock(session=session))
+    monkeypatch.setattr(
+        indexing, "get_knowledge_base", lambda _id: {"indexing_config": {"strategy": "chunk_embed"}}
+    )
+    monkeypatch.setattr(indexing, "get_source", lambda _id: {"name": "s", "auto_metadata": {}})
+    monkeypatch.setattr(
+        indexing, "_get_indexed_source_snapshot", lambda _id: {"strategy": "chunk_embed"}
+    )
+    monkeypatch.setattr(indexing, "update_indexed_source_config_snapshot", lambda *_a: None)
+    monkeypatch.setattr(indexing, "get_storage", MagicMock())
+    monkeypatch.setattr(indexing, "get_text_derivative_content", lambda *_a: None)
+    monkeypatch.setattr(indexing, "_fenced_mark_failed", MagicMock())
+    knowledge_store = MagicMock()
+    knowledge_store.return_value.delete_chunks = AsyncMock(return_value=0)
+    monkeypatch.setattr(indexing, "PgVectorKnowledgeStore", knowledge_store)
+    for name in ("PageIndexStore", "FullDocumentStore", "GraphIndexStore", "Doc2JSONStore"):
+        monkeypatch.setattr(indexing, name, MagicMock())
+    return session
+
+
+def test_the_reindex_cleanup_takes_the_gate_before_reading_the_ids_it_deletes(run_body):
+    indexing._run_index_body(
+        knowledge_base_id=KB,
+        source_id=SRC,
+        indexed_source_id=IS_ID,
+        task_id="task-1",
+        provider_keys=None,
+    )
+    _assert_gate_opens_every_transaction_on_an_item_table(run_body.log)

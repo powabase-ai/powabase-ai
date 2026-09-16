@@ -12,6 +12,7 @@ import uuid
 from sqlalchemy import text
 
 from ..db import AI_SCHEMA
+from . import pg_bm25_index
 from .base_toc_store import BaseTocStore
 from .base_vector_store import ensure_embedding_index
 
@@ -28,6 +29,16 @@ class GraphIndexStore(BaseTocStore):
 
     TOC_TABLE = "graph_index_toc"
     NODES_TABLE = "graph_index_nodes"
+
+    # The ToC and its nodes are written in one transaction, and the nodes'
+    # foreign key references the ToC, so the move gate goes first in both.
+    def store_toc(self, *args, **kwargs) -> str:
+        pg_bm25_index.hold_move_gate_shared(self.session)
+        return super().store_toc(*args, **kwargs)
+
+    def delete_by_indexed_source(self, indexed_source_id: str) -> int:
+        pg_bm25_index.hold_move_gate_shared(self.session)
+        return super().delete_by_indexed_source(indexed_source_id)
 
     def store_nodes(
         self,
@@ -47,6 +58,7 @@ class GraphIndexStore(BaseTocStore):
         """
         if not nodes:
             return 0, []
+        pg_bm25_index.hold_move_gate_shared(self.session)
 
         stmt = text(f"""
             INSERT INTO "{AI_SCHEMA}".graph_index_nodes (

@@ -1586,6 +1586,12 @@ def _run_index_body(
         # deleted. Deliberate residual: losing the fence means a sibling
         # re-claimed the row and is re-indexing the same source, so the
         # artifacts are on their way back.
+        # First in this transaction, before the reads of the ids below: a
+        # partition move and this cleanup take turns, so the cleanup never holds
+        # a DEFAULT partition into the move's lock tries (see
+        # ``pg_bm25_index.move_gate_relation``). The stores take it again at the
+        # start of each transaction of their own.
+        pg_bm25_index.hold_move_gate_shared(db.session)
         db.session.execute(
             text(f"""
                 DELETE FROM "{AI_SCHEMA}".embeddings
