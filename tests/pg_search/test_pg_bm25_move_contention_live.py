@@ -407,3 +407,114 @@ def test_start_up_clears_a_leftover_check_without_ever_blocking(engine, session)
 def test_start_up_check_sweep_never_raises_without_the_tables(engine, monkeypatch):
     monkeypatch.setattr(pgb, "AI_SCHEMA", f"absent_{uuid.uuid4().hex[:8]}")
     assert set(pgb.clear_leftover_move_checks_at_start(engine).values()) == {"not_partitioned"}
+
+
+def test_the_move_is_not_starved_by_a_steady_stream_of_short_reads(engine, session):
+    """Overlapping short reads leave DEFAULT without a single free moment, so
+    ``NOWAIT`` tries alone never succeed. One short queued try lets the reads in
+    flight drain while holding new ones back only briefly."""
+    _seed(session, KB_A, 2_000)
+    stop = threading.Event()
+    latencies: list[float] = []
+
+    def busy_reader():
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            while not stop.is_set():
+                issued = time.monotonic()
+                conn.execute(
+                    text(
+                        f"SELECT count(*), pg_sleep(0.03) FROM {SCHEMA}.chunks_default "
+                        "WHERE knowledge_base_id = CAST(:kb AS uuid)"
+                    ),
+                    {"kb": KB_C},
+                ).all()
+                latencies.append(time.monotonic() - issued)
+
+    readers = [threading.Thread(target=busy_reader, daemon=True) for _ in range(8)]
+    for thread in readers:
+        thread.start()
+    try:
+        time.sleep(0.3)
+        move = pgb.create_partition(engine, KB_A, "chunks")
+    finally:
+        stop.set()
+        for thread in readers:
+            thread.join(timeout=30)
+
+    assert move["rows_moved"] == 2_000 + len(KB_A_DOCS)
+    # A read waits at most for one queued try, plus its own 30 ms.
+    assert max(latencies) < pgb.DEFAULT_EXCLUSIVE_QUEUED_TRY_MS / 1000 + 0.3, max(latencies)
+
+
+def test_a_queued_try_is_never_made_while_a_holder_of_default_waits_for_a_lock(engine, session):
+    """The one case a queued request could close a lock cycle in: a transaction
+    that holds DEFAULT and is itself waiting -- for the move's parent lock, or
+    for anything that might be waiting on the move."""
+    with engine.connect() as holder, engine.connect() as blocker, engine.connect() as probe:
+        blocker.execute(text(f"LOCK TABLE {SCHEMA}.knowledge_bases IN ACCESS EXCLUSIVE MODE"))
+        holder.execute(text(f"SELECT count(*) FROM {SCHEMA}.chunks_default")).scalar()
+        waiter = threading.Thread(
+            target=lambda: holder.execute(
+                text(f"SELECT count(*) FROM {SCHEMA}.knowledge_bases")
+            ).scalar(),
+            daemon=True,
+        )
+        assert pgb._default_holder_is_waiting(probe, "chunks") is False
+        probe.rollback()
+        waiter.start()
+        deadline = time.monotonic() + 10
+        waiting = False
+        while time.monotonic() < deadline and not waiting:
+            waiting = pgb._default_holder_is_waiting(probe, "chunks")
+            probe.rollback()
+            time.sleep(0.02)
+        blocker.rollback()
+        waiter.join(timeout=10)
+        holder.rollback()
+    assert waiting is True
+
+
+def test_the_queued_try_is_skipped_when_it_would_land_on_a_waiting_transactions_deadlock_check(
+    engine, session
+):
+    """Timed so that, were the queued try made, it would still be waiting when
+    the application transaction's deadlock check runs -- which would find the
+    cycle and abort the application. The try is skipped, the lock attempt gives
+    up, and the application transaction commits once the mover rolls back."""
+    with engine.connect() as probe:
+        deadlock_seconds = (
+            probe.execute(
+                text("SELECT setting::int FROM pg_settings WHERE name = 'deadlock_timeout'")
+            ).scalar()
+            / 1000
+        )
+    app: dict = {}
+    app_waiting = threading.Event()
+
+    def app_transaction():
+        with engine.connect() as conn:
+            try:
+                conn.execute(text(f"SELECT count(*) FROM {SCHEMA}.chunks_default")).scalar()
+                app_waiting.set()
+                _insert(conn, KB_B, "rando qui attend")
+                conn.commit()
+                app["committed"] = True
+            except Exception as exc:
+                conn.rollback()
+                app["error"] = _first_line(exc)
+
+    with engine.connect() as mover:
+        mover.execute(text(pgb.partition_lock_parent_ddl("chunks")))
+        thread = threading.Thread(target=app_transaction, daemon=True)
+        thread.start()
+        app_waiting.wait(timeout=10)
+        # The queued try would start ~0.1 s into the call and wait up to 0.2 s,
+        # straddling the moment the application's deadlock check runs.
+        time.sleep(max(deadlock_seconds - 0.2, 0.0))
+        with pytest.raises(Exception) as caught:
+            pgb._lock_default_exclusively(mover, "chunks", 1.0)
+        mover.rollback()
+    thread.join(timeout=30)
+
+    assert pgb.is_lock_conflict(caught.value), _first_line(caught.value)
+    assert app == {"committed": True}

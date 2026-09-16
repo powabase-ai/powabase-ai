@@ -75,16 +75,27 @@ _PARTITION_BUILD_LOCK_POLL_SECONDS = 0.25
 MOVE_LOCK_TIMEOUT_MS = 5_000
 
 # How long the move keeps trying for ACCESS EXCLUSIVE on the DEFAULT partition
-# (for its temporary check, for the ATTACH, and to drop the check). It never
-# *waits* for that lock in Postgres' queue: each try is ``NOWAIT``, with a short
-# sleep in between. Two reasons. A queued ACCESS EXCLUSIVE request makes every
-# new reader of DEFAULT queue behind it. And a transaction that read DEFAULT and
-# then writes through the parent is already waiting on the move's SHARE lock, so
-# a queued request would close a lock cycle that Postgres breaks by aborting
-# whichever side runs its deadlock check first -- often the application's. A
-# move that cannot get the lock in time rolls back (SQLSTATE 55P03) and its task
-# retries later.
+# (for its temporary check, for the ATTACH, and to drop the check). It does not
+# simply wait for that lock in Postgres' queue, for two reasons. A queued ACCESS
+# EXCLUSIVE request makes every new reader of DEFAULT queue behind it for as
+# long as it waits. And a transaction that read DEFAULT and then writes through
+# the parent is already waiting on the move's SHARE lock, so a queued request
+# closes a lock cycle that Postgres breaks by aborting whichever side runs its
+# deadlock check first -- the application's, whenever it began waiting less than
+# ``deadlock_timeout`` before the request (a short lock_timeout on the request
+# does not avoid that: with 2 s the application still lost every time).
+#
+# So the tries are ``NOWAIT``, with a short backoff, plus at most one queued try
+# of ``DEFAULT_EXCLUSIVE_QUEUED_TRY_MS`` (capped at half of the server's
+# ``deadlock_timeout``) -- without it, overlapping short reads that never leave
+# DEFAULT free starve the move. That try is skipped while any holder of a lock
+# on DEFAULT is itself waiting for a lock, the one state in which queueing could
+# close a cycle; a transaction that only starts waiting after the request starts
+# its deadlock check after the queued try has already timed out. A move that
+# cannot get the lock in time rolls back (SQLSTATE 55P03) and its task retries.
 DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS = 2.0
+DEFAULT_EXCLUSIVE_QUEUED_TRY_MS = 200
+_EXCLUSIVE_LOCK_QUEUED_TRY_AFTER_SECONDS = 0.1
 _EXCLUSIVE_LOCK_FIRST_SLEEP_SECONDS = 0.01
 _EXCLUSIVE_LOCK_MAX_SLEEP_SECONDS = 0.25
 
@@ -1221,29 +1232,102 @@ def partition_lock_default_exclusive_ddl(item_table: str) -> str:
     )
 
 
+def _default_holder_is_waiting(conn, item_table: str) -> bool:
+    """Does any other session holding a lock on DEFAULT wait for a lock itself?
+
+    Such a session may be waiting -- directly or through others -- on the
+    caller, and then a queued request for DEFAULT would close a lock cycle.
+    """
+    return bool(
+        conn.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks held "
+                "JOIN pg_locks waiting ON waiting.pid = held.pid AND NOT waiting.granted "
+                "WHERE held.relation = to_regclass(:default) AND held.granted "
+                "AND held.pid <> pg_backend_pid())"
+            ),
+            {"default": _qualified(default_partition_name(item_table))},
+        ).scalar()
+    )
+
+
+def _queued_try_ms(conn) -> int:
+    """The queued try's lock_timeout: the constant, capped at deadlock_timeout / 2."""
+    deadlock_ms = conn.execute(
+        text("SELECT setting::int FROM pg_settings WHERE name = 'deadlock_timeout'")
+    ).scalar()
+    cap = int(deadlock_ms) // 2 if deadlock_ms else DEFAULT_EXCLUSIVE_QUEUED_TRY_MS
+    return max(1, min(DEFAULT_EXCLUSIVE_QUEUED_TRY_MS, cap))
+
+
 def _lock_default_exclusively(conn, item_table: str, wait_seconds: float) -> None:
-    """Take ACCESS EXCLUSIVE on DEFAULT without ever waiting in its lock queue.
+    """Take ACCESS EXCLUSIVE on DEFAULT without stalling readers or closing a cycle.
 
     Tries ``NOWAIT`` inside a savepoint, so a refusal leaves the caller's
-    transaction usable, and sleeps with a doubling backoff between tries. After
-    ``wait_seconds`` the last refusal (SQLSTATE 55P03) is raised. See
-    ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS`` for why it never queues.
+    transaction usable, and sleeps with a doubling backoff between tries. Once
+    ``_EXCLUSIVE_LOCK_QUEUED_TRY_AFTER_SECONDS`` of refusals have passed, it
+    makes one queued try bounded by ``_queued_try_ms`` -- unless a holder of
+    DEFAULT is waiting for a lock (``_default_holder_is_waiting``), or the
+    remaining time is too short. After ``wait_seconds`` the last refusal
+    (SQLSTATE 55P03) is raised. See ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS``.
     """
-    deadline = time.monotonic() + wait_seconds
+    started = time.monotonic()
+    deadline = started + wait_seconds
     sleep = _EXCLUSIVE_LOCK_FIRST_SLEEP_SECONDS
+    queued_try_done = False
     while True:
         conn.execute(text("SAVEPOINT bm25_default_lock"))
         try:
             conn.execute(text(partition_lock_default_exclusive_ddl(item_table)))
         except Exception as exc:
             conn.execute(text("ROLLBACK TO SAVEPOINT bm25_default_lock"))
-            if not is_lock_conflict(exc) or time.monotonic() + sleep > deadline:
+            conn.execute(text("RELEASE SAVEPOINT bm25_default_lock"))
+            if not is_lock_conflict(exc):
                 raise
-            time.sleep(sleep)
-            sleep = min(sleep * 2, _EXCLUSIVE_LOCK_MAX_SLEEP_SECONDS)
-            continue
+            refusal = exc
+        else:
+            conn.execute(text("RELEASE SAVEPOINT bm25_default_lock"))
+            return
+        now = time.monotonic()
+        if not queued_try_done and now - started >= _EXCLUSIVE_LOCK_QUEUED_TRY_AFTER_SECONDS:
+            queued_try_done = True
+            queued_ms = _queued_try_ms(conn)
+            if now + queued_ms / 1000 <= deadline and not _default_holder_is_waiting(
+                conn, item_table
+            ):
+                if _queued_lock_try(conn, item_table, queued_ms):
+                    return
+                continue
+        if time.monotonic() + sleep > deadline:
+            raise refusal
+        time.sleep(sleep)
+        sleep = min(sleep * 2, _EXCLUSIVE_LOCK_MAX_SLEEP_SECONDS)
+
+
+def _queued_lock_try(conn, item_table: str, lock_timeout_ms: int) -> bool:
+    """One queued request for ACCESS EXCLUSIVE on DEFAULT, bounded by a lock_timeout.
+
+    The timeout is set in a savepoint and put back afterwards, so the caller's
+    transaction keeps its own. Returns whether the lock was taken.
+    """
+    previous = conn.execute(text("SELECT current_setting('lock_timeout')")).scalar()
+    conn.execute(text("SAVEPOINT bm25_default_lock"))
+    try:
+        conn.execute(text(f"SET LOCAL lock_timeout = '{int(lock_timeout_ms)}ms'"))
+        conn.execute(
+            text(
+                f"LOCK TABLE {_qualified(default_partition_name(item_table))} IN ACCESS EXCLUSIVE MODE"
+            )
+        )
+    except Exception as exc:
+        conn.execute(text("ROLLBACK TO SAVEPOINT bm25_default_lock"))
         conn.execute(text("RELEASE SAVEPOINT bm25_default_lock"))
-        return
+        if not is_lock_conflict(exc):
+            raise
+        return False
+    conn.execute(text("RELEASE SAVEPOINT bm25_default_lock"))
+    conn.execute(text("SELECT set_config('lock_timeout', :value, true)"), {"value": previous})
+    return True
 
 
 def _drop_move_checks(
