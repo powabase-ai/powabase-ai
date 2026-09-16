@@ -81,8 +81,18 @@ jobs:
 
       # The `app` fixture creates the ai schema, the vector extension and the
       # ORM tables itself, so no migration step is needed here.
+      #
+      # tests/test_index_source_retry.py runs here too: it pins how indexing
+      # requeues a source (the single attempts bound, and the countdown a lock
+      # conflict or partition-move race requeues with) against real rows, and
+      # needs only this job's database -- no pg_search.
       - name: Run store tests
-        run: uv run --no-sync pytest tests/test_graph_index_store.py tests/test_full_text_search_timeout_live.py -q
+        run: >-
+          uv run --no-sync pytest
+          tests/test_graph_index_store.py
+          tests/test_full_text_search_timeout_live.py
+          tests/test_index_source_retry.py
+          -q
 
   # tests/pg_search exercises the Postgres-native BM25 path for real: the
   # partitioning and extension migrations, row-level security through the
@@ -93,9 +103,31 @@ jobs:
   # PG_SEARCH_REQUIRED=1 turns every "pg_search is unavailable" skip into a
   # failure, and the run step also fails on any skip at all: a job whose only
   # purpose is this extension must not go green by skipping it.
+  #
+  # This image is NOT the production Postgres image, and the differences are
+  # visible to these tests:
+  # - supautils: production runs it, and it lets ordinary roles create
+  #   privileged extensions such as pg_search. Here nothing does, so a test that
+  #   makes CREATE EXTENSION fail by withholding a role's privilege passes here
+  #   and fails in production. Inject such failures server-independently (a
+  #   read-only transaction, a monkeypatch).
+  # - roles: this image has only supabase_admin; production also has
+  #   authenticated, anon, service_role and the other Supabase roles.
+  # - preload order: this image loads pg_search first in
+  #   shared_preload_libraries, production loads it last, after a dozen others. That
+  #   decides whether a check-constraint violation (23514) arrives with its
+  #   diag fields (constraint and table name) -- here it does not, in production
+  #   it does -- so the two branches of code that reads them are each exercised
+  #   on only one of the two images. Run this suite on the production image too
+  #   before changing that code.
+  #
+  # Hangs: tests/pg_search/conftest.py gives every test there a pytest-timeout
+  # limit, so a lock wait that never returns fails that test instead of the
+  # run; timeout-minutes bounds the whole job as a backstop.
   pg_search:
     name: pytest tests/pg_search (Postgres 15 + pg_search 0.25.9)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: paradedb/paradedb:0.25.9-pg15
