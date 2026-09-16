@@ -17,8 +17,10 @@ from ..services.base_vector_store import (
     get_retrieval_degradations,
     reset_retrieval_degradations,
 )
+from ..services.bm25_build_outcome import read_bm25_build_outcome
 from ..services.pg_bm25_index import (
     keyword_index_backend,
+    pg_bm25_item_table,
     pg_bm25_status,
     pg_search_installed,
 )
@@ -431,28 +433,74 @@ def _dispatch_drop_pg_bm25_index(kb_id: str) -> None:
         )
 
 
+# Recorded outcomes that describe a move/build still to finish, or one that
+# gave up. A recorded "ready" is not in here: once the index serves, its own
+# state is reported, and a "ready" without a ready index is history (the index
+# was dropped or is being rebuilt since).
+_UNFINISHED_BM25_BUILD_STATUSES = frozenset({"queued", "moving", "building", "retrying", "failed"})
+
+
+def _unfinished_bm25_build_outcome(kb_id: str, item_table: str | None) -> dict | None:
+    """The KB's recorded move/build outcome on ``item_table``, if unfinished.
+
+    None when there is no such record, when the latest record is for another
+    item table (the KB's strategy changed since), or when it cannot be read.
+    Never raises.
+    """
+    if item_table is None:
+        return None
+    try:
+        outcome = read_bm25_build_outcome(db.session, kb_id)
+    except Exception:
+        logger.debug("Could not read the bm25 build outcome for KB %s", kb_id, exc_info=True)
+        return None
+    if not outcome or outcome.get("item_table") != item_table:
+        return None
+    if outcome.get("status") not in _UNFINISHED_BM25_BUILD_STATUSES:
+        return None
+    return outcome
+
+
 def _compute_bm25_status(kb) -> str | None:
     """The ``bm25_status`` field of the KB detail response, or None to omit it.
 
-    Values:
+    See ``_bm25_status_detail`` for the values.
+    """
+    return _bm25_status_detail(kb)[0]
+
+
+def _bm25_status_detail(kb) -> tuple[str | None, str | None]:
+    """``(bm25_status, bm25_status_reason)`` for the KB detail response.
+
+    A None status means "omit the field"; a None reason means "omit the
+    reason". Values of ``bm25_status``:
       - ``"absent"``: no index exists yet -- neither a pg_search index nor,
         for a KB that predates the extension, a bm25s file index;
       - ``"building"``: the pg_search index exists but cannot answer a query
-        yet (a concurrent build still running, or one that did not finish);
+        yet (a concurrent build still running, or one that did not finish),
+        or the recorded move/build is building it;
       - ``"stale"``: the bm25s file index is older than the KB's items
         (file index only);
-      - ``"ready"``: the index serves keyword queries.
+      - ``"ready"``: the index serves keyword queries;
+      - ``"queued"``, ``"moving"``, ``"retrying"``, ``"failed"``: pg_search
+        only, the recorded outcome of the move/build that gives the KB its
+        own index (``ai.bm25_index_builds``) -- dispatched, moving its rows
+        out of DEFAULT, waiting to retry, or given up. These come with
+        ``bm25_status_reason`` when the worker recorded one.
 
     The index reported is the one the keyword leg actually uses (see
     ``_keyword_index_backend``): the pg_search index when that is the
-    backend and the KB has one, the bm25s file index otherwise -- including a
-    KB that predates the extension and has not been given its own index yet
-    (``POST /build-bm25`` does that).
+    backend and the KB has a ready one; otherwise, on a pg_search item table,
+    the recorded outcome of the move/build that has not finished (or gave
+    up), so an operator can see it; and failing both, the bm25s file index --
+    including a KB that predates the extension and has not been given its own
+    index yet (``POST /build-bm25`` does that).
 
-    Returns None (caller should omit the field) when:
+    The status is None (caller should omit the field) when:
       - the KB's retrieval method does not use BM25, OR
-      - there is no pg_search index to report on AND BM25_AUTO_INDEXING is on
-        (platform manages the file index; user has nothing to act on).
+      - there is no pg_search index or recorded outcome to report on AND
+        BM25_AUTO_INDEXING is on (platform manages the file index; user has
+        nothing to act on).
     """
     if isinstance(kb, dict):
         retrieval_config = kb.get("retrieval_config") or {}
@@ -465,14 +513,20 @@ def _compute_bm25_status(kb) -> str | None:
 
     method = retrieval_config.get("method")
     if method not in _KEYWORD_RETRIEVAL_METHODS:
-        return None
+        return None, None
 
     strategy = indexing_config.get("strategy")
     item_table = _STRATEGY_TO_ITEM_TABLE.get(strategy)
     if _keyword_index_backend(strategy) == "pg_search":
         pg_state = pg_bm25_status(kb_id, strategy)
+        if pg_state != "ready":
+            outcome = _unfinished_bm25_build_outcome(
+                kb_id, pg_bm25_item_table(strategy or "chunk_embed")
+            )
+            if outcome is not None:
+                return outcome["status"], outcome.get("reason")
         if pg_state is not None and pg_state != "absent":
-            return pg_state
+            return pg_state, None
         if pg_state == "absent":
             # No pg_search index of its own yet. A KB from before the extension
             # still has its bm25s file index, and its keyword leg reads that
@@ -482,22 +536,22 @@ def _compute_bm25_status(kb) -> str | None:
             if file_table is None or not SparseIndexStore(knowledge_base_id=kb_id).index_exists(
                 file_table
             ):
-                return "absent"
+                return "absent", None
 
     if get_setting("BM25_AUTO_INDEXING"):
-        return None
+        return None, None
 
     if item_table is None:
-        return None
+        return None, None
 
     store = SparseIndexStore(knowledge_base_id=kb_id)
     if not store.index_exists(item_table):
-        return "absent"
+        return "absent", None
     metadata = store.read_metadata(item_table)
     if metadata is None:
-        return "stale"
+        return "stale", None
     current = _count_items_for_kb_bm25(kb_id, item_table)
-    return "ready" if metadata.get("item_count") == current else "stale"
+    return ("ready" if metadata.get("item_count") == current else "stale"), None
 
 
 @knowledge_bases_bp.route("", methods=["GET"])
@@ -719,9 +773,11 @@ def get_knowledge_base(kb_id: str):
         "drift": drift,
     }
 
-    bm25_status = _compute_bm25_status(kb)
+    bm25_status, bm25_status_reason = _bm25_status_detail(kb)
     if bm25_status is not None:
         response_body["bm25_status"] = bm25_status
+        if bm25_status_reason is not None:
+            response_body["bm25_status_reason"] = bm25_status_reason
 
     return jsonify(response_body)
 

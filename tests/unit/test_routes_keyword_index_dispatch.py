@@ -455,3 +455,140 @@ class TestStatus:
             store_cls.return_value.read_metadata.return_value = {"item_count": 3}
             assert kb_route._compute_bm25_status(self.KB) == "ready"
         pg_status.assert_not_called()
+
+
+class TestStatusReportsThePersistedBuildOutcome:
+    """On a pg_search item table, a KB whose own index is not serving yet
+    reports the last recorded outcome of its move/build -- a retrying or
+    failed move must not look like a KB nobody scheduled."""
+
+    KB = TestStatus.KB
+
+    @staticmethod
+    def _outcome(status, reason=None, item_table="chunks", attempts=None):
+        return {
+            "status": status,
+            "reason": reason,
+            "item_table": item_table,
+            "attempts": attempts,
+            "updated_at": None,
+        }
+
+    def _detail(self, *, pg_state, outcome, backend="pg_search", auto_indexing=True, file=True):
+        with (
+            patch(f"{R}.db"),
+            patch(f"{R}._keyword_index_backend", return_value=backend),
+            patch(f"{R}.pg_bm25_status", return_value=pg_state),
+            patch(f"{R}.read_bm25_build_outcome", return_value=outcome) as read,
+            patch(f"{R}.get_setting", return_value=auto_indexing),
+            patch(f"{R}.SparseIndexStore") as store_cls,
+            patch(f"{R}._count_items_for_kb_bm25", return_value=3),
+        ):
+            store_cls.return_value.index_exists.return_value = file
+            store_cls.return_value.read_metadata.return_value = {"item_count": 3}
+            return kb_route._bm25_status_detail(self.KB), read
+
+    @pytest.mark.parametrize("status", ["queued", "moving", "building", "retrying", "failed"])
+    def test_a_file_served_kb_reports_its_pending_or_failed_move(self, status):
+        (got, reason), _ = self._detail(
+            pg_state="absent", outcome=self._outcome(status, reason="lock_not_available")
+        )
+        assert got == status
+        assert reason == "lock_not_available"
+
+    def test_the_status_is_reported_with_auto_indexing_on(self):
+        """Auto-indexing on used to omit the field for a file-served KB."""
+        (got, _), _ = self._detail(
+            pg_state="absent", outcome=self._outcome("failed", "gave up"), auto_indexing=True
+        )
+        assert got == "failed"
+
+    def test_an_invalid_index_with_a_failed_build_reports_failed(self):
+        (got, reason), _ = self._detail(
+            pg_state="building", outcome=self._outcome("failed", "index build failed")
+        )
+        assert (got, reason) == ("failed", "index build failed")
+
+    def test_a_served_kb_ignores_the_outcome(self):
+        (got, reason), read = self._detail(
+            pg_state="ready", outcome=self._outcome("failed", "old failure")
+        )
+        assert (got, reason) == ("ready", None)
+        read.assert_not_called()
+
+    def test_an_outcome_for_another_item_table_is_ignored(self):
+        (got, reason), _ = self._detail(
+            pg_state="absent",
+            outcome=self._outcome("failed", "old table", item_table="full_documents"),
+            auto_indexing=False,
+        )
+        assert (got, reason) == ("ready", None)
+
+    def test_a_ready_outcome_without_a_ready_index_is_not_reported(self):
+        """The index was dropped since (a strategy or ts_language change); the
+        recorded "ready" is history, and the file index is what search reads."""
+        (got, reason), _ = self._detail(
+            pg_state="absent", outcome=self._outcome("ready"), auto_indexing=False
+        )
+        assert (got, reason) == ("ready", None)
+
+    def test_no_outcome_keeps_reporting_the_file_index(self):
+        (got, reason), _ = self._detail(pg_state="absent", outcome=None, auto_indexing=False)
+        assert (got, reason) == ("ready", None)
+
+    def test_the_file_index_backend_never_reads_the_outcome(self):
+        (got, _), read = self._detail(
+            pg_state="absent",
+            outcome=self._outcome("failed", "x"),
+            backend="bm25s",
+            auto_indexing=False,
+        )
+        assert got == "ready"
+        read.assert_not_called()
+
+    def test_an_unreadable_outcome_falls_back_to_the_index_state(self):
+        """Outside an app context even ``db.session`` raises; the status must
+        still come back."""
+        with (
+            patch(f"{R}._keyword_index_backend", return_value="pg_search"),
+            patch(f"{R}.pg_bm25_status", return_value="building"),
+            patch(f"{R}.read_bm25_build_outcome", side_effect=RuntimeError("no app context")),
+        ):
+            assert kb_route._bm25_status_detail(self.KB) == ("building", None)
+
+    def test_compute_bm25_status_returns_only_the_status(self):
+        with patch(f"{R}._bm25_status_detail", return_value=("failed", "why")):
+            assert kb_route._compute_bm25_status(self.KB) == "failed"
+
+
+class TestStatusField:
+    def _get(self, detail):
+        kb_id = "11111111-1111-1111-1111-111111111111"
+        kb = {
+            "id": kb_id,
+            "name": "kb",
+            "description": None,
+            "indexing_config": {"strategy": "chunk_embed"},
+            "retrieval_config": {"method": "hybrid"},
+            "created_at": None,
+            "updated_at": None,
+        }
+        with (
+            _AUTH,
+            patch(f"{R}.db") as db,
+            patch(f"{R}._fetch_kb_or_404", return_value=kb),
+            patch(f"{R}._compute_drift", return_value="none"),
+            patch(f"{R}._bm25_status_detail", return_value=detail),
+        ):
+            db.session.execute.return_value = iter([])
+            return _client().get(f"/api/knowledge-bases/{kb_id}", headers=_headers()).get_json()
+
+    def test_the_reason_is_in_the_response(self):
+        body = self._get(("retrying", "lock_not_available (attempt 2)"))
+        assert body["bm25_status"] == "retrying"
+        assert body["bm25_status_reason"] == "lock_not_available (attempt 2)"
+
+    def test_no_reason_no_field(self):
+        body = self._get(("ready", None))
+        assert body["bm25_status"] == "ready"
+        assert "bm25_status_reason" not in body
