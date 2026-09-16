@@ -1477,7 +1477,9 @@ def _partition_index_state(conn, partition: str) -> tuple[set, set, set]:
     return constraints, shapes, invalid
 
 
-def _build_move_indexes_and_keys(conn, kb_id: str, item_table: str) -> None:
+def _build_move_indexes_and_keys(
+    conn, kb_id: str, item_table: str, *, every_index: bool = False
+) -> None:
     """Inside the move, after the copy: what correctness rests on, in bulk.
 
     Constraint-backed indexes (the local primary key) and every UNIQUE index,
@@ -1489,15 +1491,19 @@ def _build_move_indexes_and_keys(conn, kb_id: str, item_table: str) -> None:
 
     Adding a foreign key takes SHARE ROW EXCLUSIVE on the table it references
     until the move commits, which is why this runs as late as it can.
+
+    ``every_index`` is for an empty clone (``_attach_empty_partition``): every
+    index costs nothing to build there, and the keys nothing to validate.
     """
     partition = _qualified(partition_name(kb_id, item_table))
     for definition in _default_index_definitions(conn, item_table):
         if "constraint" in definition:
             conn.execute(text(f"ALTER TABLE {partition} ADD {definition['constraint']}"))
-        elif definition["unique"]:
-            conn.execute(text(f"CREATE UNIQUE INDEX ON {partition} {definition['tail']}"))
+        elif definition["unique"] or every_index:
+            unique = "UNIQUE " if definition["unique"] else ""
+            conn.execute(text(f"CREATE {unique}INDEX ON {partition} {definition['tail']}"))
     for definition in _foreign_key_defs(conn, default_partition_name(item_table)):
-        suffix = "" if definition.endswith(" NOT VALID") else " NOT VALID"
+        suffix = "" if definition.endswith(" NOT VALID") or every_index else " NOT VALID"
         conn.execute(text(f"ALTER TABLE {partition} ADD {definition}{suffix}"))
 
 
@@ -1973,6 +1979,108 @@ def _drop_failed_move_check(conn, kb_id: str, item_table: str) -> None:
         )
 
 
+def _kb_rows_in_default(conn, kb_id: str, item_table: str) -> bool:
+    return bool(
+        conn.execute(
+            text(
+                f"SELECT EXISTS (SELECT 1 FROM {_qualified(default_partition_name(item_table))} "
+                "WHERE knowledge_base_id = CAST(:kb AS uuid))"
+            ),
+            {"kb": kb_id},
+        ).scalar()
+    )
+
+
+def _attach_empty_partition(engine, conn, kb_id: str, item_table: str) -> dict | None:
+    """Attach the partition of a knowledge base with no rows in DEFAULT.
+
+    Nothing has to move, so nothing needs writers held off the parent: the
+    check that lets ATTACH skip its scan of DEFAULT is added ``NOT VALID`` and
+    committed (a brief ACCESS EXCLUSIVE try on DEFAULT), validated in a
+    transaction of its own (SHARE UPDATE EXCLUSIVE: readers and writers carry
+    on while DEFAULT is scanned), and then the ATTACH takes a second brief
+    ACCESS EXCLUSIVE try, drops the check and commits. A write of this
+    knowledge base routed to DEFAULT in the meantime is refused by the check
+    (SQLSTATE 23514, which indexing requeues). Every index is built on the
+    empty clone first, and the foreign keys added valid -- both free there.
+
+    Returns ``None`` when a row of the knowledge base reached DEFAULT before
+    the check went up (it then fails to validate): the check and the clone
+    are dropped, and the caller prepares a bare clone again and moves the rows
+    the ordinary way. Called under the item table's
+    build lock, with the clone prepared.
+    """
+    partition = partition_name(kb_id, item_table)
+    fence = default_move_check_name(kb_id)
+    fence_sql = default_move_check_add_ddl(kb_id, item_table)
+    fence_committed = False
+    blocked = 0.0
+    step = "build"
+    try:
+        conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+        _build_move_indexes_and_keys(conn, kb_id, item_table, every_index=True)
+        conn.commit()
+
+        step = "fence"
+        started = time.monotonic()
+        _lock_default_exclusively(conn, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
+        conn.execute(text(fence_sql))
+        fence_committed = True
+        conn.commit()
+        blocked += time.monotonic() - started
+
+        step = "validate"
+        conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+        try:
+            conn.execute(text(default_move_check_validate_ddl(kb_id, item_table)))
+        except Exception as exc:
+            if getattr(getattr(exc, "orig", None), "sqlstate", None) != "23514":
+                raise
+            conn.rollback()
+            logger.info(
+                "A row of KB %s reached %s.%s before its check went up; moving its rows instead",
+                kb_id,
+                AI_SCHEMA,
+                default_partition_name(item_table),
+            )
+            _drop_move_checks(conn, item_table, [fence])
+            # The clone carries every index now; the move wants it bare.
+            conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+            conn.execute(text(partition_drop_ddl(kb_id, item_table)))
+            conn.commit()
+            return None
+        conn.commit()
+
+        step = "attach"
+        attach_sql = partition_attach_ddl(kb_id, item_table)
+        started = time.monotonic()
+        conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+        _lock_default_exclusively(conn, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
+        conn.execute(text(attach_sql))
+        conn.execute(text(default_move_check_drop_ddl(item_table, fence)))
+        conn.execute(
+            text(mirror_relation_settings_sql(_qualified(item_table), _qualified(partition)))
+        )
+        conn.commit()
+        blocked += time.monotonic() - started
+    except Exception as exc:
+        conn.rollback()
+        _log_move_failure(
+            conn, kb_id, item_table, exc, action=f"Attaching the empty partition ({step}) of"
+        )
+        if fence_committed:
+            _drop_failed_move_check(conn, kb_id, item_table)
+        raise
+    logger.info(
+        "Attached empty partition %s.%s without moving rows; writes to its DEFAULT partition "
+        "waited at most %.3f s",
+        AI_SCHEMA,
+        partition,
+        blocked,
+    )
+    return {"rows_moved": 0, "writes_blocked_seconds": blocked}
+
+
 def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
     """Move one knowledge base into a partition of its own, atomically.
 
@@ -2083,6 +2191,12 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                 return {"rows_moved": 0, "writes_blocked_seconds": 0.0}
 
             _prepare_partition(conn, kb_id, item_table)
+            if not _kb_rows_in_default(conn, kb_id, item_table):
+                conn.commit()
+                attached = _attach_empty_partition(engine, conn, kb_id, item_table)
+                if attached is not None:
+                    return attached
+                _prepare_partition(conn, kb_id, item_table)
             insert_sql, delete_sql = move_rows_sql(
                 kb_id, item_table, _insertable_columns(conn, default)
             )

@@ -65,6 +65,7 @@ class _FakeConn:
         check_constraint=False,
         partition_foreign_keys=(),
         build_in_progress=False,
+        default_rows=True,
     ):
         self.extension = extension
         self.kb_row = kb_row
@@ -78,6 +79,7 @@ class _FakeConn:
         self.check_constraint = check_constraint
         self.partition_foreign_keys = list(partition_foreign_keys)
         self.build_in_progress = build_in_progress
+        self.default_rows = default_rows
         self.statements: list[str] = []
         self.commits: list[int] = []
         self.rollbacks: list[int] = []
@@ -147,6 +149,8 @@ class _FakeConn:
                 else self.foreign_keys
             )
             rows = [(fk,) for fk in source]
+        elif sql.startswith("SELECT EXISTS (SELECT 1 FROM") and "_default " in sql:
+            row = (self.default_rows,)
         elif "pg_attribute" in sql:
             rows = [(column,) for column in _COLUMNS]
         elif "indisvalid" in sql:
@@ -402,6 +406,21 @@ def test_ensure_declines_cleanly_when_another_build_holds_the_lock(monkeypatch):
     assert out["reason"] == "partition_build_in_progress"
     assert _partition_ddl(conn) == []
     assert _ddl(conn) == []
+
+
+def test_a_knowledge_base_with_no_rows_in_default_is_attached_without_the_parent_lock():
+    conn = _FakeConn(default_rows=False)
+
+    out = pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    assert out["rows_moved"] == 0
+    assert pgb.partition_lock_parent_ddl("chunks") not in conn.statements
+    add = conn.statements.index(pgb.default_move_check_add_ddl(KB, "chunks"))
+    validate = conn.statements.index(pgb.default_move_check_validate_ddl(KB, "chunks"))
+    attach = conn.statements.index(pgb.partition_attach_ddl(KB, "chunks"))
+    # Three transactions: the check, its validation, the attach.
+    assert any(add < c <= validate for c in conn.commits)
+    assert any(validate < c <= attach for c in conn.commits)
 
 
 def test_ensure_adds_the_check_constraint_so_the_attach_skips_its_scan():
