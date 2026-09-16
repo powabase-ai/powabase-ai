@@ -113,14 +113,15 @@ _EXCLUSIVE_LOCK_MAX_SLEEP_SECONDS = 0.25
 
 # Before it takes the parent lock, the move checks that DEFAULT can be locked
 # at all: ``NOWAIT`` tries of ACCESS EXCLUSIVE, each released at once, for up to
-# this long. A transaction that began before the first try and still holds
-# DEFAULT after the last -- a reader idle in its transaction, typically --
-# would refuse every lock try the move makes on DEFAULT, so the move gives up
-# there (SQLSTATE 55P03) instead of holding writers off the parent for those
-# tries first. Overlapping short transactions refuse the tries too, but none
-# of them outlasts the window, so the move goes ahead. Only a heuristic: a long
-# reader can still arrive after the probe, and the bounded tries remain the
-# guard for that.
+# this long. If every try is refused and a transaction that has been open for
+# longer than ``BM25_MOVE_LONG_HOLDER_SECONDS`` (a project setting, 5 s by
+# default) holds DEFAULT -- a reader idle in its transaction, typically -- it
+# would refuse every lock try the move makes on DEFAULT too, so the move gives
+# up there (SQLSTATE 55P03) instead of holding writers off the parent for those
+# tries first. Ordinary requests and overlapping short transactions refuse the
+# tries as well, but are younger than that, so the move goes ahead and its
+# bounded tries wait them out. Only a heuristic: a long reader can still arrive
+# after the probe, and the bounded tries remain the guard for that.
 DEFAULT_PREFLIGHT_WAIT_SECONDS = 0.25
 
 # How long a failed move keeps trying to drop the temporary check it put on
@@ -1696,10 +1697,39 @@ def _default_holder_is_waiting(conn, item_table: str) -> bool:
     )
 
 
+def _has_app_context() -> bool:
+    try:
+        from flask import has_app_context
+
+        return has_app_context()
+    except Exception:
+        return False
+
+
+def _long_holder_seconds() -> int:
+    """``BM25_MOVE_LONG_HOLDER_SECONDS``, or its registry default without an app.
+
+    Read per move. Outside an application context there is no settings table
+    to read, so the registry default applies.
+    """
+    from . import settings_registry
+
+    definition = settings_registry.SETTINGS_REGISTRY["BM25_MOVE_LONG_HOLDER_SECONDS"]
+    if not _has_app_context():
+        return int(definition.default)
+    try:
+        value = int(settings_registry.get_setting("BM25_MOVE_LONG_HOLDER_SECONDS"))
+    except Exception:
+        return int(definition.default)
+    return max(int(definition.min), min(int(definition.max), value))
+
+
 def _default_has_a_long_holder(conn, item_table: str, held_for_seconds: float) -> bool:
     """Does a transaction that began at least ``held_for_seconds`` ago hold DEFAULT?
 
-    A lock of a prepared transaction has no backend, and counts as long.
+    The age is absolute -- how long the holding transaction has been open --
+    not how long the caller has been probing. A lock of a prepared transaction
+    has no backend, and counts as long.
     """
     this_database = "(SELECT oid FROM pg_database WHERE datname = current_database())"
     return bool(
@@ -1748,7 +1778,7 @@ def _probe_default_before_moving(conn, item_table: str) -> None:
             break
         time.sleep(sleep)
         sleep = min(sleep * 2, _EXCLUSIVE_LOCK_MAX_SLEEP_SECONDS)
-    long_holder = _default_has_a_long_holder(conn, item_table, time.monotonic() - started)
+    long_holder = _default_has_a_long_holder(conn, item_table, _long_holder_seconds())
     conn.rollback()
     if long_holder:
         raise refusal

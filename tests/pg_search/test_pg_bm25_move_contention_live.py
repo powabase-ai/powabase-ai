@@ -275,7 +275,9 @@ def test_a_long_reader_makes_the_move_give_up_without_stalling_writers(
     """A reader idle in its transaction on DEFAULT would refuse every lock try
     the move makes on DEFAULT, so an attempt is bound to fail -- and it used to
     hold every writer of the item table off for those ~2 s of tries first. The
-    pre-flight probe sees the reader and gives up before the parent lock."""
+    pre-flight probe sees the reader, open for longer than the long-holder
+    setting, and gives up before the parent lock."""
+    monkeypatch.setattr(pgb, "_long_holder_seconds", lambda: 1)
     _seed(session, KB_A, 2_000)
     parent_locks: list[str] = []
     real_parent_lock = pgb.partition_lock_parent_ddl
@@ -288,7 +290,7 @@ def test_a_long_reader_makes_the_move_give_up_without_stalling_writers(
     holder = _read_default_and_hold(engine)
     try:
         with _WriterLoop(engine) as writers:
-            time.sleep(0.2)
+            time.sleep(1.2)
             started = time.monotonic()
             with pytest.raises(Exception) as caught:
                 pgb.create_partition(engine, KB_A, "chunks")

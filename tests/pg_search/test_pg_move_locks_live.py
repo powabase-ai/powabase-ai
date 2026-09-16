@@ -118,3 +118,90 @@ def test_a_stale_clone_that_somehow_holds_rows_is_not_dropped(engine, session):
     else:
         raise AssertionError("a non-empty stale clone was dropped or reused")
     assert _rows_in(session, partition) == 1
+
+
+# ---------------------------------------------------------------------------
+# Who counts as a long holder of DEFAULT
+# ---------------------------------------------------------------------------
+
+
+def _hold_default_in_a_transaction(engine, seconds, started):
+    def run():
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    f"SELECT count(*) FROM {SCHEMA}.chunks "
+                    "WHERE knowledge_base_id = CAST(:kb AS uuid)"
+                ),
+                {"kb": KB_B},
+            ).scalar()
+            started.set()
+            time.sleep(seconds)
+            conn.rollback()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+def _spy_parent_lock(monkeypatch) -> list:
+    taken: list = []
+    real = pgb.partition_lock_parent_ddl
+    monkeypatch.setattr(
+        pgb, "partition_lock_parent_ddl", lambda *a, **k: taken.append(1) or real(*a, **k)
+    )
+    return taken
+
+
+def test_an_ordinary_short_read_of_default_does_not_make_the_move_give_up(
+    engine, session, monkeypatch
+):
+    """A request reading the item table for well under a second is not a long
+    transaction. The pre-flight used to call anything older than its own
+    ~0.16 s probe window long, so such a read refused the move outright."""
+    monkeypatch.setattr(pgb, "DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS", 3.0)
+    monkeypatch.setattr(pgb, "_long_holder_seconds", lambda: 5)
+    started = threading.Event()
+    reader = _hold_default_in_a_transaction(engine, 0.8, started)
+    assert started.wait(timeout=10)
+
+    moved = pgb.create_partition(engine, KB_A, "chunks")
+    reader.join(timeout=10)
+
+    assert moved["rows_moved"] == len(KB_A_DOCS)
+
+
+def test_a_transaction_older_than_the_setting_makes_the_move_give_up_before_locking(
+    engine, session, monkeypatch
+):
+    monkeypatch.setattr(pgb, "_long_holder_seconds", lambda: 1)
+    taken = _spy_parent_lock(monkeypatch)
+    started = threading.Event()
+    reader = _hold_default_in_a_transaction(engine, 3.0, started)
+    assert started.wait(timeout=10)
+    time.sleep(1.2)
+    try:
+        pgb.create_partition(engine, KB_A, "chunks")
+    except Exception as exc:
+        error = exc
+    else:
+        error = None
+    reader.join(timeout=10)
+
+    assert error is not None and pgb.is_lock_conflict(error)
+    assert taken == []
+    assert _rows_in(session, "chunks_default", KB_A) == len(KB_A_DOCS)
+
+
+def test_the_long_holder_threshold_is_the_registry_setting(monkeypatch):
+    """Outside an application context there is no settings table to read, so
+    the registry default applies; inside one, the stored value."""
+    from agentic_project_service.services import settings_registry
+
+    assert (
+        pgb._long_holder_seconds()
+        == settings_registry.SETTINGS_REGISTRY["BM25_MOVE_LONG_HOLDER_SECONDS"].default
+    )
+    monkeypatch.setattr(pgb, "_has_app_context", lambda: True)
+    monkeypatch.setattr(settings_registry, "get_setting", lambda key: 42)
+    assert pgb._long_holder_seconds() == 42
