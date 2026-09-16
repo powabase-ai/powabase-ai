@@ -18,7 +18,9 @@ class _Store(bvs.BasePgVectorStore):
 
 
 def _item(i: str) -> RetrievedItem:
-    return RetrievedItem(item_id=i, text=f"t{i}", score=0.9, source_id="s", knowledge_base_id="kb", meta={})
+    return RetrievedItem(
+        item_id=i, text=f"t{i}", score=0.9, source_id="s", knowledge_base_id="kb", meta={}
+    )
 
 
 def _store_with_timeout():
@@ -45,7 +47,9 @@ def _fake_embedding():
 def test_keyword_search_for_hybrid_swallows_timeout():
     store = _store_with_timeout()
     out = asyncio.run(
-        store.keyword_search_for_hybrid("q", top_k=4, filter_metadata=None, item_ids=None, source_ids=None)
+        store.keyword_search_for_hybrid(
+            "q", top_k=4, filter_metadata=None, item_ids=None, source_ids=None
+        )
     )
     assert out == []
 

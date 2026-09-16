@@ -164,8 +164,7 @@ def _bm25_fallback_timeout_ms() -> int:
         clamped = min(clamped, defn.max)
     if clamped != value:
         logger.warning(
-            "BM25_FALLBACK_TIMEOUT_MS=%d is outside the allowed range %s-%s; "
-            "using %d ms instead",
+            "BM25_FALLBACK_TIMEOUT_MS=%d is outside the allowed range %s-%s; using %d ms instead",
             value,
             defn.min,
             defn.max,
