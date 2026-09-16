@@ -123,7 +123,10 @@ def test_a_transaction_that_read_default_then_writes_is_never_the_deadlock_victi
 
     assert app == {"committed": True}
     if first_attempt is not None:
-        assert pgb.is_transient_db_error(first_attempt), _first_line(first_attempt)
+        # A lock timeout, never a deadlock: 40P01 would mean the move had
+        # queued into the cycle and merely happened to be the side aborted.
+        sqlstate = getattr(getattr(first_attempt, "orig", first_attempt), "sqlstate", None)
+        assert sqlstate == "55P03", _first_line(first_attempt)
         assert _move_check_names(session) == []
         assert pgb.create_partition(engine, KB_A, "chunks")["rows_moved"] == 2_000 + len(KB_A_DOCS)
     partition = pgb.partition_name(KB_A, "chunks")
@@ -691,6 +694,23 @@ def test_a_holder_of_default_waiting_on_a_row_lock_counts_as_waiting(engine, ses
     assert waiting is True
 
 
+def _create_database_from_template(admin, name, template, wait_seconds=20.0):
+    """``CREATE DATABASE ... TEMPLATE`` refuses while any session is connected to
+    the template (SQLSTATE 55006), and on some servers a background worker
+    briefly connects to every new database. Retry until it has left."""
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            with admin.connect() as conn:
+                conn.execute(text(f"CREATE DATABASE {name} TEMPLATE {template}"))
+            return
+        except Exception as exc:
+            sqlstate = getattr(getattr(exc, "orig", exc), "sqlstate", None)
+            if sqlstate != "55006" or time.monotonic() > deadline:
+                raise
+            time.sleep(0.25)
+
+
 def test_a_waiting_holder_of_a_same_oid_table_in_another_database_does_not_count(engine):
     """``pg_locks`` spans the cluster, and a database copied from a template has
     the template's relation OIDs. A session in the copy that holds its own
@@ -715,8 +735,7 @@ def test_a_waiting_holder_of_a_same_oid_table_in_another_database_does_not_count
             conn.execute(text(f"CREATE TABLE {SCHEMA}.knowledge_bases (id int)"))
             conn.execute(text(f"INSERT INTO {SCHEMA}.knowledge_bases VALUES (1)"))
         seeded.dispose()
-        with admin.connect() as conn:
-            conn.execute(text(f"CREATE DATABASE {twin} TEMPLATE {original}"))
+        _create_database_from_template(admin, twin, original)
         copied = _engine_for(twin)
         seeded = _engine_for(original)
         oid_sql = text(f"SELECT to_regclass('{SCHEMA}.chunks_default')::oid")

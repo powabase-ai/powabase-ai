@@ -444,6 +444,61 @@ def test_a_policy_gated_role_can_read_the_new_partition_by_name(engine, session)
             conn.execute(text(f"DROP ROLE IF EXISTS {role}"))
 
 
+def test_the_partitions_policies_match_the_parents_in_every_part(engine, session):
+    """Name, PERMISSIVE/RESTRICTIVE, command, roles, USING and WITH CHECK.
+
+    Pinned against the catalog, so a copy that dropped the WITH CHECK clause or
+    granted a policy to PUBLIC instead of its roles cannot pass unnoticed.
+    """
+    role = "bm25_live_writer"
+    partition = pgb.partition_name(KB_A, "chunks")
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(
+            text(
+                f"DO $$ BEGIN CREATE ROLE {role} NOLOGIN NOBYPASSRLS; "
+                "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
+            )
+        )
+        conn.execute(text(f"ALTER TABLE {SCHEMA}.chunks ENABLE ROW LEVEL SECURITY"))
+        conn.execute(
+            text(
+                f"CREATE POLICY writer_own_kb ON {SCHEMA}.chunks AS PERMISSIVE FOR ALL "
+                f"TO {role} USING (knowledge_base_id <> '{KB_B}'::uuid) "
+                f"WITH CHECK (source_id IS NOT NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                f"CREATE POLICY writer_no_blank ON {SCHEMA}.chunks AS RESTRICTIVE FOR INSERT "
+                f"TO {role}, public WITH CHECK (length(text) > 0)"
+            )
+        )
+
+    pgb.create_partition(engine, KB_A, "chunks")
+
+    def policies(table):
+        rows = session.execute(
+            text(
+                "SELECT policyname, permissive, roles::text[], cmd, qual, with_check "
+                "FROM pg_policies WHERE schemaname = :s AND tablename = :t ORDER BY policyname"
+            ),
+            {"s": SCHEMA, "t": table},
+        ).all()
+        session.rollback()
+        return [tuple(sorted(r) if isinstance(r, list) else r for r in row) for row in rows]
+
+    try:
+        on_parent = policies("chunks")
+        assert [p[0] for p in on_parent] == ["writer_no_blank", "writer_own_kb"]
+        assert on_parent[1][2] == [role] and on_parent[1][5] is not None
+        assert policies(partition) == on_parent
+    finally:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
+            conn.execute(text(f"DROP OWNED BY {role}"))
+            conn.execute(text(f"DROP ROLE IF EXISTS {role}"))
+
+
 def _seed(session, kb_id, count, prefix="Wanderung Nummer"):
     """Bulk-insert ``count`` rows for one KB. One statement, so tests stay quick."""
     session.execute(
