@@ -814,6 +814,33 @@ def test_the_attach_scans_neither_the_new_partition_nor_default(engine, session)
     assert _rows_in(session, partition) == 2_008
 
 
+def test_an_unrelated_check_on_default_does_not_stop_the_kb_check(engine, session):
+    """I13: the clone inherits every CHECK on DEFAULT; its own kb check must
+    still be added, or the ATTACH would scan the new partition."""
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(
+            text(
+                f"ALTER TABLE {SCHEMA}.chunks_default "
+                "ADD CONSTRAINT chunks_text_not_huge CHECK (length(text) < 1000000)"
+            )
+        )
+
+    pgb.create_partition(engine, KB_A, "chunks")
+
+    partition = pgb.partition_name(KB_A, "chunks")
+    names = {
+        row[0]
+        for row in session.execute(
+            text(
+                "SELECT conname FROM pg_constraint "
+                f"WHERE conrelid = '{SCHEMA}.{partition}'::regclass AND contype = 'c'"
+            )
+        ).all()
+    }
+    session.rollback()
+    assert f"{partition}_kb_check" in names
+
+
 def test_a_failed_move_does_not_leave_the_default_check_behind(engine, session, monkeypatch):
     """The temporary CHECK refuses this KB's rows in DEFAULT; a failed move
     must not leave it there, or every later write for the KB would fail."""

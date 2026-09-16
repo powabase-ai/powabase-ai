@@ -759,16 +759,95 @@ def _foreign_key_defs(conn, relname: str) -> list[str]:
 
 
 def _check_constraint_exists(conn, partition: str) -> bool:
+    """Does the clone already carry *its own* kb check, by name?
+
+    Not "any CHECK": ``LIKE ... INCLUDING CONSTRAINTS`` copies every CHECK on
+    DEFAULT onto the clone, so the first unrelated CHECK on the item table
+    would otherwise stop this one being added, and ATTACH would quietly go back
+    to scanning the new partition.
+    """
     row = conn.execute(
         text(
             "SELECT 1 FROM pg_constraint c "
             "JOIN pg_class t ON t.oid = c.conrelid "
             "JOIN pg_namespace n ON n.oid = t.relnamespace "
-            "WHERE n.nspname = :schema AND t.relname = :relname AND c.contype = 'c'"
+            "WHERE n.nspname = :schema AND t.relname = :relname AND c.contype = 'c' "
+            "AND c.conname = :conname"
         ),
-        {"schema": AI_SCHEMA, "relname": partition},
+        {"schema": AI_SCHEMA, "relname": partition, "conname": f"{partition}_kb_check"},
     ).first()
     return row is not None
+
+
+# SQLSTATEs worth retrying a partition or index build for: nothing about the
+# request is wrong, another transaction was simply in the way.
+_TRANSIENT_SQLSTATES = frozenset(
+    {
+        "55P03",  # lock_not_available (lock_timeout)
+        "40P01",  # deadlock_detected
+        "40001",  # serialization_failure
+    }
+)
+
+
+def is_transient_db_error(exc: BaseException) -> bool:
+    """Did this fail only because another transaction was in the way?"""
+    orig = getattr(exc, "orig", exc)
+    return getattr(orig, "sqlstate", None) in _TRANSIENT_SQLSTATES
+
+
+def _lock_holders_sql() -> str:
+    return (
+        "SELECT l.pid, l.mode, l.granted, pg_blocking_pids(l.pid) AS blocked_by, "
+        "a.state, now() - a.xact_start AS xact_age, left(a.query, 200) AS query "
+        "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+        "WHERE l.relation IN (to_regclass(:parent), to_regclass(:default)) "
+        "AND l.pid <> pg_backend_pid() ORDER BY l.granted DESC, l.pid"
+    )
+
+
+def _log_move_failure(conn, knowledge_base_id: str, item_table: str, exc: BaseException) -> None:
+    """Say why a move failed, and for a lock timeout, who was in the way.
+
+    Runs after the rollback. A lock timeout has already ended the wait, so
+    there is no blocked backend left to ask ``pg_blocking_pids`` about; the
+    sessions still holding or waiting for locks on the parent and DEFAULT are
+    the nearest evidence, each with whatever blocks *it*.
+    """
+    if not is_transient_db_error(exc):
+        logger.warning(
+            "Moving KB %s into its own partition of %s.%s failed; rolled back",
+            knowledge_base_id,
+            AI_SCHEMA,
+            item_table,
+        )
+        return
+    holders: list = []
+    try:
+        holders = [
+            dict(row._mapping)
+            for row in conn.execute(
+                text(_lock_holders_sql()),
+                {
+                    "parent": _qualified(item_table),
+                    "default": _qualified(default_partition_name(item_table)),
+                },
+            ).all()
+        ]
+        conn.rollback()
+    except Exception:
+        conn.rollback()
+        logger.debug("Could not list lock holders", exc_info=True)
+    logger.warning(
+        "Moving KB %s into its own partition of %s.%s gave up (lock_timeout %d ms, or a "
+        "deadlock); rolled back, retryable. Sessions holding or awaiting locks on the "
+        "table: %s",
+        knowledge_base_id,
+        AI_SCHEMA,
+        item_table,
+        MOVE_LOCK_TIMEOUT_MS,
+        holders,
+    )
 
 
 def _acquire_partition_build_lock(conn, item_table: str) -> None:
@@ -968,6 +1047,10 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                 )
                 conn.commit()
                 blocked = time.monotonic() - started
+            except Exception as exc:
+                conn.rollback()
+                _log_move_failure(conn, kb_id, item_table, exc)
+                raise
             finally:
                 conn.rollback()
                 try:

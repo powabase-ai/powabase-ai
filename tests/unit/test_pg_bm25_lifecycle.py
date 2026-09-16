@@ -74,6 +74,8 @@ class _FakeConn:
         self.partition_foreign_keys = list(partition_foreign_keys)
         self.statements: list[str] = []
         self.commits: list[int] = []
+        self.rollbacks: list[int] = []
+        self.fail_on: tuple[str, Exception] | None = None
         self.options: dict = {}
 
     # engine.connect().execution_options(...) -> connection
@@ -90,6 +92,8 @@ class _FakeConn:
     def execute(self, statement, params=None):
         sql = getattr(statement, "text", str(statement))
         self.statements.append(sql)
+        if self.fail_on and self.fail_on[0] in sql:
+            raise self.fail_on[1]
         result = MagicMock()
         result.rowcount = 0
         row = None
@@ -112,7 +116,16 @@ class _FakeConn:
         elif "pg_advisory_unlock" in sql:
             row = (True,)
         elif "contype = 'c'" in sql:
-            row = (1,) if self.check_constraint else None
+            # ``True`` means the clone carries its own kb check; a string is the
+            # name of some other CHECK on it. A query that does not ask for a
+            # name matches whatever is there.
+            name = (
+                f"{(params or {}).get('relname')}_kb_check"
+                if self.check_constraint is True
+                else self.check_constraint
+            )
+            wanted = (params or {}).get("conname") if "conname = :conname" in sql else None
+            row = (1,) if name and (wanted is None or wanted == name) else None
         elif "pg_get_constraintdef" in sql:
             relname = (params or {}).get("relname")
             source = (
@@ -136,7 +149,7 @@ class _FakeConn:
         self.commits.append(len(self.statements))
 
     def rollback(self):
-        pass
+        self.rollbacks.append(len(self.statements))
 
 
 class _FakeEngine:
@@ -341,6 +354,73 @@ def test_ensure_resumes_a_partition_that_exists_but_was_never_attached():
     assert pgb.partition_attach_ddl(KB, "chunks") in conn.statements
     # The clone is idempotent, so re-issuing it is harmless and expected.
     assert pgb.partition_create_ddl(KB, "chunks") in conn.statements
+
+
+def test_an_unrelated_check_on_the_clone_does_not_stand_in_for_the_kb_check():
+    """I13: ``LIKE ... INCLUDING CONSTRAINTS`` copies every CHECK on DEFAULT.
+
+    Matching "any CHECK" meant the first CHECK anyone added to the item table
+    would silently stop the kb check being added, and ATTACH would go back to
+    scanning the new partition.
+    """
+    conn = _FakeConn(
+        relkinds=_with_partition(), attached=False, check_constraint="chunks_text_length_check"
+    )
+
+    pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    assert pgb.partition_check_ddl(KB, "chunks") in conn.statements
+
+
+def _lock_timeout_error():
+    from sqlalchemy.exc import OperationalError
+
+    class _Orig(Exception):
+        sqlstate = "55P03"
+
+    return OperationalError("LOCK TABLE", {}, _Orig("canceling statement due to lock timeout"))
+
+
+def test_a_failed_move_rolls_back_before_releasing_the_build_lock_and_names_the_holders(
+    caplog,
+):
+    """I14: the unlock used to run on the aborted transaction.
+
+    It logged a misleading "could not release the lock" traceback, threw the
+    connection away, and -- worse -- on a move that failed part-way without
+    aborting, its commit made the half-done move durable. Now the move rolls
+    back first, and a lock timeout is logged with who held the locks.
+    """
+    conn = _FakeConn(moved=5)
+    conn.fail_on = (pgb.partition_lock_parent_ddl("chunks"), _lock_timeout_error())
+
+    with caplog.at_level("WARNING"), pytest.raises(Exception, match="lock timeout"):
+        pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    unlock_at = next(i for i, s in enumerate(conn.statements) if "pg_advisory_unlock" in s)
+    lock_at = conn.statements.index(pgb.partition_lock_parent_ddl("chunks"))
+    first_rollback = min(r for r in conn.rollbacks if r > lock_at)
+    assert first_rollback <= unlock_at
+    # Nothing is committed between the failure and that rollback.
+    assert not [c for c in conn.commits if lock_at < c < first_rollback]
+    assert "could not release" not in caplog.text.lower()
+    assert "lock_timeout" in caplog.text or "lock timeout" in caplog.text
+    assert any("pg_blocking_pids" in s for s in conn.statements)
+
+
+def test_transient_database_errors_are_recognised_by_sqlstate():
+    from sqlalchemy.exc import OperationalError
+
+    def _err(code):
+        class _Orig(Exception):
+            sqlstate = code
+
+        return OperationalError("stmt", {}, _Orig("boom"))
+
+    for code in ("55P03", "40P01", "40001"):
+        assert pgb.is_transient_db_error(_err(code)) is True
+    assert pgb.is_transient_db_error(_err("23505")) is False
+    assert pgb.is_transient_db_error(RuntimeError("no sqlstate")) is False
 
 
 def test_ensure_copies_the_default_partitions_foreign_keys_onto_the_new_one():
