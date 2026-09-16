@@ -476,6 +476,34 @@ def test_a_failed_move_rolls_back_before_releasing_the_build_lock_and_names_the_
     assert any("pg_blocking_pids" in s for s in conn.statements)
 
 
+class _FenceCommitLostConn(_FakeConn):
+    """The fence's commit reaches the server, but the client never hears back."""
+
+    def commit(self):
+        super().commit()
+        if self.statements and self.statements[-1] == pgb.default_move_check_add_ddl(KB, "chunks"):
+            from sqlalchemy.exc import OperationalError
+
+            raise OperationalError("COMMIT", {}, Exception("server closed the connection"))
+
+
+def test_a_fence_whose_commit_errors_on_the_client_is_still_dropped(monkeypatch):
+    """A commit can succeed on the server and still raise on the client (the
+    connection drops before the reply). The move must treat the check as
+    committed and try to drop it: ``DROP CONSTRAINT IF EXISTS`` costs one try if
+    it was not, while skipping it would leave the knowledge base's writes to
+    DEFAULT refused until the next sweep."""
+    monkeypatch.setattr(pgb, "MOVE_CHECK_CLEANUP_WAIT_SECONDS", 0.0)
+    conn = _FenceCommitLostConn(moved=5)
+
+    with pytest.raises(Exception, match="server closed the connection"):
+        pgb.create_partition(_FakeEngine(conn), KB, "chunks")
+
+    add = conn.statements.index(pgb.default_move_check_add_ddl(KB, "chunks"))
+    drop = pgb.default_move_check_drop_ddl("chunks", pgb.default_move_check_name(KB))
+    assert drop in conn.statements[add:]
+
+
 def test_transient_database_errors_are_recognised_by_sqlstate():
     from sqlalchemy.exc import OperationalError
 

@@ -1593,8 +1593,11 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                         fencer, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS
                     )
                     fencer.execute(text(default_move_check_add_ddl(kb_id, item_table)))
+                    # Before the commit, not after: a commit that reaches the
+                    # server can still raise on the client, and then the check
+                    # is up. A false positive costs one try of an IF EXISTS drop.
+                    fence_committed = True
                     fencer.commit()
-                fence_committed = True
                 conn.execute(text(partition_lock_default_ddl(item_table)))
                 moved = conn.execute(text(insert_sql), {"kb": kb_id}).rowcount
                 conn.execute(text(delete_sql), {"kb": kb_id})
