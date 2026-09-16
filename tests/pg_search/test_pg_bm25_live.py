@@ -43,15 +43,15 @@ SOURCE_2 = "22222222-2222-4222-8222-222222222222"
 # German for KB A, French for KB B: each partition carries its own stemmer, so
 # the two must fold their own inflections and neither the other's.
 KB_A_DOCS = [
-    (SOURCE_1, "Die Beschwerde des Werkeigentümers wurde abgewiesen"),
-    (SOURCE_1, "Mehrere Beschwerden gingen beim Gericht ein"),
-    (SOURCE_2, "Verjährung der Forderung nach drei Jahren"),
+    (SOURCE_1, "Die Wanderung des Bergführers wurde abgesagt"),
+    (SOURCE_1, "Mehrere Wanderungen fanden am Wochenende statt"),
+    (SOURCE_2, "Die Brücke wurde nach drei Jahren erneuert"),
 ]
 KB_B_DOCS = [
-    (SOURCE_1, "La réclamation du propriétaire a été rejetée"),
-    (SOURCE_1, "Plusieurs réclamations sont arrivées au tribunal"),
+    (SOURCE_1, "La randonnée en montagne a été magnifique"),
+    (SOURCE_1, "Plusieurs randonnées ont eu lieu ce week-end"),
 ]
-KB_C_DOCS = [(SOURCE_1, "Eine Beschwerde in einer dritten Wissensbasis")]
+KB_C_DOCS = [(SOURCE_1, "Eine Wanderung in einer dritten Wissensbasis")]
 
 
 class _ChunkStore(bvs.BasePgVectorStore):
@@ -370,7 +370,7 @@ def test_the_new_partition_is_reachable_by_the_same_roles_as_the_parent(engine, 
         session.rollback()
 
 
-def _seed(session, kb_id, count, prefix="Beschwerde Nummer"):
+def _seed(session, kb_id, count, prefix="Wanderung Nummer"):
     """Bulk-insert ``count`` rows for one KB. One statement, so tests stay quick."""
     session.execute(
         text(f"""
@@ -480,7 +480,7 @@ def test_a_concurrent_insert_during_the_move_either_lands_or_fails_loudly(engine
                             INSERT INTO {SCHEMA}.chunks (knowledge_base_id, source_id, text)
                             VALUES (CAST(:kb AS uuid), CAST(:src AS uuid), :body)
                         """),
-                        {"kb": KB_A, "src": SOURCE_1, "body": f"Beschwerde spaet {n}"},
+                        {"kb": KB_A, "src": SOURCE_1, "body": f"Wanderung spaet {n}"},
                     )
                 landed.append(n)
             except Exception as exc:
@@ -517,8 +517,8 @@ def test_two_knowledge_bases_can_be_indexed_at_the_same_time(engine, session):
     the ACCESS EXCLUSIVE its own ATTACH needs. Serialised per item table, the
     second caller waits and both finish.
     """
-    _seed(session, KB_A, 400, prefix="Beschwerde A")
-    _seed(session, KB_B, 400, prefix="reclamation B")
+    _seed(session, KB_A, 400, prefix="Wanderung A")
+    _seed(session, KB_B, 400, prefix="rando B")
 
     results: dict[str, dict] = {}
     errors: list[str] = []
@@ -547,8 +547,8 @@ def test_two_knowledge_bases_can_be_indexed_at_the_same_time(engine, session):
     # Both indexes exist and answer only their own knowledge base.
     assert _indexdef(session, KB_A) is not None
     assert _indexdef(session, KB_B) is not None
-    assert len(_search(session, "reclamation", kb_id=KB_B, top_k=5)) == 5
-    assert _search(session, "reclamation", kb_id=KB_A, top_k=5) == []
+    assert len(_search(session, "rando", kb_id=KB_B, top_k=5)) == 5
+    assert _search(session, "rando", kb_id=KB_A, top_k=5) == []
 
 
 def test_a_second_caller_is_told_to_retry_rather_than_blocking_for_ever(
@@ -604,7 +604,7 @@ def test_the_writers_keep_working_and_the_cutover_window_stays_short(engine, ses
                             INSERT INTO {SCHEMA}.chunks (knowledge_base_id, source_id, text)
                             VALUES (CAST(:kb AS uuid), CAST(:src AS uuid), :body)
                         """),
-                        {"kb": KB_A, "src": SOURCE_1, "body": f"Beschwerde spaet {n}"},
+                        {"kb": KB_A, "src": SOURCE_1, "body": f"Wanderung spaet {n}"},
                     )
                 landed.append(time.monotonic() - issued)
             except Exception as exc:
@@ -714,7 +714,7 @@ def test_a_crashed_move_is_resumed_with_no_row_lost_or_duplicated(engine, sessio
     assert _rows_in(session, "chunks_default", KB_A) == 0
     assert _rows_in(session, "chunks", KB_A) == 403
     assert _indexdef(session) is not None
-    assert len(_search(session, "Beschwerde", top_k=5)) == 5
+    assert len(_search(session, "Wanderung", top_k=5)) == 5
 
 
 def test_ensure_is_idempotent_and_does_not_rebuild_the_partition(engine, session):
@@ -815,29 +815,29 @@ def test_two_knowledge_bases_each_get_their_own_index_and_score_independently(en
     assert pgb.bm25_index_ready(session, KB_A, "chunks") is True
     assert pgb.bm25_index_ready(session, KB_B, "chunks") is True
 
-    german = _search(session, "Beschwerde", kb_id=KB_A, top_k=10)
-    french = _search(session, "réclamation", kb_id=KB_B, top_k=10)
+    german = _search(session, "Wanderung", kb_id=KB_A, top_k=10)
+    french = _search(session, "randonnée", kb_id=KB_B, top_k=10)
 
     assert len(german) == 2
     assert {item.knowledge_base_id for item in german} == {KB_A}
     assert len(french) == 2
     assert {item.knowledge_base_id for item in french} == {KB_B}
     # Neither sees the other's rows.
-    assert _search(session, "réclamation", kb_id=KB_A, top_k=10) == []
-    assert _search(session, "Beschwerde", kb_id=KB_B, top_k=10) == []
+    assert _search(session, "randonnée", kb_id=KB_A, top_k=10) == []
+    assert _search(session, "Wanderung", kb_id=KB_B, top_k=10) == []
 
 
 def test_a_third_index_does_not_disturb_the_first_two(engine, session):
     """The old design's failure: building KB B's index broke KB A's scores."""
     pgb.ensure_bm25_index(KB_A, engine=engine)
-    before = [item.score for item in _search(session, "Beschwerde", kb_id=KB_A, top_k=10)]
+    before = [item.score for item in _search(session, "Wanderung", kb_id=KB_A, top_k=10)]
 
     pgb.ensure_bm25_index(KB_B, engine=engine)
     pgb.ensure_bm25_index(KB_C, engine=engine)
 
-    after = [item.score for item in _search(session, "Beschwerde", kb_id=KB_A, top_k=10)]
+    after = [item.score for item in _search(session, "Wanderung", kb_id=KB_A, top_k=10)]
     assert after == before
-    assert len(_search(session, "Beschwerde", kb_id=KB_C, top_k=10)) == 1
+    assert len(_search(session, "Wanderung", kb_id=KB_C, top_k=10)) == 1
 
 
 def test_each_partition_stems_in_its_own_language(engine, session):
@@ -848,13 +848,13 @@ def test_each_partition_stems_in_its_own_language(engine, session):
     assert "'stemmer=french'" in _indexdef(session, KB_B)
 
     # German folds singular and plural, from either direction.
-    assert len(_search(session, "Beschwerde", kb_id=KB_A, top_k=10)) == 2
-    assert len(_search(session, "Beschwerden", kb_id=KB_A, top_k=10)) == 2
-    assert len(_search(session, "Werkeigentümer", kb_id=KB_A, top_k=10)) == 1
+    assert len(_search(session, "Wanderung", kb_id=KB_A, top_k=10)) == 2
+    assert len(_search(session, "Wanderungen", kb_id=KB_A, top_k=10)) == 2
+    assert len(_search(session, "Bergführer", kb_id=KB_A, top_k=10)) == 1
     # French does the same for its own inflections.
-    assert len(_search(session, "réclamation", kb_id=KB_B, top_k=10)) == 2
-    assert len(_search(session, "réclamations", kb_id=KB_B, top_k=10)) == 2
-    assert len(_search(session, "propriétaires", kb_id=KB_B, top_k=10)) == 1
+    assert len(_search(session, "randonnée", kb_id=KB_B, top_k=10)) == 2
+    assert len(_search(session, "randonnées", kb_id=KB_B, top_k=10)) == 2
+    assert len(_search(session, "montagnes", kb_id=KB_B, top_k=10)) == 1
 
 
 def test_a_kb_without_a_partition_falls_back_instead_of_erroring(engine, session):
@@ -868,7 +868,7 @@ def test_a_kb_without_a_partition_falls_back_instead_of_erroring(engine, session
 
     assert pgb.bm25_index_ready(session, KB_B, "chunks") is False
     store = _store(session, KB_B)
-    items = asyncio.run(store.bm25s_search("réclamation", top_k=5))
+    items = asyncio.run(store.bm25s_search("randonnée", top_k=5))
 
     assert isinstance(items, list)
     assert {item.knowledge_base_id for item in items} <= {KB_B}
@@ -886,7 +886,7 @@ def test_a_scored_query_against_the_parent_is_refused_by_pg_search(engine, sessi
         session.execute(
             text(
                 f"SELECT id, pdb.score(id) FROM {SCHEMA}.chunks "
-                f"WHERE knowledge_base_id = '{KB_A}' AND text ||| 'Beschwerde' "
+                f"WHERE knowledge_base_id = '{KB_A}' AND text ||| 'Wanderung' "
                 "ORDER BY pdb.score(id) DESC LIMIT 5"
             )
         ).fetchall()
@@ -903,9 +903,9 @@ def test_graph_index_nodes_indexes_title_and_text_together(engine, session):
     session.execute(
         text(f"""
             INSERT INTO {SCHEMA}.graph_index_nodes (knowledge_base_id, source_id, title, text)
-            VALUES (CAST(:kb AS uuid), CAST(:src AS uuid), 'Titel Beschwerde',
-                    'Werkeigentümers Pflichten'),
-                   (CAST(:kb AS uuid), CAST(:src AS uuid), 'Anderer Titel', 'Verjährung')
+            VALUES (CAST(:kb AS uuid), CAST(:src AS uuid), 'Titel Wanderung',
+                    'Bergführers Pflichten'),
+                   (CAST(:kb AS uuid), CAST(:src AS uuid), 'Anderer Titel', 'Brücke')
         """),
         {"kb": KB_A, "src": SOURCE_1},
     )
@@ -926,7 +926,7 @@ def test_graph_index_nodes_indexes_title_and_text_together(engine, session):
     assert "'alias=bm25_text'" in _indexdef(session, KB_A, "graph_index_nodes")
     # A term from the title matches, and so does one from the text.
     assert len(_search(session, "Titel", cls=_NodeStore, top_k=5)) == 2
-    assert len(_search(session, "Werkeigentümer", cls=_NodeStore, top_k=5)) == 1
+    assert len(_search(session, "Bergführer", cls=_NodeStore, top_k=5)) == 1
     # And KB C's node never appears.
     assert _search(session, "Basis", cls=_NodeStore, top_k=5) == []
 
@@ -936,8 +936,8 @@ def test_full_documents_indexes_the_summary(engine, session):
     session.execute(
         text(f"""
             INSERT INTO {SCHEMA}.full_documents (knowledge_base_id, source_id, summary)
-            VALUES (CAST(:kb AS uuid), CAST(:src AS uuid), 'Zusammenfassung der Beschwerden'),
-                   (CAST(:kb AS uuid), CAST(:src AS uuid), 'Bericht über die Verjährung')
+            VALUES (CAST(:kb AS uuid), CAST(:src AS uuid), 'Zusammenfassung der Wanderungen'),
+                   (CAST(:kb AS uuid), CAST(:src AS uuid), 'Bericht über die Brücke')
         """),
         {"kb": KB_A, "src": SOURCE_1},
     )
@@ -949,7 +949,7 @@ def test_full_documents_indexes_the_summary(engine, session):
     assert result["item_table"] == "full_documents"
     assert result["partition"] == pgb.partition_name(KB_A, "full_documents")
     assert "(summary)::pdb.simple('stemmer=german')" in _indexdef(session, KB_A, "full_documents")
-    items = _search(session, "Beschwerde", cls=_FullDocumentStore, top_k=5)
+    items = _search(session, "Wanderung", cls=_FullDocumentStore, top_k=5)
     assert len(items) == 1
     assert "Zusammenfassung" in items[0].text
 
@@ -962,68 +962,68 @@ def test_full_documents_indexes_the_summary(engine, session):
 def test_search_returns_scored_rows_ordered_by_score(engine, session):
     pgb.ensure_bm25_index(KB_A, engine=engine)
 
-    items = _search(session, "Beschwerde", top_k=5)
+    items = _search(session, "Wanderung", top_k=5)
 
     assert len(items) == 2
     assert all(item.score > 0 for item in items)
     assert [item.score for item in items] == sorted((item.score for item in items), reverse=True)
     assert {item.knowledge_base_id for item in items} == {KB_A}
-    assert all("Beschwerde" in item.text for item in items)
+    assert all("Wanderung" in item.text for item in items)
 
 
 def test_top_k_bounds_the_result_set(engine, session):
     pgb.ensure_bm25_index(KB_A, engine=engine)
 
-    assert len(_search(session, "Beschwerde", top_k=1)) == 1
+    assert len(_search(session, "Wanderung", top_k=1)) == 1
 
 
 def test_source_ids_filter_restricts_results(engine, session):
     pgb.ensure_bm25_index(KB_A, engine=engine)
 
-    both = _search(session, "Beschwerde", top_k=10)
+    both = _search(session, "Wanderung", top_k=10)
     assert {item.source_id for item in both} == {SOURCE_1}
 
-    assert _search(session, "Beschwerde", top_k=10, source_ids=[SOURCE_2]) == []
+    assert _search(session, "Wanderung", top_k=10, source_ids=[SOURCE_2]) == []
 
-    verjaehrung = _search(session, "Verjährung", top_k=10, source_ids=[SOURCE_2])
-    assert len(verjaehrung) == 1
-    assert verjaehrung[0].source_id == SOURCE_2
+    bruecke = _search(session, "Brücke", top_k=10, source_ids=[SOURCE_2])
+    assert len(bruecke) == 1
+    assert bruecke[0].source_id == SOURCE_2
 
 
 def test_metadata_filter_and_item_ids_restrict_results(engine, session):
     pgb.ensure_bm25_index(KB_A, engine=engine)
 
-    assert len(_search(session, "Beschwerde", top_k=10, filter_metadata={"lang": "de"})) == 2
-    assert _search(session, "Beschwerde", top_k=10, filter_metadata={"lang": "fr"}) == []
+    assert len(_search(session, "Wanderung", top_k=10, filter_metadata={"lang": "de"})) == 2
+    assert _search(session, "Wanderung", top_k=10, filter_metadata={"lang": "fr"}) == []
 
-    one = _search(session, "Beschwerde", top_k=1)[0]
-    restricted = _search(session, "Beschwerde", top_k=10, item_ids={one.item_id})
+    one = _search(session, "Wanderung", top_k=1)[0]
+    restricted = _search(session, "Wanderung", top_k=10, item_ids={one.item_id})
     assert [item.item_id for item in restricted] == [one.item_id]
 
 
 def test_inserts_and_deletes_through_the_parent_are_visible_without_a_rebuild(engine, session):
     pgb.ensure_bm25_index(KB_A, engine=engine)
-    assert len(_search(session, "Verjährung", top_k=10)) == 1
+    assert len(_search(session, "Brücke", top_k=10)) == 1
 
     new_id = str(uuid.uuid4())
     session.execute(
         text(f"""
             INSERT INTO {SCHEMA}.chunks (id, knowledge_base_id, source_id, text)
             VALUES (CAST(:id AS uuid), CAST(:kb AS uuid), CAST(:src AS uuid),
-                    'Die Verjährung beginnt erneut')
+                    'Die Brücke wird erneut gebaut')
         """),
         {"id": new_id, "kb": KB_A, "src": SOURCE_1},
     )
     session.commit()
     # Written through the parent, routed into the partition, indexed there.
     assert _rows_in(session, pgb.partition_name(KB_A, "chunks")) == 4
-    assert len(_search(session, "Verjährung", top_k=10)) == 2
+    assert len(_search(session, "Brücke", top_k=10)) == 2
 
     session.execute(
         text(f"DELETE FROM {SCHEMA}.chunks WHERE id = CAST(:id AS uuid)"), {"id": new_id}
     )
     session.commit()
-    assert len(_search(session, "Verjährung", top_k=10)) == 1
+    assert len(_search(session, "Brücke", top_k=10)) == 1
 
 
 def test_a_cascading_delete_of_the_kb_empties_its_partition(engine, session):
@@ -1037,7 +1037,7 @@ def test_a_cascading_delete_of_the_kb_empties_its_partition(engine, session):
     session.commit()
 
     assert _rows_in(session, partition) == 0
-    assert _search(session, "Beschwerde", top_k=10) == []
+    assert _search(session, "Wanderung", top_k=10) == []
 
 
 def test_without_a_stemmer_the_inflection_no_longer_matches(engine, session):
@@ -1051,8 +1051,8 @@ def test_without_a_stemmer_the_inflection_no_longer_matches(engine, session):
 
     assert pgb.ensure_bm25_index(KB_A, engine=engine)["status"] == "ready"
     assert "stemmer" not in _indexdef(session)
-    assert len(_search(session, "Beschwerden", top_k=10)) == 1
-    assert _search(session, "Werkeigentümer", top_k=10) == []
+    assert len(_search(session, "Wanderungen", top_k=10)) == 1
+    assert _search(session, "Bergführer", top_k=10) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1071,12 +1071,12 @@ def test_without_a_stemmer_the_inflection_no_longer_matches(engine, session):
         "\\",
         "plus+minus-tilde~caret^",
         "(parens) [brackets] {braces}",
-        "Beschwerde (",
+        "Wanderung (",
         "AND OR NOT",
         "/slashes/",
         "' OR 1=1; DROP TABLE chunks; --",
-        "Besch\x00werde",
-        "Beschwerde^2",
+        "Wander\x00ung",
+        "Wanderung^2",
         "[a TO z]",
         '{"k": "v"}',
         "a ||| b",
@@ -1105,7 +1105,7 @@ def test_the_nul_byte_is_stripped_before_it_reaches_psycopg(engine, session):
     """psycopg refuses a text parameter containing NUL, so it must not get one."""
     pgb.ensure_bm25_index(KB_A, engine=engine)
 
-    items = _search(session, "Beschwerde\x00", top_k=5)
+    items = _search(session, "Wanderung\x00", top_k=5)
 
     assert len(items) == 2
 
@@ -1119,7 +1119,7 @@ def test_bm25s_search_uses_the_pg_index_when_it_is_ready(engine, session):
     pgb.ensure_bm25_index(KB_A, engine=engine)
     store = _store(session)
 
-    items = asyncio.run(store.bm25s_search("Beschwerde", top_k=5))
+    items = asyncio.run(store.bm25s_search("Wanderung", top_k=5))
 
     assert len(items) == 2
     assert all(item.score > 0 for item in items)

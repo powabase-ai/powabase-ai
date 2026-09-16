@@ -23,7 +23,7 @@ def _insert_chunks(kb_id: str, source_id: str, n: int) -> None:
         text("""
             INSERT INTO "ai".chunks (knowledge_base_id, source_id, text, chunk_index)
             SELECT CAST(:kb AS uuid), CAST(:sid AS uuid),
-                   'appeal against the decision of the court number ' || g
+                   'weather note for the hiking trip number ' || g
                    || repeat(' filler words for the parser', 40),
                    g
             FROM generate_series(1, :n) AS g
@@ -46,7 +46,7 @@ def test_fallback_is_cancelled_and_session_survives(app, test_source, test_knowl
 
         with patch.object(bvs, "_bm25_fallback_timeout_ms", return_value=1):
             with pytest.raises(bvs.KeywordSearchTimeout):
-                asyncio.run(store.full_text_search("appeal", top_k=5))
+                asyncio.run(store.full_text_search("weather", top_k=5))
 
         assert db.session.execute(text("SELECT 1")).scalar() == 1
         assert _statement_timeout() == before
@@ -62,7 +62,7 @@ def test_fallback_within_budget_returns_results_and_restores_timeout(
         store = PgVectorKnowledgeStore(db_session=db.session, knowledge_base_id=kb_id)
 
         with patch.object(bvs, "_bm25_fallback_timeout_ms", return_value=60000):
-            results = asyncio.run(store.full_text_search("appeal", top_k=5))
+            results = asyncio.run(store.full_text_search("weather", top_k=5))
 
         assert len(results) == 5
         assert _statement_timeout() == before

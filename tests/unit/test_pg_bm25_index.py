@@ -242,7 +242,7 @@ def test_bare_tokenizer_is_not_confused_with_a_stemmed_one():
 @pytest.mark.parametrize(
     "raw",
     [
-        "Beschwerde",
+        "Wanderung",
         "it's a quote",
         'a "quoted" phrase',
         "field:value",
@@ -263,13 +263,13 @@ def test_normalisation_never_raises_and_returns_a_string(raw):
 
 def test_normalisation_strips_nul_bytes():
     """psycopg refuses a text parameter containing NUL, so it must never reach it."""
-    out = pgb.normalize_bm25_query("Besch\x00werde")
+    out = pgb.normalize_bm25_query("Wander\x00ung")
     assert "\x00" not in out
-    assert "Beschwerde" in out.replace(" ", "")
+    assert "Wanderung" in out.replace(" ", "")
 
 
 def test_normalisation_collapses_control_characters_to_whitespace():
-    assert pgb.normalize_bm25_query("Beschwerde\n\tGerichts") == "Beschwerde Gerichts"
+    assert pgb.normalize_bm25_query("Wanderung\n\tBerges") == "Wanderung Berges"
 
 
 def test_normalisation_bounds_the_query_length():

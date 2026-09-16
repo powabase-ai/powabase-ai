@@ -120,7 +120,7 @@ def _create_unpartitioned(conn, rows_per_kb: int = 3) -> None:
                     INSERT INTO {SCHEMA}.chunks (knowledge_base_id, source_id, text)
                     VALUES (CAST(:kb AS uuid), CAST(:src AS uuid), :body)
                 """),
-                {"kb": kb_id, "src": SOURCE, "body": f"Beschwerde {kb_id} {n}"},
+                {"kb": kb_id, "src": SOURCE, "body": f"Wanderung {kb_id} {n}"},
             )
             conn.execute(
                 text(f"""

@@ -80,7 +80,7 @@ def _row(i: int, score: float):
 def _capture(store_cls=_ChunkStore, rows=(), **kwargs):
     session = _spy_session(rows)
     store = store_cls(db_session=session, knowledge_base_id=KB)
-    items = asyncio.run(store.pg_bm25_search("Beschwerde", top_k=7, **kwargs))
+    items = asyncio.run(store.pg_bm25_search("Wanderung", top_k=7, **kwargs))
     return session.calls, items
 
 
@@ -122,7 +122,7 @@ def test_search_sql_uses_the_match_operator_and_score_ordering():
     assert "ORDER BY pdb.score(c.id) DESC" in sql
     assert "LIMIT :top_k" in sql
     assert params["top_k"] == 7
-    assert params["bm25_query"] == "Beschwerde"
+    assert params["bm25_query"] == "Wanderung"
 
 
 def test_search_sql_for_an_expression_indexed_table():
@@ -207,7 +207,7 @@ def test_a_table_with_no_partition_never_reaches_the_database():
     session = _spy_session()
     store = _Doc2JsonStore(db_session=session, knowledge_base_id=KB)
     with pytest.raises(ValueError):
-        asyncio.run(store.pg_bm25_search("Beschwerde", top_k=5))
+        asyncio.run(store.pg_bm25_search("Wanderung", top_k=5))
     assert session.calls == []
 
 
@@ -224,7 +224,7 @@ def test_a_kb_without_a_partition_falls_back_instead_of_erroring():
         patch.object(bvs.pg_bm25_index, "pg_search_installed", return_value=True),
         patch.object(bvs.pg_bm25_index, "bm25_index_ready", return_value=False),
     ):
-        asyncio.run(store.bm25s_search("Beschwerde", top_k=5))
+        asyncio.run(store.bm25s_search("Wanderung", top_k=5))
     assert calls == ["tsvector"]
 
 
@@ -258,7 +258,7 @@ def _run_bm25s(store, patches):
     for p in patches:
         p.start()
     try:
-        return asyncio.run(store.bm25s_search("Beschwerde", top_k=5))
+        return asyncio.run(store.bm25s_search("Wanderung", top_k=5))
     finally:
         for p in patches:
             p.stop()
