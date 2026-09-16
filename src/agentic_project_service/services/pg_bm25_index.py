@@ -1006,8 +1006,88 @@ def table_is_partitioned(conn, item_table: str) -> bool:
     return _relkind(conn, _validated_partitioned_table(item_table)) == "p"
 
 
-def partition_exists(conn, knowledge_base_id: Any, item_table: str) -> bool:
+def _clone_exists(conn, knowledge_base_id: Any, item_table: str) -> bool:
+    """Is there a relation of the partition's name, attached or not?"""
     return _relkind(conn, partition_name(knowledge_base_id, item_table)) is not None
+
+
+def _run_probe(bind, fn):
+    """Run ``fn(conn)`` on a connection derived from ``bind``, safely.
+
+    An Engine gets a connection of its own; a Session or Connection runs the
+    probe in a savepoint (``_probe``), so a failure cannot abort the caller's
+    transaction.
+    """
+    from sqlalchemy.engine import Engine
+
+    if isinstance(bind, Engine):
+        with bind.connect() as conn:
+            try:
+                return fn(conn)
+            finally:
+                conn.rollback()
+    return fn(bind)
+
+
+def partition_exists(bind, kb_id: str, item_table: str) -> bool:
+    """Does this knowledge base have its own *attached* partition of the item table?
+
+    An unattached clone of that name is a move that did not finish, and does
+    not count. ``bind`` is an Engine, Connection or Session. Never raises: an
+    invalid id, a table that is never partitioned, or a failed probe is False.
+    """
+    try:
+        partition = partition_name(kb_id, item_table)
+        row = _run_probe(
+            bind,
+            lambda conn: _probe(
+                conn,
+                "SELECT 1 FROM pg_inherits i "
+                "JOIN pg_class c ON c.oid = i.inhrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "JOIN pg_class p ON p.oid = i.inhparent "
+                "WHERE n.nspname = :schema AND c.relname = :partition AND p.relname = :parent",
+                {"schema": AI_SCHEMA, "partition": partition, "parent": item_table},
+            ),
+        )
+        return row is not None
+    except Exception as exc:
+        logger.debug(
+            "Could not tell whether KB %s has a partition of %s: %s", kb_id, item_table, exc
+        )
+        return False
+
+
+def kb_has_rows_in_default(bind, kb_id: str, item_table: str) -> bool | None:
+    """Does the item table's DEFAULT partition still hold rows of this knowledge base?
+
+    ``None`` means "cannot tell": an invalid id, a table that is never
+    partitioned, no DEFAULT partition, or a failed probe. Reads one row at
+    most through the DEFAULT partition's ``knowledge_base_id`` index. The read
+    takes ACCESS SHARE on DEFAULT until the caller's transaction ends, so a
+    request path should end its transaction promptly. Never raises.
+    """
+    try:
+        kb = _validated_kb_id(kb_id)
+        default = _qualified(default_partition_name(item_table))
+        row = _run_probe(
+            bind,
+            lambda conn: _probe(
+                conn,
+                f"SELECT EXISTS (SELECT 1 FROM {default} "
+                "WHERE knowledge_base_id = CAST(:kb AS uuid))",
+                {"kb": kb},
+            ),
+        )
+        return bool(row[0]) if row is not None else None
+    except Exception as exc:
+        logger.debug(
+            "Could not tell whether KB %s has rows in the DEFAULT partition of %s: %s",
+            kb_id,
+            item_table,
+            exc,
+        )
+        return None
 
 
 def _partition_is_attached(conn, knowledge_base_id: Any, item_table: str) -> bool:
@@ -1977,7 +2057,7 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
 
         # An unattached partition is a move that did not finish -- a crash, or a
         # move that timed out waiting for its locks. Resuming it is the same call.
-        needs_move = not partition_exists(conn, kb_id, item_table) or not _partition_is_attached(
+        needs_move = not _clone_exists(conn, kb_id, item_table) or not _partition_is_attached(
             conn, kb_id, item_table
         )
         if not needs_move:
