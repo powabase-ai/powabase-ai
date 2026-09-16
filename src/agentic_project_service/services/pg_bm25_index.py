@@ -722,6 +722,13 @@ def _acquire_partition_build_lock(conn, item_table: str) -> None:
 
 
 def _release_partition_build_lock(conn, item_table: str) -> None:
+    """Give the lock back, and if that cannot be done, throw the session away.
+
+    The lock is session-scoped, and a pooled connection handed back to the pool
+    keeps its session -- so a lock left behind would keep every later build on
+    this item table waiting. Invalidating the connection ends the backend, which
+    releases it for certain.
+    """
     try:
         conn.execute(
             text(partition_build_unlock_sql()),
@@ -729,8 +736,17 @@ def _release_partition_build_lock(conn, item_table: str) -> None:
         )
         conn.commit()
     except Exception:
-        # Session-scoped, so closing the connection releases it anyway.
-        logger.debug("Could not release the partition build lock", exc_info=True)
+        logger.warning(
+            "Could not release the partition build lock for %s.%s; discarding the "
+            "connection so the lock cannot outlive it",
+            AI_SCHEMA,
+            item_table,
+            exc_info=True,
+        )
+        try:
+            conn.invalidate()
+        except Exception:
+            logger.debug("Could not invalidate the connection either", exc_info=True)
 
 
 def _prepare_partition(conn, kb_id: str, item_table: str) -> None:

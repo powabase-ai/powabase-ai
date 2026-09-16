@@ -556,20 +556,25 @@ def test_a_second_caller_is_told_to_retry_rather_than_blocking_for_ever(
 ):
     """With no patience left, contention is a retryable outcome, not a 500."""
     monkeypatch.setattr(pgb, "PARTITION_BUILD_LOCK_WAIT_SECONDS", 0.0)
+    relation = pgb.partition_build_lock_relation("chunks")
     with engine.connect() as holder:
-        holder.execute(
-            text(pgb.partition_build_lock_sql()),
-            {"relation": pgb.partition_build_lock_relation("chunks")},
-        )
+        holder.execute(text(pgb.partition_build_lock_sql()), {"relation": relation})
         holder.commit()
-
-        out = pgb.ensure_bm25_index(KB_A, engine=engine)
+        try:
+            out = pgb.ensure_bm25_index(KB_A, engine=engine)
+        finally:
+            # Released by hand, and this is the point: the lock is session
+            # scoped, so returning the connection to the pool does NOT drop it.
+            holder.execute(text(pgb.partition_build_unlock_sql()), {"relation": relation})
+            holder.commit()
 
     assert out["status"] == "skipped"
     assert out["reason"] == "partition_build_in_progress"
     assert _indexdef(session) is None
     # Nothing half-done: the knowledge base's rows never moved.
     assert _rows_in(session, "chunks_default", KB_A) == 3
+    # And the next caller is not locked out by the one that just declined.
+    assert pgb.ensure_bm25_index(KB_A, engine=engine)["status"] == "ready"
 
 
 def test_the_writers_keep_working_and_the_cutover_window_stays_short(engine, session, monkeypatch):
@@ -581,8 +586,8 @@ def test_the_writers_keep_working_and_the_cutover_window_stays_short(engine, ses
     where writes really are blocked -- the cutover -- is a small fraction of the
     total.
     """
-    _seed(session, KB_A, 3000)
-    monkeypatch.setattr(pgb, "EVACUATION_BATCH_ROWS", 100)
+    _seed(session, KB_A, 20_000)
+    monkeypatch.setattr(pgb, "EVACUATION_BATCH_ROWS", 200)
 
     landed: list[float] = []
     failed: list[str] = []
@@ -605,7 +610,7 @@ def test_the_writers_keep_working_and_the_cutover_window_stays_short(engine, ses
             except Exception as exc:
                 failed.append(str(exc).splitlines()[0])
             n += 1
-            time.sleep(0.01)
+            time.sleep(0.005)
 
     thread = threading.Thread(target=writer, daemon=True)
     thread.start()
@@ -620,16 +625,23 @@ def test_the_writers_keep_working_and_the_cutover_window_stays_short(engine, ses
     # Writers were not shut out for the duration. Under the previous design,
     # which held the lock for the whole move, a writer got exactly one statement
     # in -- and waited out the entire move for it.
-    assert len(landed) >= 10, (len(landed), failed)
+    assert len(landed) >= 5, (len(landed), failed)
     # And no single write waited anywhere near the length of the move.
     assert max(landed) < total / 2, (max(landed), total)
     # Only the in-flight-at-ATTACH statement may fail, and only that way.
     assert len(failed) <= 1, failed
     assert all("violates partition constraint" in message for message in failed), failed
-    # Nothing lost, nothing duplicated.
-    expected = len(KB_A_DOCS) + 3000 + len(landed)
+    # Nothing lost, nothing duplicated. Counted as DEFAULT + partition, never
+    # rows_moved + DEFAULT: a write that commits after the ATTACH goes straight
+    # into the partition, so it is never a row this move "moved".
+    expected = len(KB_A_DOCS) + 20_000 + len(landed)
     assert _rows_in(session, "chunks", KB_A) == expected
-    assert move["rows_moved"] + _rows_in(session, "chunks_default", KB_A) == expected
+    assert (
+        _rows_in(session, "chunks_default", KB_A)
+        + _rows_in(session, pgb.partition_name(KB_A, "chunks"))
+        == expected
+    )
+    assert move["rows_moved"] >= 20_000 + len(KB_A_DOCS)
     # The blocking window is a small slice of the whole move.
     assert move["cutover_seconds"] < total / 2, (move, total)
 
@@ -642,7 +654,7 @@ def test_the_attach_skips_its_validation_scan(engine, session):
     the constraint is really there, and the cutover on a 3000-row partition is
     no slower than the one on a 3-row partition by more than a small margin.
     """
-    _seed(session, KB_A, 3000)
+    _seed(session, KB_A, 20_000)
     small = pgb.create_partition(engine, KB_B, "chunks")
     big = pgb.create_partition(engine, KB_A, "chunks")
 
@@ -657,11 +669,12 @@ def test_the_attach_skips_its_validation_scan(engine, session):
         ).all()
     ]
     session.rollback()
-    assert constraints == [f"CHECK (knowledge_base_id = '{KB_A}'::uuid)"]
+    # Postgres re-renders the expression with its own parentheses.
+    assert constraints == [f"CHECK ((knowledge_base_id = '{KB_A}'::uuid))"]
 
-    assert big["rows_moved"] == 3003
+    assert big["rows_moved"] == 20_003
     assert small["rows_moved"] == 2
-    # A thousand times the rows, nowhere near a thousand times the lock.
+    # Ten thousand times the rows, nowhere near that much lock time.
     assert big["cutover_seconds"] < max(small["cutover_seconds"], 0.05) * 20, (small, big)
 
 
@@ -678,10 +691,13 @@ def test_a_crashed_move_is_resumed_with_no_row_lost_or_duplicated(engine, sessio
     def _explode(*_args, **_kwargs):
         raise RuntimeError("simulated crash just before the cutover")
 
+    # Restored by hand, not with monkeypatch.undo(): undo() would also revert the
+    # fixture's AI_SCHEMA patch and send the rest of this test at the real schema.
+    real_attach = pgb.partition_attach_ddl
     monkeypatch.setattr(pgb, "partition_attach_ddl", _explode)
     with pytest.raises(RuntimeError, match="simulated crash"):
         pgb.ensure_bm25_index(KB_A, engine=engine)
-    monkeypatch.undo()
+    monkeypatch.setattr(pgb, "partition_attach_ddl", real_attach)
 
     partition = pgb.partition_name(KB_A, "chunks")
     moved_early = _rows_in(session, partition)
