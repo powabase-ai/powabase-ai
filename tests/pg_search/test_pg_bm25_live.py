@@ -949,6 +949,49 @@ def test_a_leftover_default_check_from_a_crashed_move_is_cleared_by_the_next_mov
     assert _rows_in(session, "chunks_default", KB_B) == len(KB_B_DOCS) + 5
 
 
+def test_the_move_gives_up_on_its_lock_instead_of_stalling_writers(engine, session, monkeypatch):
+    """The move's lock wait is bounded (mutation M04).
+
+    A writer transaction left open on the parent holds ROW EXCLUSIVE, which the
+    move's SHARE lock conflicts with. Waiting on it unbounded would queue every
+    other writer of the table behind the move for as long as that transaction
+    lives. The move must time out, roll back whole, drop its DEFAULT check and
+    release the build lock so a retry can succeed.
+    """
+    monkeypatch.setattr(pgb, "MOVE_LOCK_TIMEOUT_MS", 200)
+    outcome: dict = {}
+
+    def move():
+        try:
+            outcome["result"] = pgb.create_partition(engine, KB_A, "chunks")
+        except Exception as exc:
+            outcome["error"] = exc
+
+    holder = engine.connect()
+    try:
+        holder.execute(
+            text(
+                f"INSERT INTO {SCHEMA}.chunks (knowledge_base_id, source_id, text) "
+                f"VALUES ('{KB_B}', '{SOURCE_1}', 'offene Transaktion')"
+            )
+        )
+        thread = threading.Thread(target=move, daemon=True)
+        thread.start()
+        thread.join(timeout=10)
+        stalled = thread.is_alive()
+    finally:
+        holder.rollback()
+        holder.close()
+    thread.join(timeout=30)
+
+    assert not stalled, "the move waited on its lock without a timeout"
+    assert pgb.is_transient_db_error(outcome["error"]), outcome
+    assert _rows_in(session, "chunks_default", KB_A) == len(KB_A_DOCS)
+    assert _rows_in(session, pgb.partition_name(KB_A, "chunks")) == 0
+    assert _move_check_names(session) == []
+    assert pgb.create_partition(engine, KB_A, "chunks")["rows_moved"] == len(KB_A_DOCS)
+
+
 def test_a_crashed_move_is_resumed_with_no_row_lost_or_duplicated(engine, session, monkeypatch):
     """A failure between moving the rows and the ATTACH rolls the move back whole.
 
@@ -1296,15 +1339,30 @@ def test_full_documents_indexes_the_summary(engine, session):
 
 
 def test_search_returns_scored_rows_ordered_by_score(engine, session):
+    """Best match first, with scores that actually differ (mutation M36).
+
+    The seed documents score identically for "Wanderung", so an ascending sort
+    passed the old assertion. Here one row repeats the term and must lead.
+    """
+    session.execute(
+        text(f"""
+            INSERT INTO {SCHEMA}.chunks (knowledge_base_id, source_id, text)
+            VALUES (CAST(:kb AS uuid), CAST(:src AS uuid),
+                    'Wanderung Wanderung Wanderung am Grat, Wanderung bei Nebel')
+        """),
+        {"kb": KB_A, "src": SOURCE_1},
+    )
+    session.commit()
     pgb.ensure_bm25_index(KB_A, engine=engine)
 
     items = _search(session, "Wanderung", top_k=5)
 
-    assert len(items) == 2
+    assert len(items) == 3
     assert all(item.score > 0 for item in items)
+    assert items[0].text.startswith("Wanderung Wanderung Wanderung")
+    assert items[0].score > items[-1].score
     assert [item.score for item in items] == sorted((item.score for item in items), reverse=True)
     assert {item.knowledge_base_id for item in items} == {KB_A}
-    assert all("Wanderung" in item.text for item in items)
 
 
 def test_top_k_bounds_the_result_set(engine, session):

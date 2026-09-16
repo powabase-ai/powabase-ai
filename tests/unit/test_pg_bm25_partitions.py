@@ -318,3 +318,9 @@ def test_copy_policies_sql_recreates_every_policy_of_the_source_on_the_target():
 def test_mirroring_a_relation_also_copies_its_policies():
     sql = pgb.mirror_relation_settings_sql('"ai".chunks', '"ai".chunks_kb_x')
     assert pgb.copy_policies_sql('"ai".chunks', '"ai".chunks_kb_x') in sql
+
+
+def test_every_bm25_item_table_is_partitioned():
+    """A bm25 index needs a relation per knowledge base; ensure_bm25_index no
+    longer has a "not partitionable" branch to fall back on."""
+    assert pgb.BM25_ITEM_TABLES <= pgb.PARTITIONED_ITEM_TABLES

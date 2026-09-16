@@ -60,6 +60,8 @@ BM25_ITEM_TABLES: frozenset[str] = frozenset(_TEXT_EXPRESSIONS)
 PARTITIONED_ITEM_TABLES: frozenset[str] = frozenset(
     {"chunks", "full_documents", "graph_index_nodes"}
 )
+# A bm25 index needs a relation of its own per knowledge base, so every table
+# that can carry one is partitioned (pinned by a unit test).
 
 # How long to wait for another caller's partition build on the same item table
 # before giving up and reporting a retryable outcome.
@@ -1163,13 +1165,20 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
     The bm25 index is built afterwards with CREATE INDEX CONCURRENTLY, outside
     any of this.
 
-    Who waits, measured on Postgres 15 moving 40 000 rows out of a DEFAULT of
-    540 000 (warm cache): writers through the parent, for every knowledge base
-    on this item table, for all of step 2 -- about 0.2 s, of which the copy
-    and delete are ~0.14 s and the VALIDATE scan ~0.05 s; it grows with the
-    rows moved and with the size of DEFAULT. Readers only for the ATTACH itself
-    (~1 ms, instead of the ~50 ms scan of DEFAULT it ran without the check)
-    and for the catalog-only ADD and DROP of the check.
+    Who waits, measured on Postgres 15 (warm cache, 128 MB shared_buffers)
+    moving a 40 000-row knowledge base:
+
+    * **writers** through the parent, for every knowledge base on this item
+      table, for all of step 2: 0.23-0.31 s with a 540 000-row (360 MB)
+      DEFAULT -- copy ~0.14-0.20 s, delete ~0.02 s, VALIDATE ~0.06 s -- and
+      0.48 s with a 2 040 000-row (1.4 GB) DEFAULT, where VALIDATE alone took
+      0.26 s. It grows with the rows moved and with the size of DEFAULT.
+      Without the DEFAULT check the ATTACH ran the same scan instead (0.06 s
+      and 0.30 s), so writers wait about as long either way.
+    * **readers** only for the ATTACH (1-8 ms) and the catalog-only ADD and
+      DROP of the check. Without the check the ATTACH held ACCESS EXCLUSIVE
+      for its whole DEFAULT scan: a reader waited up to 0.07 s at 540 000 rows
+      and 0.64 s at 2 040 000, and on a cold cache that scan is disk-bound.
 
     Why this order. The DEFAULT check cannot be validated while any of the
     knowledge base's rows are still in DEFAULT, so VALIDATE has to follow the
@@ -1364,6 +1373,10 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
 
+    # Two connections, deliberately: this AUTOCOMMIT one, because CREATE and
+    # DROP INDEX CONCURRENTLY refuse to run inside a transaction; and the one
+    # ``create_partition`` opens for itself, because the move is transactional
+    # and its session-scoped build lock has to live and die on that connection.
     with _autocommit_connection(engine) as conn:
         if not pg_search_installed(conn, use_cache=False):
             return {"status": "skipped", "reason": "extension_absent"}
@@ -1378,12 +1391,8 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
         item_table = pg_bm25_item_table(strategy)
         if item_table is None:
             return {"status": "skipped", "reason": "strategy"}
-        if item_table not in PARTITIONED_ITEM_TABLES:
-            return {
-                "status": "skipped",
-                "reason": "table_not_partitionable",
-                "item_table": item_table,
-            }
+        # Every BM25 item table is partitioned (doc2json has none), so there is
+        # no "not partitionable" case left to skip (pinned by a unit test).
         if not table_is_partitioned(conn, item_table):
             logger.warning(
                 "Not building a BM25 index for KB %s: %s.%s is not partitioned by "
