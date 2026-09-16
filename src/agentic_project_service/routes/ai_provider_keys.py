@@ -103,7 +103,6 @@ def platform_supported():
     # (a pod with only GEMINI_API_KEY set should report ``google`` as
     # AI-on-us-available).
     from ..services.ai_provider_keys_resolver import _BYOK_PROVIDER_ALIAS
-
     canonical_supported: set[str] = set()
     for p, env in _PROVIDER_ENV.items():
         if not os.environ.get(env):
