@@ -17,6 +17,3 @@ htmlcov/
 
 # Local env
 .env
-
-# Local agent workspace
-.superpowers/
