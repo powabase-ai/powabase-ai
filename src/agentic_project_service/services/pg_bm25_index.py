@@ -1,24 +1,29 @@
 """Postgres-native BM25 keyword search via the ParadeDB ``pg_search`` extension.
 
-One partial ``USING bm25`` index per knowledge base and item table, so a
-keyword query is answered by Tantivy inside Postgres instead of by the bm25s
-file index or the tsvector fallback. Everything here degrades: when the
-extension is not installed, or this KB has no ready index, callers keep
-today's behaviour.
+One ``USING bm25`` index per knowledge base, so a keyword query is answered by
+Tantivy inside Postgres instead of by the bm25s file index or the tsvector
+fallback. Everything here degrades: when the extension is not installed, or
+this KB has no ready index, callers keep today's behaviour.
 
-Two properties of the extension shape this module and are easy to get wrong:
+Three properties of the extension shape this module, and the first is why the
+item tables are partitioned at all:
 
-* **The partial-index predicate is only matched by a literal.** A bound
-  parameter (``knowledge_base_id = :kb``) does not match
-  ``WHERE knowledge_base_id = '<uuid>'``, so the planner cannot use the index.
-  Every KB id that reaches SQL therefore goes through ``uuid.UUID()`` first and
-  is interpolated as a canonical literal -- never a caller's raw string.
-* **A missing index is not a loud failure.** Querying with ``|||`` against a
-  table with no bm25 index at all raises ("does not contain a `USING bm25`
-  index"), but querying a KB whose *partial* index does not exist while another
-  KB's does returns **zero rows, silently**. Readiness therefore has to be
-  checked per knowledge base before this path is used, or a search quietly
-  answers nothing.
+* **One bm25 index per relation.** So a per-knowledge-base index needs a
+  per-knowledge-base relation: ``chunks``, ``full_documents`` and
+  ``graph_index_nodes`` are partitioned ``BY LIST (knowledge_base_id)`` with a
+  DEFAULT partition for every KB that has not been given one of its own, and
+  each partition carries its own index -- with its own stemmer. A partial index
+  on the shared table cannot do this: building a second one makes the first
+  unscorable.
+* **A scored query must name a relation that carries the index.** A partitioned
+  parent never does; ``SELECT ... FROM ai.chunks WHERE ... ||| ...`` is refused
+  with "`chunks` does not contain a `USING bm25` index" even with a
+  ``knowledge_base_id`` predicate that would prune to exactly one indexed
+  partition. So the search path names the partition, and the KB id reaches SQL
+  only as part of a relation name built from a ``uuid.UUID()``-validated value.
+* **A missing index is not always a loud failure.** Readiness is therefore
+  checked per knowledge base before this path is used, and a KB with no
+  partition or no valid index keeps the existing keyword path.
 """
 
 from __future__ import annotations
@@ -323,6 +328,22 @@ def partition_drop_ddl(knowledge_base_id: Any, item_table: str) -> str:
     return f"DROP TABLE IF EXISTS {_qualified(partition_name(knowledge_base_id, item_table))}"
 
 
+def partition_lock_default_ddl(item_table: str) -> str:
+    """Hold writers off the DEFAULT partition for the length of a move.
+
+    Verified against Postgres 15: a row inserted into DEFAULT after the
+    evacuation has drained but before the ATTACH makes Postgres refuse the
+    attach outright ("updated partition constraint for default partition would
+    be violated by some row"), rolling the whole move back. SHARE conflicts
+    with ROW EXCLUSIVE, so it stops INSERT/UPDATE/DELETE on the DEFAULT
+    partition -- including writes routed there through the parent -- while
+    leaving every reader untouched. Upgrading it to the ACCESS EXCLUSIVE that
+    ATTACH needs cannot self-deadlock: Postgres lets a request past waiters
+    whose locks the requester already conflicts with.
+    """
+    return f"LOCK TABLE {_qualified(default_partition_name(item_table))} IN SHARE MODE"
+
+
 def evacuate_batch_sql(knowledge_base_id: Any, item_table: str) -> str:
     """Move one bounded batch of a KB's rows out of DEFAULT into its partition.
 
@@ -613,7 +634,11 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> int:
 
     The order is forced by Postgres: a partition cannot be attached while the
     DEFAULT partition still holds a row that would belong to it, so the rows
-    move into an unattached clone first and the ATTACH comes last.
+    move into an unattached clone first and the ATTACH comes last -- and the
+    DEFAULT partition is locked against writers throughout, or a row arriving
+    after the last batch would make that ATTACH fail. Readers are never blocked
+    by the lock; they are blocked only for the moment the ATTACH itself holds
+    ACCESS EXCLUSIVE.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     partition = partition_name(kb_id, item_table)
@@ -622,6 +647,7 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> int:
 
     with engine.begin() as tx:
         tx.execute(text(partition_create_ddl(kb_id, item_table)))
+        tx.execute(text(partition_lock_default_ddl(item_table)))
         for definition in _foreign_key_defs(tx, default):
             tx.execute(text(f'ALTER TABLE "{AI_SCHEMA}".{partition} ADD {definition}'))
 

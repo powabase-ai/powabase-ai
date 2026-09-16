@@ -186,6 +186,22 @@ def test_evacuation_sql_moves_a_bounded_batch_and_binds_its_values():
     assert "RETURNING *" in sql
 
 
+def test_the_default_partition_is_locked_against_writers_not_readers():
+    """SHARE, because a writer during the move breaks the ATTACH outright.
+
+    A row inserted into DEFAULT after the evacuation drained but before the
+    ATTACH makes Postgres refuse the attach ("updated partition constraint for
+    default partition would be violated by some row") and the whole move rolls
+    back. SHARE conflicts with ROW EXCLUSIVE, so it holds writers off the
+    DEFAULT partition for the duration while every reader carries on.
+    """
+    sql = pgb.partition_lock_default_ddl("chunks")
+
+    assert sql == 'LOCK TABLE "ai".chunks_default IN SHARE MODE'
+    with pytest.raises(ValueError):
+        pgb.partition_lock_default_ddl("doc2json_documents")
+
+
 def test_evacuation_sql_refuses_an_unpartitioned_table():
     with pytest.raises(ValueError):
         pgb.evacuate_batch_sql(KB, "doc2json_documents")

@@ -134,7 +134,15 @@ def _ddl(conn) -> list[str]:
 
 #: Statement shapes that only appear while a partition is being built or torn
 #: down: the clone, the row moves, ATTACH/DETACH, the settings mirror, the drop.
-_PARTITION_WORK = ("PARTITION", "moved AS", "(LIKE ", "INSERT INTO", "DROP TABLE", "DO $$")
+_PARTITION_WORK = (
+    "PARTITION",
+    "moved AS",
+    "(LIKE ",
+    "INSERT INTO",
+    "DROP TABLE",
+    "LOCK TABLE",
+    "DO $$",
+)
 
 
 def _partition_ddl(conn) -> list[str]:
@@ -184,6 +192,9 @@ def test_ensure_creates_the_partition_before_indexing_it():
     assert out["rows_moved"] == 14_000
     statements = _partition_ddl(conn)
     assert statements[0] == pgb.partition_create_ddl(KB, "chunks")
+    # Writers are held off DEFAULT before the first row is read out of it: one
+    # arriving between the last batch and the ATTACH would break the attach.
+    assert statements[1] == pgb.partition_lock_default_ddl("chunks")
     assert statements[-1].strip().startswith("DO $$")
     assert pgb.partition_attach_ddl(KB, "chunks") in statements
     evacuations = [s for s in statements if "moved AS" in s]
