@@ -534,7 +534,7 @@ def partition_lock_default_ddl(item_table: str) -> str:
     return f"LOCK TABLE {_qualified(default_partition_name(item_table))} IN SHARE MODE"
 
 
-def move_rows_sql(knowledge_base_id: Any, item_table: str) -> tuple[str, str]:
+def move_rows_sql(knowledge_base_id: Any, item_table: str, columns: list[str]) -> tuple[str, str]:
     """Copy every row of a KB from DEFAULT into its partition, then delete them.
 
     A partition cannot be attached while the DEFAULT partition still holds a
@@ -563,12 +563,20 @@ def move_rows_sql(knowledge_base_id: Any, item_table: str) -> tuple[str, str]:
     guaranteed to be the side that survives. In the measured case (a source
     deleted while the move was about to ATTACH) the delete waited 1.0 s and
     both committed with no orphaned rows.
+
+    ``columns`` are DEFAULT's insertable columns, already quoted
+    (``_insertable_columns``), and are named on both sides: a column added to
+    the parent after the clone was created would otherwise shift every value.
     """
     partition = partition_name(knowledge_base_id, item_table)
     default = default_partition_name(item_table)
+    if not columns:
+        raise ValueError("move_rows_sql needs the column list")
+    names = ", ".join(columns)
     predicate = "WHERE knowledge_base_id = CAST(:kb AS uuid)"
     return (
-        f"INSERT INTO {_qualified(partition)} SELECT * FROM {_qualified(default)} {predicate}",
+        f"INSERT INTO {_qualified(partition)} ({names}) "
+        f"SELECT {names} FROM {_qualified(default)} {predicate}",
         f"DELETE FROM {_qualified(default)} {predicate}",
     )
 
@@ -1311,6 +1319,68 @@ def _release_advisory_lock(conn, relation: str) -> None:
             logger.debug("Could not invalidate the connection either", exc_info=True)
 
 
+def _insertable_columns(conn, relname: str) -> list[str]:
+    """A relation's columns in order, quoted, leaving out generated ones."""
+    return [
+        row[0]
+        for row in conn.execute(
+            text(
+                "SELECT quote_ident(a.attname) FROM pg_attribute a "
+                "WHERE a.attrelid = to_regclass(:relation) AND a.attnum > 0 "
+                "AND NOT a.attisdropped AND a.attgenerated = '' ORDER BY a.attnum"
+            ),
+            {"relation": _qualified(relname)},
+        ).all()
+    ]
+
+
+def _column_signature(conn, relname: str) -> list[tuple]:
+    """(name, type, not null, generated) per column, for comparing two relations."""
+    return [
+        tuple(row)
+        for row in conn.execute(
+            text(
+                "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, "
+                "a.attgenerated FROM pg_attribute a "
+                "WHERE a.attrelid = to_regclass(:relation) AND a.attnum > 0 "
+                "AND NOT a.attisdropped ORDER BY a.attname"
+            ),
+            {"relation": _qualified(relname)},
+        ).all()
+    ]
+
+
+def _drop_stale_clone(conn, kb_id: str, item_table: str) -> None:
+    """Drop an unattached clone that no longer matches DEFAULT's columns.
+
+    An unattached clone is not a partition, so a column added to (or changed
+    on) the parent after a failed move left it behind never reaches it, and
+    moving into it would fail for good. The move is one transaction, so a
+    clone is empty whenever no move is in flight -- and the caller holds the
+    item table's build lock, so none is. A clone that holds rows anyway is
+    never dropped: the move stops with an error naming it instead.
+    """
+    partition = partition_name(kb_id, item_table)
+    if _relkind(conn, partition) is None:
+        return
+    if _column_signature(conn, partition) == _column_signature(
+        conn, default_partition_name(item_table)
+    ):
+        return
+    if conn.execute(text(f"SELECT EXISTS (SELECT 1 FROM {_qualified(partition)})")).scalar():
+        raise RuntimeError(
+            f"{AI_SCHEMA}.{partition} is an unattached clone whose columns no longer match "
+            f"{AI_SCHEMA}.{default_partition_name(item_table)}, and it holds rows; not "
+            "dropping it. Move its rows back or drop it, then retry"
+        )
+    logger.warning(
+        "Dropping the stale clone %s.%s: its columns no longer match the DEFAULT partition's",
+        AI_SCHEMA,
+        partition,
+    )
+    conn.execute(text(partition_drop_ddl(kb_id, item_table)))
+
+
 def _prepare_partition(conn, kb_id: str, item_table: str) -> None:
     """Create the clone, its CHECK constraint and its foreign keys. Idempotent.
 
@@ -1323,6 +1393,7 @@ def _prepare_partition(conn, kb_id: str, item_table: str) -> None:
     partition = partition_name(kb_id, item_table)
     default = default_partition_name(item_table)
     conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+    _drop_stale_clone(conn, kb_id, item_table)
     conn.execute(text(partition_create_ddl(kb_id, item_table)))
     if not _check_constraint_exists(conn, partition):
         conn.execute(text(partition_check_ddl(kb_id, item_table)))
@@ -1845,7 +1916,6 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
     kb_id = _validated_kb_id(knowledge_base_id)
     partition = partition_name(kb_id, item_table)
     default = default_partition_name(item_table)
-    insert_sql, delete_sql = move_rows_sql(kb_id, item_table)
     fence = default_move_check_name(kb_id)
 
     with engine.connect() as conn:
@@ -1859,6 +1929,10 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                 return {"rows_moved": 0, "writes_blocked_seconds": 0.0}
 
             _prepare_partition(conn, kb_id, item_table)
+            insert_sql, delete_sql = move_rows_sql(
+                kb_id, item_table, _insertable_columns(conn, default)
+            )
+            conn.commit()
 
             fence_committed = False
             try:
@@ -1959,8 +2033,12 @@ def drop_partition(engine, knowledge_base_id: Any, item_table: str) -> bool:
                 conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
                 if _partition_is_attached(conn, kb_id, item_table):
                     conn.execute(text(partition_detach_ddl(kb_id, item_table)))
+                names = ", ".join(_insertable_columns(conn, default))
                 survivors = conn.execute(
-                    text(f"INSERT INTO {_qualified(default)} SELECT * FROM {_qualified(partition)}")
+                    text(
+                        f"INSERT INTO {_qualified(default)} ({names}) "
+                        f"SELECT {names} FROM {_qualified(partition)}"
+                    )
                 ).rowcount
                 conn.execute(text(partition_drop_ddl(kb_id, item_table)))
                 conn.commit()

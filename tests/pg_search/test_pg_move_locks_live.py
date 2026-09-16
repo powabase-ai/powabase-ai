@@ -67,3 +67,54 @@ def test_preparing_the_partition_gives_up_behind_a_writer_of_a_referenced_table(
     # Nothing moved, and the next attempt goes through.
     assert _rows_in(session, "chunks_default", KB_A) == len(KB_A_DOCS)
     assert pgb.create_partition(engine, KB_A, "chunks")["rows_moved"] == len(KB_A_DOCS)
+
+
+# ---------------------------------------------------------------------------
+# A clone left behind by a failed move
+# ---------------------------------------------------------------------------
+
+
+def test_a_stale_clone_missing_a_column_added_since_is_recreated(engine, session):
+    """An unattached clone is not a partition, so a column added to the parent
+    later never reaches it. Reusing it made every later move fail for good
+    (``INSERT has more expressions than target columns``)."""
+    with engine.connect() as conn:
+        conn.execute(text(pgb.partition_create_ddl(KB_A, "chunks")))
+        conn.commit()
+        conn.execute(text(f"ALTER TABLE {SCHEMA}.chunks ADD COLUMN rank integer DEFAULT 7"))
+        conn.commit()
+
+    moved = pgb.create_partition(engine, KB_A, "chunks")
+
+    assert moved["rows_moved"] == len(KB_A_DOCS)
+    partition = pgb.partition_name(KB_A, "chunks")
+    ranks = session.execute(text(f"SELECT DISTINCT rank FROM {SCHEMA}.{partition}")).scalars()
+    assert list(ranks) == [7]
+    session.rollback()
+
+
+def test_a_stale_clone_that_somehow_holds_rows_is_not_dropped(engine, session):
+    """A clone is empty whenever no move is in flight (the move is one
+    transaction). One that is not is left for a person to look at, never
+    dropped with the rows in it."""
+    partition = pgb.partition_name(KB_A, "chunks")
+    with engine.connect() as conn:
+        conn.execute(text(pgb.partition_create_ddl(KB_A, "chunks")))
+        conn.execute(
+            text(
+                f"INSERT INTO {SCHEMA}.{partition} (knowledge_base_id, text) "
+                "VALUES (CAST(:kb AS uuid), 'verloren')"
+            ),
+            {"kb": KB_A},
+        )
+        conn.commit()
+        conn.execute(text(f"ALTER TABLE {SCHEMA}.chunks ADD COLUMN rank integer"))
+        conn.commit()
+
+    try:
+        pgb.create_partition(engine, KB_A, "chunks")
+    except Exception as exc:
+        assert "rows" in str(exc)
+    else:
+        raise AssertionError("a non-empty stale clone was dropped or reused")
+    assert _rows_in(session, partition) == 1

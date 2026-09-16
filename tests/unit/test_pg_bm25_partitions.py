@@ -174,11 +174,15 @@ def test_detach_and_drop_partition_ddl():
 
 
 def test_the_move_copies_then_deletes_and_binds_the_kb():
-    insert_sql, delete_sql = pgb.move_rows_sql(KB, "chunks")
+    insert_sql, delete_sql = pgb.move_rows_sql(KB, "chunks", ["id", "knowledge_base_id", "text"])
 
-    # Identifiers are interpolated (validated); values are bound.
+    # Identifiers are interpolated (validated); values are bound. The columns
+    # are named on both sides: a clone left by an earlier failed move does not
+    # receive a column added to the parent since, and ``SELECT *`` would then
+    # hand it more values than it has columns.
     assert insert_sql == (
-        f'INSERT INTO "ai".chunks_kb_{KB_HEX} SELECT * FROM "ai".chunks_default '
+        f'INSERT INTO "ai".chunks_kb_{KB_HEX} (id, knowledge_base_id, text) '
+        'SELECT id, knowledge_base_id, text FROM "ai".chunks_default '
         "WHERE knowledge_base_id = CAST(:kb AS uuid)"
     )
     assert delete_sql == (
@@ -283,7 +287,12 @@ def test_the_default_partition_is_locked_against_writers_not_readers():
 
 def test_move_sql_refuses_an_unpartitioned_table():
     with pytest.raises(ValueError):
-        pgb.move_rows_sql(KB, "doc2json_documents")
+        pgb.move_rows_sql(KB, "doc2json_documents", ["id"])
+
+
+def test_move_sql_refuses_an_empty_column_list():
+    with pytest.raises(ValueError):
+        pgb.move_rows_sql(KB, "chunks", [])
 
 
 def test_mirror_relation_settings_sql_copies_owner_grants_and_rls():

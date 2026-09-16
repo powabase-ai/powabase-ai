@@ -40,6 +40,10 @@ _MIGRATED = {t: "p" for t in pgb.PARTITIONED_ITEM_TABLES} | {
 _UNMIGRATED = {t: "r" for t in pgb.PARTITIONED_ITEM_TABLES}
 
 
+#: The item table's columns, as the catalog lists them.
+_COLUMNS = ("id", "knowledge_base_id", "text")
+
+
 def _with_partition(kb_id=None, item_table="chunks"):
     """``_MIGRATED``, plus one knowledge base's partition."""
     return _MIGRATED | {pgb.partition_name(kb_id or KB, item_table): "r"}
@@ -143,6 +147,8 @@ class _FakeConn:
                 else self.foreign_keys
             )
             rows = [(fk,) for fk in source]
+        elif "pg_attribute" in sql:
+            rows = [(column,) for column in _COLUMNS]
         elif "indisvalid" in sql:
             row = (self.indisvalid,)
         elif sql.startswith("INSERT INTO") and "_kb_" in sql.split(" SELECT")[0]:
@@ -281,7 +287,7 @@ def test_ensure_moves_every_row_and_attaches_in_one_transaction():
     assert out["partition_created"] is True
     assert out["rows_moved"] == 14_000
     assert out["writes_blocked_seconds"] >= 0
-    insert_sql, delete_sql = pgb.move_rows_sql(KB, "chunks")
+    insert_sql, delete_sql = pgb.move_rows_sql(KB, "chunks", list(_COLUMNS))
     parent_lock = conn.statements.index(pgb.partition_lock_parent_ddl("chunks"))
     # The move's own timeout: the last one set before the parent lock (preparing
     # the clone sets one of its own, in the transaction before).
@@ -329,7 +335,7 @@ def test_the_default_partition_is_fenced_so_the_attach_does_not_scan_it():
     statements = conn.statements
     parent_lock = statements.index(pgb.partition_lock_parent_ddl("chunks"))
     add = statements.index(pgb.default_move_check_add_ddl(KB, "chunks"))
-    delete_at = statements.index(pgb.move_rows_sql(KB, "chunks")[1])
+    delete_at = statements.index(pgb.move_rows_sql(KB, "chunks", list(_COLUMNS))[1])
     validate = statements.index(pgb.default_move_check_validate_ddl(KB, "chunks"))
     attach = statements.index(pgb.partition_attach_ddl(KB, "chunks"))
     drop = statements.index(
@@ -770,7 +776,8 @@ def test_drop_detaches_and_drops_the_partition_when_asked():
     assert out["partitions"] == [f"chunks_kb_{HEX}"]
     assert _partition_ddl(conn) == [
         pgb.partition_detach_ddl(KB, "chunks"),
-        f'INSERT INTO "ai".chunks_default SELECT * FROM "ai".chunks_kb_{HEX}',
+        f'INSERT INTO "ai".chunks_default (id, knowledge_base_id, text) '
+        f'SELECT id, knowledge_base_id, text FROM "ai".chunks_kb_{HEX}',
         pgb.partition_drop_ddl(KB, "chunks"),
     ]
 
@@ -788,7 +795,8 @@ def test_drop_of_a_detached_partition_still_rescues_its_rows():
     pgb.drop_bm25_index(KB, engine=_FakeEngine(conn), drop_partitions=True)
 
     assert _partition_ddl(conn) == [
-        f'INSERT INTO "ai".chunks_default SELECT * FROM "ai".chunks_kb_{HEX}',
+        f'INSERT INTO "ai".chunks_default (id, knowledge_base_id, text) '
+        f'SELECT id, knowledge_base_id, text FROM "ai".chunks_kb_{HEX}',
         pgb.partition_drop_ddl(KB, "chunks"),
     ]
 
