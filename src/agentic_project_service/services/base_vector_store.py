@@ -550,13 +550,21 @@ class BasePgVectorStore:
     ) -> list[RetrievedItem]:
         """BM25 search answered by this KB's pg_search index.
 
-        Requires that index to exist and be valid — see
-        ``pg_bm25_index.bm25_index_ready``. The KB id is interpolated as a
-        validated UUID literal because a bound parameter does not match the
-        index's partial predicate, which would cost the query its index; every
-        other value, the query text included, is bound.
+        The query names the knowledge base's **partition** of the item table,
+        not the table. pg_search refuses a scored query against a partitioned
+        parent outright ("does not contain a `USING bm25` index"), whatever
+        predicate would have pruned it to one indexed partition — so the
+        partition is the only relation that can answer, and its LIST bound is
+        what restricts the result to this knowledge base. No
+        ``knowledge_base_id`` predicate is therefore needed.
+
+        The relation name is the one interpolated value, and it is built from a
+        UUID that has been through ``uuid.UUID()``, so nothing a caller supplies
+        reaches SQL as an identifier. Every other value, the query text
+        included, is bound. Requires the partition's index to exist and be valid
+        — see ``pg_bm25_index.bm25_index_ready``.
         """
-        kb_literal = pg_bm25_index._validated_kb_id(self.kb_id)
+        partition = pg_bm25_index.partition_name(self.kb_id, self.TABLE)
         normalized = pg_bm25_index.normalize_bm25_query(query)
         if not normalized:
             return []
@@ -569,9 +577,8 @@ class BasePgVectorStore:
                 pdb.score(c.id) AS score,
                 c.source_id,
                 c.meta
-            FROM "{self.schema}".{self.TABLE} c
-            WHERE c.knowledge_base_id = '{kb_literal}'
-              AND {match_expression} ||| :bm25_query
+            FROM "{self.schema}".{partition} c
+            WHERE {match_expression} ||| :bm25_query
         """
         params: dict[str, Any] = {"bm25_query": normalized}
 
