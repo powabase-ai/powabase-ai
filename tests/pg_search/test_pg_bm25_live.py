@@ -7,7 +7,9 @@ stemmers, the filters push down, DML is visible without a reindex, and an
 adversarial query answers instead of raising.
 
 Runs against ``PG_SEARCH_TEST_DATABASE_URL`` if set, otherwise ``DATABASE_URL``,
-and skips with a reason when that server cannot offer the extension. Every test
+and skips with a reason when that server cannot offer the extension -- unless
+``PG_SEARCH_REQUIRED=1``, where a missing extension fails instead, so a CI job
+built to run these cannot pass by skipping them. Every test
 works in a scratch schema of its own, so nothing here touches the ``ai`` schema.
 The scratch schema is built unpartitioned and then converted by the real
 migration, so these tests run against the shape a migrated database has.
@@ -90,15 +92,24 @@ def migration():
 def engine():
     dsn = os.environ.get("PG_SEARCH_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
     if not dsn:
+        if os.environ.get("PG_SEARCH_REQUIRED") == "1":
+            pytest.fail("PG_SEARCH_REQUIRED=1 but no PG_SEARCH_TEST_DATABASE_URL or DATABASE_URL")
         pytest.skip("no PG_SEARCH_TEST_DATABASE_URL or DATABASE_URL to test pg_search against")
     eng = create_engine(dsn)
     where = eng.url.render_as_string(hide_password=True)
     try:
         with eng.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            # pg_search hard-requires vector ("required extension "vector" is not
+            # installed"); without this every test here skipped on a fresh
+            # database, and a skip reads as green.
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_search"))
     except Exception as exc:
         eng.dispose()
-        pytest.skip(f"pg_search is not available on {where}: {str(exc).splitlines()[0]}")
+        reason = f"pg_search is not available on {where}: {str(exc).splitlines()[0]}"
+        if os.environ.get("PG_SEARCH_REQUIRED") == "1":
+            pytest.fail(reason)
+        pytest.skip(reason)
     yield eng
     eng.dispose()
 
