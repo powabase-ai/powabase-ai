@@ -746,21 +746,28 @@ def _prepare_partition(conn, kb_id: str, item_table: str) -> None:
     conn.commit()
 
 
-def _drain(conn, kb_id: str, item_table: str, batch: int, *, commit_each: bool) -> int:
-    """Move this KB's rows out of DEFAULT until none are left. Returns the count."""
+def _drain(
+    conn, kb_id: str, item_table: str, batch: int, *, commit_each: bool, stop_when_short: bool
+) -> tuple[int, bool]:
+    """Move this KB's rows out of DEFAULT. Returns ``(rows moved, drained)``.
+
+    ``stop_when_short`` belongs to the unlocked bulk phase. A batch that comes
+    back short means few rows are left, and chasing the last few without the
+    lock is pointless: a writer appending to this knowledge base refills DEFAULT
+    as fast as the batches empty it, so a loop that waits for a zero-row batch
+    never terminates. The cutover finishes the job with writers held off.
+    """
     evacuate = text(evacuate_batch_sql(kb_id, item_table))
     moved = 0
     for _ in range(_MAX_EVACUATION_BATCHES):
         result = conn.execute(evacuate, {"kb": kb_id, "batch": batch})
         if commit_each:
             conn.commit()
-        if not result.rowcount:
-            return moved
         moved += result.rowcount
-    raise RuntimeError(
-        f'the DEFAULT partition of "{AI_SCHEMA}".{item_table} did not drain for '
-        f"knowledge base {kb_id} after {_MAX_EVACUATION_BATCHES} batches"
-    )
+        enough = result.rowcount < batch if stop_when_short else result.rowcount == 0
+        if enough:
+            return moved, True
+    return moved, False
 
 
 def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
@@ -807,12 +814,42 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                 return {"rows_moved": 0, "cutover_seconds": 0.0}
 
             _prepare_partition(conn, kb_id, item_table)
-            moved = _drain(conn, kb_id, item_table, EVACUATION_BATCH_ROWS, commit_each=True)
+            moved, settled = _drain(
+                conn,
+                kb_id,
+                item_table,
+                EVACUATION_BATCH_ROWS,
+                commit_each=True,
+                stop_when_short=True,
+            )
+            if not settled:
+                logger.warning(
+                    "The bulk move of KB %s out of %s.%s is still returning full batches "
+                    "after %d of them; finishing under the cutover lock instead, which "
+                    "will block writes for longer",
+                    kb_id,
+                    AI_SCHEMA,
+                    default,
+                    _MAX_EVACUATION_BATCHES,
+                )
 
             started = time.monotonic()
             conn.execute(text(f"SET LOCAL lock_timeout = '{CUTOVER_LOCK_TIMEOUT_MS}ms'"))
             conn.execute(text(partition_lock_default_ddl(item_table)))
-            moved += _drain(conn, kb_id, item_table, CUTOVER_BATCH_ROWS, commit_each=False)
+            delta, drained = _drain(
+                conn,
+                kb_id,
+                item_table,
+                CUTOVER_BATCH_ROWS,
+                commit_each=False,
+                stop_when_short=False,
+            )
+            moved += delta
+            if not drained:
+                raise RuntimeError(
+                    f'the DEFAULT partition of "{AI_SCHEMA}".{item_table} did not drain for '
+                    f"knowledge base {kb_id} after {_MAX_EVACUATION_BATCHES} cutover batches"
+                )
             conn.execute(text(partition_attach_ddl(kb_id, item_table)))
             conn.execute(
                 text(mirror_relation_settings_sql(_qualified(item_table), _qualified(partition)))

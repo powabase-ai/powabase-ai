@@ -221,6 +221,7 @@ def test_ensure_moves_the_bulk_of_the_rows_without_holding_a_table_lock():
     assert out["rows_moved"] == 14_000
     statements = _partition_ddl(conn)
     lock = pgb.partition_lock_default_ddl("chunks")
+    bulk = pgb.evacuate_batch_sql(KB, "chunks")
     # Every bulk batch happens before the lock is taken, and the bulk phase
     # stops as soon as a batch comes back short -- chasing the last few rows
     # unlocked is pointless while a writer can still add more, and against a
