@@ -57,6 +57,9 @@ class _FakeConn:
         foreign_keys=("FOREIGN KEY (source_id) REFERENCES ai.sources(id) ON DELETE CASCADE",),
         evacuated=(0,),
         attached=True,
+        build_lock=True,
+        check_constraint=False,
+        partition_foreign_keys=(),
     ):
         self.extension = extension
         self.kb_row = kb_row
@@ -66,7 +69,11 @@ class _FakeConn:
         self.foreign_keys = list(foreign_keys)
         self.evacuated = list(evacuated)
         self.attached = attached
+        self.build_lock = build_lock
+        self.check_constraint = check_constraint
+        self.partition_foreign_keys = list(partition_foreign_keys)
         self.statements: list[str] = []
+        self.commits: list[int] = []
         self.options: dict = {}
 
     # engine.connect().execution_options(...) -> connection
@@ -98,8 +105,20 @@ class _FakeConn:
             row = (kind,) if kind else None
         elif "pg_inherits" in sql:
             row = (1,) if self.attached else None
+        elif "pg_try_advisory_lock" in sql:
+            row = (self.build_lock,)
+        elif "pg_advisory_unlock" in sql:
+            row = (True,)
+        elif "contype = 'c'" in sql:
+            row = (1,) if self.check_constraint else None
         elif "pg_get_constraintdef" in sql:
-            rows = [(fk,) for fk in self.foreign_keys]
+            relname = (params or {}).get("relname")
+            source = (
+                self.partition_foreign_keys
+                if relname and relname.endswith(HEX)
+                else self.foreign_keys
+            )
+            rows = [(fk,) for fk in source]
         elif "indisvalid" in sql:
             row = (self.indisvalid,)
         elif "moved AS" in sql:
@@ -111,6 +130,10 @@ class _FakeConn:
         return result
 
     def commit(self):
+        """Record where each transaction boundary fell, in statement counts."""
+        self.commits.append(len(self.statements))
+
+    def rollback(self):
         pass
 
 
@@ -174,16 +197,15 @@ def test_ensure_reports_building_while_the_index_is_invalid():
 # ---------------------------------------------------------------------------
 
 
-def test_ensure_creates_the_partition_before_indexing_it():
-    """The KB's rows are in DEFAULT, so they have to move out first.
+def test_ensure_moves_the_bulk_of_the_rows_without_holding_a_table_lock():
+    """The whole point of the online move: writers keep working during the bulk.
 
-    A partition cannot be attached while the DEFAULT partition still holds a
-    row that belongs to it, so the order is fixed: clone, add the local foreign
-    keys, evacuate, attach, mirror ownership/grants/RLS -- all in one
-    transaction -- and only then build the index (CONCURRENTLY, which cannot
-    run inside one).
+    Locking the DEFAULT partition for the length of the move blocks every write
+    to the item table -- measured at 13.4 s for 40 000 rows on a 512 MB
+    Postgres, minutes at real scale. So the bulk batches each commit on their
+    own with no table-wide lock held, and only the short cutover takes one.
     """
-    conn = _FakeConn(evacuated=(10_000, 4_000, 0))
+    conn = _FakeConn(evacuated=(10_000, 4_000, 0, 0))
 
     out = pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
 
@@ -191,20 +213,114 @@ def test_ensure_creates_the_partition_before_indexing_it():
     assert out["partition_created"] is True
     assert out["rows_moved"] == 14_000
     statements = _partition_ddl(conn)
-    assert statements[0] == pgb.partition_create_ddl(KB, "chunks")
-    # Writers are held off DEFAULT before the first row is read out of it: one
-    # arriving between the last batch and the ATTACH would break the attach.
-    assert statements[1] == pgb.partition_lock_default_ddl("chunks")
-    assert statements[-1].strip().startswith("DO $$")
-    assert pgb.partition_attach_ddl(KB, "chunks") in statements
-    evacuations = [s for s in statements if "moved AS" in s]
-    assert evacuations == [pgb.evacuate_batch_sql(KB, "chunks")] * 3
-    # Attaching only happens once the evacuation has drained.
-    assert statements.index(pgb.partition_attach_ddl(KB, "chunks")) > statements.index(
-        evacuations[-1]
+    lock = pgb.partition_lock_default_ddl("chunks")
+    bulk = pgb.evacuate_batch_sql(KB, "chunks")
+
+    # Every bulk batch happens before the lock is taken...
+    first_lock = statements.index(lock)
+    assert statements[:first_lock].count(bulk) == 3
+    # ...and each of them committed on its own.
+    bulk_commits = [
+        c
+        for c in conn.commits
+        if c <= conn.statements.index(lock)  # noqa: PLR1730
+    ]
+    assert len(bulk_commits) >= 3, conn.commits
+
+
+def test_ensure_takes_the_build_lock_before_touching_anything():
+    """Two concurrent moves out of one DEFAULT partition deadlocked each other.
+
+    Observed on a real project: both tasks failed with `deadlock detected` on
+    `LOCK TABLE ... IN SHARE MODE`. The advisory lock serialises the moves, so
+    the second caller waits (or is told to retry) instead.
+    """
+    conn = _FakeConn(evacuated=(5, 0))
+
+    pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    lock_at = next(i for i, s in enumerate(conn.statements) if "pg_try_advisory_lock" in s)
+    first_write = next(
+        i for i, s in enumerate(conn.statements) if any(marker in s for marker in _PARTITION_WORK)
     )
-    # And the index build comes after the partition exists.
+    assert lock_at < first_write
+    # And it is released again once the move is done.
+    assert any("pg_advisory_unlock" in s for s in conn.statements)
+
+
+def test_ensure_declines_cleanly_when_another_build_holds_the_lock(monkeypatch):
+    """A retryable outcome, not an exception that becomes a failed task."""
+    monkeypatch.setattr(pgb, "PARTITION_BUILD_LOCK_WAIT_SECONDS", 0.0)
+    conn = _FakeConn(build_lock=False)
+
+    out = pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    assert out["status"] == "skipped"
+    assert out["reason"] == "partition_build_in_progress"
+    assert _partition_ddl(conn) == []
+    assert _ddl(conn) == []
+
+
+def test_the_cutover_drains_the_delta_attaches_and_mirrors_in_one_transaction():
+    conn = _FakeConn(evacuated=(10_000, 0, 7, 0))
+
+    out = pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    assert out["rows_moved"] == 10_007
+    statements = _partition_ddl(conn)
+    lock = pgb.partition_lock_default_ddl("chunks")
+    attach = pgb.partition_attach_ddl(KB, "chunks")
+    cutover = statements[statements.index(lock) :]
+
+    assert cutover[0] == lock
+    assert cutover.count(pgb.evacuate_batch_sql(KB, "chunks")) == 2
+    assert cutover.index(attach) > cutover.index(pgb.evacuate_batch_sql(KB, "chunks"))
+    assert cutover[-1].strip().startswith("DO $$")
+    # One transaction: nothing commits between taking the lock and mirroring.
+    lock_position = conn.statements.index(lock)
+    mirror_position = (
+        len(conn.statements)
+        - 1
+        - next(i for i, s in enumerate(reversed(conn.statements)) if s.strip().startswith("DO $$"))
+    )
+    assert not [c for c in conn.commits if lock_position < c <= mirror_position]
+    # The index build is outside it -- CONCURRENTLY cannot run in a transaction.
     assert _ddl(conn) == [pgb.bm25_index_ddl(KB, "chunks", "german")]
+    assert out["cutover_seconds"] >= 0
+
+
+def test_ensure_adds_the_check_constraint_so_the_attach_skips_its_scan():
+    conn = _FakeConn(evacuated=(0,))
+
+    pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    assert pgb.partition_check_ddl(KB, "chunks") in conn.statements
+
+
+def test_a_resumed_move_does_not_add_the_check_constraint_twice():
+    conn = _FakeConn(relkinds=_with_partition(), check_constraint=True, attached=False)
+
+    pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    assert pgb.partition_check_ddl(KB, "chunks") not in conn.statements
+
+
+def test_ensure_resumes_a_partition_that_exists_but_was_never_attached():
+    """A crash mid-move leaves the partition unattached and partly filled.
+
+    Rows are then split across DEFAULT and the partition -- none lost, none
+    duplicated, because each batch was its own transaction -- and a retry has to
+    finish the job rather than decide there is nothing to do.
+    """
+    conn = _FakeConn(relkinds=_with_partition(), attached=False, evacuated=(40, 0, 0))
+
+    out = pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    assert out["status"] == "ready"
+    assert out["rows_moved"] == 40
+    assert pgb.partition_attach_ddl(KB, "chunks") in conn.statements
+    # The clone is idempotent, so re-issuing it is harmless and expected.
+    assert pgb.partition_create_ddl(KB, "chunks") in conn.statements
 
 
 def test_ensure_copies_the_default_partitions_foreign_keys_onto_the_new_one():
@@ -225,6 +341,20 @@ def test_ensure_copies_the_default_partitions_foreign_keys_onto_the_new_one():
         f'ALTER TABLE "ai".chunks_kb_{HEX} ADD FOREIGN KEY (source_id) '
         "REFERENCES ai.sources(id) ON DELETE CASCADE",
     ]
+
+
+def test_a_resumed_move_does_not_add_the_foreign_keys_twice():
+    conn = _FakeConn(
+        relkinds=_with_partition(),
+        attached=False,
+        partition_foreign_keys=(
+            "FOREIGN KEY (source_id) REFERENCES ai.sources(id) ON DELETE CASCADE",
+        ),
+    )
+
+    pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    assert [s for s in conn.statements if "ADD FOREIGN KEY" in s] == []
 
 
 def test_ensure_does_not_recreate_a_partition_that_already_exists():

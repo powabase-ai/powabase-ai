@@ -186,6 +186,78 @@ def test_evacuation_sql_moves_a_bounded_batch_and_binds_its_values():
     assert "RETURNING *" in sql
 
 
+def test_the_partition_carries_a_check_constraint_matching_its_bound():
+    """What lets the ATTACH skip its validation scan of the new partition.
+
+    Postgres skips the scan when the table being attached already has a CHECK
+    constraint that implies the partition constraint. Without it, ATTACH reads
+    every row of the partition while holding ACCESS EXCLUSIVE -- exactly the
+    window this design is trying to keep short.
+    """
+    ddl = pgb.partition_check_ddl(KB, "chunks")
+
+    assert ddl == (
+        f'ALTER TABLE "ai".chunks_kb_{KB_HEX} '
+        f"ADD CONSTRAINT chunks_kb_{KB_HEX}_kb_check "
+        f"CHECK (knowledge_base_id = '{KB}')"
+    )
+
+
+def test_the_check_constraint_name_fits_the_identifier_limit():
+    for item_table in pgb.PARTITIONED_ITEM_TABLES:
+        ddl = pgb.partition_check_ddl(KB, item_table)
+        name = ddl.split("ADD CONSTRAINT ")[1].split(" ")[0]
+        assert len(name.encode("utf-8")) <= 63, (item_table, name)
+
+
+def test_check_ddl_refuses_an_unpartitioned_table():
+    with pytest.raises(ValueError):
+        pgb.partition_check_ddl(KB, "doc2json_documents")
+
+
+# ---------------------------------------------------------------------------
+# Serialising partition builds per item table
+# ---------------------------------------------------------------------------
+
+
+def test_the_build_lock_is_a_try_lock_keyed_on_the_qualified_table():
+    """Two moves out of the same DEFAULT partition deadlock each other.
+
+    Each holds SHARE on ``<table>_default`` and then asks to upgrade to the
+    ACCESS EXCLUSIVE its own ATTACH needs, so each waits for the other's SHARE:
+    ``deadlock detected``, observed on a real project. A Postgres advisory lock
+    keyed on the item table serialises the whole move instead, and the *try*
+    form is what makes the wait bounded -- a caller that cannot get it is told
+    to retry rather than left blocking.
+    """
+    sql = pgb.partition_build_lock_sql()
+
+    assert "pg_try_advisory_lock" in sql
+    assert "hashtextextended(:relation, 0)" in sql
+    assert "ai" not in sql, "the relation is bound, not interpolated"
+
+
+def test_the_build_lock_is_released_by_name_not_by_transaction():
+    """It has to outlive the transactions, because the move is several of them."""
+    assert "pg_advisory_unlock" in pgb.partition_build_unlock_sql()
+    assert "hashtextextended(:relation, 0)" in pgb.partition_build_unlock_sql()
+
+
+def test_the_build_lock_relation_is_schema_qualified():
+    assert pgb.partition_build_lock_relation("chunks") == "ai.chunks"
+    with pytest.raises(ValueError):
+        pgb.partition_build_lock_relation("doc2json_documents")
+
+
+def test_a_contended_build_is_a_named_error_not_a_bare_exception():
+    assert issubclass(pgb.PartitionBuildInProgress, Exception)
+
+
+def test_the_cutover_batch_is_smaller_than_the_bulk_batch():
+    """The cutover batches run under the lock, so they are sized to be quick."""
+    assert 0 < pgb.CUTOVER_BATCH_ROWS < pgb.EVACUATION_BATCH_ROWS
+
+
 def test_the_default_partition_is_locked_against_writers_not_readers():
     """SHARE, because a writer during the move breaks the ATTACH outright.
 
