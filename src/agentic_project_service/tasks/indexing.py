@@ -2564,13 +2564,15 @@ def ensure_pg_bm25_index(kb_id: str) -> dict:
 
 @celery_app.task(max_retries=2, default_retry_delay=300)
 @billing.no_billing_context
-def drop_pg_bm25_index(kb_id: str) -> dict:
-    """Drop this KB's BM25 indexes and its partitions (dispatched on KB delete).
+def drop_pg_bm25_index(kb_id: str, drop_partitions: bool = True) -> dict:
+    """Drop this KB's BM25 indexes, and by default its partitions.
 
-    The partitions go too: a relation named after a knowledge base that no
-    longer exists has nothing to hold. Any row still in one is returned to the
-    DEFAULT partition first.
+    KB delete relies on the default: a relation named after a knowledge base
+    that no longer exists has nothing to hold, and any row still in one is
+    returned to the DEFAULT partition first. A KB leaving hybrid/full_text
+    passes ``drop_partitions=False``: it keeps its partition, only the index
+    (which Postgres would otherwise keep maintaining) goes.
     """
     from ..services import pg_bm25_index
 
-    return pg_bm25_index.drop_bm25_index(kb_id, drop_partitions=True)
+    return pg_bm25_index.drop_bm25_index(kb_id, drop_partitions=drop_partitions)

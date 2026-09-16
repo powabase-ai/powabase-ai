@@ -808,9 +808,13 @@ def pg_bm25_status(knowledge_base_id: str, strategy: str | None, session=None) -
 
 
 def _kb_config_sql() -> str:
-    """The three KB fields that decide whether and how to index it."""
+    """The three KB fields that decide whether and how to index it.
+
+    A config with no ``strategy`` key is searched as chunk_embed, so it is
+    indexed as one.
+    """
     return (
-        "SELECT indexing_config->>'strategy', "
+        "SELECT COALESCE(indexing_config->>'strategy', 'chunk_embed'), "
         "retrieval_config->>'method', "
         "retrieval_config->>'ts_language' "
         f'FROM "{AI_SCHEMA}".knowledge_bases WHERE id = :id'
@@ -926,7 +930,14 @@ def _lock_holders_sql() -> str:
     )
 
 
-def _log_move_failure(conn, knowledge_base_id: str, item_table: str, exc: BaseException) -> None:
+def _log_move_failure(
+    conn,
+    knowledge_base_id: str,
+    item_table: str,
+    exc: BaseException,
+    *,
+    action: str = "Moving the rows into the partition of",
+) -> None:
     """Say why a move failed, and for a lock timeout, who was in the way.
 
     Runs after the rollback. A lock timeout has already ended the wait, so
@@ -936,7 +947,8 @@ def _log_move_failure(conn, knowledge_base_id: str, item_table: str, exc: BaseEx
     """
     if not is_transient_db_error(exc):
         logger.warning(
-            "Moving KB %s into its own partition of %s.%s failed; rolled back",
+            "%s KB %s on %s.%s failed; rolled back",
+            action,
             knowledge_base_id,
             AI_SCHEMA,
             item_table,
@@ -959,9 +971,9 @@ def _log_move_failure(conn, knowledge_base_id: str, item_table: str, exc: BaseEx
         conn.rollback()
         logger.debug("Could not list lock holders", exc_info=True)
     logger.warning(
-        "Moving KB %s into its own partition of %s.%s gave up (lock_timeout %d ms, or a "
-        "deadlock); rolled back, retryable. Sessions holding or awaiting locks on the "
-        "table: %s",
+        "%s KB %s on %s.%s gave up (lock_timeout %d ms, or a deadlock); rolled back, "
+        "retryable. Sessions holding or awaiting locks on the table: %s",
+        action,
         knowledge_base_id,
         AI_SCHEMA,
         item_table,
@@ -1205,10 +1217,16 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
 def drop_partition(engine, knowledge_base_id: Any, item_table: str) -> bool:
     """Detach and drop one KB's partition, returning any rows to DEFAULT first.
 
-    Rescuing the rows makes this safe to call on a knowledge base that still
-    exists: the worst case is that the KB goes back to the fallback keyword
-    path, never that a row is lost. After a KB delete the partition is already
-    empty (its rows went with the cascade), so the rescue costs nothing.
+    Meant for a deleted knowledge base, whose partition is already empty (its
+    rows went with the cascade), so the copy back costs nothing. It is safe on
+    a knowledge base that still exists -- no row is lost, the KB just goes back
+    to the fallback keyword path -- but not cheap: DETACH holds ACCESS
+    EXCLUSIVE on the parent until the commit, so every read and write of the
+    item table waits while the rows are copied back.
+
+    The wait for that lock is bounded by ``MOVE_LOCK_TIMEOUT_MS``; a timeout
+    rolls back, logs who held the table, and raises a transient error for the
+    caller to retry.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     partition = partition_name(kb_id, item_table)
@@ -1221,17 +1239,33 @@ def drop_partition(engine, knowledge_base_id: Any, item_table: str) -> bool:
         try:
             if _relkind(conn, partition) is None:
                 return False
-            if _partition_is_attached(conn, kb_id, item_table):
-                conn.execute(text(partition_detach_ddl(kb_id, item_table)))
-            conn.execute(
-                text(f"INSERT INTO {_qualified(default)} SELECT * FROM {_qualified(partition)}")
-            )
-            conn.execute(text(partition_drop_ddl(kb_id, item_table)))
-            conn.commit()
+            try:
+                conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+                if _partition_is_attached(conn, kb_id, item_table):
+                    conn.execute(text(partition_detach_ddl(kb_id, item_table)))
+                survivors = conn.execute(
+                    text(f"INSERT INTO {_qualified(default)} SELECT * FROM {_qualified(partition)}")
+                ).rowcount
+                conn.execute(text(partition_drop_ddl(kb_id, item_table)))
+                conn.commit()
+            except Exception as exc:
+                conn.rollback()
+                _log_move_failure(conn, kb_id, item_table, exc, action="Dropping the partition of")
+                raise
         finally:
             _release_partition_build_lock(conn, item_table)
 
-    logger.info("Dropped partition %s.%s; its rows are back in %s", AI_SCHEMA, partition, default)
+    if survivors:
+        logger.warning(
+            "Dropped partition %s.%s of a knowledge base that still had %d rows; they are "
+            "back in %s",
+            AI_SCHEMA,
+            partition,
+            survivors,
+            default,
+        )
+    else:
+        logger.info("Dropped partition %s.%s", AI_SCHEMA, partition)
     return True
 
 
@@ -1414,41 +1448,41 @@ def drop_bm25_index(knowledge_base_id: str, engine=None, drop_partitions: bool =
     strategy may have changed since the index was built, and by the time a KB
     is deleted its row is gone anyway. ``drop_partitions`` is what a deleted KB
     needs -- leaving a partition behind would leave a relation named after a
-    knowledge base that no longer exists.
+    knowledge base that no longer exists. Partitions are dropped even when the
+    extension is gone, because they outlive it.
+
+    A contended or timed-out partition drop raises (``PartitionBuildInProgress``
+    or a transient database error) so the task retries; reporting ``dropped``
+    there would orphan the partition with nothing left to reconcile it.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
 
     dropped: list[str] = []
     with _autocommit_connection(engine) as conn:
-        if not pg_search_installed(conn, use_cache=False):
-            return {"status": "skipped", "reason": "extension_absent"}
-
-        for item_table in sorted(BM25_ITEM_TABLES):
-            try:
-                conn.execute(text(bm25_drop_ddl(kb_id, item_table)))
-                dropped.append(bm25_index_name(kb_id, item_table))
-            except Exception:
-                logger.warning(
-                    "Could not drop BM25 index for KB %s on %s",
-                    kb_id,
-                    item_table,
-                    exc_info=True,
-                )
+        installed = pg_search_installed(conn, use_cache=False)
+        if installed:
+            for item_table in sorted(BM25_ITEM_TABLES):
+                try:
+                    conn.execute(text(bm25_drop_ddl(kb_id, item_table)))
+                    dropped.append(bm25_index_name(kb_id, item_table))
+                except Exception as exc:
+                    if is_transient_db_error(exc):
+                        raise
+                    logger.warning(
+                        "Could not drop BM25 index for KB %s on %s",
+                        kb_id,
+                        item_table,
+                        exc_info=True,
+                    )
 
     removed: list[str] = []
     if drop_partitions:
         for item_table in sorted(PARTITIONED_ITEM_TABLES):
-            try:
-                if drop_partition(engine, kb_id, item_table):
-                    removed.append(partition_name(kb_id, item_table))
-            except Exception:
-                logger.warning(
-                    "Could not drop the partition of %s for KB %s",
-                    item_table,
-                    kb_id,
-                    exc_info=True,
-                )
+            if drop_partition(engine, kb_id, item_table):
+                removed.append(partition_name(kb_id, item_table))
 
     invalidate_bm25_index_cache(kb_id)
+    if not installed and not removed:
+        return {"status": "skipped", "reason": "extension_absent"}
     return {"status": "dropped", "indexes": dropped, "partitions": removed}

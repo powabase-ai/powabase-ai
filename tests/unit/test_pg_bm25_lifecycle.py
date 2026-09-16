@@ -701,6 +701,78 @@ def test_drop_is_a_no_op_without_the_extension():
     assert _ddl(conn) == []
 
 
+def test_drop_still_removes_partitions_when_the_extension_is_gone():
+    """I6: after pg_search is dropped (a rollback of the image, say), deleting a
+    KB must still remove its partitions, or each delete leaks three relations."""
+    conn = _FakeConn(extension=False, relkinds=_with_partition())
+
+    out = pgb.drop_bm25_index(KB, engine=_FakeEngine(conn), drop_partitions=True)
+
+    assert out["partitions"] == [f"chunks_kb_{HEX}"]
+    assert _ddl(conn) == []
+    assert pgb.partition_detach_ddl(KB, "chunks") in conn.statements
+
+
+def test_drop_lets_a_contended_partition_drop_raise_so_the_task_retries(monkeypatch):
+    """I6: it used to log a WARNING and report ``dropped``, orphaning the
+    deleted KB's partition with nothing left to reconcile it."""
+    monkeypatch.setattr(pgb, "PARTITION_BUILD_LOCK_WAIT_SECONDS", 0.0)
+    conn = _FakeConn(relkinds=_with_partition(), build_lock=False)
+
+    with pytest.raises(pgb.PartitionBuildInProgress):
+        pgb.drop_bm25_index(KB, engine=_FakeEngine(conn), drop_partitions=True)
+
+
+def test_drop_partition_bounds_the_wait_for_its_detach_lock():
+    """I2: DETACH takes ACCESS EXCLUSIVE on the parent. Waiting on it unbounded
+    behind one long reader (a nightly dump) queues every read and write of the
+    item table behind it."""
+    conn = _FakeConn(relkinds=_with_partition())
+
+    pgb.drop_partition(_FakeEngine(conn), KB, "chunks")
+
+    timeout = max(
+        i
+        for i, s in enumerate(conn.statements)
+        if "SET LOCAL lock_timeout" in s
+        and i < conn.statements.index(pgb.partition_detach_ddl(KB, "chunks"))
+    )
+    assert timeout < conn.statements.index(pgb.partition_detach_ddl(KB, "chunks"))
+    assert str(pgb.MOVE_LOCK_TIMEOUT_MS) in conn.statements[timeout]
+
+
+def test_a_detach_that_times_out_rolls_back_logs_the_holders_and_raises(caplog):
+    conn = _FakeConn(relkinds=_with_partition())
+    conn.fail_on = (pgb.partition_detach_ddl(KB, "chunks"), _lock_timeout_error())
+
+    with caplog.at_level("WARNING"), pytest.raises(Exception, match="lock timeout"):
+        pgb.drop_partition(_FakeEngine(conn), KB, "chunks")
+
+    detach_at = conn.statements.index(pgb.partition_detach_ddl(KB, "chunks"))
+    unlock_at = next(i for i, s in enumerate(conn.statements) if "pg_advisory_unlock" in s)
+    assert min(r for r in conn.rollbacks if r > detach_at) <= unlock_at
+    assert any("pg_blocking_pids" in s for s in conn.statements)
+    assert "could not release" not in caplog.text.lower()
+
+
+def test_the_drop_task_keeps_partitions_when_asked():
+    """A KB leaving hybrid/full_text keeps its partition; only the index goes."""
+    from agentic_project_service.tasks.indexing import drop_pg_bm25_index
+
+    with patch(
+        "agentic_project_service.services.pg_bm25_index.drop_bm25_index",
+        return_value={"status": "dropped"},
+    ) as drop:
+        drop_pg_bm25_index.run(KB, drop_partitions=False)
+    drop.assert_called_once_with(KB, drop_partitions=False)
+
+
+def test_the_kb_strategy_defaults_to_chunk_embed_when_the_key_is_missing():
+    """A legacy KB with no ``strategy`` key is searched as chunk_embed, so it
+    must be indexed as one rather than skipped."""
+    assert "COALESCE(indexing_config->>'strategy', 'chunk_embed')" in pgb._kb_config_sql()
+
+
 # ---------------------------------------------------------------------------
 # pg_bm25_status (used by the KB detail response)
 # ---------------------------------------------------------------------------

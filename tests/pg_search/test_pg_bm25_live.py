@@ -1005,6 +1005,45 @@ def test_ensure_repairs_an_index_whose_concurrent_build_failed(engine, session, 
     assert len(_search(session, "Wanderung", top_k=5)) == 2
 
 
+def test_a_kb_with_no_strategy_key_is_indexed_as_chunk_embed(engine, session):
+    """Search treats a missing strategy as chunk_embed, so the build must too."""
+    session.execute(
+        text(
+            f"UPDATE {SCHEMA}.knowledge_bases SET indexing_config = '{{}}'::jsonb "
+            "WHERE id = CAST(:id AS uuid)"
+        ),
+        {"id": KB_A},
+    )
+    session.commit()
+
+    result = pgb.ensure_bm25_index(KB_A, engine=engine)
+
+    assert result["status"] == "ready"
+    assert result["item_table"] == "chunks"
+
+
+def test_drop_partition_refuses_to_wait_for_ever_behind_a_long_reader(engine, session, monkeypatch):
+    """I2: DETACH wants ACCESS EXCLUSIVE on the parent; a reader holding its
+    transaction open must make it give up (retryable), not stall the table."""
+    pgb.ensure_bm25_index(KB_A, engine=engine)
+    monkeypatch.setattr(pgb, "MOVE_LOCK_TIMEOUT_MS", 200)
+
+    with engine.connect() as reader:
+        reader.execute(text(f"SELECT count(*) FROM {SCHEMA}.chunks")).scalar()
+        started = time.monotonic()
+        with pytest.raises(Exception, match="lock timeout") as caught:
+            pgb.drop_partition(engine, KB_A, "chunks")
+        waited = time.monotonic() - started
+        reader.rollback()
+
+    assert pgb.is_transient_db_error(caught.value)
+    assert waited < 5
+    # Nothing changed, and the build lock was released for the retry.
+    assert _rows_in(session, pgb.partition_name(KB_A, "chunks")) == 3
+    assert pgb.drop_partition(engine, KB_A, "chunks") is True
+    assert _rows_in(session, "chunks", KB_A) == 3
+
+
 def test_ensure_is_idempotent_and_does_not_rebuild_the_partition(engine, session):
     first = pgb.ensure_bm25_index(KB_A, engine=engine)
     created = _indexdef(session)
