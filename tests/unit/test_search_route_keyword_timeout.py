@@ -1,10 +1,11 @@
 """POST /knowledge-bases/<id>/search maps a keyword-search timeout to 503, and
 reports a hybrid search that silently lost its keyword leg."""
 
+import json
+import logging
 import uuid
 from unittest.mock import patch
 
-import pytest
 from agentic.knowledge.models import RetrievedItem
 
 from agentic_project_service.routes import knowledge_bases as kb_route
@@ -20,21 +21,42 @@ def _app():
     return app
 
 
-def _kb(strategy: str, stored_method: str) -> dict:
+def _kb(strategy: str | None, stored_method: str) -> dict:
+    indexing_config = {} if strategy is None else {"strategy": strategy}
     return {
         "id": "kb",
-        "indexing_config": {"strategy": strategy},
+        "indexing_config": indexing_config,
         "retrieval_config": {"method": stored_method},
     }
 
 
-def _timeout_503(kb: dict | tuple, request_method: str = "full_text"):
+def _timeout_503(
+    kb: dict | tuple | None = None,
+    request_method: str = "full_text",
+    *,
+    fetch_error: Exception | None = None,
+    auto_indexing: bool = True,
+):
     """Drive the 503 path with a given KB row and return the parsed body."""
     kb_id = str(uuid.uuid4())
+    fetch = (
+        patch(
+            "agentic_project_service.routes.knowledge_bases._fetch_kb_or_404",
+            side_effect=fetch_error,
+        )
+        if fetch_error is not None
+        else patch(
+            "agentic_project_service.routes.knowledge_bases._fetch_kb_or_404", return_value=kb
+        )
+    )
     with (
         patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role"}),
         patch("agentic_project_service.routes.knowledge_bases.db"),
-        patch("agentic_project_service.routes.knowledge_bases._fetch_kb_or_404", return_value=kb),
+        patch(
+            "agentic_project_service.routes.knowledge_bases.get_setting",
+            side_effect=lambda key: auto_indexing if key == "BM25_AUTO_INDEXING" else None,
+        ),
+        fetch,
         patch(
             "agentic_project_service.services.knowledge_search.search_knowledge_base",
             side_effect=KeywordSearchTimeout(kb_id, 10000),
@@ -47,55 +69,135 @@ def _timeout_503(kb: dict | tuple, request_method: str = "full_text"):
             json={"query": "weather", "retrieval_method": request_method},
         )
     assert resp.status_code == 503
+    assert resp.is_json, resp.data[:200]
     body = resp.get_json()
     assert body["code"] == "keyword_search_timeout"
     assert body["timeout_ms"] == 10000
-    # Every branch must keep saying that nothing self-heals.
+    # Every branch must keep saying that nothing self-heals, and never leak a
+    # bare None where a strategy or method name belongs.
     assert "No build starts on its own" in body["error"]
     assert "queued" not in body["error"]
+    assert "None" not in body["error"]
     return body
+
+
+def _is_generic(error: str) -> bool:
+    return "build-bm25" in error and "vector_search" in error and "strategy" not in error
 
 
 def test_keyword_timeout_is_503():
     """The buildable case: mapped strategy, stored method already hybrid."""
     body = _timeout_503(_kb("chunk_embed", "hybrid"))
-    assert "build-bm25" in body["error"]
-    assert "vector_search" in body["error"]
+    assert _is_generic(body["error"])
 
 
-@pytest.mark.parametrize("strategy", ["doc2json", "page_index"])
-def test_unmapped_strategy_is_never_told_to_build(strategy):
-    """These strategies have no BM25 item table, so a build cannot help them.
+def test_unmapped_strategy_is_never_told_to_build():
+    """doc2json has no BM25 item table, so a build cannot help it.
 
-    POST /build-bm25 would answer 202 and the task would then die with
-    ValueError and retry twice. They are also the knowledge bases permanently on
-    the tsvector fallback, i.e. the likeliest 503 producers, so naming that
-    endpoint here would send every one of them down a dead end.
+    POST /build-bm25 now refuses such a KB with a 400 (before, it answered 202
+    and the task then failed once with ValueError). doc2json is the one
+    unmapped strategy that can reach this 503: page_index is rejected for
+    full_text/hybrid by validate_retriever before any query runs.
     """
-    body = _timeout_503(_kb(strategy, "hybrid"))
+    body = _timeout_503(_kb("doc2json", "hybrid"))
     assert "build-bm25" not in body["error"]
     assert "vector_search" in body["error"]
-    assert strategy in body["error"]
+    assert "doc2json" in body["error"]
 
 
-def test_stored_method_must_allow_a_build_before_one_is_suggested():
-    """A per-request retrieval_method override does not make /build-bm25 work.
+def test_missing_strategy_key_is_chunk_embed_not_unmapped():
+    """A config without "strategy" is searched as chunk_embed, so remedy it as one.
+
+    Every other strategy read on this path defaults to chunk_embed; reading it
+    as "no strategy" told a buildable KB that a build could not help it.
+
+    Uses the stored-method branch on purpose: only a KB resolved as a real,
+    mapped strategy reaches it, so this cannot pass by falling through to the
+    generic wording the way an unresolved strategy would.
+    """
+    body = _timeout_503(_kb(None, "vector_search"), auto_indexing=False)
+    assert "stored retrieval method" in body["error"]
+    assert "build-bm25" in body["error"]
+
+
+def test_json_string_indexing_config_still_yields_a_json_503():
+    """Legacy rows can hold a JSON string where an object belongs.
+
+    Reading .get() off one used to raise inside the except KeywordSearchTimeout
+    handler, which the route's generic handler cannot catch, so the caller got a
+    Flask HTML 500 and lost code, timeout_ms and the remedy.
+    """
+    kb = _kb("doc2json", "hybrid")
+    kb["indexing_config"] = json.dumps(kb["indexing_config"])
+    body = _timeout_503(kb)
+    # Parsed, not discarded: a doc2json KB must still not be told to build.
+    assert "build-bm25" not in body["error"]
+    assert "doc2json" in body["error"]
+
+
+def test_json_string_retrieval_config_still_yields_a_json_503():
+    kb = _kb("chunk_embed", "vector_search")
+    kb["retrieval_config"] = json.dumps(kb["retrieval_config"])
+    body = _timeout_503(kb, auto_indexing=False)
+    # Parsed: the stored vector_search method is still seen.
+    assert "stored retrieval method" in body["error"]
+
+
+def test_unparseable_string_config_falls_back_to_the_generic_remedy():
+    kb = _kb("doc2json", "hybrid")
+    kb["indexing_config"] = "not json at all"
+    body = _timeout_503(kb)
+    assert _is_generic(body["error"])
+
+
+def test_stored_method_branch_with_auto_indexing_on_does_not_ask_for_a_second_build():
+    """With auto-indexing on, the PATCH to hybrid/full_text dispatches the build.
+
+    Telling the caller to POST /build-bm25 as well would start a second
+    concurrent rebuild of the same index files.
+    """
+    body = _timeout_503(
+        _kb("chunk_embed", "vector_search"), request_method="full_text", auto_indexing=True
+    )
+    assert "stored retrieval method" in body["error"]
+    assert "hybrid or full_text" in body["error"]
+    assert "automatically" in body["error"]
+    assert "build-bm25" not in body["error"]
+
+
+def test_stored_method_branch_with_auto_indexing_off_names_the_build():
+    """With auto-indexing off nothing dispatches, so the build must be requested.
 
     That endpoint 400s unless the KB's STORED method is hybrid or full_text, so
-    the remedy has to name that step first.
+    the remedy names that step first.
     """
-    body = _timeout_503(_kb("chunk_embed", "vector_search"), request_method="full_text")
+    body = _timeout_503(
+        _kb("chunk_embed", "vector_search"), request_method="full_text", auto_indexing=False
+    )
     assert "stored retrieval method" in body["error"]
     assert "hybrid or full_text" in body["error"]
     assert "build-bm25" in body["error"]
+    assert "automatically" not in body["error"]
 
 
 def test_unresolvable_kb_falls_back_to_the_generic_remedy():
-    """A 404 tuple or a failed lookup must not produce a nonsense strategy name."""
     body = _timeout_503((None, 404))
-    assert "build-bm25" in body["error"]
-    assert "vector_search" in body["error"]
-    assert "None" not in body["error"]
+    assert _is_generic(body["error"])
+
+
+def test_failed_kb_lookup_falls_back_to_the_generic_remedy_and_logs_the_cause(caplog):
+    """The lookup runs after a cancelled statement; if it fails, say why.
+
+    Silently swallowing it would hide, for instance, an aborted transaction left
+    behind by a savepoint rollback that stopped working.
+    """
+    with caplog.at_level(logging.WARNING, logger=kb_route.logger.name):
+        body = _timeout_503(fetch_error=RuntimeError("lookup exploded"))
+    assert _is_generic(body["error"])
+    records = [r for r in caplog.records if "keyword-timeout remedy" in r.getMessage()]
+    assert len(records) == 1
+    assert "lookup exploded" in records[0].getMessage()
+    assert records[0].exc_info is not None
 
 
 def _item() -> RetrievedItem:

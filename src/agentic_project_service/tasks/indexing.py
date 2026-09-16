@@ -1741,8 +1741,7 @@ def _run_index_body(
             "and graph_index/full_document write their sparse entries there too",
             indexed_source_id,
         )
-        return {"status": "skipped", "reason": "superseded",
-                "indexed_source_id": indexed_source_id}
+        return {"status": "skipped", "reason": "superseded", "indexed_source_id": indexed_source_id}
     db.session.commit()
 
     # --- side effects: owner only, and only once a result is durably committed.
@@ -2002,8 +2001,11 @@ def index_source(
                 "index_source: %s not claimable (superseded or terminal); skipping",
                 indexed_source_id,
             )
-            return {"status": "skipped", "reason": "not_claimable",
-                    "indexed_source_id": indexed_source_id}
+            return {
+                "status": "skipped",
+                "reason": "not_claimable",
+                "indexed_source_id": indexed_source_id,
+            }
         claimed = True
 
         return _run_index_body(
@@ -2421,7 +2423,8 @@ def reenrich_graph_references(
                 WHERE knowledge_base_id = :kb_id
                   AND index_status = 'indexing'
                   AND celery_task_id = :tid
-            """ + (" AND id = :id" if indexed_source_id else ""),
+            """
+            + (" AND id = :id" if indexed_source_id else ""),
             (
                 {
                     "kb_id": knowledge_base_id,

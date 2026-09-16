@@ -1553,16 +1553,38 @@ def get_items_by_sources(kb_id: str):
     )
 
 
+def _kb_config_as_dict(raw: Any) -> dict | None:
+    """A KB config column as a dict, or None when its shape cannot be trusted.
+
+    Legacy rows can hold a JSON string where an object belongs, so a string is
+    parsed rather than discarded: throwing its contents away would read a
+    doc2json KB as chunk_embed and advise it to build an index it cannot have.
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    return raw if isinstance(raw, dict) else None
+
+
 def _keyword_timeout_remedy(kb_id: str) -> str:
     """Name a remedy this KB's caller can actually carry out.
 
     POST /build-bm25 only helps a KB whose strategy has an item table AND whose
-    STORED retrieval method is hybrid or full_text. For an unmapped strategy it
-    answers 202 and the task then dies with ValueError and retries twice; for a
-    per-request method override with a vector_search stored method it 400s. The
-    unmapped strategies are exactly the ones permanently on the tsvector
-    fallback, so they are the likeliest 503 producers here and must never be
-    pointed at that endpoint.
+    STORED retrieval method is hybrid or full_text. It refuses an unmapped
+    strategy with a 400, and a stored method that does not use BM25 with a 400,
+    so a per-request retrieval_method override cannot reach it either. The one
+    unmapped strategy that can produce this 503 is doc2json, which sits on the
+    tsvector fallback permanently (page_index is rejected for full_text and
+    hybrid by validate_retriever before any query runs).
+
+    Runs inside the route's ``except KeywordSearchTimeout`` handler, where
+    nothing else would catch a raise, so every read of the KB row is guarded
+    and any doubt falls back to the generic two-remedy wording. A strategy name
+    or method is only ever interpolated when it is a real string.
     """
     generic = (
         f"Build the index with POST /api/knowledge-bases/{kb_id}/build-bm25, or "
@@ -1570,13 +1592,27 @@ def _keyword_timeout_remedy(kb_id: str) -> str:
     )
     try:
         kb = _fetch_kb_or_404(kb_id)
-    except Exception:
-        logger.warning("Could not read KB %s to tailor the keyword-timeout remedy", kb_id)
-        return generic
-    if isinstance(kb, tuple):  # 404 response tuple
+        if isinstance(kb, tuple):  # 404 response tuple
+            return generic
+        indexing_config = _kb_config_as_dict(kb.get("indexing_config"))
+        if indexing_config is None:
+            return generic
+        # Same default as search_knowledge_base and build_bm25_for_kb: a config
+        # with no "strategy" key is searched, and built, as chunk_embed.
+        strategy = indexing_config.get("strategy", "chunk_embed")
+        if not isinstance(strategy, str):
+            return generic
+        stored_method = (_kb_config_as_dict(kb.get("retrieval_config")) or {}).get("method")
+        auto_indexing = bool(get_setting("BM25_AUTO_INDEXING"))
+    except Exception as exc:
+        logger.warning(
+            "Could not read KB %s to tailor the keyword-timeout remedy: %s",
+            kb_id,
+            exc,
+            exc_info=True,
+        )
         return generic
 
-    strategy = (kb.get("indexing_config") or {}).get("strategy")
     if strategy not in _STRATEGY_TO_ITEM_TABLE:
         return (
             f"This knowledge base's indexing strategy ({strategy}) has no BM25 "
@@ -1585,8 +1621,17 @@ def _keyword_timeout_remedy(kb_id: str) -> str:
             "to vector_search."
         )
 
-    stored_method = (kb.get("retrieval_config") or {}).get("method")
     if stored_method not in ("hybrid", "full_text"):
+        if auto_indexing:
+            # The PATCH that moves the stored method onto hybrid/full_text
+            # dispatches build_bm25_for_kb itself; a second request would start
+            # a concurrent rebuild of the same index files.
+            return (
+                "Set this knowledge base's stored retrieval method to hybrid or "
+                "full_text; with automatic BM25 indexing on, that change builds "
+                "the index automatically. A per-request retrieval_method does not. "
+                "Or query with vector_search instead."
+            )
         return (
             "Set this knowledge base's stored retrieval method to hybrid or "
             f"full_text, then build the index with POST /api/knowledge-bases/{kb_id}"
