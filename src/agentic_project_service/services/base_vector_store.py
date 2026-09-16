@@ -186,6 +186,12 @@ def record_retrieval_degradation(reason: str) -> None:
     degraded answer from a healthy one. Recorded on the Flask request context,
     read back by the search route; celery tasks and bare threads have no
     request to write to and get the log line only.
+
+    Deliberately appends without checking for duplicates. Retrieval can run in
+    a ThreadPoolExecutor over a copied context, so several worker threads share
+    one ``g`` and neither the getattr/setattr pair nor a membership test and an
+    append are atomic. Reads deduplicate instead, which makes a lost update or
+    a duplicated append unable to change what a caller sees.
     """
     if not has_request_context():
         return
@@ -193,15 +199,25 @@ def record_retrieval_degradation(reason: str) -> None:
     if reasons is None:
         reasons = []
         setattr(g, _DEGRADED_ATTR, reasons)
-    if reason not in reasons:
-        reasons.append(reason)
+    reasons.append(reason)
 
 
 def get_retrieval_degradations() -> list[str]:
-    """Reasons recorded for the current request, in the order they occurred."""
+    """Distinct reasons recorded for the current request, sorted."""
     if not has_request_context():
         return []
-    return list(getattr(g, _DEGRADED_ATTR, ()))
+    return sorted(set(getattr(g, _DEGRADED_ATTR, ())))
+
+
+def reset_retrieval_degradations() -> None:
+    """Drop any reasons carried over from earlier work on this context.
+
+    ``flask.g`` is scoped to the *app* context, not the request, so under a
+    long-lived outer app context one request would otherwise read the previous
+    request's degradations. The search route calls this before dispatching.
+    """
+    if has_request_context():
+        g.pop(_DEGRADED_ATTR, None)
 
 
 class BasePgVectorStore:

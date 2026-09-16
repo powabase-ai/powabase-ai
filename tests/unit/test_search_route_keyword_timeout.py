@@ -162,7 +162,13 @@ def test_healthy_search_omits_the_degraded_field(mock_search, _db, _jwt):
 @patch("agentic_project_service.routes.knowledge_bases.db")
 @patch("agentic_project_service.services.knowledge_search.search_knowledge_base")
 def test_degradation_does_not_leak_into_the_next_request(mock_search, _db, _jwt):
-    """The record is per-request state, not per-process."""
+    """flask.g is app-context-scoped, not request-scoped.
+
+    Under an outer app context -- which a test client inherits, and which the
+    service can hold across several searches -- g survives from one request to
+    the next, so the route has to clear the record before it dispatches. Run
+    inside `with app.app_context()` precisely so this is not vacuous.
+    """
     kb_id = str(uuid.uuid4())
     calls = {"n": 0}
 
@@ -174,7 +180,8 @@ def test_degradation_does_not_leak_into_the_next_request(mock_search, _db, _jwt)
 
     mock_search.side_effect = maybe_degrade
 
-    with _app().test_client() as c:
+    app = _app()
+    with app.app_context(), app.test_client() as c:
         first = _post(c, kb_id)
         second = _post(c, kb_id)
 
@@ -186,3 +193,30 @@ def test_recording_a_degradation_outside_a_request_is_a_no_op():
     """Celery tasks and bare threads have no request context to write to."""
     bvs.record_retrieval_degradation(bvs.KEYWORD_SEARCH_TIMEOUT)
     assert bvs.get_retrieval_degradations() == []
+
+
+def test_reset_clears_a_recorded_degradation():
+    app = _app()
+    with app.test_request_context("/"):
+        bvs.record_retrieval_degradation(bvs.KEYWORD_SEARCH_TIMEOUT)
+        assert bvs.get_retrieval_degradations() == ["keyword_search_timeout"]
+        bvs.reset_retrieval_degradations()
+        assert bvs.get_retrieval_degradations() == []
+
+
+def test_reset_outside_a_request_is_a_no_op():
+    bvs.reset_retrieval_degradations()
+
+
+def test_reasons_are_deduplicated_and_ordered_on_read():
+    """Worker threads share one g, so writes race; dedupe where it is safe.
+
+    context_handler runs retrieval in a ThreadPoolExecutor over a copied
+    context, so several threads append to the same list. Deduplicating on read
+    means a lost update or a duplicated append cannot change the output.
+    """
+    app = _app()
+    with app.test_request_context("/"):
+        for reason in ("zzz_other", bvs.KEYWORD_SEARCH_TIMEOUT, "zzz_other"):
+            bvs.record_retrieval_degradation(reason)
+        assert bvs.get_retrieval_degradations() == ["keyword_search_timeout", "zzz_other"]

@@ -12,7 +12,11 @@ from ..auth import require_auth
 from ..celery import celery_app
 from ..db import db, AI_SCHEMA
 from ..services.ai_provider_keys_resolver import get_all_user_provider_keys
-from ..services.base_vector_store import KeywordSearchTimeout, get_retrieval_degradations
+from ..services.base_vector_store import (
+    KeywordSearchTimeout,
+    get_retrieval_degradations,
+    reset_retrieval_degradations,
+)
 from ..services.settings_registry import get_setting
 from ..services.sparse_retrieval import (
     SparseIndexStore,
@@ -1615,6 +1619,10 @@ def search_knowledge_base_route(kb_id: str):
     if source_ids is not None:
         if not isinstance(source_ids, list):
             return jsonify({"error": "source_ids must be a list of UUID strings"}), 400
+
+    # flask.g is app-context-scoped, so without this a request served under a
+    # long-lived outer app context would inherit the previous one's record.
+    reset_retrieval_degradations()
 
     try:
         results = do_search(
