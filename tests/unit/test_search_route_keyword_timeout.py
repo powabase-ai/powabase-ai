@@ -25,7 +25,7 @@ def test_keyword_timeout_is_503(mock_search, _db, _jwt):
         resp = c.post(
             f"/api/knowledge-bases/{kb_id}/search",
             headers={"Authorization": "Bearer fake.jwt.token"},
-            json={"query": "appeal", "retrieval_method": "full_text"},
+            json={"query": "weather", "retrieval_method": "full_text"},
         )
     assert resp.status_code == 503
     body = resp.get_json()
