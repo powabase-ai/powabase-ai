@@ -25,26 +25,30 @@ KB_B = "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
 SOURCE = "11111111-1111-4111-8111-111111111111"
 
 
-@pytest.fixture(scope="module")
-def migration():
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "migrations"
-        / "versions"
-        / "0031_partition_bm25_item_tables.py"
-    )
-    spec = importlib.util.spec_from_file_location("mig_0031", path)
+def load_revision(filename: str, module_name: str):
+    """Import one Alembic revision file as a module."""
+    path = Path(__file__).resolve().parents[2] / "migrations" / "versions" / filename
+    spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-@pytest.fixture(scope="module")
-def engine():
+def database_url_or_skip() -> str:
     dsn = os.environ.get("PG_SEARCH_TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
     if not dsn:
         pytest.skip("no PG_SEARCH_TEST_DATABASE_URL or DATABASE_URL to test against")
-    eng = create_engine(dsn)
+    return dsn
+
+
+@pytest.fixture(scope="module")
+def migration():
+    return load_revision("0031_partition_bm25_item_tables.py", "mig_0031")
+
+
+@pytest.fixture(scope="module")
+def engine():
+    eng = create_engine(database_url_or_skip())
     yield eng
     eng.dispose()
 

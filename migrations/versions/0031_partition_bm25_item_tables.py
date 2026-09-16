@@ -21,8 +21,14 @@ The conversion copies nothing. For each table:
 3. attach the renamed table as the DEFAULT partition, so every knowledge base
    that has not been given a partition of its own keeps reading and writing
    exactly where it did before;
-4. mirror ownership, grants and the RLS flag onto the parent, since ``LIKE``
-   copies none of them.
+4. mirror ownership, grants, the RLS flag and every row-level security
+   policy onto the parent, since ``LIKE`` copies none of them. The policies
+   matter most: Postgres applies only the policies of the relation a statement
+   names, so a parent with RLS enabled and no policy of its own would return
+   no rows at all to a role subject to RLS (``authenticated`` on a self-hosted
+   install, say), while the DEFAULT partition still held every one. The
+   DEFAULT partition keeps its own policies too, for anything that names it
+   directly.
 
 Every step is catalog-only, so the migration's cost does not scale with the
 number of rows. It is idempotent (a table already partitioned is left alone),
@@ -76,9 +82,7 @@ def _mirror_settings(bind, schema: str, source: str, target: str) -> None:
     """Copy ownership, GRANTs and the RLS flag from one relation to another.
 
     Server-side, so every identifier is quoted by ``format()`` rather than
-    here. Policies are deliberately not copied: reads through the parent keep
-    applying the parent's policies, and the DEFAULT partition still carries the
-    ones it always had.
+    here. Policies are copied separately by ``_copy_policies``.
     """
     bind.execute(
         _sql(f"""
@@ -102,6 +106,67 @@ def _mirror_settings(bind, schema: str, source: str, target: str) -> None:
                 LOOP
                     EXECUTE format('GRANT %s ON TABLE "{schema}"."{target}" TO %s',
                                    g.privileges, g.role);
+                END LOOP;
+            END $$;
+        """)
+    )
+
+
+def _copy_policies(bind, schema: str, source: str, target: str) -> None:
+    """Recreate every row-level security policy of ``source`` on ``target``.
+
+    Postgres applies only the policies of the relation a statement names. A
+    query through the partitioned parent therefore never consults the
+    policies still sitting on the DEFAULT partition, and a parent with RLS
+    enabled but no policy of its own denies every row to every role that does
+    not bypass RLS. Each policy keeps its name, command, roles,
+    permissive/restrictive mode, USING and WITH CHECK expressions. A policy
+    whose name already exists on the target is left alone.
+    """
+    bind.execute(
+        _sql(f"""
+            DO $$
+            DECLARE
+                src oid := '"{schema}"."{source}"'::regclass;
+                tgt oid := '"{schema}"."{target}"'::regclass;
+                p record;
+                roles text;
+                statement text;
+            BEGIN
+                FOR p IN
+                    SELECT pol.polname, pol.polpermissive, pol.polcmd, pol.polroles,
+                           pg_get_expr(pol.polqual, pol.polrelid) AS qual,
+                           pg_get_expr(pol.polwithcheck, pol.polrelid) AS with_check
+                    FROM pg_policy pol
+                    WHERE pol.polrelid = src
+                      AND NOT EXISTS (
+                          SELECT 1 FROM pg_policy existing
+                          WHERE existing.polrelid = tgt AND existing.polname = pol.polname
+                      )
+                    ORDER BY pol.polname
+                LOOP
+                    SELECT string_agg(
+                               CASE WHEN r = 0 THEN 'PUBLIC'
+                                    ELSE quote_ident(pg_get_userbyid(r)) END,
+                               ', ')
+                      INTO roles
+                      FROM unnest(p.polroles) AS r;
+                    statement := format(
+                        'CREATE POLICY %I ON "{schema}"."{target}" AS %s FOR %s TO %s',
+                        p.polname,
+                        CASE WHEN p.polpermissive THEN 'PERMISSIVE' ELSE 'RESTRICTIVE' END,
+                        CASE p.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT'
+                                      WHEN 'w' THEN 'UPDATE' WHEN 'd' THEN 'DELETE'
+                                      ELSE 'ALL' END,
+                        roles
+                    );
+                    IF p.qual IS NOT NULL THEN
+                        statement := statement || ' USING (' || p.qual || ')';
+                    END IF;
+                    IF p.with_check IS NOT NULL THEN
+                        statement := statement || ' WITH CHECK (' || p.with_check || ')';
+                    END IF;
+                    EXECUTE statement;
                 END LOOP;
             END $$;
         """)
@@ -162,6 +227,7 @@ def _partition_one(bind, schema: str, table: str) -> None:
         _sql(f'ALTER TABLE "{schema}"."{table}" ATTACH PARTITION "{schema}"."{default}" DEFAULT')
     )
     _mirror_settings(bind, schema, default, table)
+    _copy_policies(bind, schema, default, table)
     logger.info(
         "Partitioned %s.%s BY LIST (%s); the original table is now its DEFAULT partition",
         schema,
