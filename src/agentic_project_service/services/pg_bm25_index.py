@@ -1261,6 +1261,16 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
         finally:
             _release_partition_build_lock(conn, item_table)
 
+        # Statistics for the new partition straight away, outside the build
+        # lock: autovacuum would get there, but the first searches would plan
+        # without them. Best effort -- the move itself is already done.
+        try:
+            conn.execute(text(f"ANALYZE {_qualified(partition)}"))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            logger.warning("Could not ANALYZE %s.%s", AI_SCHEMA, partition, exc_info=True)
+
     logger.info(
         "Moved %d rows from %s into partition %s.%s; writes were blocked for %.3f s",
         moved,

@@ -1580,26 +1580,31 @@ def _run_index_body(
         chunk_ids_to_remove = [
             str(r[0])
             for r in db.session.execute(
-                text(f'SELECT id FROM "{AI_SCHEMA}".chunks WHERE indexed_source_id = :is_id'),
-                {"is_id": indexed_source_id},
+                text(
+                    f'SELECT id FROM "{AI_SCHEMA}".chunks '
+                    "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id"
+                ),
+                {"kb_id": knowledge_base_id, "is_id": indexed_source_id},
             ).fetchall()
         ]
         fd_ids_to_remove = [
             str(r[0])
             for r in db.session.execute(
                 text(
-                    f'SELECT id FROM "{AI_SCHEMA}".full_documents WHERE indexed_source_id = :is_id'
+                    f'SELECT id FROM "{AI_SCHEMA}".full_documents '
+                    "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id"
                 ),
-                {"is_id": indexed_source_id},
+                {"kb_id": knowledge_base_id, "is_id": indexed_source_id},
             ).fetchall()
         ]
         gi_ids_to_remove = [
             str(r[0])
             for r in db.session.execute(
                 text(
-                    f'SELECT id FROM "{AI_SCHEMA}".graph_index_nodes WHERE indexed_source_id = :is_id'
+                    f'SELECT id FROM "{AI_SCHEMA}".graph_index_nodes '
+                    "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id"
                 ),
-                {"is_id": indexed_source_id},
+                {"kb_id": knowledge_base_id, "is_id": indexed_source_id},
             ).fetchall()
         ]
 

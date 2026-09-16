@@ -343,6 +343,18 @@ def test_the_move_check_name_fits_the_identifier_limit_and_is_validated():
         pgb.default_move_check_drop_ddl("chunks", "chunks_pkey; DROP TABLE x")
 
 
+def test_the_new_partition_is_analyzed_after_the_move():
+    """I10: planner statistics for the new partition from the start; autovacuum
+    would get there eventually, but the first searches would plan blind."""
+    conn = _FakeConn(moved=10)
+
+    pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    analyze = conn.statements.index(f'ANALYZE "ai".chunks_kb_{HEX}')
+    attach = conn.statements.index(pgb.partition_attach_ddl(KB, "chunks"))
+    assert any(attach < c <= analyze for c in conn.commits)
+
+
 def test_ensure_takes_the_build_lock_before_touching_anything():
     """Two concurrent moves out of one DEFAULT partition deadlocked each other.
 

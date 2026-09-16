@@ -467,6 +467,15 @@ def test_partition_creation_moves_every_row_in_one_go(engine, session):
     assert _rows_in(session, "chunks", KB_A) == 503
     assert _rows_in(session, "chunks_default", KB_A) == 0
     assert _rows_in(session, pgb.partition_name(KB_A, "chunks")) == 503
+    analyzed = session.execute(
+        text(
+            "SELECT last_analyze IS NOT NULL FROM pg_stat_user_tables "
+            "WHERE schemaname = :s AND relname = :r"
+        ),
+        {"s": SCHEMA, "r": pgb.partition_name(KB_A, "chunks")},
+    ).scalar()
+    session.rollback()
+    assert analyzed is True
 
 
 def _hold_the_move_open(monkeypatch, moving: threading.Event, seconds: float) -> None:

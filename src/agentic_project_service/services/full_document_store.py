@@ -189,18 +189,21 @@ class FullDocumentStore(BasePgVectorStore):
                 paths_result = self.session.execute(
                     text(f"""
                         SELECT full_text_path FROM "{self.schema}".full_documents
-                        WHERE indexed_source_id = :indexed_source_id
+                        WHERE knowledge_base_id = :kb_id
+                          AND indexed_source_id = :indexed_source_id
                     """),
-                    {"indexed_source_id": indexed_source_id},
+                    {"kb_id": self.kb_id, "indexed_source_id": indexed_source_id},
                 )
                 storage_paths = [row[0] for row in paths_result if row[0]]
 
             result = self.session.execute(
                 text(f"""
                     DELETE FROM "{self.schema}".full_documents
-                    WHERE indexed_source_id = :indexed_source_id
+                    WHERE knowledge_base_id = :kb_id
+                      AND indexed_source_id = :indexed_source_id
                 """),
-                {"indexed_source_id": indexed_source_id},
+                # The KB predicate prunes both statements to this KB's partition.
+                {"kb_id": self.kb_id, "indexed_source_id": indexed_source_id},
             )
             self.session.commit()
 

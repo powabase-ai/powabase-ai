@@ -118,9 +118,11 @@ class PgVectorKnowledgeStore(BasePgVectorStore):
         result = self.session.execute(
             text(f"""
                 DELETE FROM "{self.schema}".chunks
-                WHERE indexed_source_id = :indexed_source_id
+                WHERE knowledge_base_id = :kb_id
+                  AND indexed_source_id = :indexed_source_id
             """),
-            {"indexed_source_id": indexed_source_id},
+            # The KB predicate prunes the delete to this KB's partition.
+            {"kb_id": self.kb_id, "indexed_source_id": indexed_source_id},
         )
         return result.rowcount
 

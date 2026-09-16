@@ -959,10 +959,13 @@ class BasePgVectorStore:
         query = f"""
             SELECT id, {self.TEXT_COL}, source_id, meta
             FROM "{self.schema}".{self.TABLE}
-            WHERE id IN ({placeholders})
+            WHERE knowledge_base_id = :kb_id AND id IN ({placeholders})
         """
 
-        params = {f"id_{i}": id for i, id in enumerate(item_ids)}
+        # The KB predicate prunes to one partition, and ids are only unique per
+        # partition once the table is partitioned by knowledge base.
+        params: dict[str, Any] = {f"id_{i}": id for i, id in enumerate(item_ids)}
+        params["kb_id"] = self.kb_id
 
         try:
             result = self.session.execute(text(query), params)

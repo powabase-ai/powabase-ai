@@ -131,9 +131,10 @@ class GraphIndexStore(BaseTocStore):
             text(f"""
                 UPDATE "{AI_SCHEMA}".graph_index_nodes
                 SET meta = CAST(:meta AS jsonb)
-                WHERE toc_id = :toc_id AND node_id = :node_id
+                WHERE knowledge_base_id = :kb_id AND toc_id = :toc_id AND node_id = :node_id
             """),
             {
+                "kb_id": self.kb_id,
                 "toc_id": toc_id,
                 "node_id": node_id,
                 "meta": json.dumps(meta),
@@ -146,9 +147,9 @@ class GraphIndexStore(BaseTocStore):
             text(f"""
                 UPDATE "{AI_SCHEMA}".graph_index_nodes
                 SET enrichment_error = :error
-                WHERE toc_id = :toc_id AND node_id = :node_id
+                WHERE knowledge_base_id = :kb_id AND toc_id = :toc_id AND node_id = :node_id
             """),
-            {"toc_id": toc_id, "node_id": node_id, "error": error},
+            {"kb_id": self.kb_id, "toc_id": toc_id, "node_id": node_id, "error": error},
         )
 
     def update_node_embedding(
@@ -167,9 +168,9 @@ class GraphIndexStore(BaseTocStore):
             text(f"""
                 SELECT id, indexed_source_id, knowledge_base_id, source_id
                 FROM "{AI_SCHEMA}".graph_index_nodes
-                WHERE toc_id = :toc_id AND node_id = :node_id
+                WHERE knowledge_base_id = :kb_id AND toc_id = :toc_id AND node_id = :node_id
             """),
-            {"toc_id": toc_id, "node_id": node_id},
+            {"kb_id": self.kb_id, "toc_id": toc_id, "node_id": node_id},
         ).fetchone()
 
         if not row:
@@ -298,10 +299,11 @@ class GraphIndexStore(BaseTocStore):
                        parent_node_id, line_num, meta, source_id,
                        enrichment_error, indexed_source_id
                 FROM "{AI_SCHEMA}".graph_index_nodes
-                WHERE toc_id = :toc_id
+                WHERE knowledge_base_id = :kb_id AND toc_id = :toc_id
                 ORDER BY node_id ASC
             """),
-            {"toc_id": toc_id},
+            # Every statement here names the KB, so each prunes to its partition.
+            {"kb_id": self.kb_id, "toc_id": toc_id},
         )
 
         nodes = []
