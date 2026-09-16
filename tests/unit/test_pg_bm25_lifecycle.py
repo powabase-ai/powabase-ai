@@ -977,7 +977,9 @@ def test_ensure_task_delegates_to_the_service():
         return_value={"status": "building"},
     ) as ensure:
         assert ensure_pg_bm25_index.run(KB) == {"status": "building"}
-    ensure.assert_called_once_with(KB)
+    ensure.assert_called_once()
+    assert ensure.call_args.args == (KB,)
+    assert callable(ensure.call_args.kwargs["on_progress"])
 
 
 def test_drop_task_also_removes_the_partition():
@@ -1398,3 +1400,37 @@ def test_a_move_that_fails_for_a_real_reason_logs_the_step_the_sqlstate_and_the_
     assert "42601" in record.getMessage()
     assert "sqlstate 42601" in record.getMessage()
     assert record.exc_info is not None
+
+
+def test_ensure_reports_its_progress_as_it_moves_and_builds():
+    conn = _FakeConn(moved=5)
+    progress: list[str] = []
+
+    out = pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn), on_progress=progress.append)
+
+    assert out["status"] == "ready"
+    assert progress == ["moving", "building"]
+
+
+def test_ensure_reports_building_for_an_attached_partition_that_has_no_index_yet():
+    """A move whose commit landed but whose index build never ran."""
+    conn = _FakeConn(relkinds=_with_partition())
+    progress: list[str] = []
+
+    pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn), on_progress=progress.append)
+
+    assert progress == ["building"]
+    assert [s for s in _ddl(conn) if "USING bm25" in s]
+
+
+def test_drop_does_not_report_dropped_when_an_index_drop_failed():
+    conn = _FakeConn()
+    conn.fail_on = ("DROP INDEX CONCURRENTLY", _sqlstate_error("42501"))
+
+    out = pgb.drop_bm25_index(KB, engine=_FakeEngine(conn))
+
+    assert out["status"] == "partial"
+    assert out["indexes"] == []
+    assert sorted(out["failed_indexes"]) == sorted(
+        pgb.bm25_index_name(KB, t) for t in pgb.BM25_ITEM_TABLES
+    )

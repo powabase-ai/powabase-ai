@@ -2575,7 +2575,25 @@ def _engine(engine=None):
     return db.engine
 
 
-def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
+def keyword_item_table(bind, knowledge_base_id: str) -> str | None:
+    """The item table a KB's pg_search index would live on, or None. Never raises.
+
+    None for a knowledge base that does not exist, whose retrieval method runs
+    no keyword leg, or whose strategy has no keyword item table.
+    """
+    try:
+        kb_id = _validated_kb_id(knowledge_base_id)
+        row = _run_probe(bind, lambda conn: _probe(conn, _kb_config_sql(), {"id": kb_id}))
+    except Exception as exc:
+        logger.debug("Could not read the keyword item table of KB %s: %s", knowledge_base_id, exc)
+        return None
+    if row is None or row[1] not in ("hybrid", "full_text"):
+        return None
+    item_table = pg_bm25_item_table(row[0])
+    return item_table if item_table in PARTITIONED_ITEM_TABLES else None
+
+
+def ensure_bm25_index(knowledge_base_id: str, engine=None, on_progress=None) -> dict:
     """Give this KB a partition and a BM25 index on it, reporting what happened.
 
     Idempotent, and a no-op whenever a BM25 index is not the right answer: no
@@ -2594,9 +2612,18 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
     it blocks writes to the whole item table for the length of the move (see
     ``create_partition``), so it is an operator step, scheduled per knowledge
     base: ``POST /knowledge-bases/<id>/build-bm25`` dispatches this.
+
+    ``on_progress(status)`` is called with ``"moving"`` before a partition is
+    created or its rows are moved, and ``"building"`` before the bm25 index
+    is built (including on a partition whose move committed but whose index
+    never got built); the ensure task persists these.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
+
+    def progress(status: str) -> None:
+        if on_progress is not None:
+            on_progress(status)
 
     # Two connections, deliberately: this AUTOCOMMIT one, because CREATE and
     # DROP INDEX CONCURRENTLY refuse to run inside a transaction; and the one
@@ -2672,6 +2699,7 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
                     "status": "skipped",
                     "reason": "default_partition_absent",
                 }
+            progress("moving")
             try:
                 move = create_partition(engine, kb_id, item_table)
             except PartitionBuildInProgress as exc:
@@ -2693,7 +2721,7 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
         if not conn.execute(text(partition_build_lock_sql()), {"relation": index_lock}).scalar():
             return {**outcome, "status": "building"}
         try:
-            outcome = _ensure_index_locked(conn, outcome, kb_id, item_table, ts_language)
+            outcome = _ensure_index_locked(conn, outcome, kb_id, item_table, ts_language, progress)
             # After the bm25 index, which is what serves this knowledge base's
             # keyword search: until then the plain indexes (the full-text GIN
             # above all, the one slow build) would only delay it.
@@ -2759,7 +2787,9 @@ def _index_build_in_progress(conn, partition: str) -> bool:
     return row is not None
 
 
-def _ensure_index_locked(conn, outcome: dict, kb_id: str, item_table: str, ts_language) -> dict:
+def _ensure_index_locked(
+    conn, outcome: dict, kb_id: str, item_table: str, ts_language, progress=lambda status: None
+) -> dict:
     name = bm25_index_name(kb_id, item_table)
     partition = partition_name(kb_id, item_table)
     cast = bm25_tokenizer_cast(item_table, ts_language)
@@ -2798,6 +2828,7 @@ def _ensure_index_locked(conn, outcome: dict, kb_id: str, item_table: str, ts_la
     if existing_def:
         logger.info("Rebuilding BM25 index %s: tokenizer changed to %s", name, cast)
         conn.execute(text(bm25_drop_ddl(kb_id, item_table)))
+    progress("building")
     # Session-level on this AUTOCOMMIT connection (CONCURRENTLY refuses a
     # transaction), so put back before the connection returns to the pool.
     conn.execute(text("SET statement_timeout = 0"))
@@ -2835,6 +2866,7 @@ def drop_bm25_index(knowledge_base_id: str, engine=None, drop_partitions: bool =
     engine = _engine(engine)
 
     dropped: list[str] = []
+    failed: list[str] = []
     with _autocommit_connection(engine) as conn:
         installed = pg_search_installed(conn, use_cache=False)
         if installed:
@@ -2845,6 +2877,7 @@ def drop_bm25_index(knowledge_base_id: str, engine=None, drop_partitions: bool =
                 except Exception as exc:
                     if is_transient_db_error(exc):
                         raise
+                    failed.append(bm25_index_name(kb_id, item_table))
                     logger.warning(
                         "Could not drop BM25 index for KB %s on %s",
                         kb_id,
@@ -2861,4 +2894,11 @@ def drop_bm25_index(knowledge_base_id: str, engine=None, drop_partitions: bool =
     invalidate_bm25_index_cache(kb_id)
     if not installed and not removed:
         return {"status": "skipped", "reason": "extension_absent"}
+    if failed:
+        return {
+            "status": "partial",
+            "indexes": dropped,
+            "failed_indexes": failed,
+            "partitions": removed,
+        }
     return {"status": "dropped", "indexes": dropped, "partitions": removed}

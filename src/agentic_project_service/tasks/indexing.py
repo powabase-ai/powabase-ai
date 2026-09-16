@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import traceback
 
 from ..celery import celery_app
@@ -28,6 +29,7 @@ from ..services.doc2json_store import Doc2JSONStore
 from ..services.full_document_store import FullDocumentStore
 from ..services.graph_index_store import GraphIndexStore
 from ..services import pg_bm25_index
+from ..services.bm25_build_outcome import record_bm25_build_outcome
 from ..services.page_index_store import PageIndexStore
 from ..services.storage import StorageError, SupabaseStorage, get_storage
 from ..services.settings_registry import get_setting
@@ -2658,16 +2660,58 @@ def build_bm25_for_kb(self, kb_id: str) -> dict:
     return {"item_table": item_table, "item_count": len(item_ids)}
 
 
-# Retry budget for the pg_search index tasks. Their only retryable failures
-# are contention -- another move holding the item table's build lock, a
-# lock_timeout, a deadlock -- so a few spaced-out attempts cover a burst of
-# builds (a rollout dispatches one per KB) without retrying for ever.
+# Retry budget for the pg_search index tasks. Their retryable failures are
+# contention -- another move holding the item table's build lock, a
+# lock_timeout, a deadlock -- and interruptions: a cancelled statement, a lost
+# connection, a failed concurrent bm25 build. A few spaced-out attempts cover a
+# burst of builds (a rollout dispatches one per KB) without retrying for ever.
 PG_BM25_TASK_MAX_RETRIES = 6
 
 
 def _pg_bm25_retry_countdown(retries: int) -> int:
-    """30 s, 60 s, 120 s ... capped at 10 min: long enough for a move to finish."""
-    return min(30 * (2**retries), 600)
+    """30 s, 60 s, 120 s ... capped at 10 min, each stretched by up to 25 %.
+
+    The jitter spreads the retries of builds that lost to the same move, so
+    they do not all wake at once.
+    """
+    base = min(30 * (2**retries), 600)
+    return int(base * random.uniform(1.0, 1.25))
+
+
+def _outcome_bind():
+    """The engine outcomes are recorded through, or None outside an app."""
+    try:
+        return db.engine
+    except Exception:
+        return None
+
+
+def _bm25_failure_reason(exc: BaseException) -> str:
+    """A short, client-safe reason for a failed move or build: no SQL, no query text."""
+    step = getattr(exc, "bm25_move_step", None)
+    at = f" at step {step!r}" if step else ""
+    if isinstance(exc, pg_bm25_index.PartitionBuildInProgress):
+        return "another partition build on the item table is in progress"
+    if isinstance(exc, pg_bm25_index.Bm25IndexBuildFailed):
+        return "the concurrent bm25 index build failed inside pg_search"
+    sqlstate = getattr(getattr(exc, "orig", exc), "sqlstate", None)
+    if pg_bm25_index.is_lock_conflict(exc):
+        holders = [h for h in getattr(exc, "bm25_lock_holders", None) or [] if h.get("granted")]
+        kind = "a deadlock" if sqlstate == "40P01" else "a lock"
+        if holders:
+            oldest = max(holders, key=lambda h: h.get("xact_seconds") or 0)
+            return (
+                f"gave up on {kind}{at}, held by another transaction "
+                f"(pid {oldest.get('pid')}, open {oldest.get('xact_seconds')} s)"
+            )
+        return f"gave up on {kind}{at}"
+    if sqlstate == "57014":
+        return f"cancelled by a statement timeout{at}"
+    if getattr(exc, "connection_invalidated", False) or (sqlstate or "").startswith(("08", "57P")):
+        return f"lost the database connection{at}"
+    if sqlstate:
+        return f"failed{at} (SQLSTATE {sqlstate})"
+    return f"failed{at} ({type(exc).__name__})"
 
 
 @celery_app.task(bind=True, max_retries=PG_BM25_TASK_MAX_RETRIES)
@@ -2675,49 +2719,82 @@ def _pg_bm25_retry_countdown(retries: int) -> int:
 def ensure_pg_bm25_index(self, kb_id: str) -> dict:
     """Give this KB its own partition and pg_search BM25 index.
 
-    Dispatched whenever the index's inputs change — a new KB, a switch to a
-    keyword retrieval method, a ts_language change (which the service handles
-    by dropping and recreating, since the tokenizer is baked into the index) —
-    and by the operator build-bm25 endpoint. The first run for a KB moves that
-    KB's rows out of the item table's DEFAULT partition into a partition of its
+    Dispatched for a new knowledge base when it is created, from a PATCH only
+    when that cannot move rows (the KB's partition already exists, or DEFAULT
+    holds none of its rows), and by the operator's ``POST /build-bm25``. The
+    first run for a KB with rows in DEFAULT moves them into a partition of its
     own, in one transaction: writes to the whole item table (every KB on it)
-    wait for the full move; readers of the DEFAULT partition wait at most a
-    fraction of a second for each of its ACCESS EXCLUSIVE steps (see
-    ``create_partition``). Later runs are cheap and
-    idempotent. Returns the service's own outcome
-    dict.
+    wait for the move -- see ``pg_bm25_index.create_partition`` for measured
+    numbers -- while readers of DEFAULT wait a fraction of a second for each of
+    its ACCESS EXCLUSIVE steps. A KB with no rows in DEFAULT is attached
+    without holding writers. Later runs are cheap and idempotent. Returns the
+    service's own outcome dict.
 
-    Nothing dispatches this for a knowledge base that predates the extension:
-    its move blocks writes to the whole item table, so an operator schedules it
-    per KB with ``POST /knowledge-bases/<id>/build-bm25``. Until then the KB is
-    searched, and kept indexed, through its bm25s file index.
-
-    Retries (with backoff, up to ``PG_BM25_TASK_MAX_RETRIES``) when another
-    build holds the item table or the move lost a lock race; any other error
-    fails the task.
+    Each run records its progress in ``ai.bm25_index_builds``: ``queued`` when
+    it starts, then ``moving`` and ``building`` as the service reaches them,
+    and ``ready``, ``retrying`` (with the reason) or ``failed``. Retries, with
+    jittered backoff up to ``PG_BM25_TASK_MAX_RETRIES``, on the failures
+    ``is_transient_db_error`` accepts and while another build holds the item
+    table; any other error, or the last retry, fails the run at ERROR.
     """
-    from ..services import pg_bm25_index
+    attempt = self.request.retries + 1
+    bind = _outcome_bind()
+    item_table = pg_bm25_index.keyword_item_table(bind, kb_id) if bind is not None else None
 
-    countdown = _pg_bm25_retry_countdown(self.request.retries)
-    try:
-        outcome = pg_bm25_index.ensure_bm25_index(kb_id)
-    except Exception as exc:
-        if pg_bm25_index.is_transient_db_error(exc):
-            logger.info(
-                "Retrying the BM25 index build for KB %s in %d s: %s", kb_id, countdown, exc
-            )
-            raise self.retry(exc=exc, countdown=countdown) from exc
-        raise
-    if outcome.get("reason") == "partition_build_in_progress":
+    def record(status: str, reason: str | None = None) -> None:
+        if bind is not None and item_table is not None:
+            record_bm25_build_outcome(bind, kb_id, item_table, status, reason, attempt)
+
+    def retry_or_give_up(reason: str, exc: BaseException | None):
         if self.request.retries >= self.max_retries:
-            logger.warning(
-                "Giving up on the BM25 index build for KB %s after %d retries: another "
-                "partition build kept the item table busy. POST /build-bm25 to try again",
+            record("failed", reason)
+            logger.error(
+                "Giving up on the BM25 index build for KB %s after %d attempts: %s. Sessions "
+                "holding or awaiting locks on the item table: %s. POST /build-bm25 to try again",
                 kb_id,
-                self.request.retries,
+                attempt,
+                reason,
+                getattr(exc, "bm25_lock_holders", None) or [],
             )
-            return outcome
-        raise self.retry(countdown=countdown)
+            return None
+        countdown = _pg_bm25_retry_countdown(self.request.retries)
+        record("retrying", reason)
+        # throw=False: schedule the retry and hand back the exception, so the
+        # log line follows the decision and precedes the raise.
+        retry = self.retry(exc=exc, countdown=countdown, throw=False)
+        logger.info(
+            "Retrying the BM25 index build for KB %s in %d s (attempt %d of %d): %s",
+            kb_id,
+            countdown,
+            attempt + 1,
+            self.max_retries + 1,
+            reason,
+        )
+        return retry
+
+    record("queued")
+    try:
+        outcome = pg_bm25_index.ensure_bm25_index(kb_id, on_progress=record)
+    except Exception as exc:
+        reason = _bm25_failure_reason(exc)
+        if pg_bm25_index.is_transient_db_error(exc):
+            retry = retry_or_give_up(reason, exc)
+            if retry is not None:
+                raise retry from exc
+            raise
+        record("failed", reason)
+        logger.error("The BM25 index build for KB %s failed: %s", kb_id, reason, exc_info=exc)
+        raise
+    status, skip_reason = outcome.get("status"), outcome.get("reason")
+    if skip_reason == "partition_build_in_progress":
+        retry = retry_or_give_up("another partition build on the item table is in progress", None)
+        if retry is not None:
+            raise retry
+        return outcome
+    if status in ("ready", "building"):
+        record(status)
+    elif status == "skipped":
+        record("failed", f"not built: {skip_reason}")
     return outcome
 
 
@@ -2732,17 +2809,30 @@ def drop_pg_bm25_index(self, kb_id: str, drop_partitions: bool = True) -> dict:
     passes ``drop_partitions=False``: it keeps its partition, only the index
     (which Postgres would otherwise keep maintaining) goes.
 
-    Retries on contention, so a partition is not orphaned by a busy table.
+    Retries on contention, so a partition is not orphaned by a busy table; the
+    last retry gives up at ERROR.
     """
-    from ..services import pg_bm25_index
-
     try:
         return pg_bm25_index.drop_bm25_index(kb_id, drop_partitions=drop_partitions)
     except Exception as exc:
-        if isinstance(exc, pg_bm25_index.PartitionBuildInProgress) or (
-            pg_bm25_index.is_transient_db_error(exc)
+        if not (
+            isinstance(exc, pg_bm25_index.PartitionBuildInProgress)
+            or pg_bm25_index.is_transient_db_error(exc)
         ):
-            raise self.retry(
-                exc=exc, countdown=_pg_bm25_retry_countdown(self.request.retries)
-            ) from exc
-        raise
+            raise
+        reason = _bm25_failure_reason(exc)
+        if self.request.retries >= self.max_retries:
+            logger.error(
+                "Giving up on dropping the BM25 index%s of KB %s after %d attempts: %s. "
+                "Sessions holding or awaiting locks on the item table: %s",
+                " and partitions" if drop_partitions else "",
+                kb_id,
+                self.request.retries + 1,
+                reason,
+                getattr(exc, "bm25_lock_holders", None) or [],
+            )
+            raise
+        countdown = _pg_bm25_retry_countdown(self.request.retries)
+        retry = self.retry(exc=exc, countdown=countdown, throw=False)
+        logger.info("Retrying the BM25 index drop for KB %s in %d s: %s", kb_id, countdown, reason)
+        raise retry from exc
