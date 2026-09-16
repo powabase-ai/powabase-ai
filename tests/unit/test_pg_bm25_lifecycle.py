@@ -987,6 +987,11 @@ _FAKE_JWT = patch(
 )
 
 
+@patch(
+    "agentic_project_service.routes.knowledge_bases.table_is_partitioned",
+    new=MagicMock(return_value=True),
+)
+@patch("agentic_project_service.routes.knowledge_bases.db", new=MagicMock())
 @_FAKE_JWT
 @patch("agentic_project_service.routes.knowledge_bases.ensure_pg_bm25_index")
 @patch("agentic_project_service.routes.knowledge_bases.build_bm25_for_kb")
@@ -1038,6 +1043,10 @@ def test_build_endpoint_keeps_the_file_index_path_without_the_extension(
     mock_ensure.delay.assert_not_called()
 
 
+@patch(
+    "agentic_project_service.routes.knowledge_bases._keyword_index_backend",
+    new=MagicMock(return_value="pg_search"),
+)
 @_FAKE_JWT
 @patch("agentic_project_service.routes.knowledge_bases.ensure_pg_bm25_index")
 @patch("agentic_project_service.routes.knowledge_bases.db", new_callable=MagicMock)
@@ -1070,6 +1079,10 @@ def test_creating_a_vector_only_kb_dispatches_nothing(mock_db, mock_ensure, _jwt
     mock_ensure.delay.assert_not_called()
 
 
+@patch(
+    "agentic_project_service.routes.knowledge_bases._keyword_index_backend",
+    new=MagicMock(return_value="pg_search"),
+)
 @_FAKE_JWT
 @patch(
     "agentic_project_service.routes.knowledge_bases.get_knowledge_base", return_value=("{}", 200)
@@ -1091,6 +1104,10 @@ def test_changing_ts_language_dispatches_a_rebuild(
     mock_ensure.delay.assert_called_once_with(KB)
 
 
+@patch(
+    "agentic_project_service.routes.knowledge_bases._keyword_index_backend",
+    new=MagicMock(return_value="pg_search"),
+)
 @_FAKE_JWT
 @patch(
     "agentic_project_service.routes.knowledge_bases.get_knowledge_base", return_value=("{}", 200)
@@ -1151,6 +1168,10 @@ def test_deleting_a_kb_drops_its_index(mock_db, mock_drop, _jwt):
 # ---------------------------------------------------------------------------
 
 
+@patch(
+    "agentic_project_service.routes.knowledge_bases._keyword_index_backend",
+    new=MagicMock(return_value="pg_search"),
+)
 @pytest.mark.parametrize("state", ["absent", "building", "ready"])
 @patch("agentic_project_service.routes.knowledge_bases.pg_bm25_status")
 def test_bm25_status_reports_the_pg_index_state(mock_pg, state):
