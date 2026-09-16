@@ -260,3 +260,44 @@ def test_the_concurrent_index_builds_run_without_a_statement_timeout(engine, ses
     assert outcome["status"] == "ready"
     assert len(seen) >= 2 and set(seen) == {"0"}, seen
     assert after == "200ms"
+
+
+# ---------------------------------------------------------------------------
+# What a failed move says about who was in the way
+# ---------------------------------------------------------------------------
+
+
+def test_a_move_that_gives_up_names_the_reader_that_refused_its_lock(
+    engine, session, monkeypatch, caplog
+):
+    monkeypatch.setattr(pgb, "MOVE_CHECK_CLEANUP_WAIT_SECONDS", 0.0)
+    real = pgb.partition_lock_default_ddl
+    reader: dict = {}
+
+    def arrive_after_the_parent_lock(item_table):
+        conn = engine.connect()
+        reader["pid"] = conn.execute(text("SELECT pg_backend_pid()")).scalar()
+        conn.execute(text(f"SELECT count(*) FROM {SCHEMA}.chunks_default")).scalar()
+        reader["conn"] = conn
+        return real(item_table)
+
+    monkeypatch.setattr(pgb, "partition_lock_default_ddl", arrive_after_the_parent_lock)
+    try:
+        with caplog.at_level("WARNING"):
+            try:
+                pgb.create_partition(engine, KB_A, "chunks")
+            except Exception as exc:
+                error = exc
+            else:
+                error = None
+    finally:
+        if "conn" in reader:
+            reader["conn"].rollback()
+            reader["conn"].close()
+
+    assert error is not None and pgb.is_lock_conflict(error)
+    assert error.bm25_move_step == "attach"
+    refusing = [h for h in error.bm25_lock_holders if h["pid"] == reader["pid"] and h["granted"]]
+    assert refusing and refusing[0]["mode"] == "AccessShareLock", error.bm25_lock_holders
+    message = next(r.getMessage() for r in caplog.records if "gave up at step" in r.getMessage())
+    assert f"'pid': {reader['pid']}" in message

@@ -1307,64 +1307,101 @@ def is_partition_move_race(exc: BaseException) -> bool:
 def _lock_holders_sql() -> str:
     return (
         "SELECT l.pid, l.mode, l.granted, pg_blocking_pids(l.pid) AS blocked_by, "
-        "a.state, now() - a.xact_start AS xact_age, left(a.query, 200) AS query "
+        "a.state, round(extract(epoch FROM now() - a.xact_start)::numeric, 1) AS xact_seconds, "
+        "left(a.query, 200) AS query "
         "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
         "WHERE l.relation IN (to_regclass(:parent), to_regclass(:default)) "
-        "AND l.pid <> pg_backend_pid() ORDER BY l.granted DESC, l.pid"
+        "AND l.pid <> pg_backend_pid() AND NOT (l.pid = ANY(CAST(:exclude AS int[]))) "
+        "ORDER BY l.granted DESC, l.pid LIMIT 20"
     )
 
 
-def _log_move_failure(
+def _backend_pid(conn) -> int | None:
+    try:
+        return int(conn.connection.dbapi_connection.info.backend_pid)
+    except Exception:
+        return None
+
+
+def _lock_holders(engine, item_table: str, exclude: list[int | None]) -> list[dict]:
+    """Sessions holding or awaiting locks on the parent and DEFAULT. Never raises.
+
+    Read on a connection of its own, so it can run while the failed move's
+    transaction is still open: its locks -- and whoever refused them -- are
+    still there to be seen. After the rollback, the list is the writers the
+    move had just released, never the reader that made it give up.
+    """
+    try:
+        with engine.connect() as probe:
+            try:
+                return [
+                    dict(row._mapping)
+                    for row in probe.execute(
+                        text(_lock_holders_sql()),
+                        {
+                            "parent": _qualified(item_table),
+                            "default": _qualified(default_partition_name(item_table)),
+                            "exclude": [pid for pid in exclude if pid is not None],
+                        },
+                    ).all()
+                ]
+            finally:
+                probe.rollback()
+    except Exception:
+        logger.debug("Could not list lock holders", exc_info=True)
+        return []
+
+
+def _fail_move(
+    engine,
     conn,
     knowledge_base_id: str,
     item_table: str,
     exc: BaseException,
     *,
+    step: str,
     action: str = "Moving the rows into the partition of",
 ) -> None:
-    """Say why a move failed, and for a lock timeout, who was in the way.
+    """Roll a failed move back and say why, and for contention, who was in the way.
 
-    Runs after the rollback. A lock timeout has already ended the wait, so
-    there is no blocked backend left to ask ``pg_blocking_pids`` about; the
-    sessions still holding or waiting for locks on the parent and DEFAULT are
-    the nearest evidence, each with whatever blocks *it*.
+    The lock holders are read *before* the rollback (``_lock_holders``) and
+    attached to the exception as ``bm25_lock_holders``, with the step as
+    ``bm25_move_step``, so the task that gives up can name them.
     """
-    if not is_transient_db_error(exc):
+    transient = is_transient_db_error(exc)
+    holders = _lock_holders(engine, item_table, [_backend_pid(conn)]) if transient else []
+    try:
+        conn.rollback()
+    except Exception:
+        logger.debug("Rollback after a failed move raised", exc_info=True)
+    try:
+        exc.bm25_lock_holders = holders
+        exc.bm25_move_step = step
+    except Exception:
+        pass
+    if not transient:
         logger.warning(
-            "%s KB %s on %s.%s failed; rolled back",
+            "%s KB %s on %s.%s failed at step %r (SQLSTATE %s): %s; rolled back",
             action,
             knowledge_base_id,
             AI_SCHEMA,
             item_table,
+            step,
+            _sqlstate(exc),
+            _first_line(exc),
+            exc_info=exc,
         )
         return
-    holders: list = []
-    try:
-        holders = [
-            dict(row._mapping)
-            for row in conn.execute(
-                text(_lock_holders_sql()),
-                {
-                    "parent": _qualified(item_table),
-                    "default": _qualified(default_partition_name(item_table)),
-                },
-            ).all()
-        ]
-        conn.rollback()
-    except Exception:
-        conn.rollback()
-        logger.debug("Could not list lock holders", exc_info=True)
     logger.warning(
-        "%s KB %s on %s.%s gave up on a lock (lock_timeout %d ms, ACCESS EXCLUSIVE on "
-        "DEFAULT not free within %.1f s or held by a long transaction when the move began, "
-        "or a deadlock); rolled back, retryable. Sessions "
-        "holding or awaiting locks on the table: %s",
+        "%s KB %s on %s.%s gave up at step %r (SQLSTATE %s: %s); rolled back, retryable. "
+        "Sessions holding or awaiting locks on the table: %s",
         action,
         knowledge_base_id,
         AI_SCHEMA,
         item_table,
-        MOVE_LOCK_TIMEOUT_MS,
-        DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS,
+        step,
+        _sqlstate(exc),
+        _first_line(exc),
         holders,
     )
 
@@ -2225,9 +2262,14 @@ def _attach_empty_partition(engine, conn, kb_id: str, item_table: str) -> dict |
         conn.commit()
         blocked += time.monotonic() - started
     except Exception as exc:
-        conn.rollback()
-        _log_move_failure(
-            conn, kb_id, item_table, exc, action=f"Attaching the empty partition ({step}) of"
+        _fail_move(
+            engine,
+            conn,
+            kb_id,
+            item_table,
+            exc,
+            step=step,
+            action="Attaching the empty partition of",
         )
         if fence_committed:
             _drop_failed_move_check(conn, kb_id, item_table)
@@ -2365,16 +2407,20 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
 
             fence_committed = False
             gate_held = False
+            step = "move gate"
             try:
                 _acquire_move_gate(conn, item_table)
                 gate_held = True
+                step = "pre-flight check of DEFAULT"
                 _probe_default_before_moving(conn, item_table)
+                step = "parent lock"
                 conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
                 # A role's or database's statement_timeout must not cancel a
                 # large copy half-way; every wait in here is bounded already.
                 conn.execute(text("SET LOCAL statement_timeout = 0"))
                 conn.execute(text(partition_lock_parent_ddl(item_table)))
                 started = time.monotonic()
+                step = "check on DEFAULT"
                 # The fence goes up on a second connection while this one holds
                 # writers off the parent: it has to commit before the move can
                 # validate it, and committing it here would release the lock and
@@ -2389,11 +2435,17 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                     # is up. A false positive costs one try of an IF EXISTS drop.
                     fence_committed = True
                     fencer.commit()
+                step = "DEFAULT lock"
                 conn.execute(text(partition_lock_default_ddl(item_table)))
+                step = "copy"
                 moved = conn.execute(text(insert_sql), {"kb": kb_id}).rowcount
+                step = "delete from DEFAULT"
                 conn.execute(text(delete_sql), {"kb": kb_id})
+                step = "validate the check on DEFAULT"
                 conn.execute(text(default_move_check_validate_ddl(kb_id, item_table)))
+                step = "key, unique indexes and foreign keys"
                 _build_move_indexes_and_keys(conn, kb_id, item_table)
+                step = "attach"
                 attach_sql = partition_attach_ddl(kb_id, item_table)
                 _lock_default_exclusively(conn, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
                 conn.execute(text(attach_sql))
@@ -2401,16 +2453,17 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                 # holds: dropping the check costs no further lock wait, and it
                 # commits with the move, so a success never leaves it behind.
                 conn.execute(text(default_move_check_drop_ddl(item_table, fence)))
+                step = "mirror settings"
                 conn.execute(
                     text(
                         mirror_relation_settings_sql(_qualified(item_table), _qualified(partition))
                     )
                 )
+                step = "commit"
                 conn.commit()
                 blocked = time.monotonic() - started
             except Exception as exc:
-                conn.rollback()
-                _log_move_failure(conn, kb_id, item_table, exc)
+                _fail_move(engine, conn, kb_id, item_table, exc, step=step)
                 # Only a check that was committed needs dropping; trying anyway
                 # would take DEFAULT's lock again for nothing.
                 if fence_committed:
@@ -2482,8 +2535,15 @@ def drop_partition(engine, knowledge_base_id: Any, item_table: str) -> bool:
                 conn.execute(text(partition_drop_ddl(kb_id, item_table)))
                 conn.commit()
             except Exception as exc:
-                conn.rollback()
-                _log_move_failure(conn, kb_id, item_table, exc, action="Dropping the partition of")
+                _fail_move(
+                    engine,
+                    conn,
+                    kb_id,
+                    item_table,
+                    exc,
+                    step="detach",
+                    action="Dropping the partition of",
+                )
                 raise
         finally:
             _release_partition_build_lock(conn, item_table)

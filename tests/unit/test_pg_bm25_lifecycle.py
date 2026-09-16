@@ -1365,3 +1365,36 @@ def test_an_internal_error_from_the_concurrent_bm25_build_is_raised_as_retryable
     assert pgb.is_transient_db_error(caught.value)
     # The session-level timeout override does not outlive the build.
     assert "RESET statement_timeout" in conn.statements
+
+
+def test_the_lock_holders_are_read_before_the_failed_move_rolls_back():
+    """After the rollback the list was only ever the writers the move had just
+    released -- never the session that refused its lock."""
+    conn = _FakeConn(moved=5)
+    conn.fail_on = (pgb.partition_attach_ddl(KB, "chunks"), _lock_timeout_error())
+
+    with pytest.raises(Exception) as caught:
+        pgb.create_partition(_FakeEngine(conn), KB, "chunks")
+
+    attach_at = conn.statements.index(pgb.partition_attach_ddl(KB, "chunks"))
+    holders_at = next(
+        i for i, s in enumerate(conn.statements) if "pg_blocking_pids" in s and i > attach_at
+    )
+    assert holders_at < min(r for r in conn.rollbacks if r > attach_at)
+    assert caught.value.bm25_move_step == "attach"
+    assert caught.value.bm25_lock_holders == []
+
+
+def test_a_move_that_fails_for_a_real_reason_logs_the_step_the_sqlstate_and_the_error(caplog):
+    conn = _FakeConn(moved=5)
+    insert_sql = pgb.move_rows_sql(KB, "chunks", list(_COLUMNS))[0]
+    conn.fail_on = (insert_sql, _sqlstate_error("42601"))
+
+    with caplog.at_level("WARNING"), pytest.raises(Exception):
+        pgb.create_partition(_FakeEngine(conn), KB, "chunks")
+
+    record = next(r for r in caplog.records if "failed at step" in r.getMessage())
+    assert "'copy'" in record.getMessage()
+    assert "42601" in record.getMessage()
+    assert "sqlstate 42601" in record.getMessage()
+    assert record.exc_info is not None
