@@ -145,13 +145,14 @@ def test_drop_index_ddl_is_unchanged_and_concurrent():
 # ---------------------------------------------------------------------------
 
 
-def test_create_partition_ddl_clones_the_default_partition():
+def test_create_partition_ddl_clones_the_default_partition_as_a_bare_heap():
+    """No indexes: the rows are copied into a bare heap and indexed in bulk."""
     ddl = pgb.partition_create_ddl(KB, "chunks")
 
     assert ddl == (
         f'CREATE TABLE IF NOT EXISTS "ai".chunks_kb_{KB_HEX} '
         '(LIKE "ai".chunks_default '
-        "INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES "
+        "INCLUDING DEFAULTS INCLUDING CONSTRAINTS "
         "INCLUDING STORAGE INCLUDING COMMENTS)"
     )
 

@@ -579,38 +579,53 @@ def test_transient_database_errors_are_recognised_by_sqlstate():
     assert pgb.is_transient_db_error(RuntimeError("no sqlstate")) is False
 
 
-def test_ensure_copies_the_default_partitions_foreign_keys_onto_the_new_one():
-    """``LIKE`` carries the primary key and indexes across, never foreign keys."""
+def test_the_move_adds_the_default_partitions_foreign_keys_not_valid_before_the_attach():
+    """``LIKE`` never copies foreign keys. They are added inside the move, after
+    the copy and ``NOT VALID`` (the rows already satisfied them in DEFAULT), so
+    the copy is not checked row by row; validated after the commit."""
     conn = _FakeConn(
         foreign_keys=(
             "FOREIGN KEY (knowledge_base_id) REFERENCES ai.knowledge_bases(id) ON DELETE CASCADE",
             "FOREIGN KEY (source_id) REFERENCES ai.sources(id) ON DELETE CASCADE",
-        )
-    )
-
-    pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
-
-    added = [s for s in conn.statements if "ADD FOREIGN KEY" in s]
-    assert added == [
-        f'ALTER TABLE "ai".chunks_kb_{HEX} ADD FOREIGN KEY (knowledge_base_id) '
-        "REFERENCES ai.knowledge_bases(id) ON DELETE CASCADE",
-        f'ALTER TABLE "ai".chunks_kb_{HEX} ADD FOREIGN KEY (source_id) '
-        "REFERENCES ai.sources(id) ON DELETE CASCADE",
-    ]
-
-
-def test_a_resumed_move_does_not_add_the_foreign_keys_twice():
-    conn = _FakeConn(
-        relkinds=_with_partition(),
-        attached=False,
-        partition_foreign_keys=(
-            "FOREIGN KEY (source_id) REFERENCES ai.sources(id) ON DELETE CASCADE",
         ),
+        moved=3,
     )
 
     pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
 
-    assert [s for s in conn.statements if "ADD FOREIGN KEY" in s] == []
+    added = [i for i, s in enumerate(conn.statements) if "ADD FOREIGN KEY" in s]
+    assert [conn.statements[i] for i in added] == [
+        f'ALTER TABLE "ai".chunks_kb_{HEX} ADD FOREIGN KEY (knowledge_base_id) '
+        "REFERENCES ai.knowledge_bases(id) ON DELETE CASCADE NOT VALID",
+        f'ALTER TABLE "ai".chunks_kb_{HEX} ADD FOREIGN KEY (source_id) '
+        "REFERENCES ai.sources(id) ON DELETE CASCADE NOT VALID",
+    ]
+    insert_at = conn.statements.index(pgb.move_rows_sql(KB, "chunks", list(_COLUMNS))[0])
+    attach_at = conn.statements.index(pgb.partition_attach_ddl(KB, "chunks"))
+    assert insert_at < added[0] and added[-1] < attach_at
+    assert not [c for c in conn.commits if insert_at < c <= attach_at]
+
+
+class _OldLayoutCloneConn(_FakeConn):
+    """An unattached clone that still carries the indexes an earlier layout gave it."""
+
+    def execute(self, statement, params=None):
+        sql = getattr(statement, "text", str(statement))
+        if "FROM pg_index WHERE indrelid" in sql and "contype = 'f'" in sql:
+            self.statements.append(sql)
+            result = MagicMock()
+            result.scalar.return_value = True
+            return result
+        return super().execute(statement, params)
+
+
+def test_a_clone_left_with_indexes_by_an_earlier_layout_is_recreated_bare():
+    conn = _OldLayoutCloneConn(relkinds=_with_partition(), attached=False, moved=3)
+
+    pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    drop_at = conn.statements.index(pgb.partition_drop_ddl(KB, "chunks"))
+    assert drop_at < conn.statements.index(pgb.partition_create_ddl(KB, "chunks"))
 
 
 def test_ensure_does_not_recreate_a_partition_that_already_exists():

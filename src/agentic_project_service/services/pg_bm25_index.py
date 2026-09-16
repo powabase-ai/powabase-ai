@@ -343,20 +343,21 @@ def _qualified(relation: str) -> str:
 
 
 def partition_create_ddl(knowledge_base_id: Any, item_table: str) -> str:
-    """Create the KB's partition as an unattached clone of DEFAULT.
+    """Create the KB's partition as an unattached, bare clone of DEFAULT.
 
     Cloning the DEFAULT partition rather than the partitioned parent is what
-    carries the column defaults, the CHECK/UNIQUE constraints and the ordinary
-    indexes across -- including the local ``PRIMARY KEY (id)``, which only the
-    partitions have (the parent deliberately declares none, so a bare ``id``
-    key stays legal). ``LIKE`` never copies foreign keys; those are added
-    separately from the DEFAULT partition's catalog entries.
+    carries the column defaults, NOT NULLs and CHECK constraints across. No
+    index and no foreign key: the move copies the knowledge base's rows into a
+    bare heap, because maintaining those row by row during the copy is most of
+    what a move used to cost (see ``create_partition``). The indexes and keys
+    are recreated from DEFAULT's catalog entries -- the ones correctness rests
+    on inside the move, the rest after it.
     """
     partition = partition_name(knowledge_base_id, item_table)
     return (
         f"CREATE TABLE IF NOT EXISTS {_qualified(partition)} "
         f"(LIKE {_qualified(default_partition_name(item_table))} "
-        "INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES "
+        "INCLUDING DEFAULTS INCLUDING CONSTRAINTS "
         "INCLUDING STORAGE INCLUDING COMMENTS)"
     )
 
@@ -1351,11 +1352,14 @@ def _column_signature(conn, relname: str) -> list[tuple]:
 
 
 def _drop_stale_clone(conn, kb_id: str, item_table: str) -> None:
-    """Drop an unattached clone that no longer matches DEFAULT's columns.
+    """Drop an unattached clone that no longer matches what the move expects.
 
     An unattached clone is not a partition, so a column added to (or changed
     on) the parent after a failed move left it behind never reaches it, and
-    moving into it would fail for good. The move is one transaction, so a
+    moving into it would fail for good. A clone is also stale when it carries
+    an index or a foreign key: the move builds those itself, inside its
+    transaction, so one already there was left by an earlier layout and would
+    make that build fail. The move is one transaction, so a
     clone is empty whenever no move is in flight -- and the caller holds the
     item table's build lock, so none is. A clone that holds rows anyway is
     never dropped: the move stops with an error naming it instead.
@@ -1363,44 +1367,189 @@ def _drop_stale_clone(conn, kb_id: str, item_table: str) -> None:
     partition = partition_name(kb_id, item_table)
     if _relkind(conn, partition) is None:
         return
-    if _column_signature(conn, partition) == _column_signature(
+    same_columns = _column_signature(conn, partition) == _column_signature(
         conn, default_partition_name(item_table)
-    ):
+    )
+    if same_columns and not _has_indexes_or_foreign_keys(conn, partition):
         return
     if conn.execute(text(f"SELECT EXISTS (SELECT 1 FROM {_qualified(partition)})")).scalar():
         raise RuntimeError(
-            f"{AI_SCHEMA}.{partition} is an unattached clone whose columns no longer match "
+            f"{AI_SCHEMA}.{partition} is an unattached clone that no longer matches "
             f"{AI_SCHEMA}.{default_partition_name(item_table)}, and it holds rows; not "
             "dropping it. Move its rows back or drop it, then retry"
         )
     logger.warning(
-        "Dropping the stale clone %s.%s: its columns no longer match the DEFAULT partition's",
+        "Dropping the stale clone %s.%s: its columns or indexes no longer match what a move "
+        "into it expects",
         AI_SCHEMA,
         partition,
     )
     conn.execute(text(partition_drop_ddl(kb_id, item_table)))
 
 
-def _prepare_partition(conn, kb_id: str, item_table: str) -> None:
-    """Create the clone, its CHECK constraint and its foreign keys. Idempotent.
+def _has_indexes_or_foreign_keys(conn, relname: str) -> bool:
+    return bool(
+        conn.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM pg_index WHERE indrelid = to_regclass(:relation)) "
+                "OR EXISTS (SELECT 1 FROM pg_constraint "
+                "WHERE conrelid = to_regclass(:relation) AND contype = 'f')"
+            ),
+            {"relation": _qualified(relname)},
+        ).scalar()
+    )
 
-    Bounded by ``MOVE_LOCK_TIMEOUT_MS`` from its first statement: adding a
-    foreign key takes SHARE ROW EXCLUSIVE on the table it references, which
-    waits for -- and then blocks -- every write there (``indexed_sources`` is
-    written by every indexing run), all while this caller holds the item
-    table's build lock. A timeout raises SQLSTATE 55P03, which is retried.
+
+def _prepare_partition(conn, kb_id: str, item_table: str) -> None:
+    """Create the bare clone and its CHECK constraint. Idempotent.
+
+    Bounded by ``MOVE_LOCK_TIMEOUT_MS`` from its first statement: every lock
+    here is on a relation other sessions use (cloning reads DEFAULT's
+    definition), and this caller holds the item table's build lock meanwhile.
+    A timeout raises SQLSTATE 55P03, which is retried.
     """
     partition = partition_name(kb_id, item_table)
-    default = default_partition_name(item_table)
     conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
     _drop_stale_clone(conn, kb_id, item_table)
     conn.execute(text(partition_create_ddl(kb_id, item_table)))
     if not _check_constraint_exists(conn, partition):
         conn.execute(text(partition_check_ddl(kb_id, item_table)))
-    if not _foreign_key_defs(conn, partition):
-        for definition in _foreign_key_defs(conn, default):
-            conn.execute(text(f"ALTER TABLE {_qualified(partition)} ADD {definition}"))
     conn.commit()
+
+
+def _default_index_definitions(conn, item_table: str) -> list[dict]:
+    """How to recreate each of DEFAULT's indexes on a partition.
+
+    One entry per valid index that is not a bm25 index, in index-name order:
+    ``constraint`` (``PRIMARY KEY (id)``, ``UNIQUE ...``, ``EXCLUDE ...``) for an
+    index that backs a constraint, else ``unique`` and ``tail`` -- the part of
+    ``pg_get_indexdef`` after the relation name (``USING btree (source_id)``),
+    which does not depend on the index's or the table's name.
+    """
+    default = _qualified(default_partition_name(item_table))
+    rows = conn.execute(
+        text(
+            "SELECT pg_get_indexdef(i.indexrelid), i.indrelid::regclass::text, i.indisunique, "
+            "(SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
+            " WHERE c.conindid = i.indexrelid AND c.conrelid = i.indrelid "
+            " AND c.contype IN ('p', 'u', 'x')) "
+            "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+            "JOIN pg_am am ON am.oid = ic.relam "
+            "WHERE i.indrelid = to_regclass(:default) AND i.indisvalid AND am.amname <> 'bm25' "
+            "ORDER BY ic.relname"
+        ),
+        {"default": default},
+    ).all()
+    definitions = []
+    for indexdef, regclass, unique, constraint in rows:
+        if constraint is not None:
+            definitions.append({"constraint": constraint})
+            continue
+        marker = f" ON {regclass} "
+        if marker not in indexdef:
+            raise RuntimeError(f"cannot read the definition of an index on {default}: {indexdef}")
+        definitions.append({"unique": bool(unique), "tail": indexdef.split(marker, 1)[1]})
+    return definitions
+
+
+def _partition_index_state(conn, partition: str) -> tuple[set, set, set]:
+    """(constraint definitions, valid index shapes, invalid index names) of a relation."""
+    rows = conn.execute(
+        text(
+            "SELECT pg_get_indexdef(i.indexrelid), i.indrelid::regclass::text, i.indisunique, "
+            "i.indisvalid, quote_ident(ic.relname), "
+            "(SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
+            " WHERE c.conindid = i.indexrelid AND c.conrelid = i.indrelid "
+            " AND c.contype IN ('p', 'u', 'x')) "
+            "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+            "WHERE i.indrelid = to_regclass(:partition)"
+        ),
+        {"partition": _qualified(partition)},
+    ).all()
+    constraints, shapes, invalid = set(), set(), set()
+    for indexdef, regclass, unique, valid, name, constraint in rows:
+        if constraint is not None:
+            constraints.add(constraint)
+        elif not valid:
+            invalid.add(name)
+        else:
+            shapes.add((bool(unique), indexdef.split(f" ON {regclass} ", 1)[-1]))
+    return constraints, shapes, invalid
+
+
+def _build_move_indexes_and_keys(conn, kb_id: str, item_table: str) -> None:
+    """Inside the move, after the copy: what correctness rests on, in bulk.
+
+    Constraint-backed indexes (the local primary key) and every UNIQUE index,
+    built once over the copied rows rather than maintained row by row; and the
+    foreign keys, added ``NOT VALID`` so no row is re-checked -- the rows came
+    from DEFAULT, where the same keys held, and the move's locks keep them
+    from changing. ``_complete_partition`` validates the keys and builds the
+    plain secondary indexes after the commit, without blocking writes.
+
+    Adding a foreign key takes SHARE ROW EXCLUSIVE on the table it references
+    until the move commits, which is why this runs as late as it can.
+    """
+    partition = _qualified(partition_name(kb_id, item_table))
+    for definition in _default_index_definitions(conn, item_table):
+        if "constraint" in definition:
+            conn.execute(text(f"ALTER TABLE {partition} ADD {definition['constraint']}"))
+        elif definition["unique"]:
+            conn.execute(text(f"CREATE UNIQUE INDEX ON {partition} {definition['tail']}"))
+    for definition in _foreign_key_defs(conn, default_partition_name(item_table)):
+        suffix = "" if definition.endswith(" NOT VALID") else " NOT VALID"
+        conn.execute(text(f"ALTER TABLE {partition} ADD {definition}{suffix}"))
+
+
+def _complete_partition(conn, kb_id: str, item_table: str) -> dict:
+    """Finish an attached partition: validate its keys, build its plain indexes.
+
+    Runs on an AUTOCOMMIT connection, after the move has committed, and never
+    blocks writes: ``VALIDATE CONSTRAINT`` and ``CREATE INDEX CONCURRENTLY`` take
+    SHARE UPDATE EXCLUSIVE on the partition. Re-entrant -- it compares the
+    partition with DEFAULT each time, so a worker killed half-way leaves work
+    the next ``ensure_bm25_index`` picks up. An INVALID index left by a failed
+    concurrent build is dropped and rebuilt. Returns what it did.
+    """
+    partition = partition_name(kb_id, item_table)
+    qualified = _qualified(partition)
+    done: dict = {}
+    conn.execute(text("SET statement_timeout = 0"))
+    try:
+        not_valid = conn.execute(
+            text(
+                "SELECT quote_ident(conname) FROM pg_constraint "
+                "WHERE conrelid = to_regclass(:partition) AND contype = 'f' "
+                "AND NOT convalidated ORDER BY conname"
+            ),
+            {"partition": qualified},
+        ).all()
+        for (name,) in not_valid:
+            conn.execute(text(f"ALTER TABLE {qualified} VALIDATE CONSTRAINT {name}"))
+            done.setdefault("validated_foreign_keys", []).append(name)
+
+        _, shapes, invalid = _partition_index_state(conn, partition)
+        if invalid and not _index_build_in_progress(conn, partition):
+            for name in sorted(invalid):
+                if name.startswith("bm25_"):
+                    continue  # the bm25 index has its own repair
+                conn.execute(text(f'DROP INDEX CONCURRENTLY IF EXISTS "{AI_SCHEMA}".{name}'))
+                done.setdefault("dropped_invalid_indexes", []).append(name)
+        for definition in _default_index_definitions(conn, item_table):
+            if "constraint" in definition:
+                continue
+            if (definition["unique"], definition["tail"]) in shapes:
+                continue
+            unique = "UNIQUE " if definition["unique"] else ""
+            conn.execute(
+                text(f"CREATE {unique}INDEX CONCURRENTLY ON {qualified} {definition['tail']}")
+            )
+            done.setdefault("built_indexes", []).append(definition["tail"])
+    finally:
+        conn.execute(text("RESET statement_timeout"))
+    if done:
+        logger.info("Completed partition %s.%s: %s", AI_SCHEMA, partition, done)
+    return done
 
 
 def _move_check_names(conn, item_table: str) -> list[str]:
@@ -1830,18 +1979,23 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
     Returns ``{"rows_moved": int, "writes_blocked_seconds": float}``.
 
     1. **prepare** (own transaction) -- clone the DEFAULT partition into an
-       unattached table with a CHECK matching the partition bound (so ATTACH
-       skips its scan of the new partition) and the foreign keys ``LIKE`` does
-       not copy. Any temporary DEFAULT check a failed or killed move left is
-       dropped.
+       unattached bare heap (no index, no foreign key) with a CHECK matching
+       the partition bound (so ATTACH skips its scan of the new partition).
+       Any temporary DEFAULT check a failed or killed move left is dropped,
+       and so is a stale clone (``_drop_stale_clone``).
     2. **move** (one transaction) -- SHARE on the parent; meanwhile, on a
        second connection, add ``CHECK (knowledge_base_id <> kb) NOT VALID`` to
        DEFAULT (a catalog change) and commit it; SHARE on DEFAULT; copy the
        KB's rows into the clone and delete them from DEFAULT; VALIDATE the
        DEFAULT check (one scan of DEFAULT, which does not block readers);
-       ATTACH, which now needs neither of its scans; drop the DEFAULT check
-       under the lock the ATTACH already holds; mirror ownership, grants, RLS
-       and policies; commit.
+       build the primary key and any UNIQUE index in bulk and add the foreign
+       keys ``NOT VALID`` (``_build_move_indexes_and_keys``); ATTACH, which
+       now needs neither of its scans; drop the DEFAULT check under the lock
+       the ATTACH already holds; mirror ownership, grants, RLS and policies;
+       commit.
+    3. **complete** (``ensure_bm25_index``, after the bm25 index) -- validate
+       the foreign keys and build the plain secondary indexes ``CONCURRENTLY``
+       (``_complete_partition``); neither blocks writes.
 
     Every ACCESS EXCLUSIVE lock on DEFAULT (adding the check, the ATTACH) is
     taken by ``_lock_default_exclusively``: ``NOWAIT`` tries for up to
@@ -1958,6 +2112,7 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                 moved = conn.execute(text(insert_sql), {"kb": kb_id}).rowcount
                 conn.execute(text(delete_sql), {"kb": kb_id})
                 conn.execute(text(default_move_check_validate_ddl(kb_id, item_table)))
+                _build_move_indexes_and_keys(conn, kb_id, item_table)
                 attach_sql = partition_attach_ddl(kb_id, item_table)
                 _lock_default_exclusively(conn, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
                 conn.execute(text(attach_sql))
@@ -2194,7 +2349,15 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
         if not conn.execute(text(partition_build_lock_sql()), {"relation": index_lock}).scalar():
             return {**outcome, "status": "building"}
         try:
-            return _ensure_index_locked(conn, outcome, kb_id, item_table, ts_language)
+            outcome = _ensure_index_locked(conn, outcome, kb_id, item_table, ts_language)
+            # After the bm25 index, which is what serves this knowledge base's
+            # keyword search: until then the plain indexes (the full-text GIN
+            # above all, the one slow build) would only delay it.
+            if outcome.get("status") == "ready":
+                completed = _complete_partition(conn, kb_id, item_table)
+                if completed:
+                    outcome["completed"] = completed
+            return outcome
         finally:
             _release_advisory_lock(conn, index_lock)
 
