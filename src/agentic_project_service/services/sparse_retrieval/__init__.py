@@ -13,8 +13,10 @@ from .query_context import QueryContextBuilder, build_search_query
 from .sparse_index_store import SparseIndexStore
 
 # Maps KB indexing strategy → the item_table that holds BM25-searchable text.
-# Read by the whole-KB rebuild (tasks/indexing.py's build_bm25_for_kb) and by
-# the bm25_status computation (routes/knowledge_bases.py). The per-source
+# Read by the whole-KB rebuild (tasks/indexing.py's build_bm25_for_kb), and in
+# routes/knowledge_bases.py by the bm25_status computation, the build-bm25
+# endpoint's up-front check and the keyword-timeout remedy
+# (_keyword_timeout_remedy). The per-source
 # incremental paths in tasks/indexing.py do NOT read this map — each hardcodes
 # the item table it writes — so a strategy is only safe to add here once it has
 # those per-source add/remove callsites too.
@@ -26,7 +28,7 @@ from .sparse_index_store import SparseIndexStore
 #     page_index_toc/page_index_nodes, so there is no item table to index. The
 #     table it used to be mapped to, full_documents, belongs to full_document.
 #   doc2json — has no sparse-index maintenance: run_doc2json_indexing never
-#     calls SparseIndexStore and index_source's removal block does not cover
+#     calls SparseIndexStore and the removal block in _run_index_body does not cover
 #     doc2json_documents. An index built here would freeze at build time —
 #     later documents invisible to keyword search, deleted ones still scoring —
 #     so doc2json stays on the slow-but-correct fallback until that lands.

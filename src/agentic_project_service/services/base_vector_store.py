@@ -319,9 +319,27 @@ class BasePgVectorStore:
 
         Rolling back to the savepoint on cancellation reverts the timeout and
         clears the aborted-transaction state, so the caller's session stays
-        usable; on success the previous timeout is put back explicitly.
+        usable.
+
+        Two details are load-bearing:
+
+        - The timeout is set with ``set_config('statement_timeout', :ms, true)``
+          rather than ``SET LOCAL``, because ``SET LOCAL`` cannot take a bind
+          parameter; the third argument ``true`` is what makes it
+          transaction-local.
+        - On success the previous value is restored explicitly before the
+          savepoint is released. ``RELEASE SAVEPOINT`` does not revert a
+          transaction-local setting made inside the savepoint, so without that
+          restore the budget would go on bounding every later statement in the
+          caller's transaction.
 
         ``query`` is the user's search text, used only for the log line.
+
+        Raises:
+            KeywordSearchTimeout: the statement was cancelled (SQLSTATE 57014)
+                and at least ``timeout_ms`` had elapsed on the client clock. A
+                57014 that arrives sooner cannot be this bound firing, so it is
+                re-raised as the original error.
         """
         started = time.monotonic()
         try:
@@ -845,9 +863,9 @@ class BasePgVectorStore:
         self,
         query: str,
         top_k: int,
-        filter_metadata: dict | None,
-        item_ids: set[str] | None,
-        source_ids: list[str] | None,
+        filter_metadata: dict | None = None,
+        item_ids: set[str] | None = None,
+        source_ids: list[str] | None = None,
         ts_language: str = "english",
         use_bm25s: bool = True,
     ) -> list[RetrievedItem]:

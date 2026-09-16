@@ -1075,7 +1075,7 @@ def _build_registry() -> dict[str, SettingDef]:
         SettingDef(
             key="BM25_FALLBACK_TIMEOUT_MS",
             category=cat,
-            label="Keyword search fallback timeout (ms)",
+            label="Keyword Search Fallback Timeout (ms)",
             type="int",
             default=10000,
             min=1000,
