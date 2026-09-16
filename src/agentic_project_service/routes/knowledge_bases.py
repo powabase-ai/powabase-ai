@@ -389,9 +389,11 @@ def _dispatch_ensure_pg_bm25_index(kb_id: str) -> None:
     """Ask a worker to reconcile this KB's pg_search partition and index.
 
     Never fatal, and always off the request path: the first run for a KB moves
-    that KB's rows out of the item table's DEFAULT partition, which is real
-    work. Dispatching it at KB creation — before the KB has any rows — is what
-    keeps that move free for every KB created from here on.
+    that KB's rows out of the item table's DEFAULT partition in one
+    transaction, and writes to that whole item table -- every KB on it -- wait
+    for the full move (readers only milliseconds). Dispatching it at KB
+    creation, before the KB has any rows, is what keeps that move free for
+    every KB created from here on.
 
     The task itself decides whether there is anything to do at all: no
     extension, a strategy with no keyword table, an item table that is not

@@ -2633,7 +2633,9 @@ def ensure_pg_bm25_index(self, kb_id: str) -> dict:
     by dropping and recreating, since the tokenizer is baked into the index) —
     and by the operator build-bm25 endpoint. The first run for a KB moves that
     KB's rows out of the item table's DEFAULT partition into a partition of its
-    own; later runs are cheap and idempotent. Returns the service's own outcome
+    own, in one transaction: writes to the whole item table (every KB on it)
+    wait for the full move, readers only milliseconds. Later runs are cheap and
+    idempotent. Returns the service's own outcome
     dict.
 
     Retries (with backoff, up to ``PG_BM25_TASK_MAX_RETRIES``) when another
