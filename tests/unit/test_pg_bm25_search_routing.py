@@ -385,3 +385,45 @@ def test_a_failing_pg_query_warns_once_with_its_cause_and_no_traceback(caplog, m
     assert "does not contain a `USING bm25` index" in warnings[0].getMessage()
     assert warnings[0].exc_info is None
     assert len(records) == 3
+
+
+# ---------------------------------------------------------------------------
+# Once a KB has its own partition, its frozen file index is never read
+# ---------------------------------------------------------------------------
+
+
+def _file_index_store(monkeypatch, *, partition: bool, installed: bool = True):
+    store, calls, patches = _routed_store(installed=installed, ready=False)
+    sparse = MagicMock()
+    sparse.index_exists.return_value = True
+    retriever = sparse.get_or_load_manager.return_value.get_retriever.return_value
+    retriever.is_ready.return_value = True
+    retriever.search.side_effect = lambda *a, **k: calls.append("file") or []
+    monkeypatch.setattr(
+        "agentic_project_service.services.sparse_retrieval.SparseIndexStore",
+        MagicMock(return_value=sparse),
+    )
+    patches.append(patch.object(bvs.pg_bm25_index, "partition_exists", return_value=partition))
+    return store, calls, patches
+
+
+def test_a_kb_with_its_own_partition_never_falls_back_to_its_frozen_file_index(monkeypatch):
+    """Indexing stops maintaining the file index once pg_search takes over, so
+    while the KB's own index is not usable (being built, rebuilt for a new
+    language, INVALID) keyword search answers from the tsvector path over the
+    live rows, not from a file index frozen at the move."""
+    store, calls, patches = _file_index_store(monkeypatch, partition=True)
+    _run_bm25s(store, patches)
+    assert calls == ["tsvector"]
+
+
+def test_a_kb_still_in_default_keeps_reading_its_file_index(monkeypatch):
+    store, calls, patches = _file_index_store(monkeypatch, partition=False)
+    _run_bm25s(store, patches)
+    assert calls == ["file"]
+
+
+def test_without_the_extension_the_file_index_is_still_read(monkeypatch):
+    store, calls, patches = _file_index_store(monkeypatch, partition=True, installed=False)
+    _run_bm25s(store, patches)
+    assert calls == ["file"]

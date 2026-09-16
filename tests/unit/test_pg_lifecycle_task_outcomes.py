@@ -197,3 +197,38 @@ def test_the_drop_task_logs_its_give_up_at_error(monkeypatch, caplog):
     retry.assert_not_called()
     assert caplog.records[-1].levelno == logging.ERROR
     assert KB in caplog.records[-1].getMessage()
+
+
+def test_a_ready_index_retires_the_kbs_frozen_file_index(task, monkeypatch):
+    ensure, _retry, _recorded = task
+    store = MagicMock()
+    monkeypatch.setattr(indexing, "SparseIndexStore", MagicMock(return_value=store))
+    with patch(
+        f"{SERVICE}.ensure_bm25_index", return_value={"status": "ready", "item_table": "chunks"}
+    ):
+        ensure.run(KB)
+    indexing.SparseIndexStore.assert_called_once_with(knowledge_base_id=KB)
+    store.delete_index.assert_called_once_with(item_table="chunks")
+
+
+@pytest.mark.parametrize("status", ["building", "skipped"])
+def test_the_file_index_stays_until_the_index_is_ready(task, monkeypatch, status):
+    ensure, _retry, _recorded = task
+    monkeypatch.setattr(indexing, "SparseIndexStore", MagicMock())
+    with patch(
+        f"{SERVICE}.ensure_bm25_index", return_value={"status": status, "item_table": "chunks"}
+    ):
+        ensure.run(KB)
+    indexing.SparseIndexStore.assert_not_called()
+
+
+def test_a_failure_to_delete_the_file_index_does_not_fail_the_build(task, monkeypatch):
+    ensure, _retry, recorded = task
+    store = MagicMock()
+    store.delete_index.side_effect = OSError("read-only file system")
+    monkeypatch.setattr(indexing, "SparseIndexStore", MagicMock(return_value=store))
+    with patch(
+        f"{SERVICE}.ensure_bm25_index", return_value={"status": "ready", "item_table": "chunks"}
+    ):
+        assert ensure.run(KB)["status"] == "ready"
+    assert recorded[-1][0] == "ready"

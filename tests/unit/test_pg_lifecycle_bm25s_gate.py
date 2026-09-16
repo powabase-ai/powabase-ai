@@ -69,7 +69,9 @@ def test_keyword_index_backend_probes_in_a_savepoint_and_never_raises():
     assert session.begin_nested.call_count == 2
 
 
-def _gate(method, strategy, backend, auto=True, index_state="ready"):
+def _gate(method, strategy, backend, auto=True, index_state="ready", partition=None):
+    if partition is None:
+        partition = index_state == "ready"
     with (
         patch.object(indexing, "db", MagicMock()),
         patch.object(indexing, "_get_kb_retrieval_method", return_value=method),
@@ -77,12 +79,24 @@ def _gate(method, strategy, backend, auto=True, index_state="ready"):
         patch.object(indexing, "get_setting", return_value=auto),
         patch.object(indexing.pg_bm25_index, "keyword_index_backend", return_value=backend),
         patch.object(indexing.pg_bm25_index, "_read_index_state", return_value=index_state),
+        patch.object(indexing.pg_bm25_index, "partition_exists", return_value=partition),
     ):
         return indexing._should_build_bm25_now(KB)
 
 
 def test_the_file_index_append_is_skipped_when_pg_search_serves_the_kb():
     assert _gate("hybrid", "chunk_embed", "pg_search") is False
+
+
+@pytest.mark.parametrize("index_state", ["absent", "building"])
+def test_the_file_index_append_stops_once_the_kb_has_its_own_partition(index_state):
+    """From then on search never reads the file index (it falls back to the
+    tsvector path while the KB's own index is not usable), so maintaining it
+    would only rebuild a file nobody reads."""
+    assert (
+        _gate("hybrid", "chunk_embed", "pg_search", index_state=index_state, partition=True)
+        is False
+    )
 
 
 @pytest.mark.parametrize("index_state", ["absent", "building"])

@@ -829,6 +829,22 @@ class BasePgVectorStore:
             )
             return False
 
+    def _file_index_retired(self) -> bool:
+        """Has this KB's keyword index moved to pg_search for good? Never raises.
+
+        True once the extension is installed and the KB has its own attached
+        partition of this table: from then on nothing maintains the bm25s file
+        index. "Can't tell" is False, which keeps today's behaviour.
+        """
+        try:
+            if self.TABLE not in pg_bm25_index.PARTITIONED_ITEM_TABLES:
+                return False
+            if not pg_bm25_index.pg_search_installed(self.session):
+                return False
+            return pg_bm25_index.partition_exists(self.session, self.kb_id, self.TABLE)
+        except Exception:
+            return False
+
     async def bm25s_search(
         self,
         query: str,
@@ -841,8 +857,9 @@ class BasePgVectorStore:
         """BM25 keyword search: pg_search index, else bm25s file index, else SQL.
 
         Prefers this KB's pg_search index when the extension is installed and
-        that index is ready. Otherwise the pre-built bm25s file index, and
-        failing that the bounded tsvector fallback.
+        that index is ready. Otherwise the pre-built bm25s file index -- unless
+        the KB already has its own partition, whose file index is no longer
+        maintained -- and failing that the bounded tsvector fallback.
 
         Args:
             query: Search query (may include conversation context).
@@ -880,6 +897,26 @@ class BasePgVectorStore:
                     self.TABLE,
                     cause,
                 )
+
+        if self._file_index_retired():
+            # Once this KB has its own partition, indexing no longer maintains
+            # its bm25s file index, so that file is frozen at the move. While
+            # the KB's own index is not usable (being built, rebuilt for a new
+            # language, INVALID), answer from the live rows instead.
+            logger.debug(
+                "pg_search index for KB %s table %s is not usable; its file index is retired, "
+                "falling back to tsvector",
+                self.kb_id,
+                self.TABLE,
+            )
+            return await self.full_text_search(
+                query,
+                top_k,
+                filter_metadata,
+                item_ids,
+                _resolve=_resolve,
+                source_ids=source_ids,
+            )
 
         sparse_store = SparseIndexStore(knowledge_base_id=self.kb_id)
 

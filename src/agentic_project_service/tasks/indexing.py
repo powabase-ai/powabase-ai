@@ -148,18 +148,38 @@ def _should_build_bm25_now(kb_id: str) -> bool:
     Returns False when:
       - the KB's retrieval method does not use BM25 (vector_search, None, unknown), OR
       - the project-level BM25_AUTO_INDEXING setting is disabled, OR
-      - this KB's own pg_search index is ready and serves its keyword leg, so
-        nothing reads the file index and appending every source to it is
-        wasted tokenising.
+      - this KB's own pg_search index is ready and serves its keyword leg, or
+        the KB has its own partition (search then falls back to the tsvector
+        path, never the file index), so nothing reads the file index and
+        appending every source to it is wasted tokenising.
     """
     method = _get_kb_retrieval_method(kb_id)
     if method not in ("hybrid", "full_text"):
         return False
     if not get_setting("BM25_AUTO_INDEXING"):
         return False
-    if _kb_served_by_pg_search(kb_id):
+    if _kb_served_by_pg_search(kb_id) or _kb_file_index_retired(kb_id):
         return False
     return True
+
+
+def _kb_file_index_retired(kb_id: str) -> bool:
+    """Does this KB have its own partition, so search never reads its file index?
+
+    Search falls back to the tsvector path, not the file index, while such a
+    KB's own index is not usable (``BasePgVectorStore._file_index_retired``).
+    False when that cannot be determined.
+    """
+    try:
+        strategy = _get_kb_indexing_strategy(kb_id)
+        if pg_bm25_index.keyword_index_backend(db.session, strategy) != "pg_search":
+            return False
+        item_table = pg_bm25_index.pg_bm25_item_table(strategy)
+        return item_table is not None and pg_bm25_index.partition_exists(
+            db.session, kb_id, item_table
+        )
+    except Exception:
+        return False
 
 
 def _fetch_kb_for_bm25_build(kb_id: str) -> dict:
@@ -2714,6 +2734,24 @@ def _bm25_failure_reason(exc: BaseException) -> str:
     return f"failed{at} ({type(exc).__name__})"
 
 
+def _retire_file_index(kb_id: str, item_table: str) -> None:
+    """Delete a KB's bm25s file index once its own pg_search index is ready.
+
+    Safe: with the partition in place search never reads the file (it falls
+    back to the tsvector path) and indexing no longer maintains it, so all it
+    holds is a copy of the keyword index frozen at the move. Best effort.
+    """
+    try:
+        SparseIndexStore(knowledge_base_id=kb_id).delete_index(item_table=item_table)
+    except Exception as exc:
+        logger.warning(
+            "Could not delete the retired bm25s file index of KB %s on %s: %s",
+            kb_id,
+            item_table,
+            exc,
+        )
+
+
 @celery_app.task(bind=True, max_retries=PG_BM25_TASK_MAX_RETRIES)
 @billing.no_billing_context
 def ensure_pg_bm25_index(self, kb_id: str) -> dict:
@@ -2791,6 +2829,8 @@ def ensure_pg_bm25_index(self, kb_id: str) -> dict:
         if retry is not None:
             raise retry
         return outcome
+    if status == "ready" and outcome.get("item_table"):
+        _retire_file_index(kb_id, outcome["item_table"])
     if status in ("ready", "building"):
         record(status)
     elif status == "skipped":
