@@ -60,6 +60,7 @@ class _FakeConn:
         build_lock=True,
         check_constraint=False,
         partition_foreign_keys=(),
+        evacuated_forever=None,
     ):
         self.extension = extension
         self.kb_row = kb_row
@@ -72,6 +73,7 @@ class _FakeConn:
         self.build_lock = build_lock
         self.check_constraint = check_constraint
         self.partition_foreign_keys = list(partition_foreign_keys)
+        self.evacuated_forever = evacuated_forever
         self.statements: list[str] = []
         self.commits: list[int] = []
         self.options: dict = {}
@@ -124,7 +126,10 @@ class _FakeConn:
         elif "indisvalid" in sql:
             row = (self.indisvalid,)
         elif "moved AS" in sql:
-            result.rowcount = self.evacuated.pop(0) if self.evacuated else 0
+            if self.evacuated_forever is not None:
+                result.rowcount = self.evacuated_forever
+            else:
+                result.rowcount = self.evacuated.pop(0) if self.evacuated else 0
         result.first.return_value = row
         result.fetchone.return_value = row
         result.scalar.return_value = row[0] if row else None
@@ -216,18 +221,15 @@ def test_ensure_moves_the_bulk_of_the_rows_without_holding_a_table_lock():
     assert out["rows_moved"] == 14_000
     statements = _partition_ddl(conn)
     lock = pgb.partition_lock_default_ddl("chunks")
-    bulk = pgb.evacuate_batch_sql(KB, "chunks")
-
-    # Every bulk batch happens before the lock is taken...
+    # Every bulk batch happens before the lock is taken, and the bulk phase
+    # stops as soon as a batch comes back short -- chasing the last few rows
+    # unlocked is pointless while a writer can still add more, and against a
+    # writer appending to the same knowledge base it would never terminate.
     first_lock = statements.index(lock)
-    assert statements[:first_lock].count(bulk) == 3
+    assert statements[:first_lock].count(bulk) == 2
     # ...and each of them committed on its own.
-    bulk_commits = [
-        c
-        for c in conn.commits
-        if c <= conn.statements.index(lock)  # noqa: PLR1730
-    ]
-    assert len(bulk_commits) >= 3, conn.commits
+    bulk_commits = [c for c in conn.commits if c <= conn.statements.index(lock)]
+    assert len(bulk_commits) >= 2, conn.commits
 
 
 def test_ensure_takes_the_build_lock_before_touching_anything():
@@ -404,12 +406,21 @@ def test_ensure_skips_when_the_default_partition_is_missing():
     assert _partition_ddl(conn) == []
 
 
-def test_ensure_refuses_to_evacuate_for_ever():
-    """A writer inserting into DEFAULT faster than the batches drain it."""
-    conn = _FakeConn(evacuated=[pgb.EVACUATION_BATCH_ROWS] * (pgb._MAX_EVACUATION_BATCHES + 1))
+def test_the_bulk_phase_gives_up_rather_than_looping_against_a_writer():
+    """A full batch every time means the writer is keeping pace with the move.
+
+    The unlocked bulk phase cannot win that race -- it would loop for ever -- so
+    it stops at its cap and hands the remainder to the cutover, which holds
+    writers off the DEFAULT partition and therefore does terminate.
+    """
+    conn = _FakeConn(evacuated_forever=pgb.EVACUATION_BATCH_ROWS)
 
     with pytest.raises(RuntimeError, match="did not drain"):
         pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    # It got as far as the cutover; the raise came from there, not the bulk loop.
+    assert pgb.partition_lock_default_ddl("chunks") in conn.statements
+    assert pgb.partition_attach_ddl(KB, "chunks") not in conn.statements
 
 
 def test_ensure_is_a_no_op_without_the_extension():
