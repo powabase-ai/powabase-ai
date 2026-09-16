@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
 from agentic_project_service.services import base_vector_store as bvs
@@ -169,9 +168,10 @@ def test_other_operational_errors_propagate_unchanged(_ms):
 
     assert not isinstance(exc_info.value, bvs.KeywordSearchTimeout)
     # The savepoint was rolled back, so the aborted state is cleared and the
-    # caller's session is still usable for the statements that follow.
+    # caller's session is still usable. That the session really is usable
+    # afterwards can only be shown against Postgres — see the live module; a
+    # spy would answer any statement regardless.
     assert ("ROLLBACK TO SAVEPOINT", None) in log
-    assert session.execute(text("SELECT 1")) is not None
 
 
 @patch.object(bvs, "_bm25_fallback_timeout_ms", return_value=4321)
@@ -198,6 +198,14 @@ def test_timeout_logs_one_warning_and_no_error(_ms, caplog):
     assert "chunks" in message  # _FakeStore.TABLE
     assert "4321" in message
     assert str(len("a moderately long hiking query")) in message
+
+
+@pytest.fixture(autouse=True)
+def _forget_warned_overrides():
+    """The warn-once memory is module state; keep these tests independent."""
+    bvs._WARNED_TIMEOUT_OVERRIDES.clear()
+    yield
+    bvs._WARNED_TIMEOUT_OVERRIDES.clear()
 
 
 def test_timeout_helper_reads_the_setting():
@@ -238,3 +246,30 @@ def test_timeout_helper_falls_back_to_the_default_on_a_non_numeric_value(caplog)
         with patch.object(bvs, "get_setting", return_value="not-a-number"):
             assert bvs._bm25_fallback_timeout_ms() == 10000
     assert [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+@pytest.mark.parametrize("stored", [0, "not-a-number"])
+def test_a_bad_stored_value_warns_once_per_process(stored, caplog):
+    """This helper runs on every keyword search.
+
+    Warning each time would put one line per search in the log for as long as
+    the bad value sits in project_settings, which buries the first one.
+    """
+    with caplog.at_level(logging.DEBUG, logger=bvs.logger.name):
+        with patch.object(bvs, "get_setting", return_value=stored):
+            for _ in range(3):
+                bvs._bm25_fallback_timeout_ms()
+
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+    # The later occurrences are still traceable, just not at WARNING.
+    assert len([r for r in caplog.records if r.levelname == "DEBUG"]) == 2
+
+
+def test_a_second_distinct_bad_value_warns_again(caplog):
+    with caplog.at_level(logging.WARNING, logger=bvs.logger.name):
+        for stored in (0, 999999, 0, 999999):
+            with patch.object(bvs, "get_setting", return_value=stored):
+                bvs._bm25_fallback_timeout_ms()
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 2

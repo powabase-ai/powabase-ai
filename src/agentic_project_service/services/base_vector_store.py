@@ -128,6 +128,23 @@ class KeywordSearchTimeout(RuntimeError):
         self.timeout_ms = timeout_ms
 
 
+# Bad BM25_FALLBACK_TIMEOUT_MS values already reported at WARNING by this
+# process. The read helper runs on every keyword search, so without this a
+# single bad row would emit one warning per search for as long as it sits in
+# project_settings — burying the first one. Bounded by the number of distinct
+# bad values, which is bounded by how often someone writes the setting.
+_WARNED_TIMEOUT_OVERRIDES: set[str] = set()
+
+
+def _warn_once_per_bad_value(key: str, message: str, *args: Any) -> None:
+    """WARNING the first time this exact bad value is seen, DEBUG afterwards."""
+    if key in _WARNED_TIMEOUT_OVERRIDES:
+        logger.debug(message, *args)
+        return
+    _WARNED_TIMEOUT_OVERRIDES.add(key)
+    logger.warning(message, *args)
+
+
 def _bm25_fallback_timeout_ms() -> int:
     """Read the keyword-fallback budget, clamped to the registry's bounds.
 
@@ -149,7 +166,8 @@ def _bm25_fallback_timeout_ms() -> int:
         value = int(raw)
     except (TypeError, ValueError):
         # This runs on the search path, so a malformed row must not raise.
-        logger.warning(
+        _warn_once_per_bad_value(
+            f"type:{raw!r}",
             "BM25_FALLBACK_TIMEOUT_MS is not an integer (%r); using the default %d ms",
             raw,
             defn.default,
@@ -162,7 +180,8 @@ def _bm25_fallback_timeout_ms() -> int:
     if defn.max is not None:
         clamped = min(clamped, defn.max)
     if clamped != value:
-        logger.warning(
+        _warn_once_per_bad_value(
+            f"range:{value}",
             "BM25_FALLBACK_TIMEOUT_MS=%d is outside the allowed range %s-%s; using %d ms instead",
             value,
             defn.min,

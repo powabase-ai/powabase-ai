@@ -98,6 +98,48 @@ def test_cancellation_rolls_back_only_the_savepoint(app, test_source, test_knowl
         db.session.rollback()
 
 
+def test_a_non_timeout_database_error_also_leaves_the_session_usable(
+    app, test_source, test_knowledge_base
+):
+    """The savepoint has to protect the caller from any failure inside it.
+
+    A missing relation is not 57014, so it never reaches the mapping branch and
+    is re-raised as itself — what keeps the session alive is begin_nested's own
+    rollback. Only Postgres can show that: against a spy session, every
+    statement after the failure answers regardless.
+    """
+    kb_id = test_knowledge_base["id"]
+    with app.app_context():
+        marker_id = db.session.execute(
+            text("""
+                INSERT INTO "ai".chunks (knowledge_base_id, source_id, text, chunk_index)
+                VALUES (CAST(:kb AS uuid), CAST(:sid AS uuid),
+                        'marker row, deliberately left uncommitted', -2)
+                RETURNING id
+            """),
+            {"kb": kb_id, "sid": test_source["id"]},
+        ).scalar()
+        txid_before = db.session.execute(text("SELECT txid_current()")).scalar()
+
+        store = PgVectorKnowledgeStore(db_session=db.session, knowledge_base_id=kb_id)
+        with pytest.raises(Exception) as exc_info:
+            store._fetch_with_timeout(
+                'SELECT 1 FROM "ai".no_such_table_here', {}, 5000, query="weather"
+            )
+        assert not isinstance(exc_info.value, bvs.KeywordSearchTimeout)
+
+        assert db.session.execute(text("SELECT 1")).scalar() == 1
+        assert db.session.execute(text("SELECT txid_current()")).scalar() == txid_before
+        assert (
+            db.session.execute(
+                text('SELECT COUNT(*) FROM "ai".chunks WHERE id = CAST(:id AS uuid)'),
+                {"id": str(marker_id)},
+            ).scalar()
+            == 1
+        )
+        db.session.rollback()
+
+
 def test_fallback_within_budget_returns_results_and_restores_timeout(
     app, test_source, test_knowledge_base
 ):
