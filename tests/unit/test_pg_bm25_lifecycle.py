@@ -561,6 +561,19 @@ def test_ensure_is_a_no_op_without_the_extension():
     assert _ddl(conn) == []
 
 
+def test_ensure_and_drop_do_not_trust_a_stale_extension_cache():
+    """I7: the search path caches availability for 30 s; the build must not."""
+    stale = _FakeConn(extension=False)
+    assert pgb.pg_search_installed(stale) is False  # now cached as absent
+
+    conn = _FakeConn(relkinds=_with_partition())
+    assert pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))["status"] == "ready"
+
+    dropped = _FakeConn()
+    pgb.drop_bm25_index(KB, engine=_FakeEngine(dropped))
+    assert _ddl(dropped)
+
+
 def test_ensure_skips_a_kb_that_does_not_use_keyword_search():
     conn = _FakeConn(kb_row=("chunk_embed", "vector_search", "english"))
     out = pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))

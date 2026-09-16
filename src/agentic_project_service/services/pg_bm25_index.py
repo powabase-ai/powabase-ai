@@ -650,26 +650,78 @@ def invalidate_bm25_index_cache(knowledge_base_id: str) -> None:
         _ready_cache.pop(key, None)
 
 
-def pg_search_installed(session) -> bool:
+def _probe(session, sql: str, params: dict | None = None):
+    """Run a read-only catalog probe without risking the caller's transaction.
+
+    On a Session or a transactional Connection the probe runs in a savepoint,
+    so a failure (a stale pooled connection, a cancelled statement) is rolled
+    back to it and the caller's transaction -- and the keyword fallback that
+    runs in it next -- stays usable. An AUTOCOMMIT connection has no
+    transaction to protect and would refuse the SAVEPOINT.
+    """
+    get_options = getattr(session, "get_execution_options", None)
+    autocommit = (
+        callable(get_options) and (get_options() or {}).get("isolation_level") == "AUTOCOMMIT"
+    )
+    begin_nested = getattr(session, "begin_nested", None)
+    if autocommit or begin_nested is None:
+        return session.execute(text(sql), params or {}).first()
+    with begin_nested():
+        return session.execute(text(sql), params or {}).first()
+
+
+def pg_search_installed(session, *, use_cache: bool = True) -> bool:
     """Is the pg_search extension created in this database?
 
-    Cached for a few seconds and never raises: this is read on the search
-    path, where the honest answer to "can't tell" is "use the old path".
+    Cached for ``_CACHE_TTL_SECONDS`` and never raises: this is read on the
+    search path, where the honest answer to "can't tell" is "use the old
+    path" -- for this call only. A failed probe is logged and not cached, so
+    one stale connection cannot hide the extension from every request for the
+    TTL. ``use_cache=False`` is for the build and drop paths, which must not
+    act on an answer that may be a TTL old.
     """
     global _extension_cache
     now = time.monotonic()
-    if _extension_cache is not None and now - _extension_cache[0] < _CACHE_TTL_SECONDS:
+    if (
+        use_cache
+        and _extension_cache is not None
+        and now - _extension_cache[0] < _CACHE_TTL_SECONDS
+    ):
         return _extension_cache[1]
     try:
-        row = session.execute(
-            text("SELECT 1 FROM pg_extension WHERE extname = 'pg_search'")
-        ).first()
-        installed = row is not None
+        installed = (
+            _probe(session, "SELECT 1 FROM pg_extension WHERE extname = 'pg_search'") is not None
+        )
     except Exception as exc:
-        logger.debug("Could not determine whether pg_search is installed: %s", exc)
-        installed = False
+        logger.warning(
+            "Could not determine whether pg_search is installed (%s); using the "
+            "existing keyword path for this request",
+            str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+        )
+        return False
     _extension_cache = (now, installed)
     return installed
+
+
+def _read_index_state(session, knowledge_base_id: str, item_table: str) -> str:
+    """``absent`` | ``building`` | ``ready``; raises if the catalog cannot be read."""
+    if item_table not in PARTITIONED_ITEM_TABLES:
+        return "absent"
+    name = bm25_index_name(knowledge_base_id, item_table)
+    partition = partition_name(knowledge_base_id, item_table)
+    row = _probe(
+        session,
+        "SELECT i.indisvalid FROM pg_index i "
+        "JOIN pg_class c ON c.oid = i.indexrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "JOIN pg_class t ON t.oid = i.indrelid "
+        "WHERE n.nspname = :schema AND c.relname = :name "
+        "AND t.relname = :partition",
+        {"schema": AI_SCHEMA, "name": name, "partition": partition},
+    )
+    if row is None:
+        return "absent"
+    return "ready" if row[0] else "building"
 
 
 def bm25_index_state(session, knowledge_base_id: str, item_table: str) -> str:
@@ -683,39 +735,42 @@ def bm25_index_state(session, knowledge_base_id: str, item_table: str) -> str:
     CREATE INDEX CONCURRENTLY still in flight leaves behind, and also one that
     failed until the next ``ensure_bm25_index`` drops and rebuilds it. Such an
     index cannot answer a query, so it is not ready.
+
+    Never raises; an unreadable catalog reads as ``absent``.
     """
-    if item_table not in PARTITIONED_ITEM_TABLES:
-        return "absent"
-    name = bm25_index_name(knowledge_base_id, item_table)
     try:
-        partition = partition_name(knowledge_base_id, item_table)
-        row = session.execute(
-            text(
-                "SELECT i.indisvalid FROM pg_index i "
-                "JOIN pg_class c ON c.oid = i.indexrelid "
-                "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "JOIN pg_class t ON t.oid = i.indrelid "
-                "WHERE n.nspname = :schema AND c.relname = :name "
-                "AND t.relname = :partition"
-            ),
-            {"schema": AI_SCHEMA, "name": name, "partition": partition},
-        ).first()
+        return _read_index_state(session, knowledge_base_id, item_table)
     except Exception as exc:
-        logger.debug("Could not read BM25 index state for %s: %s", name, exc)
+        logger.warning(
+            "Could not read BM25 index state for KB %s on %s: %s",
+            knowledge_base_id,
+            item_table,
+            str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+        )
         return "absent"
-    if row is None:
-        return "absent"
-    return "ready" if row[0] else "building"
 
 
 def bm25_index_ready(session, knowledge_base_id: str, item_table: str) -> bool:
-    """Cached "can this KB's BM25 index answer a query right now?"."""
+    """Cached "can this KB's BM25 index answer a query right now?".
+
+    A failed probe answers False for this call and is not cached.
+    """
     key = (str(knowledge_base_id), item_table)
     now = time.monotonic()
     cached = _ready_cache.get(key)
     if cached is not None and now - cached[0] < _CACHE_TTL_SECONDS:
         return cached[1]
-    ready = bm25_index_state(session, knowledge_base_id, item_table) == "ready"
+    try:
+        ready = _read_index_state(session, knowledge_base_id, item_table) == "ready"
+    except Exception as exc:
+        logger.warning(
+            "Could not read BM25 index readiness for KB %s on %s: %s; using the "
+            "existing keyword path for this request",
+            knowledge_base_id,
+            item_table,
+            str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+        )
+        return False
     if len(_ready_cache) >= _READY_CACHE_MAX_ENTRIES:
         _ready_cache.clear()
     _ready_cache[key] = (now, ready)
@@ -1208,7 +1263,7 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None) -> dict:
     engine = _engine(engine)
 
     with _autocommit_connection(engine) as conn:
-        if not pg_search_installed(conn):
+        if not pg_search_installed(conn, use_cache=False):
             return {"status": "skipped", "reason": "extension_absent"}
 
         row = conn.execute(text(_kb_config_sql()), {"id": kb_id}).first()
@@ -1366,7 +1421,7 @@ def drop_bm25_index(knowledge_base_id: str, engine=None, drop_partitions: bool =
 
     dropped: list[str] = []
     with _autocommit_connection(engine) as conn:
-        if not pg_search_installed(conn):
+        if not pg_search_installed(conn, use_cache=False):
             return {"status": "skipped", "reason": "extension_absent"}
 
         for item_table in sorted(BM25_ITEM_TABLES):

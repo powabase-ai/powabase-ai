@@ -1411,3 +1411,27 @@ def test_bm25s_search_uses_the_pg_index_when_it_is_ready(engine, session):
 
     assert len(items) == 2
     assert all(item.score > 0 for item in items)
+
+
+def test_a_stale_ready_cache_degrades_to_the_fallback_inside_one_transaction(engine, session):
+    """The savepoint around the scored query is load-bearing (mutation M31).
+
+    The readiness cache can say "ready" for up to its TTL after the index is
+    gone (dropped by a worker in another process, say). The scored query then
+    fails; without the savepoint that failure aborts the caller's transaction
+    and the keyword fallback dies with "current transaction is aborted".
+    """
+    pgb.ensure_bm25_index(KB_A, engine=engine)
+    assert pgb.bm25_index_ready(session, KB_A, "chunks") is True  # cached: ready
+    session.rollback()
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(f"DROP INDEX {SCHEMA}.{pgb.bm25_index_name(KB_A, 'chunks')}"))
+
+    # One open transaction across the whole search, as a request has.
+    session.execute(text("SELECT 1"))
+    items = asyncio.run(_store(session).bm25s_search("Wanderung", top_k=5))
+
+    assert {item.knowledge_base_id for item in items} == {KB_A}
+    assert len(items) >= 1
+    assert session.execute(text("SELECT 1")).scalar() == 1
+    session.rollback()

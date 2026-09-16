@@ -336,6 +336,97 @@ def test_extension_detection_never_raises_on_a_broken_session():
     assert pgb.pg_search_installed(session) is False
 
 
+def test_a_failed_extension_probe_is_not_cached_and_is_logged(caplog):
+    """I7: caching "can't tell" as "not installed" hid pg_search for 30 s
+    process-wide after one stale connection, and said so only at DEBUG."""
+    ok = MagicMock()
+    ok.first.return_value = (1,)
+    session = MagicMock()
+    session.execute.side_effect = [RuntimeError("server closed the connection"), ok]
+
+    with caplog.at_level("WARNING"):
+        assert pgb.pg_search_installed(session) is False
+    assert "pg_search" in caplog.text
+    assert pgb.pg_search_installed(session) is True
+    assert session.execute.call_count == 2
+
+
+def test_the_extension_probe_runs_inside_a_savepoint():
+    """I7: a failing probe must not abort the caller's transaction, or the
+    keyword fallback that follows dies with InFailedSqlTransaction."""
+    session = _session([(1,)])
+    pgb.pg_search_installed(session)
+    session.begin_nested.assert_called_once()
+
+
+def test_the_index_state_probe_runs_inside_a_savepoint():
+    session = _session([(True,)])
+    pgb.bm25_index_state(session, KB, "chunks")
+    session.begin_nested.assert_called_once()
+
+
+def test_an_autocommit_connection_is_probed_without_a_savepoint():
+    """SAVEPOINT outside a transaction block is an error, and there is no
+    transaction to protect."""
+    conn = _session([(1,)])
+    conn.get_execution_options.return_value = {"isolation_level": "AUTOCOMMIT"}
+    assert pgb.pg_search_installed(conn, use_cache=False) is True
+    conn.begin_nested.assert_not_called()
+
+
+def test_use_cache_false_bypasses_a_cached_answer():
+    """ensure/drop must not trust a search-path cache that may be 30 s stale."""
+    assert pgb.pg_search_installed(_session([None])) is False
+    fresh = _session([(1,)])
+    assert pgb.pg_search_installed(fresh, use_cache=False) is True
+    assert fresh.execute.call_count == 1
+
+
+def test_the_extension_cache_expires_after_its_ttl(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(pgb.time, "monotonic", lambda: clock[0])
+    session = _session([None, (1,)])
+
+    assert pgb.pg_search_installed(session) is False
+    clock[0] += pgb._CACHE_TTL_SECONDS - 0.01
+    assert pgb.pg_search_installed(session) is False
+    assert session.execute.call_count == 1
+    clock[0] += 0.02
+    assert pgb.pg_search_installed(session) is True
+    assert session.execute.call_count == 2
+
+
+def test_the_readiness_cache_expires_after_its_ttl(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(pgb.time, "monotonic", lambda: clock[0])
+    session = _session([(False,), (True,)])
+
+    assert pgb.bm25_index_ready(session, KB, "chunks") is False
+    clock[0] += pgb._CACHE_TTL_SECONDS - 0.01
+    assert pgb.bm25_index_ready(session, KB, "chunks") is False
+    assert session.execute.call_count == 1
+    clock[0] += 0.02
+    assert pgb.bm25_index_ready(session, KB, "chunks") is True
+    assert session.execute.call_count == 2
+
+
+def test_a_failed_readiness_probe_is_not_cached():
+    ok = MagicMock()
+    ok.first.return_value = (True,)
+    session = MagicMock()
+    session.execute.side_effect = [RuntimeError("stale connection"), ok]
+
+    assert pgb.bm25_index_ready(session, KB, "chunks") is False
+    assert pgb.bm25_index_ready(session, KB, "chunks") is True
+    assert session.execute.call_count == 2
+
+
+def test_the_readiness_cache_is_bounded():
+    for n in range(pgb._READY_CACHE_MAX_ENTRIES + 5):
+        pgb.bm25_index_ready(_session([(True,)]), str(uuid.UUID(int=n + 1)), "chunks")
+    assert len(pgb._ready_cache) <= pgb._READY_CACHE_MAX_ENTRIES
+
+
 def test_extension_detection_is_cached():
     session = _session([(1,), (1,)])
     assert pgb.pg_search_installed(session) is True
