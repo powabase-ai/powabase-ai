@@ -95,3 +95,65 @@ def test_index_source_still_fails_a_real_check_violation(harness):
 
     requeue.assert_not_called()
     failed.assert_called_once()
+
+
+def _operational(sqlstate: str, message: str):
+    from sqlalchemy.exc import OperationalError
+
+    class _Orig(Exception):
+        pass
+
+    orig = _Orig(message)
+    orig.sqlstate = sqlstate
+    return OperationalError("INSERT INTO ai.chunks ...", {}, orig)
+
+
+LOCK_CONFLICTS = [
+    ("40P01", "deadlock detected"),
+    ("55P03", "canceling statement due to lock timeout"),
+]
+
+
+@pytest.mark.parametrize(("sqlstate", "message"), LOCK_CONFLICTS)
+def test_a_lock_conflict_is_recognised(sqlstate, message):
+    assert pgb.is_lock_conflict(_operational(sqlstate, message)) is True
+
+
+def test_other_operational_errors_are_not_lock_conflicts():
+    assert pgb.is_lock_conflict(_operational("57014", "canceling statement due to user")) is False
+    assert pgb.is_lock_conflict(RuntimeError("deadlock detected")) is False
+
+
+@pytest.mark.parametrize(("sqlstate", "message"), LOCK_CONFLICTS)
+def test_index_source_requeues_a_source_that_lost_a_lock_conflict(harness, sqlstate, message):
+    """A deadlock or lock timeout says another transaction was in the way -- a
+    partition move holding the item table, typically -- not that the source is
+    bad, so it is re-queued within the attempts bound."""
+    monkeypatch, requeue, failed = harness
+
+    def _raise(**_kwargs):
+        raise _operational(sqlstate, message)
+
+    monkeypatch.setattr(indexing, "_run_index_body", _raise)
+
+    out = indexing.index_source.run(KB, SRC, indexed_source_id=IS_ID)
+
+    failed.assert_not_called()
+    requeue.assert_called_once()
+    assert requeue.call_args.kwargs["indexed_source_id"] == IS_ID
+    assert out["status"] == "retrying_or_failed"
+
+
+def test_a_lock_conflict_before_the_claim_is_not_requeued(harness):
+    """Only the owner of the row may re-queue it."""
+    monkeypatch, requeue, failed = harness
+    monkeypatch.setattr(
+        indexing,
+        "_claim_indexed_source",
+        MagicMock(side_effect=_operational("40P01", "deadlock detected")),
+    )
+
+    indexing.index_source.run(KB, SRC, indexed_source_id=IS_ID)
+
+    requeue.assert_not_called()
+    failed.assert_not_called()

@@ -2103,10 +2103,16 @@ def index_source(
         return {"status": "retrying_or_failed", "source_id": source_id}
 
     except Exception as exc:
-        if claimed and indexed_source_id and pg_bm25_index.is_partition_move_race(exc):
+        if (
+            claimed
+            and indexed_source_id
+            and (pg_bm25_index.is_partition_move_race(exc) or pg_bm25_index.is_lock_conflict(exc))
+        ):
             # This KB's rows were being moved into its own partition while this
             # run wrote them (SQLSTATE 23514 from the partition constraint or
-            # the move's temporary check). Nothing is wrong with the source:
+            # the move's temporary check), or this run lost a deadlock or lock
+            # timeout (40P01, 55P03) to another transaction -- a move holding
+            # the item table, typically. Nothing is wrong with the source:
             # re-queue it within the attempts bound instead of failing it.
             logger.warning(
                 "Indexing of source %s raced a partition move of KB %s; re-queueing: %s",
@@ -2122,7 +2128,7 @@ def index_source(
                 provider_keys=provider_keys,
                 idempotency_action=idempotency_action,
                 idempotency_parts=idempotency_parts,
-                cause="writes kept racing a partition move",
+                cause="writes kept racing a partition move or losing a lock conflict",
             )
             return {"status": "retrying_or_failed", "source_id": source_id}
         logger.error(f"Indexing failed for source {source_id}", exc_info=True)

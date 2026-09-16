@@ -74,6 +74,20 @@ _PARTITION_BUILD_LOCK_POLL_SECONDS = 0.25
 # whole move back -- nothing has moved -- and the task retries later.
 MOVE_LOCK_TIMEOUT_MS = 5_000
 
+# How long the move keeps trying for ACCESS EXCLUSIVE on the DEFAULT partition
+# (for its temporary check, for the ATTACH, and to drop the check). It never
+# *waits* for that lock in Postgres' queue: each try is ``NOWAIT``, with a short
+# sleep in between. Two reasons. A queued ACCESS EXCLUSIVE request makes every
+# new reader of DEFAULT queue behind it. And a transaction that read DEFAULT and
+# then writes through the parent is already waiting on the move's SHARE lock, so
+# a queued request would close a lock cycle that Postgres breaks by aborting
+# whichever side runs its deadlock check first -- often the application's. A
+# move that cannot get the lock in time rolls back (SQLSTATE 55P03) and its task
+# retries later.
+DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS = 2.0
+_EXCLUSIVE_LOCK_FIRST_SLEEP_SECONDS = 0.01
+_EXCLUSIVE_LOCK_MAX_SLEEP_SECONDS = 0.25
+
 # Alias pg_search records for an indexed expression, so the query's expression
 # can be matched back to the indexed one.
 _EXPRESSION_ALIAS = "bm25_text"
@@ -975,6 +989,15 @@ def is_transient_db_error(exc: BaseException) -> bool:
     return getattr(orig, "sqlstate", None) in _TRANSIENT_SQLSTATES
 
 
+def is_lock_conflict(exc: BaseException) -> bool:
+    """Did a statement lose a deadlock or a lock timeout (SQLSTATE 40P01, 55P03)?
+
+    Either means another transaction held what this one needed -- a partition
+    move holding the item table, typically -- not that the statement was wrong.
+    """
+    return getattr(getattr(exc, "orig", None), "sqlstate", None) in {"40P01", "55P03"}
+
+
 def is_partition_move_race(exc: BaseException) -> bool:
     """Did a write fail only because it raced a knowledge base's partition move?
 
@@ -1044,13 +1067,15 @@ def _log_move_failure(
         conn.rollback()
         logger.debug("Could not list lock holders", exc_info=True)
     logger.warning(
-        "%s KB %s on %s.%s gave up (lock_timeout %d ms, or a deadlock); rolled back, "
-        "retryable. Sessions holding or awaiting locks on the table: %s",
+        "%s KB %s on %s.%s gave up on a lock (lock_timeout %d ms, ACCESS EXCLUSIVE on "
+        "DEFAULT not free within %.1f s, or a deadlock); rolled back, retryable. Sessions "
+        "holding or awaiting locks on the table: %s",
         action,
         knowledge_base_id,
         AI_SCHEMA,
         item_table,
         MOVE_LOCK_TIMEOUT_MS,
+        DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS,
         holders,
     )
 
@@ -1145,14 +1170,48 @@ def _move_check_names(conn, item_table: str) -> list[str]:
     ]
 
 
+def partition_lock_default_exclusive_ddl(item_table: str) -> str:
+    """One try for ACCESS EXCLUSIVE on the DEFAULT partition, never queueing."""
+    return (
+        f"LOCK TABLE {_qualified(default_partition_name(item_table))} "
+        "IN ACCESS EXCLUSIVE MODE NOWAIT"
+    )
+
+
+def _lock_default_exclusively(conn, item_table: str, wait_seconds: float) -> None:
+    """Take ACCESS EXCLUSIVE on DEFAULT without ever waiting in its lock queue.
+
+    Tries ``NOWAIT`` inside a savepoint, so a refusal leaves the caller's
+    transaction usable, and sleeps with a doubling backoff between tries. After
+    ``wait_seconds`` the last refusal (SQLSTATE 55P03) is raised. See
+    ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS`` for why it never queues.
+    """
+    deadline = time.monotonic() + wait_seconds
+    sleep = _EXCLUSIVE_LOCK_FIRST_SLEEP_SECONDS
+    while True:
+        conn.execute(text("SAVEPOINT bm25_default_lock"))
+        try:
+            conn.execute(text(partition_lock_default_exclusive_ddl(item_table)))
+        except Exception as exc:
+            conn.execute(text("ROLLBACK TO SAVEPOINT bm25_default_lock"))
+            if not is_lock_conflict(exc) or time.monotonic() + sleep > deadline:
+                raise
+            time.sleep(sleep)
+            sleep = min(sleep * 2, _EXCLUSIVE_LOCK_MAX_SLEEP_SECONDS)
+            continue
+        conn.execute(text("RELEASE SAVEPOINT bm25_default_lock"))
+        return
+
+
 def _drop_move_checks(conn, item_table: str, names: list[str]) -> None:
     """Drop temporary DEFAULT checks, each in its own short transaction.
 
     DROP CONSTRAINT takes ACCESS EXCLUSIVE on DEFAULT for a catalog change
-    only, bounded by the same lock timeout as the move.
+    only; the lock is taken without queueing, within
+    ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS``.
     """
     for name in names:
-        conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+        _lock_default_exclusively(conn, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
         conn.execute(text(default_move_check_drop_ddl(item_table, name)))
         conn.commit()
 
@@ -1244,14 +1303,18 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                 # validate it, and committing it here would release the lock and
                 # open a gap in which this KB's writes hit it and fail.
                 with engine.connect() as fencer:
-                    fencer.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+                    _lock_default_exclusively(
+                        fencer, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS
+                    )
                     fencer.execute(text(default_move_check_add_ddl(kb_id, item_table)))
                     fencer.commit()
                 conn.execute(text(partition_lock_default_ddl(item_table)))
                 moved = conn.execute(text(insert_sql), {"kb": kb_id}).rowcount
                 conn.execute(text(delete_sql), {"kb": kb_id})
                 conn.execute(text(default_move_check_validate_ddl(kb_id, item_table)))
-                conn.execute(text(partition_attach_ddl(kb_id, item_table)))
+                attach_sql = partition_attach_ddl(kb_id, item_table)
+                _lock_default_exclusively(conn, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
+                conn.execute(text(attach_sql))
                 conn.execute(
                     text(
                         mirror_relation_settings_sql(_qualified(item_table), _qualified(partition))
