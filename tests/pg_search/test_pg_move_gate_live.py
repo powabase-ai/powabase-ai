@@ -77,7 +77,7 @@ def _reindex_shaped_transaction(
 def test_a_reindex_transaction_that_holds_default_does_not_make_the_move_give_up(
     engine, session, monkeypatch
 ):
-    """Without the gate this is the reviewer's failure: the transaction holds
+    """Without the gate every move failed this way: the transaction holds
     DEFAULT while its DELETE waits on the move's parent lock, and every lock try
     the move makes on DEFAULT is refused until it gives up."""
     monkeypatch.setattr(pgb, "DEFAULT_PREFLIGHT_WAIT_SECONDS", 0.0)
