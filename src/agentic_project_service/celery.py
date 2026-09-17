@@ -116,6 +116,16 @@ def seed_indexed_sources_watchdog(**kwargs):
 
 
 @worker_ready.connect
+def seed_stranded_extraction_recovery(**kwargs):
+    """Schedule a sweep for extraction deliveries lost with a worker that died
+    while they waited. A worker starting is often the replacement for one
+    that was killed."""
+    from .tasks import extraction
+
+    extraction.schedule_stranded_extraction_recovery()
+
+
+@worker_ready.connect
 def seed_docs_refresh(**kwargs):
     """Bootstrap the self-rescheduling docs-KB refresh on the singleton docs
     project ONLY (gated by DOCS_KB_REFRESH_ENABLED). No Celery beat process runs

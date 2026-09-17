@@ -231,16 +231,25 @@ class SupabaseStorage:
     def object_size(self, storage_path: str) -> int | None:
         """Size in bytes of a file (full ``bucket/path``), None if not reported.
 
-        Reads the response headers only; the body is never transferred.
+        Asks with HEAD, which transfers no body. A storage server that does
+        not answer HEAD is asked with a GET whose body is never read.
         """
         parts = storage_path.split("/", 1)
         if len(parts) != 2:
             raise StorageError(f"Invalid storage path: {storage_path}")
-        stream = self.stream_download(parts[0], parts[1])
-        try:
-            length = next(stream)
-        finally:
-            stream.close()
+        bucket_id, path = parts
+        response = self._request("HEAD", f"/object/{bucket_id}/{path.lstrip('/')}")
+        if response.status_code in (400, 404):
+            # storage-api answers a HEAD for a missing object with 400.
+            raise StorageError(f"File not found: {storage_path}")
+        if response.status_code == 200:
+            length = response.headers.get("content-length")
+        else:
+            stream = self.stream_download(bucket_id, path)
+            try:
+                length = next(stream)
+            finally:
+                stream.close()
         try:
             return int(length)
         except (TypeError, ValueError):

@@ -121,11 +121,24 @@ def _broker_client():
     )
 
 
-def max_hold_seconds() -> int:
-    """Longest a slot is kept renewed: the task time limit, read the same way
-    the Celery configuration reads it. The threads pool does not enforce that
-    limit, so without this a hung extraction would hold its slot forever."""
+def task_time_limit_seconds() -> int:
+    """The task time limit, read the same way the Celery configuration reads
+    it. It is also the broker's visibility timeout: an unacknowledged task is
+    handed out again once this much time has passed."""
     return int(os.getenv("CELERY_TASK_TIME_LIMIT") or 21600)
+
+
+def max_hold_seconds() -> int:
+    """Longest a slot is kept renewed.
+
+    The threads pool does not enforce the task time limit, so without a cap a
+    hung extraction would hold its slot forever. The cap sits a lease and a
+    minute below that limit, so by the time the broker redelivers an
+    unfinished task its lease has lapsed, and the redelivery is judged as an
+    interruption rather than first waiting on a lease that is about to vanish
+    and then running beside the original.
+    """
+    return task_time_limit_seconds() - LEASE_SECONDS - 60
 
 
 # Lease times come from the Redis server clock, never a worker's: pods whose
@@ -315,7 +328,7 @@ def process_incarnation() -> str:
 def _record_ttl_seconds() -> int:
     # The broker redelivers a killed task after its visibility timeout, which
     # is the task time limit; the record has to outlive that wait.
-    return 2 * max_hold_seconds() + 3600
+    return 2 * task_time_limit_seconds() + 3600
 
 
 @dataclass(frozen=True)
@@ -408,3 +421,121 @@ class ExtractionAttempts:
             score = peers[0][1]
             largest = sys.maxsize if score == float("inf") else int(score)
         return PreviousAttempt(record.get("slot_token"), record.get("size"), largest)
+
+
+# A waiting delivery refreshes its record every time it wakes (about once a
+# minute). One nobody has refreshed for this long belongs to a message that
+# was lost with the worker holding it.
+WAITING_STALE_SECONDS = 600
+
+
+class WaitingExtractions:
+    """Deliveries sitting in some worker as countdown messages.
+
+    A task waiting for a large-extraction slot, or for a retry, is held by
+    the worker that fetched it until it is due. If that worker is killed, the
+    broker hands the message back only after its visibility timeout (the task
+    time limit, six hours by default). Recording each wait lets the project
+    notice a wait nobody has refreshed and dispatch the task again.
+    """
+
+    def __init__(self, redis_client=None):
+        self._client = redis_client
+
+    def _redis(self):
+        if self._client is None:
+            self._client = _broker_client()
+        return self._client
+
+    @staticmethod
+    def _index_key() -> str:
+        return f"extraction:waiting:{_project_ref()}"
+
+    @staticmethod
+    def _record_key(task_id: str) -> str:
+        return f"extraction:waiting:{_project_ref()}:{task_id}"
+
+    def _now(self) -> float:
+        seconds, micros = self._redis().time()
+        return seconds + micros / 1_000_000
+
+    def touch(self, task_id: str, source_id: str, dispatch: dict) -> None:
+        """Record (or refresh) that *task_id* is waiting to run again.
+
+        *dispatch* holds what is needed to send it again: ``args``,
+        ``kwargs`` and ``retries``.
+        """
+        ttl = _record_ttl_seconds()
+        try:
+            now = self._now()
+            pipe = self._redis().pipeline()
+            pipe.set(
+                self._record_key(task_id),
+                json.dumps({"source_id": source_id, "dispatch": dispatch}),
+                ex=ttl,
+            )
+            pipe.zadd(self._index_key(), {task_id: now})
+            pipe.expire(self._index_key(), ttl)
+            pipe.execute()
+        except Exception:
+            logger.warning(
+                "Could not record that extraction task %s is waiting; if its worker dies "
+                "it is not recovered before the broker redelivers it",
+                task_id,
+                exc_info=True,
+            )
+            _count_fail_open("record_waiting")
+
+    def clear(self, task_id: str) -> None:
+        try:
+            pipe = self._redis().pipeline()
+            pipe.delete(self._record_key(task_id))
+            pipe.zrem(self._index_key(), task_id)
+            pipe.execute()
+        except Exception:
+            logger.warning("Could not clear waiting record of task %s", task_id, exc_info=True)
+
+    def get(self, task_id: str) -> dict | None:
+        try:
+            raw = self._redis().get(self._record_key(task_id))
+        except Exception:
+            logger.warning("Could not read waiting record of task %s", task_id, exc_info=True)
+            return None
+        return None if raw is None else json.loads(raw)
+
+    def stale(self, older_than: float) -> list[tuple[str, dict]]:
+        """Waits not refreshed for *older_than* seconds, oldest first."""
+        try:
+            client = self._redis()
+            cutoff = self._now() - older_than
+            task_ids = client.zrangebyscore(self._index_key(), "-inf", cutoff)
+            stale = []
+            for raw_id in task_ids:
+                task_id = raw_id.decode() if isinstance(raw_id, bytes) else raw_id
+                record = self.get(task_id)
+                if record is None:
+                    client.zrem(self._index_key(), task_id)
+                    continue
+                stale.append((task_id, record))
+            return stale
+        except Exception:
+            logger.warning("Could not list waiting extraction tasks", exc_info=True)
+            return []
+
+    def any_waiting(self) -> bool:
+        try:
+            return bool(self._redis().zcard(self._index_key()))
+        except Exception:
+            return False
+
+    def claim_sweep(self, interval: float) -> bool:
+        """True for the one caller per *interval* that should schedule a sweep."""
+        try:
+            return bool(
+                self._redis().set(
+                    f"extraction:waiting-sweep:{_project_ref()}", "1", nx=True, ex=int(interval)
+                )
+            )
+        except Exception:
+            logger.warning("Could not coordinate the waiting-extraction sweep", exc_info=True)
+            return False

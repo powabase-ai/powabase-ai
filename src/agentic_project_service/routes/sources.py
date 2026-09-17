@@ -153,8 +153,10 @@ def _insert_source_with_dedup(
     metadata: dict,
     auto_metadata: dict,
     content_hash: str,
+    celery_task_id: str,
 ) -> bool:
-    """INSERT a source row with race recovery on the content_hash unique
+    """INSERT a source row, owned by the extraction task that is about to be
+    dispatched as *celery_task_id*, with race recovery on the content_hash unique
     index. Returns True on commit, False if a concurrent INSERT won the
     race (in which case the storage object is already cleaned up and the
     caller should return ``_duplicate_response(content_hash)``). Re-raises
@@ -165,14 +167,16 @@ def _insert_source_with_dedup(
             text(f"""
                 INSERT INTO "{AI_SCHEMA}".sources (
                     id, name, file_type, storage_path, extraction_status,
-                    metadata, auto_metadata, content_hash
+                    metadata, auto_metadata, content_hash, celery_task_id
                 ) VALUES (
                     :id, :name, :file_type, :storage_path, 'pending',
-                    CAST(:metadata AS jsonb), CAST(:auto_metadata AS jsonb), :content_hash
+                    CAST(:metadata AS jsonb), CAST(:auto_metadata AS jsonb), :content_hash,
+                    :celery_task_id
                 )
             """),
             {
                 "id": source_id,
+                "celery_task_id": celery_task_id,
                 "name": name,
                 "file_type": file_type,
                 "storage_path": full_path,
@@ -393,6 +397,9 @@ def upload_source():
         auto_metadata: dict = {"origin_path": file.filename}
         if extraction_model:
             auto_metadata["extraction_model"] = extraction_model
+        # The task id is recorded with the row, before the task exists: the
+        # extraction task only runs a source it owns.
+        task_id = str(uuid.uuid4())
         committed = _insert_source_with_dedup(
             storage=storage,
             source_id=source_id,
@@ -403,28 +410,21 @@ def upload_source():
             metadata=metadata,
             auto_metadata=auto_metadata,
             content_hash=content_hash,
+            celery_task_id=task_id,
         )
         if not committed:
             uploaded_storage_path = None
             return _duplicate_response(content_hash)
         source_row_committed = True
 
-        task = extract_source.delay(
-            source_id,
-            SOURCES_BUCKET,
-            extraction_model=extraction_model,
-            provider_keys=get_all_user_provider_keys(),
+        task = extract_source.apply_async(
+            args=[source_id, SOURCES_BUCKET],
+            kwargs={
+                "extraction_model": extraction_model,
+                "provider_keys": get_all_user_provider_keys(),
+            },
+            task_id=task_id,
         )
-
-        db.session.execute(
-            text(f"""
-                UPDATE "{AI_SCHEMA}".sources
-                SET celery_task_id = :task_id
-                WHERE id = :id
-            """),
-            {"task_id": task.id, "id": source_id},
-        )
-        db.session.commit()
 
         return jsonify(
             {
@@ -482,9 +482,11 @@ def _validate_url(url: str) -> bool:
     return True
 
 
-def _create_url_source(url: str) -> tuple[str, str]:
-    """Create a source DB record for a URL and return (source_id, name)."""
+def _create_url_source(url: str) -> tuple[str, str, str]:
+    """Create a source DB record for a URL, owned by the task about to be
+    dispatched for it, and return (source_id, name, task_id)."""
     source_id = str(uuid.uuid4())
+    task_id = str(uuid.uuid4())
     name = url
     storage_path = f"{SOURCES_BUCKET}/{get_source_storage_path(source_id, 'page.html')}"
     metadata: dict = {}
@@ -494,40 +496,32 @@ def _create_url_source(url: str) -> tuple[str, str]:
         text(f"""
             INSERT INTO "{AI_SCHEMA}".sources (
                 id, name, file_type, storage_path, extraction_status,
-                metadata, auto_metadata
+                metadata, auto_metadata, celery_task_id
             ) VALUES (
                 :id, :name, 'text/html', :storage_path, 'pending',
-                CAST(:metadata AS jsonb), CAST(:auto_metadata AS jsonb)
+                CAST(:metadata AS jsonb), CAST(:auto_metadata AS jsonb), :celery_task_id
             )
         """),
         {
             "id": source_id,
+            "celery_task_id": task_id,
             "name": name,
             "storage_path": storage_path,
             "metadata": json.dumps(metadata),
             "auto_metadata": json.dumps(auto_metadata),
         },
     )
-    return source_id, name
+    return source_id, name, task_id
 
 
 def _dispatch_url_extraction(
-    source_id: str, url: str, provider_keys: dict[str, str] | None = None
+    source_id: str, url: str, provider_keys: dict[str, str] | None, task_id: str
 ) -> str:
-    """Dispatch the URL extraction task and update the source with task ID."""
-    task = extract_url_source.delay(
-        source_id,
-        SOURCES_BUCKET,
-        url,
-        provider_keys=provider_keys,
-    )
-    db.session.execute(
-        text(f"""
-            UPDATE "{AI_SCHEMA}".sources
-            SET celery_task_id = :task_id
-            WHERE id = :id
-        """),
-        {"task_id": task.id, "id": source_id},
+    """Dispatch the URL extraction task under the id already recorded on the source."""
+    task = extract_url_source.apply_async(
+        args=[source_id, SOURCES_BUCKET, url],
+        kwargs={"provider_keys": provider_keys},
+        task_id=task_id,
     )
     return task.id
 
@@ -719,8 +713,10 @@ def import_url():
 
         # Create source records and dispatch extraction tasks
         sources_created = []
+        task_ids = {}
         for u in urls:
-            source_id, name = _create_url_source(u)
+            source_id, name, task_id = _create_url_source(u)
+            task_ids[source_id] = task_id
             sources_created.append({"id": source_id, "name": name, "url": u})
 
         db.session.commit()
@@ -728,7 +724,7 @@ def import_url():
         # Dispatch tasks after commit so source records exist
         provider_keys = get_all_user_provider_keys()
         for src in sources_created:
-            _dispatch_url_extraction(src["id"], src["url"], provider_keys)
+            _dispatch_url_extraction(src["id"], src["url"], provider_keys, task_ids[src["id"]])
 
         db.session.commit()
 
@@ -849,6 +845,7 @@ def import_from_storage():
         )
 
         # Create DB record pointing to sources bucket (not user bucket)
+        task_id = str(uuid.uuid4())
         committed = _insert_source_with_dedup(
             storage=storage,
             source_id=source_id,
@@ -856,6 +853,7 @@ def import_from_storage():
             file_type=file_type,
             full_path=full_path,
             storage_path=storage_dest,
+            celery_task_id=task_id,
             metadata=metadata,
             auto_metadata={
                 "origin_path": path,
@@ -870,24 +868,16 @@ def import_from_storage():
             return _duplicate_response(content_hash)
         source_row_committed = True
 
-        # Trigger extraction from sources bucket (not user bucket)
-        task = extract_source.delay(
-            source_id,
-            SOURCES_BUCKET,
-            extraction_model=extraction_model,
-            provider_keys=get_all_user_provider_keys(),
+        # Trigger extraction from sources bucket (not user bucket), under the
+        # task id recorded with the row.
+        task = extract_source.apply_async(
+            args=[source_id, SOURCES_BUCKET],
+            kwargs={
+                "extraction_model": extraction_model,
+                "provider_keys": get_all_user_provider_keys(),
+            },
+            task_id=task_id,
         )
-
-        # Update with task ID
-        db.session.execute(
-            text(f"""
-                UPDATE "{AI_SCHEMA}".sources
-                SET celery_task_id = :task_id
-                WHERE id = :id
-            """),
-            {"task_id": task.id, "id": source_id},
-        )
-        db.session.commit()
 
         return jsonify(
             {
@@ -1275,47 +1265,47 @@ def reextract_source(source_id: str):
     # port no-ops the check when billing is unconfigured.
     billing.check_balance(estimated_cost=_estimated_extraction_cost(re_action))
 
-    # Reset status and trigger extraction; metadata (user-owned) is not touched.
-    # Only mutate state AFTER balance check has passed.
+    provider_keys = get_all_user_provider_keys()
+
+    # Reset status and hand the source to the new task in ONE statement,
+    # committed before the task is sent: any earlier task for this source —
+    # running, or waiting for a slot or a retry — stops being its owner at the
+    # same moment, and gives up instead of overwriting the re-extract.
+    # metadata (user-owned) is not touched. Only mutate state AFTER the
+    # balance check has passed.
+    task_id = str(uuid.uuid4())
     db.session.execute(
         text(f"""
             UPDATE "{AI_SCHEMA}".sources
             SET extraction_status = 'pending', error_message = NULL, error_code = NULL,
+                celery_task_id = :task_id,
                 auto_metadata = CAST(:auto_metadata AS jsonb), updated_at = NOW()
             WHERE id = :id
         """),
-        {"id": source_id, "auto_metadata": json.dumps(updated_auto_metadata)},
+        {
+            "id": source_id,
+            "task_id": task_id,
+            "auto_metadata": json.dumps(updated_auto_metadata),
+        },
     )
     db.session.commit()
-
-    provider_keys = get_all_user_provider_keys()
 
     if origin_url:
-        task = extract_url_source.delay(
-            source_id,
-            SOURCES_BUCKET,
-            origin_url,
-            provider_keys=provider_keys,
-            reextract_seed=per_call_seed,
+        task = extract_url_source.apply_async(
+            args=[source_id, SOURCES_BUCKET, origin_url],
+            kwargs={"provider_keys": provider_keys, "reextract_seed": per_call_seed},
+            task_id=task_id,
         )
     else:
-        task = extract_source.delay(
-            source_id,
-            SOURCES_BUCKET,
-            extraction_model=extraction_model,
-            provider_keys=provider_keys,
-            reextract_seed=per_call_seed,
+        task = extract_source.apply_async(
+            args=[source_id, SOURCES_BUCKET],
+            kwargs={
+                "extraction_model": extraction_model,
+                "provider_keys": provider_keys,
+                "reextract_seed": per_call_seed,
+            },
+            task_id=task_id,
         )
-
-    db.session.execute(
-        text(f"""
-            UPDATE "{AI_SCHEMA}".sources
-            SET celery_task_id = :task_id
-            WHERE id = :id
-        """),
-        {"task_id": task.id, "id": source_id},
-    )
-    db.session.commit()
 
     return jsonify(
         {

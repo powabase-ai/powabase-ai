@@ -18,9 +18,11 @@ from sqlalchemy import text
 from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
 from ..services.extraction_gate import (
+    WAITING_STALE_SECONDS,
     ExtractionAttempts,
     LargeExtractionGate,
     PreviousAttempt,
+    WaitingExtractions,
     is_large_file,
 )
 from ..services.storage import (
@@ -60,10 +62,15 @@ LARGE_EXTRACTION_REQUEUE_SECONDS = 60
 
 large_extraction_gate = LargeExtractionGate()
 extraction_attempts = ExtractionAttempts()
+waiting_extractions = WaitingExtractions()
 
 
 class PageImageStorageError(StorageError):
     """A page image handed over by the extractor could not be stored."""
+
+
+class ExtractionSuperseded(Exception):
+    """The source now belongs to another task (a re-extract was dispatched)."""
 
 
 @functools.cache
@@ -158,17 +165,26 @@ def update_source_status(
     error_message: str | None = None,
     celery_task_id: str | None = None,
     error_code: str | None = None,
-) -> None:
-    """Update source extraction status."""
-    db.session.execute(
+) -> bool:
+    """Update source extraction status on behalf of task *celery_task_id*.
+
+    Writes nothing, and returns False, when the source belongs to another
+    task (a re-extract took it over) or was cancelled: a run that lost the
+    source must not overwrite the status of the one that replaced it.
+    """
+    result = db.session.execute(
         text(f"""
             UPDATE "{AI_SCHEMA}".sources
             SET extraction_status = :status,
                 error_message = :error_message,
                 error_code = :error_code,
-                celery_task_id = :celery_task_id,
+                celery_task_id = COALESCE(CAST(:celery_task_id AS text), celery_task_id),
                 updated_at = NOW()
             WHERE id = :id
+              AND extraction_status <> 'cancelled'
+              AND (CAST(:celery_task_id AS text) IS NULL
+                   OR celery_task_id IS NULL
+                   OR celery_task_id = CAST(:celery_task_id AS text))
         """),
         {
             "id": source_id,
@@ -179,6 +195,44 @@ def update_source_status(
         },
     )
     db.session.commit()
+    return bool(result.rowcount)
+
+
+def claim_source(source_id: str, task_id: str) -> bool:
+    """Mark the source `extracting` for *task_id*, if it may run it.
+
+    A source may be run by the task recorded as its owner, or by any task if
+    none is recorded. Dispatching routes record the owner before the task is
+    sent, so a False here means a re-extract replaced this task, or the source
+    was cancelled.
+    """
+    result = db.session.execute(
+        text(f"""
+            UPDATE "{AI_SCHEMA}".sources
+            SET extraction_status = 'extracting',
+                celery_task_id = :task_id,
+                error_message = NULL,
+                error_code = NULL,
+                updated_at = NOW()
+            WHERE id = :id
+              AND extraction_status <> 'cancelled'
+              AND (celery_task_id IS NULL OR celery_task_id = :task_id)
+        """),
+        {"id": source_id, "task_id": task_id},
+    )
+    db.session.commit()
+    return bool(result.rowcount)
+
+
+def source_is_owned_by(source_id: str, task_id: str) -> bool:
+    owner = db.session.execute(
+        text(f"""
+            SELECT celery_task_id FROM "{AI_SCHEMA}".sources
+            WHERE id = :id AND extraction_status <> 'cancelled'
+        """),
+        {"id": source_id},
+    ).fetchone()
+    return owner is not None and owner[0] in (None, task_id)
 
 
 def record_extraction_interruption(
@@ -251,7 +305,7 @@ def update_source_extraction_result(
         },
     )
     db.session.commit()
-    return result.rowcount > 0
+    return bool(result.rowcount)
 
 
 def _delete_replaced_derivatives(
@@ -285,6 +339,36 @@ def _delete_replaced_derivatives(
         logger.warning(f"Could not delete replaced derivatives of source {source_id}: {e}")
 
 
+def _delete_unreferenced_page_images(
+    storage: SupabaseStorage, bucket_id: str, source: dict, stored_paths: list[str]
+) -> None:
+    """Remove page images a failed attempt stored, unless the source's current
+    derivatives still point at them (a later attempt writes the same names)."""
+    current = source.get("derivatives")
+    referenced: set[str] = set()
+    if isinstance(current, dict):
+        referenced = {
+            record["storage_path"]
+            for records in current.values()
+            if isinstance(records, list)
+            for record in records
+            if isinstance(record, dict) and isinstance(record.get("storage_path"), str)
+        }
+    prefix = f"{bucket_id}/"
+    orphans = sorted(
+        path[len(prefix) :]
+        for path in stored_paths
+        if path not in referenced and path.startswith(prefix)
+    )
+    if not orphans:
+        return
+    try:
+        storage.delete(bucket_id, orphans)
+        logger.info(f"Deleted {len(orphans)} page images of a failed attempt on {source['id']}")
+    except Exception as e:
+        logger.warning(f"Could not delete page images of a failed attempt on {source['id']}: {e}")
+
+
 def _sink_failure_behind(exc: BaseException, sink_errors: list) -> StorageError | None:
     """The sink error that *exc* was raised from, if any."""
     seen = set()
@@ -303,8 +387,14 @@ async def run_extraction(
     bucket_id: str,
     extraction_model: str | None = None,
     provider_keys: dict[str, str] | None = None,
+    still_owned=None,
 ) -> tuple[dict, dict]:
-    """Run the actual extraction asynchronously."""
+    """Run the actual extraction asynchronously.
+
+    *still_owned*, when given, is asked before derivatives are uploaded: a
+    run whose source was handed to another task stops there with
+    ``ExtractionSuperseded`` instead of overwriting that task's files.
+    """
     from agentic.ingest import ExtractorRegistry, RawContent
 
     source_id = source["id"]
@@ -389,6 +479,12 @@ async def run_extraction(
     try:
         result = await extractor.extract(raw_content)
     except Exception as e:
+        _delete_unreferenced_page_images(
+            storage,
+            bucket_id,
+            source,
+            [record["storage_path"] for record in streamed_images.values()],
+        )
         # The engine may have wrapped a page-image storage failure; surface it
         # as the StorageError the task retries on. Only when it is in this
         # failure's own chain: an earlier sink error the engine recovered from
@@ -404,6 +500,11 @@ async def run_extraction(
         f"Extraction complete: {len(result.derivatives)} derivatives, "
         f"method: {result.extraction_method}"
     )
+
+    if still_owned is not None and not still_owned():
+        raise ExtractionSuperseded(
+            f"Source {source_id} was handed to another task during extraction"
+        )
 
     derivatives = {}
     if streamed_images:
@@ -483,6 +584,31 @@ async def run_extraction(
     }
 
     return derivatives, auto_metadata
+
+
+def _superseded(source_id: str, task_id: str, owner: str) -> dict:
+    logger.info(
+        f"Source {source_id}: extraction task {task_id} was superseded by {owner} "
+        f"(re-extracted or cancelled); not running it"
+    )
+    return {"status": "superseded", "source_id": source_id}
+
+
+def _mark_waiting(task, source_id: str, source_size: int | None) -> None:
+    """Record that this delivery is about to wait in a worker, with what is
+    needed to send it again if that worker dies holding it."""
+    kwargs = dict(task.request.kwargs or {})
+    if source_size is not None:
+        kwargs["source_size"] = source_size
+    waiting_extractions.touch(
+        task.request.id,
+        source_id,
+        {
+            "args": list(task.request.args or []),
+            "kwargs": kwargs,
+            "retries": task.request.retries or 0,
+        },
+    )
 
 
 def _requeue(task, countdown: int, source_size: int | None) -> None:
@@ -589,6 +715,8 @@ def extract_source(
 
     slot = None
     forget_attempt = False
+    # This delivery is running, so it is no longer a message waiting somewhere.
+    waiting_extractions.clear(task_id)
     try:
         source = get_source(source_id)
         if not source:
@@ -602,6 +730,10 @@ def extract_source(
         if source["extraction_status"] == "extracted":
             logger.info(f"Source {source_id} already extracted, skipping")
             return {"status": "skipped", "reason": "already_extracted"}
+
+        owner = source.get("celery_task_id")
+        if task_id and owner and owner != task_id:
+            return _superseded(source_id, task_id, owner)
 
         storage = get_storage()
         size = source_size
@@ -629,16 +761,23 @@ def extract_source(
                 f"Source {source_id}: task {task_id} is still extracting in another "
                 f"worker; checking again in {LARGE_EXTRACTION_REQUEUE_SECONDS}s"
             )
+            _mark_waiting(self, source_id, size)
             _requeue(self, LARGE_EXTRACTION_REQUEUE_SECONDS, size)
             return {"status": "deferred", "source_id": source_id, "reason": "still_running"}
 
         if is_large_file(size):
+            if size is None:
+                logger.warning(
+                    f"Source {source_id}: storage did not report the file size (unknown "
+                    f"size); extracting it under the large-file limit"
+                )
             slot = large_extraction_gate.try_acquire(task_id)
             if slot is None:
                 logger.info(
                     f"Source {source_id}: all large-file extraction slots are taken "
                     f"({size} bytes); trying again in {LARGE_EXTRACTION_REQUEUE_SECONDS}s"
                 )
+                _mark_waiting(self, source_id, size)
                 _requeue(self, LARGE_EXTRACTION_REQUEUE_SECONDS, size)
                 return {"status": "deferred", "source_id": source_id, "reason": "slots_busy"}
 
@@ -648,9 +787,11 @@ def extract_source(
                 forget_attempt = True
                 return failure
 
+        if not claim_source(source_id, task_id):
+            return _superseded(source_id, task_id, "another task")
+
         extraction_attempts.begin(task_id, size, slot.token if slot else None)
         forget_attempt = True
-        update_source_status(source_id, "extracting", celery_task_id=task_id)
 
         derivatives, auto_metadata = asyncio.run(
             run_extraction(
@@ -659,6 +800,7 @@ def extract_source(
                 bucket_id,
                 extraction_model=extraction_model,
                 provider_keys=provider_keys,
+                still_owned=lambda: source_is_owned_by(source_id, task_id),
             )
         )
 
@@ -778,17 +920,39 @@ def extract_source(
         ).scalar()
         if current == "cancelled":
             return {"status": "cancelled", "source_id": source_id}
-        update_source_status(source_id, "failed", "Extraction timed out", task_id)
+        if not update_source_status(
+            source_id, "failed", "Extraction timed out", task_id, error_code="timeout"
+        ):
+            return _superseded(source_id, task_id, "another task")
         return {"status": "error", "source_id": source_id, "error": "Extraction timed out"}
+
+    except ExtractionSuperseded:
+        return _superseded(source_id, task_id, "another task")
 
     except StorageError as e:
         logger.error(f"Storage error during extraction: {e}")
-        update_source_status(source_id, "failed", str(e), task_id)
-        raise self.retry(exc=e) from e
+        attempts = self.max_retries + 1
+        attempt = self.request.retries + 1
+        if attempt < attempts:
+            # Not `failed`: callers polling the status treat that as final,
+            # and this source is about to be tried again.
+            message = (
+                f"Attempt {attempt} of {attempts} failed: {e}. "
+                f"Retrying in {self.default_retry_delay}s."
+            )
+            if not update_source_status(source_id, "pending", message, task_id):
+                return _superseded(source_id, task_id, "another task")
+            _mark_waiting(self, source_id, source_size)
+            raise self.retry(exc=e) from e
+        message = f"Extraction failed after {attempts} attempts: {e}"
+        if not update_source_status(source_id, "failed", message, task_id, error_code="transient"):
+            return _superseded(source_id, task_id, "another task")
+        return {"status": "error", "source_id": source_id, "error": message}
 
     except Exception as e:
         logger.exception(f"Extraction failed for source {source_id}")
-        update_source_status(source_id, "failed", str(e), task_id)
+        if not update_source_status(source_id, "failed", str(e), task_id):
+            return _superseded(source_id, task_id, "another task")
 
         return {
             "status": "error",
@@ -801,3 +965,58 @@ def extract_source(
             extraction_attempts.end(task_id)
         if slot is not None:
             slot.release()
+
+
+@celery_app.task(name="recover_stranded_extractions")
+@billing.no_billing_context
+def recover_stranded_extractions() -> dict:
+    """Send again extraction deliveries lost with a killed worker.
+
+    A delivery waiting for a large-extraction slot or a retry refreshes its
+    wait record each time it wakes. A record nobody refreshed for
+    WAITING_STALE_SECONDS belongs to a countdown message that died with its
+    worker; the broker would hand it back only after the task time limit.
+    It is dispatched again under the same task id, which still owns the
+    source, so any copy that does turn up later finds the work done or
+    claimed.
+    """
+    recovered = 0
+    for task_id, record in waiting_extractions.stale(WAITING_STALE_SECONDS):
+        source_id = record.get("source_id")
+        dispatch = record.get("dispatch") or {}
+        source = get_source(source_id) if source_id else None
+        if (
+            source is None
+            or source.get("celery_task_id") != task_id
+            or source.get("extraction_status") not in ("pending", "extracting")
+        ):
+            waiting_extractions.clear(task_id)
+            continue
+        previous = extraction_attempts.previous(task_id)
+        if (
+            previous is not None
+            and previous.slot_token
+            and large_extraction_gate.is_live(previous.slot_token)
+        ):
+            continue
+        logger.warning(
+            f"Source {source_id}: extraction task {task_id} has not been heard from for "
+            f"{WAITING_STALE_SECONDS}s while waiting; its worker probably died. Sending it again."
+        )
+        extract_source.apply_async(
+            args=dispatch.get("args") or [],
+            kwargs=dispatch.get("kwargs") or {},
+            task_id=task_id,
+            retries=dispatch.get("retries") or 0,
+        )
+        waiting_extractions.touch(task_id, source_id, dispatch)
+        recovered += 1
+    if waiting_extractions.any_waiting():
+        schedule_stranded_extraction_recovery()
+    return {"recovered": recovered}
+
+
+def schedule_stranded_extraction_recovery() -> None:
+    """Schedule one recovery sweep for the project, however many workers ask."""
+    if waiting_extractions.claim_sweep(WAITING_STALE_SECONDS):
+        recover_stranded_extractions.apply_async(countdown=WAITING_STALE_SECONDS + 60)

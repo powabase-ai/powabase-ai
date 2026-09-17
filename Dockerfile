@@ -37,6 +37,15 @@ FROM python:3.13-slim
 WORKDIR /app
 ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:$PATH" \
     FLASK_APP=agentic_project_service.main:create_app
+# Two glibc malloc arenas per process instead of up to eight per CPU. The
+# Celery worker runs a threads pool, and every thread that allocates gets its
+# own arena by default; the large buffers of one extraction are freed into
+# whichever arena held them and stay mapped there. Extracting large files one
+# after another then ratchets a long-lived worker's memory up by hundreds of
+# MiB per file until it hits its limit, although each file fits on its own.
+# With two arenas that memory is reused and the worker levels off. Set here so
+# every deployment of the image gets it; see env.example for other setups.
+ENV MALLOC_ARENA_MAX=2
 # git: the docs-KB refresh (tasks/docs_refresh.py) shallow-clones its two
 # GitHub sources at runtime — without the binary those legs fail on every
 # cycle ("[Errno 2] No such file or directory: 'git'") and the KB serves
