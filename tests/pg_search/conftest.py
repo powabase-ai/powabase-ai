@@ -8,8 +8,9 @@ import pytest
 # Per-test limit (pytest-timeout) for every test in this directory that does
 # not set its own ``@pytest.mark.timeout``. Many of these tests wait on locks
 # on purpose; a regression that turns a bounded wait into an unbounded one must
-# fail that test, not hang the run. The slowest test takes a few seconds, so
-# this only ever fires on a hang. ``--timeout`` on the command line wins.
+# fail that test, not hang the run. The slowest test, the move under a live
+# re-index mix, takes 20-26 s and every other one under 4 s, so this only ever
+# fires on a hang. ``--timeout`` on the command line wins.
 PG_SEARCH_TEST_TIMEOUT_SECONDS = 120
 
 _HERE = Path(__file__).resolve().parent
