@@ -19,7 +19,7 @@ dependencies = [
     "httpx>=0.27.0",
     "python-dotenv>=1.0.0",
     "pyjwt>=2.13.0",
-    "openai>=1.0.0",
+    "openai>=2.53.0",
     "litellm>=1.90.1,!=1.92.0,!=1.92.1",  # 1.92.0/1.92.1 eager-import litellm.proxy->fastapi inside completion() whenever `tools=` is passed; fastapi is not a dependency, so every tool-calling completion raises ModuleNotFoundError. Fixed from 1.93.0. Floor is for Anthropic adaptive-thinking (Opus 4.7/4.8) reasoning separation.
     "flask-migrate>=4.0.0",
     "pgvector>=0.3.0",
