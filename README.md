@@ -52,6 +52,28 @@ gunicorn -w 4 -b 0.0.0.0:5000 agentic_project_service.main:app
 celery -A agentic_project_service.celery worker --loglevel=info
 ```
 
+## Keyword search with pg_search (optional)
+
+When the project's Postgres provides the ParadeDB
+[`pg_search`](https://github.com/paradedb/paradedb) extension (preloaded via
+`shared_preload_libraries`, with `vector` available), the service creates it at
+start-up and serves hybrid and full-text keyword search from a `USING bm25`
+index per knowledge base. Without it, keyword search uses the bm25s file index
+or the tsvector fallback.
+
+**On Postgres 15 and 16, use a pg_search build that contains
+[paradedb/paradedb#6211](https://github.com/paradedb/paradedb/pull/6211).**
+The service builds these indexes with `CREATE INDEX CONCURRENTLY` while the
+knowledge base keeps being written to, and without that fix pg_search fails
+such a build -- stock 0.25.9 can crash the Postgres server doing it. No 0.25.x
+release contains the fix; Postgres 17 and 18 are not affected.
+`ci/pg_search/Dockerfile` builds 0.25.9 with the fix, and is what the
+`tests/pg_search` suite runs against in CI:
+
+```bash
+docker build -t pg-search-ci:0.25.9-paradedb-6211 ci/pg_search  # compiles pg_search: minutes to tens of minutes
+```
+
 ## Docker
 
 The image is **published automatically to `ghcr.io/powabase-ai/powabase-ai`**

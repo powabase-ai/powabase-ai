@@ -24,6 +24,16 @@ item tables are partitioned at all:
 * **A missing index is not always a loud failure.** Readiness is therefore
   checked per knowledge base before this path is used, and a KB with no
   partition or no valid index keeps the existing keyword path.
+
+Requirement: on Postgres 15 and 16, a pg_search build that contains ParadeDB's
+fix paradedb/paradedb#6211 (no 0.25.x release does). Indexes here are built
+with ``CREATE INDEX CONCURRENTLY`` while the item table keeps being written to,
+and without the fix that build fails inside pg_search -- XX000 "buffer ... is
+not owned by resource owner", leaving the index INVALID -- or crashes the
+server, ending every session on it. Both are retried (``Bm25IndexBuildFailed``,
+and a lost connection), and the retry rebuilds the INVALID index, but under
+steady writes they recur. Postgres 17 and 18 are not affected.
+``ci/pg_search/Dockerfile`` builds 0.25.9 with the fix.
 """
 
 from __future__ import annotations
@@ -1252,9 +1262,12 @@ _LOCK_CONFLICT_SQLSTATES = frozenset({"40P01", "55P03"})
 class Bm25IndexBuildFailed(RuntimeError):
     """pg_search's own ``CREATE INDEX CONCURRENTLY`` failed with an internal error.
 
-    Seen with pg_search 0.25.9 under concurrent writes (``XX000: buffer ... is
-    not owned by resource owner``). It leaves an INVALID index that the next
-    ``ensure_bm25_index`` drops and rebuilds, so it is retried.
+    Seen with stock pg_search 0.25.9 on Postgres 15/16 under concurrent writes
+    (``XX000: buffer ... is not owned by resource owner``), fixed by
+    paradedb/paradedb#6211. It leaves an INVALID index that the next
+    ``ensure_bm25_index`` drops and rebuilds, so it is retried. The same bug can
+    crash the server instead; the build then fails with a lost connection,
+    which is retried as well (see ``_reset_statement_timeout``).
     """
 
 

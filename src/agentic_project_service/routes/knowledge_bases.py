@@ -2124,6 +2124,11 @@ def build_bm25_endpoint(kb_id: str):
     - The pg_search extension is created when the project service starts. After
       swapping in a Postgres image that provides it, restart the project
       service first; until then this builds the bm25s file index instead.
+    - On Postgres 15 and 16 the image's pg_search must contain
+      paradedb/paradedb#6211. The index is built concurrently while the item
+      table takes writes, and without that fix the build fails or crashes the
+      Postgres server (stock 0.25.9 does both). The task retries either way, but
+      under steady writes the failures recur.
 
     Returns 202 + the Celery task id. Caller can poll ``bm25_status`` (and
     ``bm25_status_reason``) on the KB to observe completion.
