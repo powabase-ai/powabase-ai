@@ -82,4 +82,4 @@ jobs:
       # The `app` fixture creates the ai schema, the vector extension and the
       # ORM tables itself, so no migration step is needed here.
       - name: Run store tests
-        run: uv run --no-sync pytest tests/test_graph_index_store.py tests/test_full_text_search_timeout_live.py -q
+        run: uv run --no-sync pytest tests/test_graph_index_store.py tests/test_full_text_search_timeout_live.py tests/test_extraction_redelivery_store.py -q

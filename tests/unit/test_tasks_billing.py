@@ -238,7 +238,9 @@ def _stub_extraction(monkeypatch, ext_mod, mock_db_session, fake_auto_metadata):
     monkeypatch.setattr(ext_mod, "get_source", lambda _: _ext_source())
     monkeypatch.setattr(ext_mod, "update_source_status", lambda *a, **kw: None)
     monkeypatch.setattr(ext_mod, "update_source_extraction_result", lambda *a, **kw: None)
-    monkeypatch.setattr(ext_mod, "get_storage", lambda: MagicMock())
+    storage = MagicMock()
+    storage.object_size.return_value = 1024  # a small file: not gated
+    monkeypatch.setattr(ext_mod, "get_storage", lambda: storage)
     monkeypatch.setattr(
         ext_mod, "asyncio", SimpleNamespace(run=lambda _coro: ({}, fake_auto_metadata))
     )
