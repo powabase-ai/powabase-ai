@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.8.0](https://github.com/powabase-ai/powabase-ai/compare/v0.7.0...v0.8.0) (2026-09-17)
+
+
+### Features
+
+* **graph_index:** bound graph expansion, ship a document outline instead ([#64](https://github.com/powabase-ai/powabase-ai/issues/64)) ([401273f](https://github.com/powabase-ai/powabase-ai/commit/401273f5b9ed6b028cacd92cfee25e0a48bfaced))
+
+
+### Bug Fixes
+
+* **deps:** bump powabase-agentic to 0.4.0 ([#75](https://github.com/powabase-ai/powabase-ai/issues/75)) ([2019bec](https://github.com/powabase-ai/powabase-ai/commit/2019becc0664182fbff7867af60e41266f2cbbd0))
+* **extraction:** keep large source files from exhausting the worker ([#74](https://github.com/powabase-ai/powabase-ai/issues/74)) ([03e5303](https://github.com/powabase-ai/powabase-ai/commit/03e530398bfd936948635767e0638a32e5ecf02a))
+* **kb-search:** bound the tsvector keyword fallback so a slow query cannot hang a search ([#72](https://github.com/powabase-ai/powabase-ai/issues/72)) ([eecf54c](https://github.com/powabase-ai/powabase-ai/commit/eecf54c16e8c904ba582b827e0248484bfbcf58f))
+
 ## [0.7.0](https://github.com/powabase-ai/powabase-ai/compare/v0.6.1...v0.7.0) (2026-08-13)
 
 

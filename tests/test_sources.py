@@ -110,7 +110,7 @@ class TestUploadSource:
         mock_task = mocker.MagicMock()
         mock_task.id = "task-123"
         mocker.patch(
-            "agentic_project_service.routes.sources.extract_source.delay",
+            "agentic_project_service.routes.sources.extract_source.apply_async",
             return_value=mock_task,
         )
 
@@ -161,7 +161,7 @@ class TestUploadSource:
         mock_task = mocker.MagicMock()
         mock_task.id = "task-456"
         mocker.patch(
-            "agentic_project_service.routes.sources.extract_source.delay",
+            "agentic_project_service.routes.sources.extract_source.apply_async",
             return_value=mock_task,
         )
 
@@ -337,7 +337,7 @@ class TestUploadDeduplication:
         mock_task = mocker.MagicMock()
         mock_task.id = "task-dup-1"
         mocker.patch(
-            "agentic_project_service.routes.sources.extract_source.delay",
+            "agentic_project_service.routes.sources.extract_source.apply_async",
             return_value=mock_task,
         )
 
@@ -389,7 +389,7 @@ class TestUploadDeduplication:
         mock_task = mocker.MagicMock()
         mock_task.id = "task-dup-2"
         mocker.patch(
-            "agentic_project_service.routes.sources.extract_source.delay",
+            "agentic_project_service.routes.sources.extract_source.apply_async",
             return_value=mock_task,
         )
 
@@ -431,7 +431,7 @@ class TestImportFromStorageDeduplication:
         mock_task = mocker.MagicMock()
         mock_task.id = "task-import-dup"
         mocker.patch(
-            "agentic_project_service.routes.sources.extract_source.delay",
+            "agentic_project_service.routes.sources.extract_source.apply_async",
             return_value=mock_task,
         )
 
@@ -469,7 +469,7 @@ class TestImportUrlNotAffectedByContentDedup:
         mock_task = mocker.MagicMock()
         mock_task.id = "task-url"
         mocker.patch(
-            "agentic_project_service.routes.sources.extract_url_source.delay",
+            "agentic_project_service.routes.sources.extract_url_source.apply_async",
             return_value=mock_task,
         )
         mocker.patch(
@@ -565,7 +565,7 @@ class TestUploadDedupRaceRecovery:
         mock_task = mocker.MagicMock()
         mock_task.id = "task-race"
         mocker.patch(
-            "agentic_project_service.routes.sources.extract_source.delay",
+            "agentic_project_service.routes.sources.extract_source.apply_async",
             return_value=mock_task,
         )
 

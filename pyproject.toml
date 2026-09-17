@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentic-project-service"
-version = "0.7.0"
+version = "0.8.0"
 description = "Per-project service for AI features: sources, knowledge bases, agents, and background tasks"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -51,6 +51,9 @@ dependencies = [
     # bounded range would make dependency automation edit this file as well as
     # the lock. Floor at 0.3.0: first release with McpError and the
     # Streamable HTTP-compliant client.
+    # Large-file extraction passes a `page_image_sink` that 0.3.1 and earlier
+    # ignore; the worker detects that at runtime and logs a WARNING rather than
+    # this floor naming a version that is not yet published.
     "powabase-agentic[rerankers]>=0.3.0",
 ]
 
