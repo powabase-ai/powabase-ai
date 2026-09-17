@@ -1367,6 +1367,90 @@ def test_an_internal_error_from_the_concurrent_bm25_build_is_raised_as_retryable
     assert "RESET statement_timeout" in conn.statements
 
 
+class _ConnectionLostConn(_FakeConn):
+    """A connection whose server went away mid-statement, as SQLAlchemy reports it.
+
+    The failing statement raises the driver's lost-connection error; after that
+    every statement is refused with ``PendingRollbackError`` until a rollback,
+    which is what a real ``Connection`` does once it has been invalidated.
+    """
+
+    def __init__(self, lost_on, error, **kw):
+        super().__init__(**kw)
+        self.lost_on = lost_on
+        self.error = error
+        self.lost = False
+        self.invalidated = False
+
+    def execute(self, statement, params=None):
+        from sqlalchemy.exc import PendingRollbackError
+
+        sql = getattr(statement, "text", str(statement))
+        if self.lost:
+            self.statements.append(sql)
+            raise PendingRollbackError("Can't reconnect until invalid transaction is rolled back.")
+        if self.lost_on in sql:
+            self.statements.append(sql)
+            self.lost = True
+            raise self.error
+        return super().execute(statement, params)
+
+    def rollback(self):
+        super().rollback()
+        self.lost = False
+
+    def invalidate(self):
+        self.invalidated = True
+
+
+def _connection_lost_error(sqlstate):
+    """The error a build's connection raises when the server dies under it.
+
+    ``None`` is a crash (psycopg: "server closed the connection unexpectedly",
+    no SQLSTATE); 57P01/57P02 are a terminated backend and a crash of another
+    backend.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    class _Orig(Exception):
+        pass
+
+    orig = _Orig("server closed the connection unexpectedly")
+    orig.sqlstate = sqlstate
+    return OperationalError("stmt", {}, orig, connection_invalidated=True)
+
+
+@pytest.mark.parametrize("sqlstate", [None, "57P01", "57P02"])
+def test_a_build_whose_server_crashed_raises_the_retryable_connection_loss(sqlstate):
+    """A pg_search build can take the server down (stock 0.25.9 on PG15/16 under
+    concurrent writes). The reset after the build then fails on the dead
+    connection; it must not replace the lost-connection error the task retries
+    with a PendingRollbackError it does not."""
+    conn = _ConnectionLostConn(
+        "USING bm25", _connection_lost_error(sqlstate), relkinds=_with_partition()
+    )
+
+    with pytest.raises(Exception) as caught:
+        pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn))
+
+    assert getattr(caught.value, "connection_invalidated", False) is True
+    assert pgb.is_transient_db_error(caught.value)
+    # The connection could not be reset, so it does not go back to the pool as is.
+    assert conn.invalidated
+
+
+def test_a_partition_completion_whose_server_crashed_raises_the_retryable_connection_loss():
+    conn = _ConnectionLostConn(
+        "quote_ident(conname)", _connection_lost_error(None), relkinds=_with_partition()
+    )
+
+    with pytest.raises(Exception) as caught:
+        pgb._complete_partition(conn, KB, "chunks")
+
+    assert pgb.is_transient_db_error(caught.value)
+    assert conn.invalidated
+
+
 def test_the_lock_holders_are_read_before_the_failed_move_rolls_back():
     """After the rollback the list was only ever the writers the move had just
     released -- never the session that refused its lock."""

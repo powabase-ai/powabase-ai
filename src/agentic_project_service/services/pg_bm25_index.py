@@ -1516,6 +1516,30 @@ def _release_advisory_lock(conn, relation: str) -> None:
             logger.debug("Could not invalidate the connection either", exc_info=True)
 
 
+def _reset_statement_timeout(conn) -> None:
+    """Undo a build's ``SET statement_timeout = 0`` without hiding the build's error.
+
+    Called from the ``finally`` of a build whose connection may already be gone:
+    a server that crashes or restarts mid-build ends every session, and
+    SQLAlchemy then refuses any further statement on the connection
+    (``PendingRollbackError``). Raised from here, that would replace the build's
+    own error -- a lost connection, which the task retries -- with one it does
+    not retry. So a failed reset is logged, and the connection is discarded
+    rather than returned to the pool with no statement timeout.
+    """
+    try:
+        conn.execute(text("RESET statement_timeout"))
+    except Exception as exc:
+        logger.warning(
+            "Could not reset statement_timeout after a build (%s); discarding the connection",
+            first_error_line(exc),
+        )
+        try:
+            conn.invalidate()
+        except Exception:
+            logger.debug("Could not invalidate the connection either", exc_info=True)
+
+
 def _insertable_columns(conn, relname: str) -> list[str]:
     """A relation's columns in order, quoted, leaving out generated ones."""
     return [
@@ -1748,7 +1772,7 @@ def _complete_partition(conn, kb_id: str, item_table: str) -> dict:
             )
             done.setdefault("built_indexes", []).append(definition["tail"])
     finally:
-        conn.execute(text("RESET statement_timeout"))
+        _reset_statement_timeout(conn)
     if done:
         logger.info("Completed partition %s.%s: %s", AI_SCHEMA, partition, done)
     return done
@@ -2909,7 +2933,7 @@ def _ensure_index_locked(
             ) from exc
         raise
     finally:
-        conn.execute(text("RESET statement_timeout"))
+        _reset_statement_timeout(conn)
 
     invalidate_bm25_index_cache(kb_id)
     return {**outcome, "status": bm25_index_state(conn, kb_id, item_table)}

@@ -1112,6 +1112,67 @@ def test_ensure_repairs_an_index_whose_concurrent_build_failed(engine, session, 
     assert len(_search(session, "Wanderung", top_k=5)) == 2
 
 
+def test_a_build_whose_backend_is_killed_is_retryable_and_the_retry_repairs_it(engine, session):
+    """A concurrent bm25 build can lose its server mid-build: stock pg_search
+    0.25.9 on PG15/16 crashes it under concurrent writes, which ends every
+    session. Terminating the building backend gives the build's connection the
+    same shape of failure. The task retries it only if the error that reaches it
+    is still the lost connection, and the retry must repair the INVALID index
+    the dead build left behind."""
+    _seed(session, KB_A, 200_000)
+    partition = pgb.partition_name(KB_A, "chunks")
+    killed: list[int] = []
+    building = threading.Event()
+
+    def kill_the_build():
+        building.wait(timeout=60)
+        deadline = time.monotonic() + 60
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            while not killed and time.monotonic() < deadline:
+                pid = conn.execute(
+                    text(
+                        "SELECT pid FROM pg_stat_progress_create_index "
+                        "WHERE relid = to_regclass(:partition)"
+                    ),
+                    {"partition": f"{SCHEMA}.{partition}"},
+                ).scalar()
+                if (
+                    pid is not None
+                    and conn.execute(
+                        text("SELECT pg_terminate_backend(:pid)"), {"pid": pid}
+                    ).scalar()
+                ):
+                    killed.append(pid)
+                time.sleep(0.01)
+
+    def before_execute(conn, cursor, statement, parameters, context, executemany):
+        if "USING bm25" in statement:
+            building.set()
+
+    event.listen(engine, "before_cursor_execute", before_execute)
+    killer = threading.Thread(target=kill_the_build, daemon=True)
+    killer.start()
+    try:
+        with pytest.raises(Exception) as caught:
+            pgb.ensure_bm25_index(KB_A, engine=engine)
+    finally:
+        event.remove(engine, "before_cursor_execute", before_execute)
+        building.set()
+        killer.join(timeout=70)
+
+    assert killed, "the build finished before it could be terminated"
+    assert pgb.is_transient_db_error(caught.value), repr(caught.value)
+    assert pgb.bm25_index_state(session, KB_A, "chunks") == "building"
+    session.rollback()
+
+    pgb.reset_pg_bm25_caches()
+    result = pgb.ensure_bm25_index(KB_A, engine=engine)
+
+    assert result["status"] == "ready"
+    assert result.get("repaired_invalid_index") is True
+    assert len(_search(session, "Wanderung", top_k=5)) == 5
+
+
 def test_a_kb_with_no_strategy_key_is_indexed_as_chunk_embed(engine, session):
     """Search treats a missing strategy as chunk_embed, so the build must too."""
     session.execute(
