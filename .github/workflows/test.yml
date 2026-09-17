@@ -104,8 +104,28 @@ jobs:
   # failure, and the run step also fails on any skip at all: a job whose only
   # purpose is this extension must not go green by skipping it.
   #
-  # This image is NOT the production Postgres image, and the differences are
-  # visible to these tests:
+  # The server is NOT the stock paradedb/paradedb:0.25.9-pg15 image. Stock
+  # pg_search 0.25.9 on Postgres 15 and 16 fails a bm25 CREATE INDEX
+  # CONCURRENTLY while another backend writes to the table -- XX000 "buffer ...
+  # is not owned by resource owner", or a server crash -- and these tests build
+  # indexes under concurrent writes on purpose, so on the stock image the job
+  # fails intermittently. ci/pg_search/Dockerfile rebuilds pg_search from the
+  # v0.25.9 source with ParadeDB's fix (paradedb/paradedb#6211, in no 0.25.x
+  # release) on top of that image; everything else in the image is upstream's.
+  # A deployment on Postgres 15 or 16 needs a pg_search build with that fix too.
+  #
+  # The compile is slow: 8 minutes with 16 parallel jobs on a workstation, so
+  # expect upwards of 30 on a hosted runner's 4 CPUs. Its layers go to the GitHub Actions cache
+  # (buildx, type=gha), so only a run that changes ci/pg_search/ or finds no
+  # usable cache pays for it; the rest restore it in a minute or two (locally, a build from a warm cache
+  # took 20 s). A pull
+  # request reads the cache its base branch wrote, so a push to main is what
+  # keeps it warm for everyone. A service container cannot use an image built
+  # by the job's own steps, so the server is started with docker run after the
+  # build.
+  #
+  # This image is NOT the production Postgres image either, and the differences
+  # are visible to these tests:
   # - supautils: production runs it, and it lets ordinary roles create
   #   privileged extensions such as pg_search. Here nothing does, so a test that
   #   makes CREATE EXTENSION fail by withholding a role's privilege passes here
@@ -123,30 +143,52 @@ jobs:
   #
   # Hangs: tests/pg_search/conftest.py gives every test there a pytest-timeout
   # limit, so a lock wait that never returns fails that test instead of the
-  # run; timeout-minutes bounds the whole job as a backstop.
+  # run; timeout-minutes bounds the whole job as a backstop, sized for a cold
+  # compile and cache upload (30-40 minutes) plus the suite (2-3).
   pg_search:
-    name: pytest tests/pg_search (Postgres 15 + pg_search 0.25.9)
+    name: pytest tests/pg_search (Postgres 15 + pg_search 0.25.9 with paradedb#6211)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    services:
-      postgres:
-        image: paradedb/paradedb:0.25.9-pg15
-        env:
-          POSTGRES_USER: supabase_admin
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U supabase_admin -d postgres_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
+    timeout-minutes: 60
     env:
       DATABASE_URL: postgresql+psycopg://supabase_admin:postgres@localhost:5432/pg_search_test
       PG_SEARCH_REQUIRED: "1"
+      PG_IMAGE: pg-search-ci:0.25.9-paradedb-6211
     steps:
       - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # A cache scope of its own, so no other image built here overwrites this
+      # one's cache entry. mode=max keeps the builder stage's layers (toolchain,
+      # compile), not only the final image's.
+      - name: Build Postgres with the patched pg_search
+        uses: docker/build-push-action@v6
+        with:
+          context: ci/pg_search
+          load: true
+          tags: ${{ env.PG_IMAGE }}
+          cache-from: type=gha,scope=pg-search-0.25.9-paradedb-6211
+          cache-to: type=gha,scope=pg-search-0.25.9-paradedb-6211,mode=max
+
+      # Readiness is checked over TCP from the runner: the image's init scripts
+      # run a temporary server on the Unix socket only, which pg_isready inside
+      # the container would report ready before the real one starts.
+      - name: Start Postgres
+        run: |
+          docker run -d --name postgres -p 5432:5432 \
+            -e POSTGRES_USER=supabase_admin \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=postgres_test \
+            "$PG_IMAGE"
+          for _ in $(seq 1 60); do
+            if pg_isready -h localhost -p 5432 -U supabase_admin -d postgres_test -q; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs postgres
+          echo "::error::Postgres did not become ready"
+          exit 1
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
@@ -176,3 +218,18 @@ jobs:
             echo "::error::tests/pg_search skipped tests; this job must run all of them"
             exit 1
           fi
+
+      # A backend that crashed restarts the server and fails whatever test was
+      # running, but a crash between tests, or one the retries absorbed, would
+      # not fail the run. The server's own log says so either way.
+      - name: Check the server log for crashed backends
+        if: always()
+        run: |
+          if docker logs postgres 2>&1 | grep "terminated by signal"; then
+            echo "::error::a Postgres backend crashed during the run"
+            exit 1
+          fi
+
+      - name: Postgres log
+        if: failure()
+        run: docker logs postgres 2>&1 | tail -n 300
