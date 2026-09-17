@@ -79,7 +79,7 @@ def upgrade():
             "search keeps using the bm25s file index or the tsvector fallback; the "
             "start-up hook retries on every start.",
             EXTENSION,
-            str(getattr(exc, "orig", exc)).strip().splitlines()[0],
+            (str(getattr(exc, "orig", exc)).strip().splitlines() or [type(exc).__name__])[0],
         )
         return
 

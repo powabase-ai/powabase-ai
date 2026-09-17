@@ -51,6 +51,28 @@ def tasks():
         yield {"ensure": ensure, "build": build, "drop": drop}
 
 
+class _gate:
+    """Patch the two catalog reads that decide whether a PATCH may dispatch the
+    ensure. ``kb_has_rows_in_default`` is created if the service does not
+    define it yet."""
+
+    def __init__(self, partition, rows_in_default):
+        self._patches = {
+            "partition_exists": patch(f"{S}.partition_exists", return_value=partition),
+            "kb_has_rows_in_default": patch(
+                f"{S}.kb_has_rows_in_default", return_value=rows_in_default, create=True
+            ),
+        }
+
+    def __enter__(self):
+        return {name: p.__enter__() for name, p in self._patches.items()}
+
+    def __exit__(self, *exc):
+        for p in reversed(list(self._patches.values())):
+            p.__exit__(*exc)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # The single predicate
 # ---------------------------------------------------------------------------
@@ -165,7 +187,16 @@ class TestCreate:
 
 
 class TestUpdate:
-    def _patch(self, old_config, new_config, backend, *, auto_indexing=True):
+    def _patch(
+        self,
+        old_config,
+        new_config,
+        backend,
+        *,
+        auto_indexing=True,
+        partition=True,
+        rows_in_default=False,
+    ):
         kb_id = str(uuid.uuid4())
         with (
             _AUTH,
@@ -176,6 +207,7 @@ class TestUpdate:
             patch(f"{R}._pg_search_available", return_value=backend == "pg_search"),
             patch(f"{R}.get_setting", return_value=auto_indexing),
             patch(f"{R}.get_knowledge_base", return_value=({"id": kb_id}, 200)),
+            _gate(partition, rows_in_default) as gate,
         ):
             resp = _client().patch(
                 f"/api/knowledge-bases/{kb_id}",
@@ -183,6 +215,8 @@ class TestUpdate:
                 headers=_headers(),
             )
         assert resp.status_code == 200
+        self.body = resp.get_json()
+        self.gate = gate
         return kb_id
 
     @pytest.mark.parametrize("method", ["hybrid", "full_text"])
@@ -239,13 +273,149 @@ class TestUpdate:
         tasks["drop"].delay.side_effect = Exception("broker unreachable")
         self._patch({"method": "hybrid"}, {"method": "vector_search"}, "pg_search")
 
+    @pytest.mark.parametrize(
+        "old, new",
+        [
+            ({"method": "hybrid"}, {"method": "full_text"}),
+            ({"method": "full_text"}, {"method": "hybrid"}),
+            (
+                {"method": "hybrid", "ts_language": "german"},
+                {"method": "hybrid", "ts_language": "german"},
+            ),
+            ({"method": "hybrid"}, {"method": "hybrid", "top_k": 7}),
+        ],
+    )
+    def test_keyword_to_keyword_on_pg_search_dispatches_nothing(self, tasks, old, new):
+        """Nothing about the index changes, so nothing may be dispatched -- even
+        for a KB whose partition exists and whose ensure would be cheap."""
+        self._patch(old, new, "pg_search", partition=True)
+        tasks["ensure"].delay.assert_not_called()
+        tasks["build"].delay.assert_not_called()
+        tasks["drop"].delay.assert_not_called()
+        assert "bm25_note" not in self.body
+
+
+class TestUpdateDoesNotStartAMove:
+    """A PATCH may reconcile a KB's pg_search index only when that cannot move
+    rows out of DEFAULT: its partition already exists, or it has no rows in
+    DEFAULT to move. Anything else blocks writes to the whole item table for
+    the length of the move, which only an operator may start
+    (``POST /build-bm25``)."""
+
+    _patch = TestUpdate._patch
+
+    @pytest.mark.parametrize(
+        "old, new",
+        [
+            ({"method": "vector_search"}, {"method": "hybrid"}),
+            (
+                {"method": "hybrid", "ts_language": "english"},
+                {"method": "hybrid", "ts_language": "german"},
+            ),
+        ],
+    )
+    def test_an_existing_partition_dispatches_the_ensure(self, tasks, old, new):
+        kb_id = self._patch(old, new, "pg_search", partition=True, rows_in_default=None)
+        tasks["ensure"].delay.assert_called_once_with(kb_id)
+        assert "bm25_note" not in self.body
+        assert self.gate["partition_exists"].call_args.args[1:] == (kb_id, "chunks")
+
+    def test_no_rows_in_default_dispatches_the_ensure(self, tasks):
+        kb_id = self._patch(
+            {"method": "vector_search"},
+            {"method": "hybrid"},
+            "pg_search",
+            partition=False,
+            rows_in_default=False,
+        )
+        tasks["ensure"].delay.assert_called_once_with(kb_id)
+        assert "bm25_note" not in self.body
+        assert self.gate["kb_has_rows_in_default"].call_args.args[1:] == (kb_id, "chunks")
+
+    @pytest.mark.parametrize("rows_in_default", [True, None])
+    @pytest.mark.parametrize(
+        "old, new",
+        [
+            ({"method": "vector_search"}, {"method": "hybrid"}),
+            ({"method": "vector_search"}, {"method": "full_text"}),
+            (
+                {"method": "hybrid", "ts_language": "english"},
+                {"method": "hybrid", "ts_language": "german"},
+            ),
+        ],
+    )
+    def test_rows_in_default_dispatch_nothing_and_point_at_build_bm25(
+        self, tasks, old, new, rows_in_default
+    ):
+        """``None`` is "cannot tell", which must not start a move either."""
+        kb_id = self._patch(old, new, "pg_search", partition=False, rows_in_default=rows_in_default)
+        tasks["ensure"].delay.assert_not_called()
+        tasks["build"].delay.assert_not_called()
+        tasks["drop"].delay.assert_not_called()
+        note = self.body["bm25_note"]
+        assert f"POST /api/knowledge-bases/{kb_id}/build-bm25" in note
+        assert "blocks writes" in note
+        assert "chunks" in note
+
+    def test_an_unreadable_gate_dispatches_nothing(self, tasks):
+        with patch(f"{S}.partition_exists", side_effect=RuntimeError("connection lost")):
+            kb_id = str(uuid.uuid4())
+            with (
+                _AUTH,
+                patch(f"{R}.db"),
+                patch(f"{R}._read_existing_retrieval_config", return_value={}),
+                patch(f"{R}._read_kb_strategy", return_value="chunk_embed"),
+                patch(f"{R}._keyword_index_backend", return_value="pg_search"),
+                patch(f"{R}._pg_search_available", return_value=True),
+                patch(f"{R}.get_setting", return_value=True),
+                patch(f"{R}.get_knowledge_base", return_value=({"id": kb_id}, 200)),
+            ):
+                resp = _client().patch(
+                    f"/api/knowledge-bases/{kb_id}",
+                    json={"retrieval_config": {"method": "hybrid"}},
+                    headers=_headers(),
+                )
+        assert resp.status_code == 200
+        tasks["ensure"].delay.assert_not_called()
+        assert "build-bm25" in resp.get_json()["bm25_note"]
+
+    def test_a_failed_get_is_returned_without_a_note(self, tasks):
+        kb_id = str(uuid.uuid4())
+        with (
+            _AUTH,
+            patch(f"{R}.db"),
+            patch(f"{R}._read_existing_retrieval_config", return_value={}),
+            patch(f"{R}._read_kb_strategy", return_value="chunk_embed"),
+            patch(f"{R}._keyword_index_backend", return_value="pg_search"),
+            patch(f"{R}._pg_search_available", return_value=True),
+            patch(f"{R}.get_knowledge_base", return_value=({"error": "gone"}, 404)),
+            _gate(False, True),
+        ):
+            resp = _client().patch(
+                f"/api/knowledge-bases/{kb_id}",
+                json={"retrieval_config": {"method": "hybrid"}},
+                headers=_headers(),
+            )
+        assert resp.status_code == 404
+        assert resp.get_json() == {"error": "gone"}
+
 
 class TestUpdateStrategy:
     """A PATCH that changes ``indexing_config.strategy`` moves the keyword text
     to another item table, so the KB needs its index there -- and the one on
     the old table is dead weight."""
 
-    def _patch(self, body, *, old_strategy, new_backend, method="hybrid", pg_available=True):
+    def _patch(
+        self,
+        body,
+        *,
+        old_strategy,
+        new_backend,
+        method="hybrid",
+        pg_available=True,
+        partition=True,
+        rows_in_default=False,
+    ):
         kb_id = str(uuid.uuid4())
         with (
             _AUTH,
@@ -256,9 +426,12 @@ class TestUpdateStrategy:
             patch(f"{R}._pg_search_available", return_value=pg_available),
             patch(f"{R}.get_setting", return_value=True),
             patch(f"{R}.get_knowledge_base", return_value=({"id": kb_id}, 200)),
+            _gate(partition, rows_in_default) as gate,
         ):
             resp = _client().patch(f"/api/knowledge-bases/{kb_id}", json=body, headers=_headers())
         assert resp.status_code == 200
+        self.body = resp.get_json()
+        self.gate = gate
         return kb_id, backend
 
     @pytest.mark.parametrize("method", ["hybrid", "full_text"])
@@ -312,6 +485,32 @@ class TestUpdateStrategy:
         tasks["ensure"].delay.assert_not_called()
         tasks["drop"].delay.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"indexing_config": {"strategy": "full_document"}},
+            {
+                "indexing_config": {"strategy": "full_document"},
+                "retrieval_config": {"method": "hybrid"},
+            },
+        ],
+    )
+    def test_rows_in_the_new_tables_default_start_no_move(self, tasks, body):
+        """The index on the table the KB left is dead weight either way, so it
+        is dropped; the new one waits for POST /build-bm25."""
+        kb_id, _ = self._patch(
+            body,
+            old_strategy="chunk_embed",
+            new_backend="pg_search",
+            partition=False,
+            rows_in_default=True,
+        )
+        tasks["ensure"].delay.assert_not_called()
+        tasks["drop"].delay.assert_called_once_with(kb_id, drop_partitions=False)
+        assert "build-bm25" in self.body["bm25_note"]
+        assert "full_documents" in self.body["bm25_note"]
+        assert self.gate["partition_exists"].call_args.args[1:] == (kb_id, "full_documents")
+
     def test_strategy_and_retrieval_change_together_dispatch_one_ensure(self, tasks):
         kb_id, _ = self._patch(
             {
@@ -349,7 +548,9 @@ class TestBuildEndpoint:
         ):
             kb_id, resp = self._post()
         assert resp.status_code == 202
-        assert resp.get_json() == {"task_id": "task-ensure", "knowledge_base_id": kb_id}
+        body = resp.get_json()
+        assert (body["task_id"], body["knowledge_base_id"]) == ("task-ensure", kb_id)
+        assert set(body) == {"task_id", "knowledge_base_id", "note"}
         tasks["ensure"].delay.assert_called_once_with(kb_id)
         tasks["build"].delay.assert_not_called()
 
@@ -383,6 +584,28 @@ class TestBuildEndpoint:
         assert resp.status_code == 202
         tasks["build"].delay.assert_called_once_with(kb_id)
         tasks["ensure"].delay.assert_not_called()
+
+    @pytest.mark.parametrize("installed", [True, False])
+    def test_the_202_states_the_write_block_and_the_restart(self, tasks, installed):
+        """Both obligations an operator has before calling this: the first build
+        of an existing KB blocks writes to its whole item table, and the
+        extension is only enabled once the service restarts after the Postgres
+        image swap (otherwise this silently builds the file index)."""
+        with (
+            patch(f"{S}.pg_search_installed", return_value=installed),
+            patch(f"{S}._item_table_is_partitioned", return_value=True),
+        ):
+            _, resp = self._post()
+        assert resp.status_code == 202
+        note = resp.get_json()["note"]
+        assert "blocks writes" in note
+        assert "chunks" in note
+        assert "restart the project service" in note
+
+    def test_the_docstring_states_the_write_block_and_the_restart(self):
+        doc = " ".join(kb_route.build_bm25_endpoint.__doc__.split())
+        assert "blocks writes" in doc
+        assert "restart" in doc
 
     def test_an_unmapped_strategy_is_a_400_on_pg_search_too(self, tasks):
         with (
@@ -455,3 +678,140 @@ class TestStatus:
             store_cls.return_value.read_metadata.return_value = {"item_count": 3}
             assert kb_route._compute_bm25_status(self.KB) == "ready"
         pg_status.assert_not_called()
+
+
+class TestStatusReportsThePersistedBuildOutcome:
+    """On a pg_search item table, a KB whose own index is not serving yet
+    reports the last recorded outcome of its move/build -- a retrying or
+    failed move must not look like a KB nobody scheduled."""
+
+    KB = TestStatus.KB
+
+    @staticmethod
+    def _outcome(status, reason=None, item_table="chunks", attempts=None):
+        return {
+            "status": status,
+            "reason": reason,
+            "item_table": item_table,
+            "attempts": attempts,
+            "updated_at": None,
+        }
+
+    def _detail(self, *, pg_state, outcome, backend="pg_search", auto_indexing=True, file=True):
+        with (
+            patch(f"{R}.db"),
+            patch(f"{R}._keyword_index_backend", return_value=backend),
+            patch(f"{R}.pg_bm25_status", return_value=pg_state),
+            patch(f"{R}.read_bm25_build_outcome", return_value=outcome) as read,
+            patch(f"{R}.get_setting", return_value=auto_indexing),
+            patch(f"{R}.SparseIndexStore") as store_cls,
+            patch(f"{R}._count_items_for_kb_bm25", return_value=3),
+        ):
+            store_cls.return_value.index_exists.return_value = file
+            store_cls.return_value.read_metadata.return_value = {"item_count": 3}
+            return kb_route._bm25_status_detail(self.KB), read
+
+    @pytest.mark.parametrize("status", ["queued", "moving", "building", "retrying", "failed"])
+    def test_a_file_served_kb_reports_its_pending_or_failed_move(self, status):
+        (got, reason), _ = self._detail(
+            pg_state="absent", outcome=self._outcome(status, reason="lock_not_available")
+        )
+        assert got == status
+        assert reason == "lock_not_available"
+
+    def test_the_status_is_reported_with_auto_indexing_on(self):
+        """Auto-indexing on used to omit the field for a file-served KB."""
+        (got, _), _ = self._detail(
+            pg_state="absent", outcome=self._outcome("failed", "gave up"), auto_indexing=True
+        )
+        assert got == "failed"
+
+    def test_an_invalid_index_with_a_failed_build_reports_failed(self):
+        (got, reason), _ = self._detail(
+            pg_state="building", outcome=self._outcome("failed", "index build failed")
+        )
+        assert (got, reason) == ("failed", "index build failed")
+
+    def test_a_served_kb_ignores_the_outcome(self):
+        (got, reason), read = self._detail(
+            pg_state="ready", outcome=self._outcome("failed", "old failure")
+        )
+        assert (got, reason) == ("ready", None)
+        read.assert_not_called()
+
+    def test_an_outcome_for_another_item_table_is_ignored(self):
+        (got, reason), _ = self._detail(
+            pg_state="absent",
+            outcome=self._outcome("failed", "old table", item_table="full_documents"),
+            auto_indexing=False,
+        )
+        assert (got, reason) == ("ready", None)
+
+    def test_a_ready_outcome_without_a_ready_index_is_not_reported(self):
+        """The index was dropped since (a strategy or ts_language change); the
+        recorded "ready" is history, and the file index is what search reads."""
+        (got, reason), _ = self._detail(
+            pg_state="absent", outcome=self._outcome("ready"), auto_indexing=False
+        )
+        assert (got, reason) == ("ready", None)
+
+    def test_no_outcome_keeps_reporting_the_file_index(self):
+        (got, reason), _ = self._detail(pg_state="absent", outcome=None, auto_indexing=False)
+        assert (got, reason) == ("ready", None)
+
+    def test_the_file_index_backend_never_reads_the_outcome(self):
+        (got, _), read = self._detail(
+            pg_state="absent",
+            outcome=self._outcome("failed", "x"),
+            backend="bm25s",
+            auto_indexing=False,
+        )
+        assert got == "ready"
+        read.assert_not_called()
+
+    def test_an_unreadable_outcome_falls_back_to_the_index_state(self):
+        """Outside an app context even ``db.session`` raises; the status must
+        still come back."""
+        with (
+            patch(f"{R}._keyword_index_backend", return_value="pg_search"),
+            patch(f"{R}.pg_bm25_status", return_value="building"),
+            patch(f"{R}.read_bm25_build_outcome", side_effect=RuntimeError("no app context")),
+        ):
+            assert kb_route._bm25_status_detail(self.KB) == ("building", None)
+
+    def test_compute_bm25_status_returns_only_the_status(self):
+        with patch(f"{R}._bm25_status_detail", return_value=("failed", "why")):
+            assert kb_route._compute_bm25_status(self.KB) == "failed"
+
+
+class TestStatusField:
+    def _get(self, detail):
+        kb_id = "11111111-1111-1111-1111-111111111111"
+        kb = {
+            "id": kb_id,
+            "name": "kb",
+            "description": None,
+            "indexing_config": {"strategy": "chunk_embed"},
+            "retrieval_config": {"method": "hybrid"},
+            "created_at": None,
+            "updated_at": None,
+        }
+        with (
+            _AUTH,
+            patch(f"{R}.db") as db,
+            patch(f"{R}._fetch_kb_or_404", return_value=kb),
+            patch(f"{R}._compute_drift", return_value="none"),
+            patch(f"{R}._bm25_status_detail", return_value=detail),
+        ):
+            db.session.execute.return_value = iter([])
+            return _client().get(f"/api/knowledge-bases/{kb_id}", headers=_headers()).get_json()
+
+    def test_the_reason_is_in_the_response(self):
+        body = self._get(("retrying", "lock_not_available (attempt 2)"))
+        assert body["bm25_status"] == "retrying"
+        assert body["bm25_status_reason"] == "lock_not_available (attempt 2)"
+
+    def test_no_reason_no_field(self):
+        body = self._get(("ready", None))
+        assert body["bm25_status"] == "ready"
+        assert "bm25_status_reason" not in body

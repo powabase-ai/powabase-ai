@@ -5,7 +5,7 @@ import logging
 import uuid
 from typing import Any
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, make_response, request
 from sqlalchemy import text
 
 from ..auth import require_auth
@@ -17,8 +17,11 @@ from ..services.base_vector_store import (
     get_retrieval_degradations,
     reset_retrieval_degradations,
 )
+from ..services import pg_bm25_index
+from ..services.bm25_build_outcome import read_bm25_build_outcome
 from ..services.pg_bm25_index import (
     keyword_index_backend,
+    pg_bm25_item_table,
     pg_bm25_status,
     pg_search_installed,
 )
@@ -306,27 +309,21 @@ def _read_existing_retrieval_config(kb_id: str) -> dict:
 
 
 def _count_items_for_kb_bm25(kb_id: str, item_table: str) -> int:
-    """COUNT(*) of items in the right table for this KB, used for stale detection."""
-    if item_table == "chunks":
-        sql = (
-            f'SELECT COUNT(*) FROM "{AI_SCHEMA}".chunks c '
-            f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = c.indexed_source_id '
-            f"WHERE i.knowledge_base_id = :kb"
-        )
-    elif item_table == "full_documents":
-        sql = (
-            f'SELECT COUNT(*) FROM "{AI_SCHEMA}".full_documents d '
-            f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = d.indexed_source_id '
-            f"WHERE i.knowledge_base_id = :kb"
-        )
-    elif item_table == "graph_index_nodes":
-        sql = (
-            f'SELECT COUNT(*) FROM "{AI_SCHEMA}".graph_index_nodes n '
-            f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = n.indexed_source_id '
-            f"WHERE i.knowledge_base_id = :kb"
-        )
-    else:
+    """COUNT(*) of items in the right table for this KB, used for stale detection.
+
+    Filters on the item table's own ``knowledge_base_id`` as well as through
+    ``indexed_sources``: that column is the partition key, so the count scans
+    only the KB's partition (or DEFAULT), not every KB's.
+    """
+    aliases = {"chunks": "c", "full_documents": "d", "graph_index_nodes": "n"}
+    alias = aliases.get(item_table)
+    if alias is None:
         return 0
+    sql = (
+        f'SELECT COUNT(*) FROM "{AI_SCHEMA}".{item_table} {alias} '
+        f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = {alias}.indexed_source_id '
+        f"WHERE {alias}.knowledge_base_id = :kb AND i.knowledge_base_id = :kb"
+    )
     row = db.session.execute(text(sql), {"kb": kb_id}).fetchone()
     return int(row[0]) if row else 0
 
@@ -388,14 +385,19 @@ def _pg_bm25_inputs_changed(old_config: dict, new_config: dict) -> bool:
 def _dispatch_ensure_pg_bm25_index(kb_id: str) -> None:
     """Ask a worker to reconcile this KB's pg_search partition and index.
 
-    Never fatal, and always off the request path: the first run for a KB moves
-    that KB's rows out of the item table's DEFAULT partition in one
-    transaction, and writes to that whole item table -- every KB on it -- wait
-    for the full move. Readers do not wait on its SHARE locks; readers of the
-    DEFAULT partition wait at most a fraction of a second for each of its
-    ACCESS EXCLUSIVE steps (see ``create_partition``). Dispatching it at KB
-    creation, before the KB has any rows, is what keeps that move free for
-    every KB created from here on.
+    Never fatal, and always off the request path. For a KB whose rows are
+    still in the item table's DEFAULT partition, the run moves them into the
+    KB's own partition in one transaction, and writes to that whole item
+    table -- every KB on it -- are blocked for the full move. Readers do not
+    wait on its SHARE locks; readers of the DEFAULT partition wait at most a
+    fraction of a second for each of its ACCESS EXCLUSIVE steps (see
+    ``create_partition``).
+
+    So only two callers dispatch it: KB creation, before the KB has any rows
+    (which is what keeps the move free for every KB created from here on),
+    and a PATCH that ``_pg_ensure_cannot_move_rows`` clears; the operator's
+    ``POST /build-bm25`` dispatches the task directly. A PATCH on a KB with
+    rows in DEFAULT dispatches nothing and points at ``/build-bm25`` instead.
 
     The task itself decides whether there is anything to do at all: no
     extension, a strategy with no keyword table, an item table that is not
@@ -410,6 +412,49 @@ def _dispatch_ensure_pg_bm25_index(kb_id: str) -> None:
             kb_id,
             exc_info=True,
         )
+
+
+def _pg_ensure_cannot_move_rows(kb_id: str, strategy: str | None) -> bool:
+    """May a PATCH dispatch the pg_search ensure for this KB?
+
+    Yes only when the ensure cannot start a table-wide move: the KB's
+    partition on the strategy's item table already exists (the ensure only
+    builds or rebuilds the index on it), or the KB has no rows in that table's
+    DEFAULT partition (there is nothing to move; an empty KB gets its partition
+    without blocking writers). A KB with rows in DEFAULT -- or one the catalog
+    cannot answer for -- is left to the operator's ``POST /build-bm25``.
+    Never raises; "can't tell" is False.
+    """
+    item_table = pg_bm25_item_table(strategy or "chunk_embed")
+    if item_table is None:
+        return False
+    try:
+        if pg_bm25_index.partition_exists(db.session, kb_id, item_table):
+            return True
+        return pg_bm25_index.kb_has_rows_in_default(db.session, kb_id, item_table) is False
+    except Exception:
+        logger.warning(
+            "Could not tell whether KB %s has its own %s partition or rows in DEFAULT; "
+            "not dispatching the pg_search index build from this update",
+            kb_id,
+            item_table,
+            exc_info=True,
+        )
+        return False
+
+
+def _build_bm25_required_note(kb_id: str, strategy: str | None) -> str:
+    """The PATCH response note for a KB whose index this update did not build."""
+    item_table = pg_bm25_item_table(strategy or "chunk_embed") or "item"
+    return (
+        "This knowledge base's keyword index was not built by this update: its "
+        f"{item_table} rows are still in the table's shared DEFAULT partition, and "
+        "moving them into their own partition blocks writes to the whole "
+        f"{AI_SCHEMA}.{item_table} table -- every knowledge base on it -- for the "
+        "duration of the move. Build it when that is acceptable with "
+        f"POST /api/knowledge-bases/{kb_id}/build-bm25. Until then keyword search "
+        "keeps its existing path."
+    )
 
 
 def _dispatch_drop_pg_bm25_index(kb_id: str) -> None:
@@ -431,28 +476,74 @@ def _dispatch_drop_pg_bm25_index(kb_id: str) -> None:
         )
 
 
+# Recorded outcomes that describe a move/build still to finish, or one that
+# gave up. A recorded "ready" is not in here: once the index serves, its own
+# state is reported, and a "ready" without a ready index is history (the index
+# was dropped or is being rebuilt since).
+_UNFINISHED_BM25_BUILD_STATUSES = frozenset({"queued", "moving", "building", "retrying", "failed"})
+
+
+def _unfinished_bm25_build_outcome(kb_id: str, item_table: str | None) -> dict | None:
+    """The KB's recorded move/build outcome on ``item_table``, if unfinished.
+
+    None when there is no such record, when the latest record is for another
+    item table (the KB's strategy changed since), or when it cannot be read.
+    Never raises.
+    """
+    if item_table is None:
+        return None
+    try:
+        outcome = read_bm25_build_outcome(db.session, kb_id)
+    except Exception:
+        logger.debug("Could not read the bm25 build outcome for KB %s", kb_id, exc_info=True)
+        return None
+    if not outcome or outcome.get("item_table") != item_table:
+        return None
+    if outcome.get("status") not in _UNFINISHED_BM25_BUILD_STATUSES:
+        return None
+    return outcome
+
+
 def _compute_bm25_status(kb) -> str | None:
     """The ``bm25_status`` field of the KB detail response, or None to omit it.
 
-    Values:
+    See ``_bm25_status_detail`` for the values.
+    """
+    return _bm25_status_detail(kb)[0]
+
+
+def _bm25_status_detail(kb) -> tuple[str | None, str | None]:
+    """``(bm25_status, bm25_status_reason)`` for the KB detail response.
+
+    A None status means "omit the field"; a None reason means "omit the
+    reason". Values of ``bm25_status``:
       - ``"absent"``: no index exists yet -- neither a pg_search index nor,
         for a KB that predates the extension, a bm25s file index;
       - ``"building"``: the pg_search index exists but cannot answer a query
-        yet (a concurrent build still running, or one that did not finish);
+        yet (a concurrent build still running, or one that did not finish),
+        or the recorded move/build is building it;
       - ``"stale"``: the bm25s file index is older than the KB's items
         (file index only);
-      - ``"ready"``: the index serves keyword queries.
+      - ``"ready"``: the index serves keyword queries;
+      - ``"queued"``, ``"moving"``, ``"retrying"``, ``"failed"``: pg_search
+        only, the recorded outcome of the move/build that gives the KB its
+        own index (``ai.bm25_index_builds``) -- dispatched, moving its rows
+        out of DEFAULT, waiting to retry, or given up. These come with
+        ``bm25_status_reason`` when the worker recorded one.
 
     The index reported is the one the keyword leg actually uses (see
     ``_keyword_index_backend``): the pg_search index when that is the
-    backend and the KB has one, the bm25s file index otherwise -- including a
-    KB that predates the extension and has not been given its own index yet
-    (``POST /build-bm25`` does that).
+    backend and the KB has a ready one; otherwise, on a pg_search item table,
+    the recorded outcome of the move/build that has not finished (or gave
+    up), so an operator can see it; and failing both, the bm25s file index --
+    including a KB that predates the extension and has not been given its own
+    index yet (``POST /build-bm25`` does that).
 
-    Returns None (caller should omit the field) when:
+    The status is None (caller should omit the field) when:
       - the KB's retrieval method does not use BM25, OR
-      - there is no pg_search index to report on AND BM25_AUTO_INDEXING is on
-        (platform manages the file index; user has nothing to act on).
+      - there is no pg_search index or recorded outcome to report on AND
+        BM25_AUTO_INDEXING is on (platform manages the file index; user has
+        nothing to act on).
     """
     if isinstance(kb, dict):
         retrieval_config = kb.get("retrieval_config") or {}
@@ -465,14 +556,20 @@ def _compute_bm25_status(kb) -> str | None:
 
     method = retrieval_config.get("method")
     if method not in _KEYWORD_RETRIEVAL_METHODS:
-        return None
+        return None, None
 
     strategy = indexing_config.get("strategy")
     item_table = _STRATEGY_TO_ITEM_TABLE.get(strategy)
     if _keyword_index_backend(strategy) == "pg_search":
         pg_state = pg_bm25_status(kb_id, strategy)
+        if pg_state != "ready":
+            outcome = _unfinished_bm25_build_outcome(
+                kb_id, pg_bm25_item_table(strategy or "chunk_embed")
+            )
+            if outcome is not None:
+                return outcome["status"], outcome.get("reason")
         if pg_state is not None and pg_state != "absent":
-            return pg_state
+            return pg_state, None
         if pg_state == "absent":
             # No pg_search index of its own yet. A KB from before the extension
             # still has its bm25s file index, and its keyword leg reads that
@@ -482,22 +579,22 @@ def _compute_bm25_status(kb) -> str | None:
             if file_table is None or not SparseIndexStore(knowledge_base_id=kb_id).index_exists(
                 file_table
             ):
-                return "absent"
+                return "absent", None
 
     if get_setting("BM25_AUTO_INDEXING"):
-        return None
+        return None, None
 
     if item_table is None:
-        return None
+        return None, None
 
     store = SparseIndexStore(knowledge_base_id=kb_id)
     if not store.index_exists(item_table):
-        return "absent"
+        return "absent", None
     metadata = store.read_metadata(item_table)
     if metadata is None:
-        return "stale"
+        return "stale", None
     current = _count_items_for_kb_bm25(kb_id, item_table)
-    return "ready" if metadata.get("item_count") == current else "stale"
+    return ("ready" if metadata.get("item_count") == current else "stale"), None
 
 
 @knowledge_bases_bp.route("", methods=["GET"])
@@ -719,9 +816,11 @@ def get_knowledge_base(kb_id: str):
         "drift": drift,
     }
 
-    bm25_status = _compute_bm25_status(kb)
+    bm25_status, bm25_status_reason = _bm25_status_detail(kb)
     if bm25_status is not None:
         response_body["bm25_status"] = bm25_status
+        if bm25_status_reason is not None:
+            response_body["bm25_status_reason"] = bm25_status_reason
 
     return jsonify(response_body)
 
@@ -741,6 +840,8 @@ def update_knowledge_base(kb_id: str):
     if shape_error:
         return jsonify({"error": shape_error}), 400
 
+    # Set when this update needs a pg_search index build it must not start.
+    bm25_note: str | None = None
     # Capture the old config BEFORE the UPDATE so we can detect transitions.
     old_method = None
     old_retrieval_config: dict = {}
@@ -795,12 +896,15 @@ def update_knowledge_base(kb_id: str):
 
         if is_keyword:
             # Exactly one index build, for the index the keyword leg will read.
-            backend = _keyword_index_backend(new_strategy or _read_kb_strategy(kb_id))
+            strategy = new_strategy or _read_kb_strategy(kb_id)
+            backend = _keyword_index_backend(strategy)
             if backend == "pg_search":
                 if strategy_changed or _pg_bm25_inputs_changed(
                     old_retrieval_config, new_retrieval_config
                 ):
-                    _dispatch_ensure_pg_bm25_index(kb_id)
+                    bm25_note = _dispatch_pg_ensure_from_patch(
+                        kb_id, strategy, strategy_changed=strategy_changed
+                    )
             else:
                 if backend == "bm25s" and not was_keyword and get_setting("BM25_AUTO_INDEXING"):
                     try:
@@ -824,11 +928,39 @@ def update_knowledge_base(kb_id: str):
         method = _read_existing_retrieval_config(kb_id).get("method")
         if method in _KEYWORD_RETRIEVAL_METHODS and _pg_search_available():
             if _keyword_index_backend(new_strategy) == "pg_search":
-                _dispatch_ensure_pg_bm25_index(kb_id)
+                bm25_note = _dispatch_pg_ensure_from_patch(
+                    kb_id, new_strategy, strategy_changed=True
+                )
             else:
                 _dispatch_drop_pg_bm25_index(kb_id)
 
-    return get_knowledge_base(kb_id)
+    response = get_knowledge_base(kb_id)
+    if bm25_note is None:
+        return response
+    response = make_response(response)
+    body = response.get_json(silent=True)
+    if response.status_code != 200 or not isinstance(body, dict):
+        return response
+    body["bm25_note"] = bm25_note
+    return jsonify(body), 200
+
+
+def _dispatch_pg_ensure_from_patch(
+    kb_id: str, strategy: str | None, *, strategy_changed: bool
+) -> str | None:
+    """Dispatch the ensure for a PATCH, unless it would start a table-wide move.
+
+    Returns None when dispatched, else the response note pointing at
+    ``POST /build-bm25``. A strategy change that cannot build the new index
+    still drops the KB's index on the table it left, which nothing reads any
+    more (the ensure would otherwise have done that).
+    """
+    if _pg_ensure_cannot_move_rows(kb_id, strategy):
+        _dispatch_ensure_pg_bm25_index(kb_id)
+        return None
+    if strategy_changed:
+        _dispatch_drop_pg_bm25_index(kb_id)
+    return _build_bm25_required_note(kb_id, strategy)
 
 
 @knowledge_bases_bp.route("/<kb_id>/sources", methods=["GET"])
@@ -1936,8 +2068,22 @@ def build_bm25_endpoint(kb_id: str):
     table for the KB's strategy and writes a fresh bm25s file index, replacing
     whatever was there.
 
-    Returns 202 + the Celery task id. Caller can poll ``bm25_status`` on
-    the KB to observe completion.
+    Two things the operator must know before calling it (both are repeated in
+    the 202 body's ``note``):
+
+    - For a KB whose rows are still in the item table's shared DEFAULT
+      partition, the move into its own partition runs in one transaction that
+      blocks writes to that whole item table -- every knowledge base on it --
+      for its duration. The block grows with the number of rows moved (on the
+      order of seconds per hundred thousand rows; see the measurements in
+      ``pg_bm25_index.create_partition``), so schedule it. A KB that already
+      has its partition, or has no rows, blocks nothing.
+    - The pg_search extension is created when the project service starts. After
+      swapping in a Postgres image that provides it, restart the project
+      service first; until then this builds the bm25s file index instead.
+
+    Returns 202 + the Celery task id. Caller can poll ``bm25_status`` (and
+    ``bm25_status_reason``) on the KB to observe completion.
     """
     err = _require_uuid(kb_id, "knowledge base id")
     if err:
@@ -2009,7 +2155,27 @@ def build_bm25_endpoint(kb_id: str):
     except Exception:
         logger.exception("Failed to dispatch build-bm25 task for KB %s", kb_id)
         return jsonify({"error": "Failed to start BM25 build task"}), 503
-    return jsonify({"task_id": t.id, "knowledge_base_id": kb_id}), 202
+    return jsonify(
+        {
+            "task_id": t.id,
+            "knowledge_base_id": kb_id,
+            "note": _build_bm25_note(_STRATEGY_TO_ITEM_TABLE[strategy]),
+        }
+    ), 202
+
+
+def _build_bm25_note(item_table: str) -> str:
+    """The operator obligations ``POST /build-bm25`` repeats in its 202 body."""
+    return (
+        "On a Postgres server with pg_search, the first build for a knowledge base "
+        "whose rows are still in the shared DEFAULT partition moves them into its own "
+        f"partition, which blocks writes to the whole {AI_SCHEMA}.{item_table} table "
+        "(every knowledge base on it) for the duration of the move; it grows with the "
+        "number of rows moved. pg_search is enabled when the project service starts: "
+        "after swapping in a Postgres image that provides it, restart the project "
+        "service before building, or this builds the bm25s file index instead. "
+        "Poll bm25_status on the knowledge base for progress."
+    )
 
 
 # =============================================================================
