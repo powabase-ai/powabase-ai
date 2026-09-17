@@ -2026,6 +2026,41 @@ def _kb_config_as_dict(raw: Any) -> dict | None:
     return raw if isinstance(raw, dict) else None
 
 
+# Recorded statuses of a BM25 build that will make keyword search fast once it ends.
+_BM25_BUILD_UNDER_WAY_STATUSES = frozenset({"queued", "moving", "building", "retrying"})
+
+
+def _bm25_build_under_way(kb_id: str) -> str | None:
+    """The KB's ``bm25_status`` when a build of its index is under way, else None. Never raises."""
+    try:
+        kb = _fetch_kb_or_404(kb_id)
+        if isinstance(kb, tuple):
+            return None
+        status, _ = _bm25_status_detail(kb)
+    except Exception:
+        logger.debug("Could not read the bm25 status of KB %s", kb_id, exc_info=True)
+        return None
+    return status if status in _BM25_BUILD_UNDER_WAY_STATUSES else None
+
+
+def _keyword_timeout_message(kb_id: str) -> str:
+    """The keyword-timeout 503's error: a build under way, or what to do about none."""
+    under_way = _bm25_build_under_way(kb_id)
+    if under_way is not None:
+        return (
+            "Keyword search timed out: this knowledge base's BM25 index is being built "
+            f"(bm25_status {under_way}), and until it is ready keyword search falls back to "
+            "a scan that exceeded its time budget. Retry once the knowledge base's "
+            "bm25_status is ready, or query with vector_search meanwhile."
+        )
+    return (
+        "Keyword search timed out: this knowledge base has no BM25 index that can answer "
+        "it, so the query fell back to a scan that exceeded its time budget. "
+        f"{_keyword_timeout_remedy(kb_id)} Retrying the same search does not start a "
+        "build, so it will time out again."
+    )
+
+
 def _keyword_timeout_remedy(kb_id: str) -> str:
     """Name a remedy this KB's caller can actually carry out.
 
@@ -2078,10 +2113,13 @@ def _keyword_timeout_remedy(kb_id: str) -> str:
         )
 
     if stored_method not in ("hybrid", "full_text"):
-        if auto_indexing:
-            # The PATCH that moves the stored method onto hybrid/full_text
-            # dispatches build_bm25_for_kb itself; a second request would start
-            # a concurrent rebuild of the same index files.
+        if auto_indexing and _keyword_index_backend(strategy) != "pg_search":
+            # On the bm25s file index, the PATCH that moves the stored method
+            # onto hybrid/full_text dispatches build_bm25_for_kb itself; a
+            # second request would start a concurrent rebuild of the same index
+            # files. On pg_search it does not for a knowledge base whose rows
+            # are in the shared DEFAULT partition (the move is an operator's
+            # step), so that case names POST /build-bm25 below.
             return (
                 "Set this knowledge base's stored retrieval method to hybrid or "
                 "full_text; with automatic BM25 indexing on, that change builds "
@@ -2166,13 +2204,7 @@ def search_knowledge_base_route(kb_id: str):
     except KeywordSearchTimeout as e:
         return jsonify(
             {
-                "error": (
-                    "Keyword search timed out: this knowledge base has no BM25 "
-                    "index, so the query fell back to a scan that exceeded its "
-                    f"time budget. {_keyword_timeout_remedy(kb_id)} Retrying "
-                    "the same search does not start a build, so it will time "
-                    "out again."
-                ),
+                "error": _keyword_timeout_message(kb_id),
                 "code": "keyword_search_timeout",
                 "timeout_ms": e.timeout_ms,
             }
