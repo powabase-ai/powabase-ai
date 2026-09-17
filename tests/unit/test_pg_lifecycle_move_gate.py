@@ -27,9 +27,12 @@ IS_ID = "22222222-2222-4222-8222-222222222222"
 
 _ITEM_TABLE = re.compile(r"\.(chunks|full_documents|graph_index_nodes|graph_index_toc)\b")
 _GATE = "pg_advisory_xact_lock_shared"
+# An existence probe the cleanup makes, alone in its transaction, before it
+# takes a table's gate: it holds nothing into a move, so it needs no gate.
+_PROBE = "SELECT EXISTS"
 
 
-def _recording_session():
+def _recording_session(source_rows_exist=None):
     session = MagicMock()
     session.log = []
 
@@ -42,7 +45,7 @@ def _recording_session():
         result.rowcount = 0
         result.fetchall.return_value = []
         result.fetchone.return_value = None
-        result.scalar.return_value = None
+        result.scalar.return_value = source_rows_exist if sql.startswith(_PROBE) else None
         result.__iter__.return_value = iter([])
         return result
 
@@ -68,13 +71,17 @@ def _assert_gate_opens_every_transaction_on_an_item_table(log) -> set[str]:
     transaction: list[str] = []
     checked = 0
     taken_anywhere: set[str] = set()
-    for entry in [*log, "COMMIT"]:
+    entries = [*log, "COMMIT"]
+    for position, entry in enumerate(entries):
         if entry in ("COMMIT", "ROLLBACK"):
             transaction = []
             continue
         transaction.append(entry)
         if _GATE in entry:
             taken_anywhere.update(entry.split("-- gates: ", 1)[1].split())
+            continue
+        if entry.startswith(_PROBE) and transaction == [entry]:
+            assert entries[position + 1] in ("COMMIT", "ROLLBACK"), entries[position : position + 2]
             continue
         for table in _ITEM_TABLE.findall(entry):
             held = {
@@ -142,8 +149,8 @@ def test_graph_writes_take_the_gate_first():
 
 
 @pytest.fixture
-def run_body(monkeypatch):
-    session = _recording_session()
+def run_body(monkeypatch, request):
+    session = _recording_session(source_rows_exist=getattr(request, "param", True))
     monkeypatch.setattr(indexing, "db", MagicMock(session=session))
     monkeypatch.setattr(
         indexing, "get_knowledge_base", lambda _id: {"indexing_config": {"strategy": "chunk_embed"}}
@@ -173,3 +180,46 @@ def test_the_reindex_cleanup_takes_the_gate_before_reading_the_ids_it_deletes(ru
         provider_keys=None,
     )
     _assert_gate_opens_every_transaction_on_an_item_table(run_body.log)
+
+
+def _run_cleanup(session):
+    indexing._run_index_body(
+        knowledge_base_id=KB,
+        source_id=SRC,
+        indexed_source_id=IS_ID,
+        task_id="task-1",
+        provider_keys=None,
+    )
+    return session.log
+
+
+def _gates_per_transaction(log) -> list[set[str]]:
+    transactions: list[set[str]] = [set()]
+    for entry in log:
+        if entry in ("COMMIT", "ROLLBACK"):
+            transactions.append(set())
+        elif _GATE in entry:
+            transactions[-1].update(entry.split("-- gates: ", 1)[1].split())
+    return [gates for gates in transactions if gates]
+
+
+def test_the_reindex_cleanup_takes_one_tables_gate_per_transaction(run_body):
+    """A graph move waiting for its gate while a graph_index run holds it must
+    not stall the cleanup of a chunk source: a transaction that held chunks'
+    gate while it queued for graph_index_nodes' held up chunk moves and every
+    cleanup behind it, for the whole 30 s wait."""
+    log = _run_cleanup(run_body)
+    _assert_gate_opens_every_transaction_on_an_item_table(log)
+    gates = _gates_per_transaction(log)
+    assert all(len(held) == 1 for held in gates), gates
+    assert set().union(*gates) == {pgb.move_gate_relation(t) for t in pgb.PARTITIONED_ITEM_TABLES}
+
+
+@pytest.mark.parametrize("run_body", [False], indirect=True)
+def test_the_reindex_cleanup_takes_no_gate_for_a_table_holding_none_of_the_sources_rows(
+    run_body,
+):
+    log = _run_cleanup(run_body)
+    assert not [entry for entry in log if _GATE in entry], log
+    probes = [entry for entry in log if entry.startswith(_PROBE)]
+    assert len(probes) == 3, probes

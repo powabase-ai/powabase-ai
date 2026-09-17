@@ -1553,6 +1553,68 @@ async def run_doc2json_indexing(
     return stats
 
 
+# Does an item table hold rows of this indexed source? graph_index rows are
+# deleted through their ToC (the nodes cascade), so a ToC row counts too.
+_SOURCE_ROWS_EXIST_SQL = {
+    "chunks": (
+        'SELECT EXISTS (SELECT 1 FROM "{schema}".chunks '
+        "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id)"
+    ),
+    "full_documents": (
+        'SELECT EXISTS (SELECT 1 FROM "{schema}".full_documents '
+        "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id)"
+    ),
+    "graph_index_nodes": (
+        'SELECT EXISTS (SELECT 1 FROM "{schema}".graph_index_nodes '
+        "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id) "
+        'OR EXISTS (SELECT 1 FROM "{schema}".graph_index_toc WHERE indexed_source_id = :is_id)'
+    ),
+}
+
+
+def _clear_source_item_rows(session, knowledge_base_id, indexed_source_id, deleters) -> dict:
+    """Delete one indexed source's rows from each item table, each in a transaction of its own.
+
+    ``deleters`` maps an item table to the call that deletes the source's rows
+    from it. Returns the ids deleted, per table, for the sparse index cleanup.
+
+    Each table takes turns with a partition move on that table alone: its
+    transaction takes only that table's move gate
+    (``pg_bm25_index.hold_move_gate_shared``), before reading the ids it is
+    about to delete, and commits before the next table's. And it takes the gate
+    only when the table holds rows of the source, which a probe in a
+    transaction of its own finds out first: a move queued for a gate makes every
+    later request for that gate wait behind it -- up to
+    ``pg_bm25_index.MOVE_GATE_WAIT_SECONDS`` while a graph_index run keeps
+    graph_index_nodes' gate -- and a chunk source has nothing there to wait
+    for. The probe is one short read that commits at once, so it holds nothing
+    into a move's lock tries.
+    """
+    removed: dict[str, list[str]] = {}
+    for item_table, delete in deleters.items():
+        params = {"kb_id": knowledge_base_id, "is_id": indexed_source_id}
+        probe = _SOURCE_ROWS_EXIST_SQL[item_table].format(schema=AI_SCHEMA)
+        has_rows = session.execute(text(probe), params).scalar()
+        session.commit()
+        if not has_rows:
+            removed[item_table] = []
+            continue
+        pg_bm25_index.hold_move_gate_shared(session, item_table)
+        removed[item_table] = [
+            str(row[0])
+            for row in session.execute(
+                text(
+                    f'SELECT id FROM "{AI_SCHEMA}".{item_table} '
+                    "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id"
+                ),
+                params,
+            ).fetchall()
+        ]
+        delete()
+        session.commit()
+    return removed
+
+
 def _run_index_body(
     *,
     knowledge_base_id: str,
@@ -1602,24 +1664,13 @@ def _run_index_body(
         # Clean up all embeddings for this indexed source FIRST
         # (prevents search queries from finding embeddings with missing content)
         #
-        # This DELETE does NOT ride the fenced transaction below, despite
-        # carrying no commit of its own: the ToC store's
-        # delete_by_indexed_source further down commits unconditionally, and
-        # that commit flushes this statement and delete_chunks along with it.
-        # So the destructive half of a re-index is durable well before the
-        # fence decides anything -- only the INSERT side is fenced. A task that
-        # then loses the fence rolls back what it wrote but not what it
-        # deleted. Deliberate residual: losing the fence means a sibling
-        # re-claimed the row and is re-indexing the same source, so the
+        # None of these deletes rides the fenced transaction below: each
+        # commits on its own. So the destructive half of a re-index is durable
+        # well before the fence decides anything -- only the INSERT side is
+        # fenced. A task that then loses the fence rolls back what it wrote but
+        # not what it deleted. Deliberate residual: losing the fence means a
+        # sibling re-claimed the row and is re-indexing the same source, so the
         # artifacts are on their way back.
-        # First in this transaction, before the reads of the ids below: a
-        # partition move and this cleanup take turns, so the cleanup never holds
-        # a DEFAULT partition into the move's lock tries (see
-        # ``pg_bm25_index.move_gate_relation``). It deletes from every item
-        # table, so it takes every table's gate, in one call. The stores take
-        # their own table's gate again at the start of each transaction of their
-        # own.
-        pg_bm25_index.hold_move_gate_shared(db.session, pg_bm25_index.PARTITIONED_ITEM_TABLES)
         db.session.execute(
             text(f"""
                 DELETE FROM "{AI_SCHEMA}".embeddings
@@ -1627,66 +1678,43 @@ def _run_index_body(
             """),
             {"indexed_source_id": indexed_source_id},
         )
+        db.session.commit()
 
-        # Delete artifacts from ALL strategy tables unconditionally.
-        # Each call is a no-op (0 rows deleted) if no artifacts exist for that type.
-
-        # First, query IDs before deletion for sparse index cleanup
-        chunk_ids_to_remove = [
-            str(r[0])
-            for r in db.session.execute(
-                text(
-                    f'SELECT id FROM "{AI_SCHEMA}".chunks '
-                    "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id"
-                ),
-                {"kb_id": knowledge_base_id, "is_id": indexed_source_id},
-            ).fetchall()
-        ]
-        fd_ids_to_remove = [
-            str(r[0])
-            for r in db.session.execute(
-                text(
-                    f'SELECT id FROM "{AI_SCHEMA}".full_documents '
-                    "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id"
-                ),
-                {"kb_id": knowledge_base_id, "is_id": indexed_source_id},
-            ).fetchall()
-        ]
-        gi_ids_to_remove = [
-            str(r[0])
-            for r in db.session.execute(
-                text(
-                    f'SELECT id FROM "{AI_SCHEMA}".graph_index_nodes '
-                    "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id"
-                ),
-                {"kb_id": knowledge_base_id, "is_id": indexed_source_id},
-            ).fetchall()
-        ]
-
+        # Delete artifacts from ALL strategy tables unconditionally, one item
+        # table per transaction (see ``_clear_source_item_rows``), collecting
+        # the ids for the sparse index cleanup after the fenced commit.
         store = PgVectorKnowledgeStore(
             db_session=db.session,
             knowledge_base_id=knowledge_base_id,
         )
-        asyncio.run(store.delete_chunks(indexed_source_id))
+        fd_store = FullDocumentStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+            storage=get_storage(),
+        )
+        gi_store = GraphIndexStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+        )
+        removed_ids = _clear_source_item_rows(
+            db.session,
+            knowledge_base_id,
+            indexed_source_id,
+            {
+                "chunks": lambda: asyncio.run(store.delete_chunks(indexed_source_id)),
+                "full_documents": lambda: fd_store.delete_by_indexed_source(indexed_source_id),
+                "graph_index_nodes": lambda: gi_store.delete_by_indexed_source(indexed_source_id),
+            },
+        )
+        chunk_ids_to_remove = removed_ids["chunks"]
+        fd_ids_to_remove = removed_ids["full_documents"]
+        gi_ids_to_remove = removed_ids["graph_index_nodes"]
 
         pi_store = PageIndexStore(
             db_session=db.session,
             knowledge_base_id=knowledge_base_id,
         )
         pi_store.delete_by_indexed_source(indexed_source_id)
-
-        fd_store = FullDocumentStore(
-            db_session=db.session,
-            knowledge_base_id=knowledge_base_id,
-            storage=get_storage(),
-        )
-        fd_store.delete_by_indexed_source(indexed_source_id)
-
-        gi_store = GraphIndexStore(
-            db_session=db.session,
-            knowledge_base_id=knowledge_base_id,
-        )
-        gi_store.delete_by_indexed_source(indexed_source_id)
 
         d2j_store = Doc2JSONStore(
             db_session=db.session,

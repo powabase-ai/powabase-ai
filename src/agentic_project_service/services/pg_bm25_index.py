@@ -565,10 +565,13 @@ def move_gate_relation(item_table: str) -> str:
     open through its LLM enrichment and embedding stages (minutes), so a move on
     that table gives up (SQLSTATE 55P03 after ``MOVE_GATE_WAIT_SECONDS``) while
     a graph_index source is indexing -- stalling graph_index indexing for that
-    wait -- and its task retries later. A transaction that takes the gates of
-    several tables takes them in one call, in name order; one that took a
-    second table's gate later, while holding locks a move on that table waits
-    for, would deadlock with it (detected, SQLSTATE 40P01, and retried).
+    wait -- and its task retries later. Nothing else waits for it: a re-index
+    clears its old rows one item table per transaction, taking only that
+    table's gate and only when the table holds rows of the source
+    (``tasks.indexing._clear_source_item_rows``). A transaction that did take
+    the gates of several tables would have to take them in one call, in name
+    order (``move_gate_shared_sql``) -- and would queue for every one of them
+    while holding the first.
 
     Other writers (API writes, enrichment, graph updates) do not take the gate;
     the parent SHARE lock and the ``NOWAIT`` tries remain their protection.
