@@ -357,6 +357,52 @@ class TestUpdateDoesNotStartAMove:
         assert "blocks writes" in note
         assert "chunks" in note
 
+    @pytest.mark.parametrize(
+        "partition, rows_in_default, dispatched",
+        [(True, None, True), (False, False, True), (False, True, False)],
+    )
+    def test_the_gate_ends_its_transaction_before_dispatching(
+        self, tasks, partition, rows_in_default, dispatched
+    ):
+        """The DEFAULT probe holds ACCESS SHARE on DEFAULT until its transaction
+        ends, and a move waits for that lock: the PATCH must end it before it
+        dispatches the ensure (which may start that move) and before it builds
+        the response."""
+        calls = []
+        kb_id = str(uuid.uuid4())
+        with (
+            _AUTH,
+            patch(f"{R}.db") as db,
+            patch(f"{R}._read_existing_retrieval_config", return_value={"method": "vector_search"}),
+            patch(f"{R}._read_kb_strategy", return_value="chunk_embed"),
+            patch(f"{R}._keyword_index_backend", return_value="pg_search"),
+            patch(f"{R}._pg_search_available", return_value=True),
+            patch(f"{R}.get_setting", return_value=True),
+            patch(
+                f"{R}.get_knowledge_base",
+                side_effect=lambda _id: calls.append("respond") or ({"id": _id}, 200),
+            ),
+            patch(
+                f"{S}.partition_exists",
+                side_effect=lambda *a: calls.append("probe partition") or partition,
+            ),
+            patch(
+                f"{S}.kb_has_rows_in_default",
+                side_effect=lambda *a: calls.append("probe DEFAULT") or rows_in_default,
+            ),
+        ):
+            db.session.rollback.side_effect = lambda: calls.append("end transaction")
+            tasks["ensure"].delay.side_effect = lambda *_: calls.append("dispatch")
+            resp = _client().patch(
+                f"/api/knowledge-bases/{kb_id}",
+                json={"retrieval_config": {"method": "hybrid"}},
+                headers=_headers(),
+            )
+        assert resp.status_code == 200
+        probes = ["probe partition"] if partition else ["probe partition", "probe DEFAULT"]
+        expected = [*probes, "end transaction", *(["dispatch"] if dispatched else []), "respond"]
+        assert calls == expected
+
     def test_an_unreadable_gate_dispatches_nothing(self, tasks):
         with patch(f"{S}.partition_exists", side_effect=RuntimeError("connection lost")):
             kb_id = str(uuid.uuid4())

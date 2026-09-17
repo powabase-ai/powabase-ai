@@ -424,6 +424,12 @@ def _pg_ensure_cannot_move_rows(kb_id: str, strategy: str | None) -> bool:
     without blocking writers). A KB with rows in DEFAULT -- or one the catalog
     cannot answer for -- is left to the operator's ``POST /build-bm25``.
     Never raises; "can't tell" is False.
+
+    The DEFAULT probe takes ACCESS SHARE on DEFAULT until the transaction it
+    ran in ends, and a move waits for that lock. So the transaction ends here,
+    before anything is dispatched and before the response is built: the
+    PATCH's own UPDATE is already committed, and all that is left to end is
+    these reads.
     """
     item_table = pg_bm25_item_table(strategy or "chunk_embed")
     if item_table is None:
@@ -441,6 +447,19 @@ def _pg_ensure_cannot_move_rows(kb_id: str, strategy: str | None) -> bool:
             exc_info=True,
         )
         return False
+    finally:
+        _end_read_transaction()
+
+
+def _end_read_transaction() -> None:
+    """End the request session's transaction, releasing its relation locks.
+
+    Only for a point where the session holds nothing but reads. Never raises.
+    """
+    try:
+        db.session.rollback()
+    except Exception:
+        logger.debug("Could not end the read transaction", exc_info=True)
 
 
 def _build_bm25_required_note(kb_id: str, strategy: str | None) -> str:
