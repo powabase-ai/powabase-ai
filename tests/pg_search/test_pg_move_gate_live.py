@@ -359,3 +359,88 @@ def test_a_failed_move_lets_indexing_back_in_before_it_finishes_cleaning_up(
     assert live._move_check_names(session) == []
     session.rollback()
     assert _rows_in(session, "chunks_default", KB_A) == 2_000 + len(KB_A_DOCS)
+
+
+# ---------------------------------------------------------------------------
+# The gate wait is reported on its own
+# ---------------------------------------------------------------------------
+
+
+def _hold_the_gate_shared_for(engine, item_table, seconds, started):
+    def run():
+        with engine.connect() as conn:
+            pgb.hold_move_gate_shared(conn, item_table)
+            started.set()
+            time.sleep(seconds)
+            conn.rollback()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+def _a_later_indexing_transaction(engine, item_table, waits):
+    def run():
+        with engine.connect() as conn:
+            began = time.monotonic()
+            pgb.hold_move_gate_shared(conn, item_table)
+            waits.append(time.monotonic() - began)
+            conn.rollback()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_the_move_reports_its_wait_for_the_gate_apart_from_the_write_block(engine, session):
+    """While the move queues for the gate, indexing transactions that start on
+    the table queue behind it: that stall is not in ``writes_blocked_seconds``."""
+    _seed(session, KB_A, 2_000)
+    started = threading.Event()
+    holder = _hold_the_gate_shared_for(engine, "chunks", 1.5, started)
+    assert started.wait(timeout=10)
+    later_waits: list[float] = []
+    later = None
+    mover_result: dict = {}
+
+    def move():
+        mover_result["move"] = pgb.create_partition(engine, KB_A, "chunks")
+
+    mover = threading.Thread(target=move, daemon=True)
+    mover.start()
+    time.sleep(0.3)
+    later = _a_later_indexing_transaction(engine, "chunks", later_waits)
+    mover.join(timeout=30)
+    later.join(timeout=30)
+    holder.join(timeout=30)
+
+    result = mover_result["move"]
+    assert result["gate_wait_seconds"] >= 1.0, result
+    assert result["writes_blocked_seconds"] < result["gate_wait_seconds"], result
+    # The indexing transaction that arrived meanwhile waited for the gate as well.
+    assert later_waits and later_waits[0] >= 0.8, later_waits
+
+
+def test_an_empty_knowledge_base_reports_its_gate_wait_too(engine, session):
+    with engine.connect() as conn:
+        conn.execute(
+            text(f"DELETE FROM {SCHEMA}.chunks WHERE knowledge_base_id = CAST(:kb AS uuid)"),
+            {"kb": KB_A},
+        )
+        conn.commit()
+    started = threading.Event()
+    holder = _hold_the_gate_shared_for(engine, "chunks", 1.0, started)
+    assert started.wait(timeout=10)
+    result = pgb.create_partition(engine, KB_A, "chunks")
+    holder.join(timeout=30)
+
+    assert result["rows_moved"] == 0
+    assert result["gate_wait_seconds"] >= 0.7, result
+    assert result["writes_blocked_seconds"] < 0.5, result
+
+
+def test_ensure_passes_the_gate_wait_on(engine, session):
+    outcome = pgb.ensure_bm25_index(KB_A, engine=engine, allow_row_move=True)
+    assert outcome["status"] == "ready"
+    assert outcome["gate_wait_seconds"] >= 0
+    assert "writes_blocked_seconds" in outcome

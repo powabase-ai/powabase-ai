@@ -2668,7 +2668,11 @@ def create_partition(
 ) -> dict:
     """Move one knowledge base into a partition of its own, atomically.
 
-    Returns ``{"rows_moved": int, "writes_blocked_seconds": float}``.
+    Returns ``{"rows_moved": int, "writes_blocked_seconds": float,
+    "gate_wait_seconds": float}``. The two times are apart:
+    ``gate_wait_seconds`` is how long the move queued for the item table's move
+    gate before it took any table lock, ``writes_blocked_seconds`` how long it
+    then held writers off (see "Who waits" below).
 
     A knowledge base with no rows in DEFAULT is attached without a move
     (``_attach_empty_partition``). With ``allow_row_move=False`` that is all
@@ -2716,6 +2720,16 @@ def create_partition(
     cache, ~700-byte rows). Cold caches, slower disks and wider rows are
     slower.
 
+    * **indexing** on this item table, before any of that, for as long as the
+      move queues for the move gate (``gate_wait_seconds``, at most
+      ``MOVE_GATE_WAIT_SECONDS``): the move waits for the indexing
+      transactions in flight on the table to finish, and every one that starts
+      meanwhile queues behind it -- a gated transaction that already holds
+      other locks keeps them while it waits. Measured under a steady indexing
+      mix (short re-indexes back to back, long ones of 2-10 s): 6-9 s per move,
+      against a reported write block under 1 s; 5.5-9.9 s for an empty
+      knowledge base's attach, whose write block is ~0.01 s. Writers that take
+      no gate (API writes) do not wait here.
     * **writers** through the parent, for every knowledge base on this item
       table, for all of step 2. A 1 million-row knowledge base: 4.2-8.8 s,
       typically 5.5 s (copy 2.9 s, delete from DEFAULT 2.0 s, VALIDATE 0.3 s,
@@ -2819,13 +2833,15 @@ def create_partition(
             # that refuses some knowledge base's writes until it is gone.
             _drop_move_checks(conn, item_table, _move_check_names(conn, item_table))
             if _partition_is_attached(conn, kb_id, item_table):
-                return {"rows_moved": 0, "writes_blocked_seconds": 0.0}
+                return {"rows_moved": 0, "writes_blocked_seconds": 0.0, "gate_wait_seconds": 0.0}
 
             step = "prepare"
             try:
                 _prepare_partition(conn, kb_id, item_table)
                 step = "move gate"
+                gate_started = time.monotonic()
                 gate.acquire()
+                gate_wait = time.monotonic() - gate_started
             except Exception as exc:
                 _fail_move(engine, conn, kb_id, item_table, exc, step=step)
                 raise
@@ -2836,7 +2852,7 @@ def create_partition(
             if not has_rows:
                 attached = _attach_empty_partition(engine, conn, kb_id, item_table, gate)
                 if attached is not None:
-                    return attached
+                    return {**attached, "gate_wait_seconds": gate_wait}
             if not allow_row_move:
                 raise RowMoveNotAllowed(
                     f"knowledge base {kb_id} has rows in {AI_SCHEMA}.{default}; moving them "
@@ -2922,14 +2938,16 @@ def create_partition(
             logger.warning("Could not ANALYZE %s.%s", AI_SCHEMA, partition, exc_info=True)
 
     logger.info(
-        "Moved %d rows from %s into partition %s.%s; writes were blocked for %.3f s",
+        "Moved %d rows from %s into partition %s.%s; writes were blocked for %.3f s, after "
+        "%.3f s waiting for the move gate (indexing on the table waited for that too)",
         moved,
         default,
         AI_SCHEMA,
         partition,
         blocked,
+        gate_wait,
     )
-    return {"rows_moved": moved, "writes_blocked_seconds": blocked}
+    return {"rows_moved": moved, "writes_blocked_seconds": blocked, "gate_wait_seconds": gate_wait}
 
 
 def drop_partition(engine, knowledge_base_id: Any, item_table: str) -> bool:
@@ -3169,6 +3187,7 @@ def ensure_bm25_index(
                 }
             outcome["rows_moved"] = move["rows_moved"]
             outcome["writes_blocked_seconds"] = move["writes_blocked_seconds"]
+            outcome["gate_wait_seconds"] = move.get("gate_wait_seconds", 0.0)
             outcome["partition_created"] = True
 
         # Everything from reading the index's state to replacing it runs under
