@@ -1530,13 +1530,17 @@ def is_partition_move_race(exc: BaseException) -> bool:
 
 
 def _lock_holders_sql() -> str:
-    """Locks on the parent, on DEFAULT, and on the item table's move gate.
+    """Locks on the parent, on DEFAULT, on the tables DEFAULT's foreign keys
+    reference, and on the item table's move gate.
 
     An advisory lock on a bigint key appears in ``pg_locks`` split into
     ``classid`` (high 32 bits) and ``objid`` (low 32 bits), with ``objsubid`` 1.
     """
     return (
-        "WITH gate AS (SELECT hashtextextended(:gate, 0) AS k) "
+        "WITH gate AS (SELECT hashtextextended(:gate, 0) AS k), "
+        "relations AS (SELECT to_regclass(:parent) AS oid UNION SELECT to_regclass(:default) "
+        "UNION SELECT k.confrelid FROM pg_constraint k "
+        "WHERE k.conrelid = to_regclass(:default) AND k.contype = 'f') "
         "SELECT l.pid, "
         "CASE WHEN l.locktype = 'advisory' THEN 'move gate' "
         "ELSE l.relation::regclass::text END AS lock_on, "
@@ -1544,7 +1548,7 @@ def _lock_holders_sql() -> str:
         "a.state, round(extract(epoch FROM now() - a.xact_start)::numeric, 1) AS xact_seconds, "
         "left(a.query, 200) AS query "
         "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid CROSS JOIN gate "
-        "WHERE (l.relation IN (to_regclass(:parent), to_regclass(:default)) "
+        "WHERE (l.relation IN (SELECT oid FROM relations) "
         "OR (l.locktype = 'advisory' AND l.objsubid = 1 AND l.database = ("
         "SELECT oid FROM pg_database WHERE datname = current_database()) "
         "AND l.classid = ((gate.k >> 32) & 4294967295)::oid "
@@ -1562,7 +1566,8 @@ def _backend_pid(conn) -> int | None:
 
 
 def _lock_holders(engine, item_table: str, exclude: list[int | None]) -> list[dict]:
-    """Sessions holding or awaiting locks on the parent, DEFAULT or the move gate. Never raises.
+    """Sessions holding or awaiting locks on the parent, DEFAULT, the tables its
+    foreign keys reference, or the move gate. Never raises.
 
     Read on a connection of its own, so it can run while the failed move's
     transaction is still open: its locks -- and whoever refused them -- are
@@ -2217,21 +2222,60 @@ def _move_check_names(conn, item_table: str) -> list[str]:
 
 def partition_lock_default_exclusive_ddl(item_table: str) -> str:
     """One try for ACCESS EXCLUSIVE on the DEFAULT partition, never queueing."""
-    return (
-        f"LOCK TABLE {_qualified(default_partition_name(item_table))} "
-        "IN ACCESS EXCLUSIVE MODE NOWAIT"
-    )
+    return _lock_nowait_ddl(_qualified(default_partition_name(item_table)), "ACCESS EXCLUSIVE")
+
+
+def _lock_nowait_ddl(relation: str, mode: str, *, only: bool = False) -> str:
+    return f"LOCK TABLE {'ONLY ' if only else ''}{relation} IN {mode} MODE NOWAIT"
+
+
+# The ``pg_locks.mode`` names each lock mode the move takes conflicts with.
+_CONFLICTING_MODES = {
+    "ACCESS EXCLUSIVE": (
+        "AccessShareLock",
+        "RowShareLock",
+        "RowExclusiveLock",
+        "ShareUpdateExclusiveLock",
+        "ShareLock",
+        "ShareRowExclusiveLock",
+        "ExclusiveLock",
+        "AccessExclusiveLock",
+    ),
+    "SHARE ROW EXCLUSIVE": (
+        "RowExclusiveLock",
+        "ShareUpdateExclusiveLock",
+        "ShareLock",
+        "ShareRowExclusiveLock",
+        "ExclusiveLock",
+        "AccessExclusiveLock",
+    ),
+    "SHARE": (
+        "RowExclusiveLock",
+        "ShareUpdateExclusiveLock",
+        "ShareRowExclusiveLock",
+        "ExclusiveLock",
+        "AccessExclusiveLock",
+    ),
+}
 
 
 def _default_holder_is_waiting(conn, item_table: str) -> bool:
     """Does any other session holding a lock on DEFAULT wait for a lock itself?
 
+    See ``_holder_is_waiting``.
+    """
+    return _holder_is_waiting(conn, _qualified(default_partition_name(item_table)))
+
+
+def _holder_is_waiting(conn, relation: str) -> bool:
+    """Does any other session holding a lock on ``relation`` wait for a lock itself?
+
     Such a session may be waiting -- directly or through others -- on the
-    caller, and then a queued request for DEFAULT would close a lock cycle.
+    caller, and then a queued request for the relation would close a lock cycle.
 
     ``pg_locks`` covers the whole cluster, and a relation OID is only unique
     within one database (a database copied from a template keeps the
-    template's), so the DEFAULT lock must be a relation lock of this database.
+    template's), so the held lock must be a relation lock of this database.
     The waiting lock belongs to the same backend; it is matched on the database
     too where it has one -- this database, or 0 for a shared catalog -- while a
     lock with no database (a transaction id, a virtual transaction id) is
@@ -2249,7 +2293,7 @@ def _default_holder_is_waiting(conn, item_table: str) -> bool:
                 "AND held.relation = to_regclass(:default) AND held.granted "
                 "AND held.pid <> pg_backend_pid())"
             ),
-            {"default": _qualified(default_partition_name(item_table))},
+            {"default": relation},
         ).scalar()
     )
 
@@ -2284,6 +2328,16 @@ def _long_holder_seconds() -> int:
 def _default_has_a_long_holder(conn, item_table: str, held_for_seconds: float) -> bool:
     """Does a transaction that began at least ``held_for_seconds`` ago hold DEFAULT?
 
+    See ``_has_a_long_holder``.
+    """
+    return _has_a_long_holder(
+        conn, _qualified(default_partition_name(item_table)), "ACCESS EXCLUSIVE", held_for_seconds
+    )
+
+
+def _has_a_long_holder(conn, relation: str, mode: str, held_for_seconds: float) -> bool:
+    """Does a transaction open for ``held_for_seconds`` hold a lock on ``relation`` that ``mode`` conflicts with?
+
     The age is absolute -- how long the holding transaction has been open --
     not how long the caller has been probing. A lock of a prepared transaction
     has no backend, and counts as long.
@@ -2296,33 +2350,50 @@ def _default_has_a_long_holder(conn, item_table: str, held_for_seconds: float) -
                 "LEFT JOIN pg_stat_activity a ON a.pid = l.pid "
                 "WHERE l.locktype = 'relation' "
                 f"AND l.database = {this_database} "
-                "AND l.relation = to_regclass(:default) AND l.granted "
+                "AND l.relation = to_regclass(:relation) AND l.granted "
+                "AND l.mode = ANY(CAST(:modes AS text[])) "
                 "AND l.pid IS DISTINCT FROM pg_backend_pid() "
                 "AND (l.pid IS NULL OR a.xact_start <= "
                 "clock_timestamp() - make_interval(secs => :seconds)))"
             ),
             {
-                "default": _qualified(default_partition_name(item_table)),
+                "relation": relation,
+                "modes": list(_CONFLICTING_MODES[mode]),
                 "seconds": held_for_seconds,
             },
         ).scalar()
     )
 
 
-def _probe_default_before_moving(conn, item_table: str) -> None:
-    """Raise SQLSTATE 55P03 if a long transaction holds DEFAULT; else return.
+def _referenced_relations(conn, item_table: str) -> list[str]:
+    """The tables DEFAULT's foreign keys reference, schema-qualified and quoted, sorted."""
+    return [
+        row[0]
+        for row in conn.execute(
+            text(
+                "SELECT DISTINCT quote_ident(n.nspname) || '.' || quote_ident(c.relname) "
+                "FROM pg_constraint k JOIN pg_class c ON c.oid = k.confrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE k.conrelid = to_regclass(:default) AND k.contype = 'f' ORDER BY 1"
+            ),
+            {"default": _qualified(default_partition_name(item_table))},
+        ).all()
+    ]
 
-    See ``DEFAULT_PREFLIGHT_WAIT_SECONDS``. Runs on a connection holding no
-    lock, each try in a transaction of its own that is rolled back straight
-    away, so a granted try blocks nobody for longer than the round trip and a
-    refused one blocks nobody at all.
+
+def _probe_relation_before_moving(
+    conn, relation: str, mode: str, long_holder_seconds, *, only: bool = False
+) -> None:
+    """``NOWAIT`` tries of ``mode`` on ``relation``, each released at once; raise if a long holder refuses them.
+
+    See ``DEFAULT_PREFLIGHT_WAIT_SECONDS``.
     """
     started = time.monotonic()
     deadline = started + DEFAULT_PREFLIGHT_WAIT_SECONDS
     sleep = _EXCLUSIVE_LOCK_FIRST_SLEEP_SECONDS
     while True:
         try:
-            conn.execute(text(partition_lock_default_exclusive_ddl(item_table)))
+            conn.execute(text(_lock_nowait_ddl(relation, mode, only=only)))
         except Exception as exc:
             conn.rollback()
             if not is_lock_conflict(exc):
@@ -2335,10 +2406,44 @@ def _probe_default_before_moving(conn, item_table: str) -> None:
             break
         time.sleep(sleep)
         sleep = min(sleep * 2, _EXCLUSIVE_LOCK_MAX_SLEEP_SECONDS)
-    long_holder = _default_has_a_long_holder(conn, item_table, _long_holder_seconds())
+    if long_holder_seconds is None:
+        long_holder_seconds = _long_holder_seconds()
+    long_holder = _has_a_long_holder(conn, relation, mode, long_holder_seconds)
     conn.rollback()
     if long_holder:
         raise refusal
+
+
+def _probe_default_before_moving(conn, item_table: str) -> None:
+    """Raise SQLSTATE 55P03 if a long transaction holds what the move will need; else return.
+
+    See ``DEFAULT_PREFLIGHT_WAIT_SECONDS``. Runs on a connection holding no
+    lock, each try in a transaction of its own that is rolled back straight
+    away, so a granted try blocks nobody for longer than the round trip and a
+    refused one blocks nobody at all. Probed, in the order the move takes them:
+    SHARE on the parent (a long ungated writer of another knowledge base's
+    partition holds only the parent), ACCESS EXCLUSIVE on DEFAULT, and SHARE ROW
+    EXCLUSIVE on each table the foreign keys reference (a long writer of
+    ``indexed_sources``, say).
+    """
+    long_holder_seconds = _long_holder_seconds()
+    _probe_relation_before_moving(
+        conn,
+        _qualified(_validated_partitioned_table(item_table)),
+        "SHARE",
+        long_holder_seconds,
+        only=True,
+    )
+    _probe_relation_before_moving(
+        conn,
+        _qualified(default_partition_name(item_table)),
+        "ACCESS EXCLUSIVE",
+        long_holder_seconds,
+    )
+    referenced = _referenced_relations(conn, item_table)
+    conn.rollback()
+    for relation in referenced:
+        _probe_relation_before_moving(conn, relation, "SHARE ROW EXCLUSIVE", long_holder_seconds)
 
 
 def _queued_try_ms(conn) -> int:
@@ -2353,11 +2458,36 @@ def _queued_try_ms(conn) -> int:
 def _lock_default_exclusively(conn, item_table: str, wait_seconds: float) -> None:
     """Take ACCESS EXCLUSIVE on DEFAULT without stalling readers or closing a cycle.
 
+    See ``_lock_without_queueing``.
+    """
+    _lock_without_queueing(
+        conn, _qualified(default_partition_name(item_table)), "ACCESS EXCLUSIVE", wait_seconds
+    )
+
+
+def _lock_referenced_tables(conn, item_table: str, wait_seconds: float) -> None:
+    """SHARE ROW EXCLUSIVE on every table DEFAULT's foreign keys reference, without queueing.
+
+    Adding a foreign key takes that lock on the table it references, and a
+    plain wait for it -- behind one open write of an unrelated ``sources`` or
+    ``indexed_sources`` row -- held every writer of the item table off for the
+    move's whole ``lock_timeout`` and then named nobody. Taken up front, each
+    with ``_lock_without_queueing``, a writer in the way makes the move give up
+    (SQLSTATE 55P03) within ``wait_seconds`` per table, and its locks name it.
+    Writers of those tables wait for the rest of the move once it holds them.
+    """
+    for relation in _referenced_relations(conn, item_table):
+        _lock_without_queueing(conn, relation, "SHARE ROW EXCLUSIVE", wait_seconds)
+
+
+def _lock_without_queueing(conn, relation: str, mode: str, wait_seconds: float) -> None:
+    """Take ``mode`` on ``relation`` without stalling its other users or closing a cycle.
+
     Tries ``NOWAIT`` inside a savepoint, so a refusal leaves the caller's
     transaction usable, and sleeps with a doubling backoff between tries. Once
     ``_EXCLUSIVE_LOCK_QUEUED_TRY_AFTER_SECONDS`` of refusals have passed, it
     makes one queued try bounded by ``_queued_try_ms`` -- unless a holder of
-    DEFAULT is waiting for a lock (``_default_holder_is_waiting``), or the
+    the relation is waiting for a lock (``_holder_is_waiting``), or the
     remaining time is too short. After ``wait_seconds`` the last refusal
     (SQLSTATE 55P03) is raised. See ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS``.
     """
@@ -2368,7 +2498,7 @@ def _lock_default_exclusively(conn, item_table: str, wait_seconds: float) -> Non
     while True:
         conn.execute(text("SAVEPOINT bm25_default_lock"))
         try:
-            conn.execute(text(partition_lock_default_exclusive_ddl(item_table)))
+            conn.execute(text(_lock_nowait_ddl(relation, mode)))
         except Exception as exc:
             conn.execute(text("ROLLBACK TO SAVEPOINT bm25_default_lock"))
             conn.execute(text("RELEASE SAVEPOINT bm25_default_lock"))
@@ -2382,10 +2512,8 @@ def _lock_default_exclusively(conn, item_table: str, wait_seconds: float) -> Non
         if not queued_try_done and now - started >= _EXCLUSIVE_LOCK_QUEUED_TRY_AFTER_SECONDS:
             queued_try_done = True
             queued_ms = _queued_try_ms(conn)
-            if now + queued_ms / 1000 <= deadline and not _default_holder_is_waiting(
-                conn, item_table
-            ):
-                if _queued_lock_try(conn, item_table, queued_ms):
+            if now + queued_ms / 1000 <= deadline and not _holder_is_waiting(conn, relation):
+                if _queued_lock_try(conn, relation, mode, queued_ms):
                     return
                 continue
         if time.monotonic() + sleep > deadline:
@@ -2394,15 +2522,15 @@ def _lock_default_exclusively(conn, item_table: str, wait_seconds: float) -> Non
         sleep = min(sleep * 2, _EXCLUSIVE_LOCK_MAX_SLEEP_SECONDS)
 
 
-def _queued_lock_try(conn, item_table: str, lock_timeout_ms: int) -> bool:
-    """One queued request for ACCESS EXCLUSIVE on DEFAULT, bounded by a lock_timeout.
+def _queued_lock_try(conn, relation: str, mode: str, lock_timeout_ms: int) -> bool:
+    """One queued request for ``mode`` on ``relation``, bounded by a lock_timeout.
 
     The timeout is set in a savepoint and put back afterwards, so the caller's
     transaction keeps its own. Returns whether the lock was taken.
 
     Not deadlock-free. A session blocked on the caller's parent lock can have
     its one-time deadlock check fire while this request waits, and a holder of
-    DEFAULT that began waiting on that session after ``_default_holder_is_waiting``
+    the relation that began waiting on that session after ``_holder_is_waiting``
     looked closes a three-party cycle within this window: Postgres aborts the
     blocked session, whose deadlock check is the one that finds it, with
     SQLSTATE 40P01. No row is lost -- ``index_source`` requeues, an API writer
@@ -2415,11 +2543,7 @@ def _queued_lock_try(conn, item_table: str, lock_timeout_ms: int) -> bool:
     conn.execute(text("SAVEPOINT bm25_default_lock"))
     try:
         conn.execute(text(f"SET LOCAL lock_timeout = '{int(lock_timeout_ms)}ms'"))
-        conn.execute(
-            text(
-                f"LOCK TABLE {_qualified(default_partition_name(item_table))} IN ACCESS EXCLUSIVE MODE"
-            )
-        )
+        conn.execute(text(f"LOCK TABLE {relation} IN {mode} MODE"))
     except Exception as exc:
         conn.execute(text("ROLLBACK TO SAVEPOINT bm25_default_lock"))
         conn.execute(text("RELEASE SAVEPOINT bm25_default_lock"))
@@ -2750,9 +2874,11 @@ def _attach_empty_partition(
             return None
         conn.commit()
 
-        step = "indexes, keys and attach"
+        step = "referenced tables"
         attach_sql = partition_attach_ddl(kb_id, item_table)
         conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+        _lock_referenced_tables(conn, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
+        step = "indexes, keys and attach"
         # Before DEFAULT's lock, not after: adding the keys waits (bounded) for
         # SHARE ROW EXCLUSIVE on the tables they reference, and must not do that
         # while holding every reader off DEFAULT.
@@ -3023,6 +3149,8 @@ def create_partition(
                 conn.execute(text(delete_sql), {"kb": kb_id})
                 step = "validate the check on DEFAULT"
                 conn.execute(text(default_move_check_validate_ddl(kb_id, item_table)))
+                step = "referenced tables"
+                _lock_referenced_tables(conn, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
                 step = "key, unique indexes and foreign keys"
                 _build_move_indexes_and_keys(conn, kb_id, item_table)
                 step = "attach"

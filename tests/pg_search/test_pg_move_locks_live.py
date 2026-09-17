@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 
 from sqlalchemy import text
 
@@ -354,3 +355,189 @@ def test_a_move_that_gives_up_names_the_reader_that_refused_its_lock(
     assert refusing and refusing[0]["mode"] == "AccessShareLock", error.bm25_lock_holders
     message = next(r.getMessage() for r in caplog.records if "gave up at step" in r.getMessage())
     assert f"'pid': {reader['pid']}" in message
+
+
+# ---------------------------------------------------------------------------
+# The tables the partition's foreign keys reference
+# ---------------------------------------------------------------------------
+
+
+def _reference_indexed_sources(engine) -> list[str]:
+    """chunks -> indexed_sources, as on the real schema; two unrelated sources."""
+    ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    with engine.connect() as conn:
+        conn.execute(text(f"CREATE TABLE {SCHEMA}.indexed_sources (id uuid PRIMARY KEY, n int)"))
+        for source_id in ids:
+            conn.execute(
+                text(f"INSERT INTO {SCHEMA}.indexed_sources VALUES (CAST(:id AS uuid), 0)"),
+                {"id": source_id},
+            )
+        conn.execute(
+            text(
+                f"ALTER TABLE {SCHEMA}.chunks ADD CONSTRAINT chunks_indexed_source_fk "
+                f"FOREIGN KEY (indexed_source_id) REFERENCES {SCHEMA}.indexed_sources(id) "
+                "ON DELETE CASCADE"
+            )
+        )
+        conn.commit()
+    return ids
+
+
+def _open_update_of(engine, source_id):
+    conn = engine.connect()
+    conn.execute(
+        text(f"UPDATE {SCHEMA}.indexed_sources SET n = n + 1 WHERE id = CAST(:id AS uuid)"),
+        {"id": source_id},
+    )
+    pid = conn.execute(text("SELECT pg_backend_pid()")).scalar()
+    return conn, pid
+
+
+def test_a_writer_of_a_referenced_table_makes_the_move_give_up_fast_and_is_named(
+    engine, session, monkeypatch
+):
+    """An open UPDATE of an unrelated indexed_sources row refused the foreign
+    keys' SHARE ROW EXCLUSIVE, and the move waited its 5 s lock_timeout for it
+    while holding every writer of the item table off -- then named nobody."""
+    source_ids = _reference_indexed_sources(engine)
+    monkeypatch.setattr(pgb, "MOVE_CHECK_CLEANUP_WAIT_SECONDS", 1.0)
+    holder, holder_pid = _open_update_of(engine, source_ids[1])
+    real = pgb.partition_lock_default_ddl
+    writer: dict = {}
+
+    def insert_for_another_kb():
+        started = time.monotonic()
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    f"INSERT INTO {SCHEMA}.chunks (knowledge_base_id, text) "
+                    "VALUES (CAST(:kb AS uuid), 'anderswo')"
+                ),
+                {"kb": KB_B},
+            )
+            conn.commit()
+        writer["waited"] = time.monotonic() - started
+
+    def start_a_writer_once_writes_are_held(item_table):
+        if "thread" not in writer:
+            writer["thread"] = threading.Thread(target=insert_for_another_kb, daemon=True)
+            writer["thread"].start()
+        return real(item_table)
+
+    monkeypatch.setattr(pgb, "partition_lock_default_ddl", start_a_writer_once_writes_are_held)
+    started = time.monotonic()
+    try:
+        try:
+            pgb.create_partition(engine, KB_A, "chunks")
+        except Exception as exc:
+            error = exc
+        else:
+            error = None
+        took = time.monotonic() - started
+        writer["thread"].join(timeout=30)
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert error is not None and pgb.is_lock_conflict(error), error
+    assert error.bm25_move_step == "referenced tables"
+    assert took < 3.0, took
+    assert writer["waited"] < 2.0, writer
+    named = [
+        h
+        for h in error.bm25_lock_holders
+        if h["pid"] == holder_pid and h["granted"] and h["lock_on"].endswith("indexed_sources")
+    ]
+    assert named, error.bm25_lock_holders
+    assert _rows_in(session, "chunks_default", KB_A) == len(KB_A_DOCS)
+    # Nothing is left behind, and the next attempt goes through.
+    assert pgb.create_partition(engine, KB_A, "chunks")["rows_moved"] == len(KB_A_DOCS)
+
+
+def test_a_long_writer_of_a_referenced_table_stops_the_move_before_it_holds_writers(
+    engine, session, monkeypatch
+):
+    source_ids = _reference_indexed_sources(engine)
+    monkeypatch.setattr(pgb, "_long_holder_seconds", lambda: 1)
+    taken = _spy_parent_lock(monkeypatch)
+    holder, _pid = _open_update_of(engine, source_ids[0])
+    try:
+        time.sleep(1.2)
+        try:
+            pgb.create_partition(engine, KB_A, "chunks")
+        except Exception as exc:
+            error = exc
+        else:
+            error = None
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert error is not None and pgb.is_lock_conflict(error), error
+    assert taken == []
+
+
+def test_the_fast_path_gives_up_fast_on_a_writer_of_a_referenced_table(
+    engine, session, monkeypatch
+):
+    source_ids = _reference_indexed_sources(engine)
+    with engine.connect() as conn:
+        conn.execute(
+            text(f"DELETE FROM {SCHEMA}.chunks WHERE knowledge_base_id = CAST(:kb AS uuid)"),
+            {"kb": KB_A},
+        )
+        conn.commit()
+    holder, holder_pid = _open_update_of(engine, source_ids[1])
+    started = time.monotonic()
+    try:
+        try:
+            pgb.create_partition(engine, KB_A, "chunks")
+        except Exception as exc:
+            error = exc
+        else:
+            error = None
+        took = time.monotonic() - started
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert error is not None and pgb.is_lock_conflict(error), error
+    assert error.bm25_move_step == "referenced tables"
+    assert took < 3.0, took
+    assert any(h["pid"] == holder_pid for h in error.bm25_lock_holders), error.bm25_lock_holders
+
+
+def test_a_long_writer_through_the_parent_stops_the_move_before_it_holds_writers(
+    engine, session, monkeypatch
+):
+    """A long ungated transaction that wrote another, already partitioned,
+    knowledge base's rows holds the parent, not DEFAULT: the move's SHARE lock
+    on the parent queued behind it for 5 s, with every writer behind the move."""
+    pgb.create_partition(engine, KB_B, "chunks")
+    monkeypatch.setattr(pgb, "_long_holder_seconds", lambda: 1)
+    taken = _spy_parent_lock(monkeypatch)
+    holder = engine.connect()
+    holder.execute(
+        text(f"UPDATE {SCHEMA}.chunks SET text = text WHERE knowledge_base_id = CAST(:kb AS uuid)"),
+        {"kb": KB_B},
+    )
+    holder_pid = holder.execute(text("SELECT pg_backend_pid()")).scalar()
+    started = time.monotonic()
+    try:
+        time.sleep(1.2)
+        started = time.monotonic()
+        try:
+            pgb.create_partition(engine, KB_A, "chunks")
+        except Exception as exc:
+            error = exc
+        else:
+            error = None
+        took = time.monotonic() - started
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert error is not None and pgb.is_lock_conflict(error), error
+    assert taken == []
+    assert took < 2.0, took
+    assert any(h["pid"] == holder_pid for h in error.bm25_lock_holders), error.bm25_lock_holders
