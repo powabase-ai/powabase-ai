@@ -4,8 +4,10 @@ The move from the DEFAULT partition into a knowledge base's own partition (and
 the index build that follows it) can retry several times before it succeeds
 or gives up. Nothing survived a restart of that bookkeeping until now: this
 table lets the pg tasks record, per (knowledge_base_id, item_table), the
-latest status (``queued``, ``moving``, ``building``, ``ready``, ``retrying``,
-``failed``, or ``unavailable`` when the server cannot build one safely), the reason for a retry or failure, and how many attempts it took
+latest status (``queued``, ``moving``, ``building``, ``completing``, ``ready``,
+``retrying``, ``failed``; ``needs_build`` when only an operator may move the
+rows, ``unavailable`` when the server cannot build the index safely), the
+reason for a retry or failure, and how many attempts it took
 -- so a KB's ``bm25_status`` can be reported even after the worker restarts.
 
 Class-B (service-only), same posture as the other backend-only ``ai`` tables
@@ -37,8 +39,8 @@ def upgrade():
                     REFERENCES ai.knowledge_bases(id) ON DELETE CASCADE,
                 item_table TEXT NOT NULL,
                 status TEXT NOT NULL
-                    CHECK (status IN ('queued', 'moving', 'building', 'ready', 'retrying',
-                                      'failed', 'unavailable')),
+                    CHECK (status IN ('queued', 'moving', 'building', 'completing', 'ready',
+                                      'retrying', 'failed', 'needs_build', 'unavailable')),
                 reason TEXT,
                 attempts INTEGER,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),

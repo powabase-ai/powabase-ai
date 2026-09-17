@@ -25,7 +25,19 @@ from ..db import AI_SCHEMA
 
 logger = logging.getLogger(__name__)
 
-STATUSES = frozenset({"queued", "moving", "building", "ready", "retrying", "failed", "unavailable"})
+STATUSES = frozenset(
+    {
+        "queued",
+        "moving",
+        "building",
+        "completing",
+        "ready",
+        "retrying",
+        "failed",
+        "needs_build",
+        "unavailable",
+    }
+)
 
 _TABLE = f"{AI_SCHEMA}.bm25_index_builds"
 

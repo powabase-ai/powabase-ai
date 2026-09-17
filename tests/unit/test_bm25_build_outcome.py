@@ -44,7 +44,17 @@ def _fake_session():
 
 def test_statuses_are_exactly_the_documented_ones():
     assert STATUSES == frozenset(
-        {"queued", "moving", "building", "ready", "retrying", "failed", "unavailable"}
+        {
+            "queued",
+            "moving",
+            "building",
+            "completing",
+            "ready",
+            "retrying",
+            "failed",
+            "needs_build",
+            "unavailable",
+        }
     )
 
 

@@ -185,3 +185,28 @@ def test_ensure_completes_a_partition_whose_indexes_or_key_validation_never_happ
     assert outcome["status"] == "ready"
     assert _index_shapes(session, partition) == expected
     assert all(valid for _, valid in _foreign_keys(session, partition))
+
+
+def test_an_unfinished_partition_is_reported_and_found_by_the_start_up_sweep(engine, session):
+    """Between the move's commit and the end of its post-commit work, the
+    partition serves keyword search but is not finished: the status must say
+    so, and a sweep at start-up must find it if the worker died there."""
+    _add_production_like_indexes(engine)
+    pgb.create_partition(engine, KB_A, "chunks")
+
+    assert pgb.partition_completion_pending(engine, KB_A, "chunks") is True
+    assert pgb.partition_completion_pending(session, KB_A, "chunks") is True
+    session.rollback()
+    assert (KB_A, "chunks") in pgb.partitions_needing_completion(engine)
+
+    progress: list[str] = []
+    outcome = pgb.ensure_bm25_index(KB_A, engine=engine, on_progress=progress.append)
+
+    assert outcome["status"] == "ready"
+    assert progress == ["building", "completing"]
+    assert pgb.partition_completion_pending(engine, KB_A, "chunks") is False
+    assert pgb.partitions_needing_completion(engine) == []
+    # A finished partition says so on the next run without recording anything.
+    again: list[str] = []
+    pgb.ensure_bm25_index(KB_A, engine=engine, on_progress=again.append)
+    assert again == []

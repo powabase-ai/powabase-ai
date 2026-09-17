@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import random
+import re
 import traceback
 
 from ..celery import celery_app
@@ -2742,24 +2743,97 @@ def _outcome_bind():
 
 # The recorded reason for an automatic build that found rows to move.
 ROW_MOVE_NOT_ALLOWED_REASON = (
-    "not built: the knowledge base has rows in the item table's shared DEFAULT partition, "
-    "and moving them blocks writes to the whole table, so only an operator starts it: "
-    "POST /build-bm25"
+    "not built yet: the knowledge base has rows in the item table's shared DEFAULT "
+    "partition, and moving them into its own partition blocks writes to the whole table "
+    "for the length of the move, so only an operator starts it: POST /build-bm25. Until "
+    "then keyword search keeps the path it uses now"
 )
+
+# What each skip reason ``ensure_bm25_index`` returns means, for the record.
+_SKIP_REASON_TEXT = {
+    "extension_absent": "the pg_search extension is not installed in this database",
+    "kb_not_found": "the knowledge base no longer exists",
+    "retrieval_method": "the knowledge base's retrieval method runs no keyword search",
+    "strategy": "the knowledge base's indexing strategy keeps no keyword text",
+    "table_not_partitioned": (
+        "the item table is not partitioned by knowledge base yet; the service's database "
+        "migrations have not reached it"
+    ),
+    "default_partition_absent": (
+        "the item table has no DEFAULT partition to move this knowledge base's rows from, "
+        "which the service's migrations create; the database schema is not what this "
+        "service expects"
+    ),
+}
+
+
+def skip_reason_text(reason: str | None) -> str:
+    """The recorded reason for a build ``ensure_bm25_index`` skipped, in words."""
+    return f"not built: {_SKIP_REASON_TEXT.get(reason or '', 'skipped by the service')}"
+
+
+# What each step a move or build reports was doing, for a failure's reason.
+MOVE_STEP_DESCRIPTIONS = {
+    "prepare": "preparing the knowledge base's partition",
+    "move gate": "waiting for indexing on the item table to pause",
+    "pre-flight check of DEFAULT": "checking that the item table could be locked",
+    "parent lock": "holding writes to the item table off",
+    "referenced tables": (
+        "locking the tables the partition's foreign keys reference "
+        "(knowledge_bases, sources, indexed_sources)"
+    ),
+    "check on DEFAULT": "fencing the knowledge base's rows in the shared DEFAULT partition",
+    "fence": "fencing the knowledge base's rows in the shared DEFAULT partition",
+    "DEFAULT lock": "locking the shared DEFAULT partition",
+    "copy": "copying the rows into the partition",
+    "delete from DEFAULT": "deleting the moved rows from the shared DEFAULT partition",
+    "validate the check on DEFAULT": (
+        "checking that no row of the knowledge base was left in the shared DEFAULT partition"
+    ),
+    "validate": "checking that the shared DEFAULT partition holds no row of the knowledge base",
+    "key, unique indexes and foreign keys": "adding the partition's key and foreign keys",
+    "indexes, keys and attach": "adding the partition's indexes and keys and attaching it",
+    "attach": "attaching the partition",
+    "mirror settings": "copying the table's grants and row-level security to the partition",
+    "commit": "committing the move",
+    "detach": "detaching the partition",
+}
+
+
+def _sqlstate_name(sqlstate: str) -> str:
+    try:
+        import psycopg.errors
+
+        name = psycopg.errors.lookup(sqlstate).__name__
+    except Exception:
+        return "database error"
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
 
 
 def _bm25_failure_reason(exc: BaseException) -> str:
-    """A short, client-safe reason for a failed move or build: no SQL, no query text."""
+    """A short, client-safe reason for a failed move or build: no SQL, no query text.
+
+    Says what was being done in words (``MOVE_STEP_DESCRIPTIONS``), never an
+    internal step name or a bare SQLSTATE, and keeps the instructions of an
+    error written for a person (``PartitionMoveRefused``).
+    """
     step = getattr(exc, "bm25_move_step", None)
-    at = f" at step {step!r}" if step else ""
+    at = f" while {MOVE_STEP_DESCRIPTIONS.get(step, 'moving or building')}" if step else ""
+    log = "; the worker log has the details"
     if isinstance(exc, pg_bm25_index.PartitionBuildInProgress):
-        return "another partition build on the item table is in progress"
+        return "another partition build on the item table is in progress; retried automatically"
     if isinstance(exc, pg_bm25_index.Bm25IndexBuildFailed):
-        return "the concurrent bm25 index build failed inside pg_search"
+        return (
+            "the concurrent bm25 index build failed inside pg_search, likely the bug fixed by "
+            "paradedb/paradedb#6211 (check the Postgres image); the next attempt rebuilds it"
+        )
+    if isinstance(exc, pg_bm25_index.PartitionMoveRefused):
+        return f"stopped{at}: {pg_bm25_index.first_error_line(exc)}"
     sqlstate = getattr(getattr(exc, "orig", exc), "sqlstate", None)
     if pg_bm25_index.is_lock_conflict(exc):
         holders = [h for h in getattr(exc, "bm25_lock_holders", None) or [] if h.get("granted")]
-        kind = "a deadlock" if sqlstate == "40P01" else "a lock"
+        kind = "a deadlock" if sqlstate == "40P01" else "gave up waiting for a lock"
+        head = f"lost {kind}{at}" if sqlstate == "40P01" else f"{kind}{at}"
         # Graph indexing holds graph_index_nodes' move gate for a whole run.
         why = (
             "; a graph_index source is indexing into this table, and the move retries after it"
@@ -2769,17 +2843,52 @@ def _bm25_failure_reason(exc: BaseException) -> str:
         if holders:
             oldest = max(holders, key=lambda h: h.get("xact_seconds") or 0)
             return (
-                f"gave up on {kind}{at}, held by another transaction "
+                f"{head}, held by another transaction "
                 f"(pid {oldest.get('pid')}, open {oldest.get('xact_seconds')} s){why}"
             )
-        return f"gave up on {kind}{at}{why}"
+        return f"{head}{why}"
     if sqlstate == "57014":
-        return f"cancelled by a statement timeout{at}"
+        return f"cancelled by a statement timeout{at}; retried automatically"
+    if pg_bm25_index.is_connect_failure(exc):
+        return f"could not connect to the database{at}; retried automatically"
     if getattr(exc, "connection_invalidated", False) or (sqlstate or "").startswith(("08", "57P")):
-        return f"lost the database connection{at}"
+        return f"lost the database connection{at}; retried automatically"
     if sqlstate:
-        return f"failed{at} (SQLSTATE {sqlstate})"
-    return f"failed{at} ({type(exc).__name__})"
+        return f"failed{at} with a database error ({_sqlstate_name(sqlstate)}, SQLSTATE {sqlstate}){log}"
+    return f"failed{at} with an unexpected error ({type(exc).__name__}){log}"
+
+
+def dispatch_partition_completion_at_start(engine) -> list[str]:
+    """Start-up: dispatch an ensure for every knowledge base whose partition has work left.
+
+    A worker killed after a move committed -- during a secondary index build or
+    before its foreign keys were validated -- leaves a partition that serves
+    keyword search but deletes a source's rows slowly, and nothing else comes
+    back to it. The ensure is idempotent and moves no rows (the partition
+    exists). Returns the knowledge base ids dispatched. Never raises.
+    """
+    try:
+        pending = pg_bm25_index.partitions_needing_completion(engine)
+    except Exception:
+        logger.warning("Could not look for unfinished BM25 partitions at start-up", exc_info=True)
+        return []
+    dispatched: list[str] = []
+    for kb_id, _item_table in pending:
+        if kb_id in dispatched:
+            continue
+        try:
+            ensure_pg_bm25_index.delay(kb_id)
+        except Exception:
+            logger.warning(
+                "Could not dispatch the completion of KB %s's partition at start-up",
+                kb_id,
+                exc_info=True,
+            )
+            continue
+        dispatched.append(kb_id)
+    if dispatched:
+        logger.info("Dispatched the completion of unfinished BM25 partitions: %s", dispatched)
+    return dispatched
 
 
 def _retire_file_index(kb_id: str, item_table: str) -> None:
@@ -2807,33 +2916,44 @@ def ensure_pg_bm25_index(self, kb_id: str, allow_row_move: bool = False) -> dict
 
     Dispatched for a new knowledge base when it is created, from a PATCH only
     when that cannot move rows (the KB's partition already exists, or DEFAULT
-    holds none of its rows), and by the operator's ``POST /build-bm25`` -- the
-    only caller that passes ``allow_row_move=True``. Without it, a KB found
-    with rows in DEFAULT is not moved -- not even when they are its own
-    sources, indexed while this run waited or retried -- and the run records
-    ``failed`` with a reason that points at ``POST /build-bm25``. With it, the
-    first run for a KB with rows in DEFAULT moves them into a partition of its
-    own, in one transaction: writes to the whole item table (every KB on it)
-    wait for the move -- see ``pg_bm25_index.create_partition`` for measured
+    holds none of its rows), at start-up for a partition whose post-move work
+    never finished, and by the operator's ``POST /build-bm25`` -- the only
+    caller that passes ``allow_row_move=True``. Without it, a KB found with
+    rows in DEFAULT is not moved -- not even when they are its own sources,
+    indexed while this run waited or retried -- and the run records
+    ``needs_build`` with a reason that points at ``POST /build-bm25``. With it,
+    the first run for a KB with rows in DEFAULT moves them into a partition of
+    its own, in one transaction: writes to the whole item table (every KB on
+    it) wait for the move, and indexing on the table waits while the move
+    queues for its gate -- see ``pg_bm25_index.create_partition`` for measured
     numbers -- while readers of DEFAULT wait a fraction of a second for each of
     its ACCESS EXCLUSIVE steps. A KB with no rows in DEFAULT is attached
     without holding writers. Later runs are cheap and idempotent. Returns the
     service's own outcome dict.
 
     Each run records its progress in ``ai.bm25_index_builds``: ``queued`` when
-    it starts, then ``moving`` and ``building`` as the service reaches them,
-    and ``ready``, ``retrying`` (with the reason) or ``failed``. Retries, with
-    jittered backoff up to ``PG_BM25_TASK_MAX_RETRIES``, on the failures
+    it starts, then ``moving``, ``building`` and ``completing`` as the service
+    reaches them, and ``ready``, ``retrying`` (with the reason), ``failed``,
+    ``needs_build`` (only an operator may move the rows) or ``unavailable``
+    (the server cannot build a bm25 index safely; see
+    ``pg_bm25_index.concurrent_build_safety``). Retries, with jittered backoff
+    up to ``PG_BM25_TASK_MAX_RETRIES``, on the failures
     ``is_transient_db_error`` accepts and while another build holds the item
     table; any other error, or the last retry, fails the run at ERROR.
     """
     attempt = self.request.retries + 1
     bind = _outcome_bind()
-    item_table = pg_bm25_index.keyword_item_table(bind, kb_id) if bind is not None else None
+    resolved: dict = {}
 
     def record(status: str, reason: str | None = None) -> None:
-        if bind is not None and item_table is not None:
-            record_bm25_build_outcome(bind, kb_id, item_table, status, reason, attempt)
+        # Resolved again until it is known: a run that starts while the server
+        # is unreachable must still record how it ends once it is back.
+        if bind is None:
+            return
+        if resolved.get("item_table") is None:
+            resolved["item_table"] = pg_bm25_index.keyword_item_table(bind, kb_id)
+        if resolved["item_table"] is not None:
+            record_bm25_build_outcome(bind, kb_id, resolved["item_table"], status, reason, attempt)
 
     def retry_or_give_up(reason: str, exc: BaseException | None):
         if self.request.retries >= self.max_retries:
@@ -2892,14 +3012,15 @@ def ensure_pg_bm25_index(self, kb_id: str, allow_row_move: bool = False) -> dict
         # safely, and nothing about that changes until an operator acts.
         record("unavailable", pg_bm25_index.CONCURRENT_BUILD_UNSAFE_REASON)
     elif skip_reason == "row_move_not_allowed":
-        record("failed", ROW_MOVE_NOT_ALLOWED_REASON)
-        logger.warning(
+        # Deliberate, not a failure: moving rows is an operator's decision.
+        record("needs_build", ROW_MOVE_NOT_ALLOWED_REASON)
+        logger.info(
             "Not building the BM25 index of KB %s: its rows are in the item table's DEFAULT "
             "partition, and this build was dispatched automatically. POST /build-bm25 to move them",
             kb_id,
         )
     elif status == "skipped":
-        record("failed", f"not built: {skip_reason}")
+        record("failed", skip_reason_text(skip_reason))
     return outcome
 
 

@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from agentic_project_service.services.bm25_build_outcome import STATUSES
 from tests.pg_search.test_migration_0030_extension import scratch_database, server_engine_or_skip
 from tests.pg_search.test_partition_migration import load_revision
 
@@ -111,7 +112,8 @@ def test_check_constraint_accepts_every_documented_status(revision, scratch_engi
     with scratch_engine.begin() as conn:
         _upgrade(revision, conn, monkeypatch)
 
-    statuses = ("queued", "moving", "building", "ready", "retrying", "failed")
+    statuses = tuple(sorted(STATUSES))
+    assert {"needs_build", "completing", "unavailable"} <= set(statuses)
     with scratch_engine.begin() as conn:
         for status in statuses:
             conn.execute(

@@ -50,6 +50,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError as _SQLAlchemyOperationalError
 
 from ..db import AI_SCHEMA
 from .sparse_retrieval import STRATEGY_TO_BM25_ITEM_TABLE
@@ -1290,6 +1291,14 @@ _TRANSIENT_SQLSTATE_CLASSES = frozenset({"08"})
 _LOCK_CONFLICT_SQLSTATES = frozenset({"40P01", "55P03"})
 
 
+class PartitionMoveRefused(RuntimeError):
+    """The move stopped on a state a person has to resolve; the message says how.
+
+    Its message names only relations of the item table and what to do, so it
+    is safe to report to an API client as it is.
+    """
+
+
 class Bm25IndexBuildFailed(RuntimeError):
     """pg_search's own ``CREATE INDEX CONCURRENTLY`` failed with an internal error.
 
@@ -1452,16 +1461,32 @@ def is_transient_db_error(exc: BaseException) -> bool:
 
     Contention, a cancelled statement, a lost connection (reported with no
     SQLSTATE by the driver, which SQLAlchemy marks ``connection_invalidated``),
-    or a failed concurrent bm25 build.
+    a connection that could not be opened, or a failed concurrent bm25 build.
+
+    A connection that could not be opened -- refused, or a server still
+    recovering, whose SQLSTATE 57P03 psycopg folds into the message -- is an
+    ``OperationalError`` raised before any statement: no statement and no
+    SQLSTATE. A retry landing while Postgres restarts meets exactly that.
     """
     if isinstance(exc, Bm25IndexBuildFailed):
         return True
     if getattr(exc, "connection_invalidated", False):
         return True
+    if is_connect_failure(exc):
+        return True
     sqlstate = _sqlstate(exc)
     if sqlstate is None:
         return False
     return sqlstate in _TRANSIENT_SQLSTATES or sqlstate[:2] in _TRANSIENT_SQLSTATE_CLASSES
+
+
+def is_connect_failure(exc: BaseException) -> bool:
+    """Could a connection not be opened at all (no statement ran, no SQLSTATE)?"""
+    return (
+        isinstance(exc, _SQLAlchemyOperationalError)
+        and getattr(exc, "statement", None) is None
+        and _sqlstate(exc) is None
+    )
 
 
 def is_lock_conflict(exc: BaseException) -> bool:
@@ -1881,7 +1906,7 @@ def _drop_stale_clone(conn, kb_id: str, item_table: str) -> None:
     if same_shape and not _has_indexes_or_foreign_keys(conn, partition):
         return
     if conn.execute(text(f"SELECT EXISTS (SELECT 1 FROM {_qualified(partition)})")).scalar():
-        raise RuntimeError(
+        raise PartitionMoveRefused(
             f"{AI_SCHEMA}.{partition} is an unattached clone that no longer matches "
             f"{AI_SCHEMA}.{default_partition_name(item_table)}, and it holds rows; not "
             "dropping it. Move its rows back or drop it, then retry"
@@ -2066,6 +2091,107 @@ def _complete_partition(conn, kb_id: str, item_table: str) -> dict:
     if done:
         logger.info("Completed partition %s.%s: %s", AI_SCHEMA, partition, done)
     return done
+
+
+def _partition_completion_pending(conn, kb_id: str, item_table: str) -> bool:
+    """Does an attached partition still lack work ``_complete_partition`` does?
+
+    A foreign key not yet validated, an INVALID plain index, or one of
+    DEFAULT's plain indexes not yet built on it. Until that work is done the
+    partition is correct but slower: without its secondary indexes a delete of
+    one source's rows scans the whole partition. Raises if the catalog cannot
+    be read.
+    """
+    if not _partition_is_attached(conn, kb_id, item_table):
+        return False
+    partition = partition_name(kb_id, item_table)
+    if conn.execute(
+        text(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass(:partition) "
+            "AND contype = 'f' AND NOT convalidated)"
+        ),
+        {"partition": _qualified(partition)},
+    ).scalar():
+        return True
+    _, shapes, invalid = _partition_index_state(conn, partition)
+    if any(not name.startswith("bm25_") for name in invalid):
+        return True
+    return any(
+        "constraint" not in definition and (definition["unique"], definition["tail"]) not in shapes
+        for definition in _default_index_definitions(conn, item_table)
+    )
+
+
+def partition_completion_pending(bind, kb_id: str, item_table: str) -> bool:
+    """``_partition_completion_pending`` for a request path. Never raises; "can't tell" is False.
+
+    ``bind`` is an Engine (a connection of its own) or a Session or Connection,
+    read in a savepoint so a failure cannot abort the caller's transaction.
+    """
+    from sqlalchemy.engine import Engine
+
+    try:
+        if isinstance(bind, Engine):
+            with bind.connect() as conn:
+                try:
+                    return bool(_partition_completion_pending(conn, kb_id, item_table))
+                finally:
+                    conn.rollback()
+        with bind.begin_nested():
+            return bool(_partition_completion_pending(bind, kb_id, item_table))
+    except Exception as exc:
+        logger.debug(
+            "Could not tell whether the partition of KB %s on %s is complete: %s",
+            kb_id,
+            item_table,
+            first_error_line(exc),
+        )
+        return False
+
+
+def partitions_needing_completion(engine) -> list[tuple[str, str]]:
+    """``(knowledge_base_id, item_table)`` of every attached partition with work left.
+
+    For the start-up sweep: a worker killed between a move's commit and the end
+    of ``_complete_partition`` leaves such a partition, and nothing else would
+    come back to it until the knowledge base's next build. A table that cannot
+    be read is logged and left out.
+    """
+    pending: list[tuple[str, str]] = []
+    pattern = re.compile(r"_kb_([0-9a-f]{32})$")
+    for item_table in sorted(PARTITIONED_ITEM_TABLES):
+        try:
+            with engine.connect() as conn:
+                try:
+                    if not table_is_partitioned(conn, item_table):
+                        continue
+                    children = conn.execute(
+                        text(
+                            "SELECT c.relname FROM pg_inherits i "
+                            "JOIN pg_class c ON c.oid = i.inhrelid "
+                            "JOIN pg_class p ON p.oid = i.inhparent "
+                            "JOIN pg_namespace n ON n.oid = p.relnamespace "
+                            "WHERE n.nspname = :schema AND p.relname = :parent ORDER BY c.relname"
+                        ),
+                        {"schema": AI_SCHEMA, "parent": item_table},
+                    ).all()
+                    for (relname,) in children:
+                        match = pattern.search(relname)
+                        if match is None or relname != partition_name(match.group(1), item_table):
+                            continue
+                        kb_id = str(uuid.UUID(match.group(1)))
+                        if _partition_completion_pending(conn, kb_id, item_table):
+                            pending.append((kb_id, item_table))
+                finally:
+                    conn.rollback()
+        except Exception as exc:
+            logger.warning(
+                "Could not look for unfinished partitions of %s.%s: %s",
+                AI_SCHEMA,
+                item_table,
+                first_error_line(exc),
+            )
+    return pending
 
 
 def _move_check_names(conn, item_table: str) -> list[str]:
@@ -3039,7 +3165,11 @@ def keyword_item_table(bind, knowledge_base_id: str) -> str | None:
         kb_id = _validated_kb_id(knowledge_base_id)
         row = _run_probe(bind, lambda conn: _probe(conn, _kb_config_sql(), {"id": kb_id}))
     except Exception as exc:
-        logger.debug("Could not read the keyword item table of KB %s: %s", knowledge_base_id, exc)
+        logger.warning(
+            "Could not read the keyword item table of KB %s: %s",
+            knowledge_base_id,
+            first_error_line(exc),
+        )
         return None
     if row is None or row[1] not in ("hybrid", "full_text"):
         return None
@@ -3077,9 +3207,10 @@ def ensure_bm25_index(
     ``row_move_not_allowed``, and nothing is moved.
 
     ``on_progress(status)`` is called with ``"moving"`` before a partition is
-    created or its rows are moved, and ``"building"`` before the bm25 index
-    is built (including on a partition whose move committed but whose index
-    never got built); the ensure task persists these.
+    created or its rows are moved, ``"building"`` before the bm25 index is
+    built (including on a partition whose move committed but whose index never
+    got built), and ``"completing"`` before the partition's foreign keys are
+    validated and its plain indexes built; the ensure task persists these.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
@@ -3208,7 +3339,11 @@ def ensure_bm25_index(
             # above all, the one slow build) would only delay it. A partition
             # whose bm25 build is not safe here is still completed: its plain
             # indexes are what keep its source-scoped deletes fast.
-            if outcome.get("status") in ("ready", "unavailable"):
+            if outcome.get("status") in (
+                "ready",
+                "unavailable",
+            ) and _partition_completion_pending(conn, kb_id, item_table):
+                progress("completing")
                 completed = _complete_partition(conn, kb_id, item_table)
                 if completed:
                     outcome["completed"] = completed

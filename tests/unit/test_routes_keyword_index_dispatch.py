@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agentic_project_service.tasks.indexing import skip_reason_text
 from agentic_project_service.routes import knowledge_bases as kb_route
 
 R = "agentic_project_service.routes.knowledge_bases"
@@ -749,6 +750,7 @@ class TestStatusReportsThePersistedBuildOutcome:
     def _detail(self, *, pg_state, outcome, backend="pg_search", auto_indexing=True, file=True):
         with (
             patch(f"{R}.db"),
+            patch(f"{R}.pg_bm25_index.partition_completion_pending", return_value=False),
             patch(f"{R}._keyword_index_backend", return_value=backend),
             patch(f"{R}.pg_bm25_status", return_value=pg_state),
             patch(f"{R}.read_bm25_build_outcome", return_value=outcome) as read,
@@ -795,8 +797,8 @@ class TestStatusReportsThePersistedBuildOutcome:
         (got, reason), read = self._detail(
             pg_state="ready", outcome=self._outcome("failed", "old failure")
         )
+        # A finished partition with a ready index: an old failure is history.
         assert (got, reason) == ("ready", None)
-        read.assert_not_called()
 
     def test_an_outcome_for_another_item_table_is_ignored(self):
         (got, reason), _ = self._detail(
@@ -844,10 +846,10 @@ class TestStatusReportsThePersistedBuildOutcome:
     @pytest.mark.parametrize(
         "reason",
         [
-            "not built: extension_absent",
-            "not built: table_not_partitioned",
-            "not built: retrieval_method",
-            "not built: strategy",
+            skip_reason_text("extension_absent"),
+            skip_reason_text("table_not_partitioned"),
+            skip_reason_text("retrieval_method"),
+            skip_reason_text("strategy"),
         ],
     )
     def test_a_skip_whose_precondition_now_holds_is_not_reported(self, reason):
@@ -862,9 +864,9 @@ class TestStatusReportsThePersistedBuildOutcome:
     def test_a_skip_for_a_missing_default_partition_is_reported(self):
         (got, reason), _ = self._detail(
             pg_state="absent",
-            outcome=self._outcome("failed", "not built: default_partition_absent"),
+            outcome=self._outcome("failed", skip_reason_text("default_partition_absent")),
         )
-        assert (got, reason) == ("failed", "not built: default_partition_absent")
+        assert (got, reason) == ("failed", skip_reason_text("default_partition_absent"))
 
     def test_an_unreadable_outcome_falls_back_to_the_index_state(self):
         """Outside an app context even ``db.session`` raises; the status must
@@ -906,7 +908,7 @@ class TestStatusReportsThePersistedBuildOutcome:
         assert repr(status) in reason and "POST /build-bm25" in reason
         assert recorded["updated_at"] == long_ago
 
-    @pytest.mark.parametrize("status", ["moving", "failed", "retrying"])
+    @pytest.mark.parametrize("status", ["moving", "failed", "needs_build"])
     def test_a_recent_or_terminal_outcome_is_reported_as_recorded(self, status):
         from datetime import datetime, timedelta, timezone
 

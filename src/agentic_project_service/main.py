@@ -391,6 +391,19 @@ def create_app(testing: bool = False):
                             "Start-up sweep for leftover partition move checks failed",
                             exc_info=True,
                         )
+                    # A worker killed after a move committed can leave a
+                    # partition whose foreign keys or secondary indexes were
+                    # never finished; nothing else comes back to it. Dispatch
+                    # its (idempotent) ensure. Never raises.
+                    try:
+                        from .tasks.indexing import dispatch_partition_completion_at_start
+
+                        dispatch_partition_completion_at_start(db.engine)
+                    except Exception:
+                        logger.warning(
+                            "Start-up sweep for unfinished BM25 partitions failed",
+                            exc_info=True,
+                        )
                 finally:
                     db.session.execute(text("SELECT pg_advisory_unlock(43)"))
                     db.session.commit()

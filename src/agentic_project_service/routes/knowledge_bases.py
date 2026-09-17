@@ -44,6 +44,7 @@ from ..tasks.indexing import (
     index_source,
     reindex_knowledge_base,
     reenrich_graph_references,
+    skip_reason_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -507,7 +508,16 @@ def _dispatch_drop_pg_bm25_index(kb_id: str) -> None:
 # state is reported, and a "ready" without a ready index is history (the index
 # was dropped or is being rebuilt since).
 _UNFINISHED_BM25_BUILD_STATUSES = frozenset(
-    {"queued", "moving", "building", "retrying", "failed", "unavailable"}
+    {
+        "queued",
+        "moving",
+        "building",
+        "completing",
+        "retrying",
+        "failed",
+        "needs_build",
+        "unavailable",
+    }
 )
 
 
@@ -541,7 +551,7 @@ def _unfinished_bm25_build_outcome(kb_id: str, item_table: str | None) -> dict |
 # since, the table partitioned, the method or strategy changed) and says
 # nothing about the build still to run.
 _STALE_BM25_SKIP_REASONS = frozenset(
-    f"not built: {reason}"
+    skip_reason_text(reason)
     for reason in (
         "extension_absent",
         "table_not_partitioned",
@@ -552,18 +562,30 @@ _STALE_BM25_SKIP_REASONS = frozenset(
 )
 
 
-# A recorded ``moving`` or ``building`` older than this is reported ``stale``.
-# The longest legitimate run -- a move of millions of rows, then its bm25 index
-# and the partition's plain indexes (the GIN index is 47 s per million rows)
-# -- takes minutes; each step records its progress as it starts.
+# A recorded status that waits for something -- a worker to pick the run up, a
+# retry's countdown, or a step in progress -- older than this is reported
+# ``stale``. The longest legitimate step -- a move of millions of rows, then its
+# bm25 index and the partition's plain indexes (about 60-90 s per million rows,
+# the GIN index most of it) -- takes minutes, and a retry waits at most 12.5 min;
+# each run records its progress as it goes.
 BM25_BUILD_OUTCOME_STALE_SECONDS = 3600
+_WAITING_BM25_BUILD_STATUSES = frozenset({"queued", "retrying", "moving", "building", "completing"})
+
+# The reason reported for a ready index whose partition is not finished yet.
+_COMPLETING_REASON = (
+    "keyword search is served by this knowledge base's own index, but its partition's "
+    "foreign keys or secondary indexes are not all in place yet, so deleting a source's "
+    "rows scans the whole partition meanwhile. The build that moved it completes them; "
+    "if that run stopped, the next POST /build-bm25 or a restart of the project service "
+    "does"
+)
 
 
 def _stale_or_recorded_status(outcome: dict) -> tuple[str, str | None]:
-    """The recorded status and reason, or ``stale`` for an in-progress one long silent."""
+    """The recorded status and reason, or ``stale`` for a waiting one long silent."""
     status, reason = outcome["status"], outcome.get("reason")
     updated_at = outcome.get("updated_at")
-    if status not in ("moving", "building") or not isinstance(updated_at, datetime):
+    if status not in _WAITING_BM25_BUILD_STATUSES or not isinstance(updated_at, datetime):
         return status, reason
     if updated_at.tzinfo is None:
         updated_at = updated_at.replace(tzinfo=timezone.utc)
@@ -600,6 +622,14 @@ def _bm25_status_detail(kb, recorded: dict | None = None) -> tuple[str | None, s
       - ``"stale"``: the bm25s file index is older than the KB's items
         (file index only);
       - ``"ready"``: the index serves keyword queries;
+      - ``"completing"`` (pg_search): the index serves keyword queries, but
+        the partition's foreign keys or plain indexes are still being built
+        after its move (or that work stopped part-way), so source-scoped
+        deletes are slow until it ends; the next ensure, and a restart, finish
+        it;
+      - ``"needs_build"`` (pg_search): an automatic build found the KB's rows
+        in the item table's shared DEFAULT partition and left the table-wide
+        move to an operator (``POST /build-bm25``); not an error;
       - ``"queued"``, ``"moving"``, ``"retrying"``, ``"failed"``: pg_search
         only, the recorded outcome of the move/build that gives the KB its
         own index (``ai.bm25_index_builds``) -- dispatched, moving its rows
@@ -609,10 +639,11 @@ def _bm25_status_detail(kb, recorded: dict | None = None) -> tuple[str | None, s
         index can be built there without the pg_search bug fixed by
         paradedb/paradedb#6211, so none was built or moved; the reason names
         the marker and the setting that enable it;
-      - ``"stale"`` (pg_search): a recorded ``moving`` or ``building`` that has
-        not been updated for ``BM25_BUILD_OUTCOME_STALE_SECONDS`` -- the run
-        that recorded it most likely stopped (a worker killed mid-move, or a
-        run that found another holding the index's lock). The reason says so.
+      - ``"stale"`` (pg_search): a recorded ``queued``, ``retrying``,
+        ``moving``, ``building`` or ``completing`` that has not been updated
+        for ``BM25_BUILD_OUTCOME_STALE_SECONDS`` -- the run that recorded it
+        most likely stopped (a worker killed mid-move, a lost task, or a run
+        that found another holding the index's lock). The reason says so.
 
     The index reported is the one the keyword leg actually uses (see
     ``_keyword_index_backend``): the pg_search index when that is the
@@ -645,10 +676,20 @@ def _bm25_status_detail(kb, recorded: dict | None = None) -> tuple[str | None, s
     item_table = _STRATEGY_TO_ITEM_TABLE.get(strategy)
     if _keyword_index_backend(strategy) == "pg_search":
         pg_state = pg_bm25_status(kb_id, strategy)
-        if pg_state != "ready":
-            outcome = _unfinished_bm25_build_outcome(
-                kb_id, pg_bm25_item_table(strategy or "chunk_embed")
-            )
+        pg_item_table = pg_bm25_item_table(strategy or "chunk_embed")
+        if pg_state == "ready":
+            # A ready index hides neither unfinished work on its partition nor
+            # a rebuild (a ts_language change) the server cannot run safely.
+            pending = pg_bm25_index.partition_completion_pending(db.session, kb_id, pg_item_table)
+            outcome = _unfinished_bm25_build_outcome(kb_id, pg_item_table)
+            if outcome is not None and (pending or outcome.get("status") == "unavailable"):
+                if recorded is not None:
+                    recorded["updated_at"] = outcome.get("updated_at")
+                return _stale_or_recorded_status(outcome)
+            if pending:
+                return "completing", _COMPLETING_REASON
+        else:
+            outcome = _unfinished_bm25_build_outcome(kb_id, pg_item_table)
             if outcome is not None:
                 if recorded is not None:
                     recorded["updated_at"] = outcome.get("updated_at")

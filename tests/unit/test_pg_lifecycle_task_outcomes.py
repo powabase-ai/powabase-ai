@@ -249,11 +249,11 @@ def test_an_automatic_run_does_not_allow_a_row_move_and_the_operator_run_does(ta
     assert seen == [False, True]
 
 
-def test_rows_found_by_an_automatic_run_record_failed_pointing_at_build_bm25(task, caplog):
+def test_rows_found_by_an_automatic_run_record_needs_build_pointing_at_build_bm25(task, caplog):
     ensure, retry, recorded = task
 
     with (
-        caplog.at_level(logging.WARNING),
+        caplog.at_level(logging.INFO),
         patch(
             f"{SERVICE}.ensure_bm25_index",
             return_value={
@@ -266,7 +266,7 @@ def test_rows_found_by_an_automatic_run_record_failed_pointing_at_build_bm25(tas
         ensure.run(KB)
 
     status, reason, _, _ = recorded[-1]
-    assert status == "failed"
+    assert status == "needs_build"
     assert "POST /build-bm25" in reason and "DEFAULT" in reason
     retry.assert_not_called()
     assert "POST /build-bm25" in caplog.text
