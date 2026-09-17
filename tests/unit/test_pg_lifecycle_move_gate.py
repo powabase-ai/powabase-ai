@@ -131,6 +131,20 @@ def test_full_document_writes_take_the_gate_first():
     assert gates == {pgb.move_gate_relation("full_documents")}
 
 
+def test_storing_a_full_document_takes_the_gate_first():
+    session = _recording_session()
+    store = FullDocumentStore(db_session=session, knowledge_base_id=KB, storage=MagicMock())
+    store.store_full_document(
+        indexed_source_id=IS_ID,
+        source_id=SRC,
+        summary="Zusammenfassung",
+        summary_embedding=[0.1, 0.2, 0.3],
+        full_text="Volltext",
+    )
+    gates = _assert_gate_opens_every_transaction_on_an_item_table(session.log)
+    assert gates == {pgb.move_gate_relation("full_documents")}
+
+
 def test_graph_writes_take_the_gate_first():
     session = _recording_session()
     store = GraphIndexStore(db_session=session, knowledge_base_id=KB)

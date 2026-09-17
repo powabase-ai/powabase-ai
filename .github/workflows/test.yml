@@ -107,12 +107,24 @@ jobs:
   # The server is NOT the stock paradedb/paradedb:0.25.9-pg15 image. Stock
   # pg_search 0.25.9 on Postgres 15 and 16 fails a bm25 CREATE INDEX
   # CONCURRENTLY while another backend writes to the table -- XX000 "buffer ...
-  # is not owned by resource owner", or a server crash -- and these tests build
-  # indexes under concurrent writes on purpose, so on the stock image the job
-  # fails intermittently. ci/pg_search/Dockerfile rebuilds pg_search from the
-  # v0.25.9 source with ParadeDB's fix (paradedb/paradedb#6211, in no 0.25.x
-  # release) on top of that image; everything else in the image is upstream's.
+  # is not owned by resource owner", or a server crash.
+  # Before the service checked for that fix, the whole suite passed on the
+  # stock image: nothing else builds an index while the same partition takes
+  # writes. test_pg_bm25_build_under_writes_live.py does (with the service's
+  # check overridden), and fails on the stock image every time. The service
+  # itself builds no index on a server without the image's
+  # powabase.pg_search_cic_safe marker (Postgres 15/16, pg_search < 0.26), so
+  # on the stock image most build tests would fail on that instead.
+  # ci/pg_search/Dockerfile rebuilds pg_search from the v0.25.9 source with
+  # ParadeDB's fix (paradedb/paradedb#6211, in no 0.25.x release) on top of
+  # that image, and sets the marker; everything else in the image is upstream's.
   # A deployment on Postgres 15 or 16 needs a pg_search build with that fix too.
+  #
+  # The pg_search.so built here is not a production binary: it is compiled
+  # against this image's Debian PostgreSQL 15 server headers, not the headers
+  # of whatever Postgres a deployment runs, so the two are different files. A
+  # green run says the code works with a pg_search that has the fix; it says
+  # nothing about the binary in any other image. Test that image itself.
   #
   # The compile is slow: 8 minutes with 16 parallel jobs on a workstation, so
   # expect upwards of 30 on a hosted runner's 4 CPUs. Its layers go to the GitHub Actions cache
@@ -229,12 +241,16 @@ jobs:
 
       # A backend that crashed restarts the server and fails whatever test was
       # running, but a crash between tests, or one the retries absorbed, would
-      # not fail the run. The server's own log says so either way.
-      - name: Check the server log for crashed backends
+      # not fail the run. The server's own log says so either way -- and it
+      # also records the pg_search bug's failures that crash nothing (XX000
+      # "buffer ... is not owned by resource owner", and the warning a leaked
+      # buffer pin leaves at commit).
+      - name: Check the server log for crashed backends and pg_search buffer errors
         if: always()
         run: |
-          if docker logs postgres 2>&1 | grep "terminated by signal"; then
-            echo "::error::a Postgres backend crashed during the run"
+          if docker logs postgres 2>&1 \
+              | grep -E "terminated by signal|not owned by resource owner|buffer refcount leak"; then
+            echo "::error::a Postgres backend crashed, or pg_search reported a buffer error"
             exit 1
           fi
 

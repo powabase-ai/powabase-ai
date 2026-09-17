@@ -343,3 +343,27 @@ def test_a_stale_clone_with_foreign_keys_is_dropped_without_queueing_readers_of_
     # With the long transaction gone, the next attempt drops it and attaches.
     outcome = pgb.ensure_bm25_index(KB_NEW, engine=engine, allow_row_move=False)
     assert (outcome["status"], outcome["rows_moved"]) == ("ready", 0)
+
+
+def test_a_role_statement_timeout_does_not_cancel_the_empty_attachs_scan_of_default(
+    engine, session, monkeypatch
+):
+    """The fence's VALIDATE scans all of DEFAULT, which grows with every other
+    knowledge base; a role's or database's statement_timeout must not cancel it."""
+    from sqlalchemy import create_engine
+
+    _create_empty_kb(engine)
+    real_validate = pgb.default_move_check_validate_ddl
+    monkeypatch.setattr(
+        pgb,
+        "default_move_check_validate_ddl",
+        lambda *a, **k: f"{real_validate(*a, **k)}; SELECT pg_sleep(0.5)",
+    )
+    slow = create_engine(engine.url, connect_args={"options": "-c statement_timeout=200"})
+    try:
+        attached = pgb.create_partition(slow, KB_NEW, "chunks")
+    finally:
+        slow.dispose()
+
+    assert attached["rows_moved"] == 0
+    assert pgb.partition_exists(session, KB_NEW, "chunks") is True

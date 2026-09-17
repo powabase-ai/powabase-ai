@@ -278,3 +278,27 @@ def test_a_graph_nodes_move_that_gives_up_on_its_gate_says_graph_indexing_holds_
     assert "graph_index source is indexing" in indexing._bm25_failure_reason(error)
     error.bm25_item_table = "chunks"
     assert "graph_index" not in indexing._bm25_failure_reason(error)
+
+
+def test_a_retried_operator_build_may_still_move_rows(monkeypatch):
+    """The retry must re-run the task with the operator's ``allow_row_move=True``:
+    a retry that dropped it would turn every contended ``POST /build-bm25`` into
+    a run that never moves the rows. Run eagerly, so Celery itself re-applies
+    the retry's signature."""
+    monkeypatch.setattr(indexing, "record_bm25_build_outcome", lambda *a, **k: None)
+    monkeypatch.setattr(indexing, "db", MagicMock())
+    monkeypatch.setattr(pgb, "keyword_item_table", lambda bind, kb_id: "chunks")
+    monkeypatch.setattr(indexing, "_pg_bm25_retry_countdown", lambda retries: 0)
+    seen: list[bool] = []
+
+    def service(kb_id, engine=None, on_progress=None, allow_row_move=False):
+        seen.append(allow_row_move)
+        if len(seen) == 1:
+            raise _lock_timeout()
+        return {"status": "ready", "item_table": "chunks"}
+
+    with patch(f"{SERVICE}.ensure_bm25_index", side_effect=service):
+        result = indexing.ensure_pg_bm25_index.apply(args=(KB,), kwargs={"allow_row_move": True})
+
+    assert result.get() == {"status": "ready", "item_table": "chunks"}
+    assert seen == [True, True]

@@ -91,6 +91,20 @@ def test_downgrade_drops_the_table(revision, scratch_engine, monkeypatch):
         assert not _table_exists(conn)
 
 
+def test_upgrade_enables_row_level_security_with_no_policy(revision, scratch_engine, monkeypatch):
+    """Service-only: with RLS on and no policy, only a role that bypasses RLS reads it."""
+    with scratch_engine.begin() as conn:
+        _upgrade(revision, conn, monkeypatch)
+        enabled = conn.execute(
+            text("SELECT relrowsecurity FROM pg_class WHERE oid = 'ai.bm25_index_builds'::regclass")
+        ).scalar()
+        policies = conn.execute(
+            text("SELECT count(*) FROM pg_policy WHERE polrelid = 'ai.bm25_index_builds'::regclass")
+        ).scalar()
+    assert enabled is True
+    assert policies == 0
+
+
 def test_check_constraint_rejects_an_unknown_status(revision, scratch_engine, monkeypatch):
     with scratch_engine.begin() as conn:
         _upgrade(revision, conn, monkeypatch)
