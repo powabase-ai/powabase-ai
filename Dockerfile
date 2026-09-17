@@ -46,6 +46,14 @@ ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:$PATH" \
 # With two arenas that memory is reused and the worker levels off. Set here so
 # every deployment of the image gets it; see env.example for other setups.
 ENV MALLOC_ARENA_MAX=2
+# Two arenas alone still stepped up by a few hundred MiB across long runs of
+# 1,500-page files. A fixed 1 MiB mmap threshold serves every allocation of
+# 1 MiB or more (rendered page images, source and OCR buffers) with its own
+# mapping that is returned to the OS on free, and glibc no longer raises the
+# threshold dynamically. Measured flat across six 1,500-page and fourteen
+# 400-page files in sequence, with no change in time per file. The trailing
+# underscore is part of glibc's variable name.
+ENV MALLOC_MMAP_THRESHOLD_=1048576
 # git: the docs-KB refresh (tasks/docs_refresh.py) shallow-clones its two
 # GitHub sources at runtime — without the binary those legs fail on every
 # cycle ("[Errno 2] No such file or directory: 'git'") and the KB serves
