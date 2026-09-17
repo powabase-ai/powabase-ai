@@ -46,6 +46,7 @@ from ..services.run_context import (
 )
 from ..services.session import _load_tool_calls_for_runs, persist_agent_run
 from ._runtime_kb import validate_runtime_knowledge_bases
+from ._runtime_tools import validate_runtime_tools
 
 logger = logging.getLogger(__name__)
 
@@ -896,6 +897,26 @@ def run_orchestration_stream(orch_id: str):
     project JWT already reaches every KB in the project through it); it is
     documented here rather than enforced. Expose this endpoint from trusted
     backends only.
+
+    runtime_tools (optional): list of up to 10 per-request tool entries,
+        each ``{"type": "builtin"|"custom"|"mcp", ...}``:
+        - builtin: ``{"type": "builtin", "name": "web_search",
+          "config_override": {...}}`` — database_query, database_write and
+          code_execute are not allowed at runtime; config_override keys must
+          exist in the tool's input schema.
+        - custom: exactly one of ``"tool_id"`` (an existing tool) or
+          ``"definition"`` (inline ``{name, description, input_schema,
+          config{endpoint, method, headers, timeout_seconds}}``).
+        - mcp: ``{"type": "mcp", "name", "url", "transport", "headers"}`` —
+          tools are discovered live at run start; discovery failure skips
+          the server without failing the run.
+        Tools exist for this run only; a runtime tool overrides an attached
+        tool with the same name. Validated but NOT access-enforced: any
+        caller authorized to run this orchestration can reference any tool
+        in the project or inject an arbitrary endpoint, and inline headers
+        travel in the request body — expose this endpoint from trusted
+        backends only. The list fans out to every sub-agent in the
+        orchestration for this run.
     """
     data = request.get_json()
     message = data.get("message")
@@ -908,6 +929,10 @@ def run_orchestration_stream(orch_id: str):
     runtime_kb_configs, runtime_kb_error = validate_runtime_knowledge_bases(data, db.session)
     if runtime_kb_error:
         return jsonify({"error": runtime_kb_error}), 400
+
+    runtime_tool_configs, runtime_tools_error = validate_runtime_tools(data, db.session)
+    if runtime_tools_error:
+        return jsonify({"error": runtime_tools_error}), 400
 
     # Pre-op balance check (free-tier hard cap) via the billing port. Done
     # outside the generator so 402/503 propagate as a normal HTTP error
@@ -966,7 +991,9 @@ def run_orchestration_stream(orch_id: str):
             )
 
             orch_row, orchestration = build_orchestration(
-                orch_id, runtime_kb_configs=runtime_kb_configs or None
+                orch_id,
+                runtime_kb_configs=runtime_kb_configs or None,
+                runtime_tool_configs=runtime_tool_configs or None,
             )
 
             hooks = load_hooks_for_orchestration(orch_id)

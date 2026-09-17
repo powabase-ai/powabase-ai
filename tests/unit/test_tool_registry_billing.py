@@ -597,3 +597,98 @@ def test_wrap_handler_bills_normally_on_non_json_result(billing_env, recording_b
     wrapped({"code": "print(1)"}, MagicMock())
 
     assert len(recording_billing.charges) == 1
+
+
+def _runtime_loader_env(monkeypatch):
+    """An agent with no attached tools, KB/MCP builders stubbed out."""
+
+    class _EmptyQuery:
+        def filter_by(self, **_):
+            return self
+
+        def all(self):
+            return []
+
+    class _FakeAgentTool:
+        query = _EmptyQuery()
+
+    monkeypatch.setattr(tool_registry, "AgentTool", _FakeAgentTool)
+    monkeypatch.setattr(tool_registry, "_get_flask_app", lambda: None)
+    monkeypatch.setattr(tool_registry, "_ensure_app_context", lambda h, app: h)
+    monkeypatch.setattr(tool_registry, "build_kb_tools_for_agent", lambda *a, **k: {})
+    monkeypatch.setattr(tool_registry, "build_mcp_tools_for_agent", lambda *a, **k: {})
+
+
+def test_runtime_builtin_with_deep_override_bills_deep(
+    billing_env, recording_billing, monkeypatch
+):
+    """A runtime-injected web_search with a pinned deep search_type must bill
+    the deep tier — pinning that runtime tools compose the override wrapper
+    OUTSIDE the billing wrapper exactly like attached tools."""
+    _runtime_loader_env(monkeypatch)
+
+    def fake_web_search(arguments, context):
+        return json.dumps([{"ok": True}])
+
+    monkeypatch.setitem(tool_registry.BUILTIN_HANDLERS, "web_search", fake_web_search)
+
+    tools = tool_registry.load_all_tools_for_agent(
+        "agent-x",
+        db_session=None,
+        runtime_tool_configs=[
+            {
+                "type": "builtin",
+                "name": "web_search",
+                "config_override": {"search_type": "deep-reasoning"},
+            }
+        ],
+    )
+    tools["web_search"].handler({"query": "anthropic"}, None)
+
+    assert recording_billing.charges[0]["action"] == "web_search_deep_reasoning"
+
+
+def test_runtime_inline_custom_tool_is_billing_wrapped(
+    billing_env, recording_billing, monkeypatch
+):
+    """An inline runtime custom tool's execute must post a charge like an
+    attached custom tool (billing wrap applied in the shared builder)."""
+    monkeypatch.setattr(tool_registry, "_get_flask_app", lambda: None)
+    monkeypatch.setattr(
+        tool_registry, "get_setting", lambda key: {"CUSTOM_TOOL_TIMEOUT": 30}.get(key, 1000)
+    )
+
+    tools = tool_registry.build_runtime_tools(
+        "agent-x",
+        None,
+        [
+            {
+                "type": "custom",
+                "definition": {
+                    "name": "case_lookup",
+                    "description": "d",
+                    "input_schema": {"type": "object", "properties": {}},
+                    "config": {"endpoint": "https://api.example.com/cases"},
+                },
+            }
+        ],
+    )
+    tool = tools["case_lookup"]
+
+    # Don't hit the network: neutralize the SSRF DNS check and the HTTP call
+    # underneath the (already billing-wrapped) execute.
+    monkeypatch.setattr("agentic.agent.url_validation.validate_url", lambda url: None)
+
+    class _FakeResponse:
+        text = "ok"
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(
+        "agentic.agent.tools.requests.request", lambda *a, **k: _FakeResponse()
+    )
+
+    assert tool.execute({"docket": "1"}, None) == "ok"
+    assert len(recording_billing.charges) == 1
+    assert recording_billing.charges[0]["action"] == "agent_tool_call"
