@@ -2349,22 +2349,35 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
     The bm25 index is built afterwards with CREATE INDEX CONCURRENTLY, outside
     any of this.
 
-    Who waits, measured on Postgres 15 in Docker (128 MB shared_buffers, the
-    table far larger but in a warm OS page cache, ~600-byte rows with two
-    btree indexes, parallel query off). Cold caches, slower disks and wider
-    rows are slower.
+    Who waits, measured on the production schema (the item table as the
+    migrations leave it: primary key, three foreign keys, three btree indexes
+    and a full-text GIN index) on Postgres 15 with pg_search in Docker (128 MB
+    shared_buffers, a 2.54 million-row, 2.0 GB DEFAULT in a warm OS page
+    cache, ~700-byte rows). Cold caches, slower disks and wider rows are
+    slower.
 
     * **writers** through the parent, for every knowledge base on this item
-      table, for all of step 2. A 40 000-row knowledge base over a 540 000-row
-      (390 MB) DEFAULT: 0.34-0.43 s (copy ~0.25 s, delete ~0.02 s, VALIDATE
-      ~0.06 s). Over a 2.5-2.9 million-row (2.1 GB) DEFAULT: 125 000 rows
-      1.2-1.3 s, 250 000 rows 2.7-3.2 s, 500 000 rows 4.9-5.2 s -- about
-      10 s per million rows moved, plus a VALIDATE of ~0.3 s that grows with
-      DEFAULT. A move that gives up still held writers for as long as it ran:
-      its copy time plus up to about 2 s of lock tries when a long reader
-      arrives mid-move (1.8-2.3 s for the 40 000-row move above). A long
-      reader already there when the move starts costs them nothing: the move
-      gives up before taking the parent lock.
+      table, for all of step 2. A 1 million-row knowledge base: 4.2-8.8 s,
+      typically 5.5 s (copy 2.9 s, delete from DEFAULT 2.0 s, VALIDATE 0.3 s,
+      primary key 0.3-0.5 s) -- against 59.5-62.6 s when the clone carried
+      its indexes and foreign keys during the copy, almost all of it the GIN
+      index, and 48-63 s with every index built in bulk inside the move. A
+      40 000-row knowledge base: 0.44-0.75 s (was 2.8-3.0 s), most of it the
+      VALIDATE scan, which grows with DEFAULT. A knowledge base with no rows
+      in DEFAULT takes no parent lock at all (``_attach_empty_partition``):
+      writers waited at most 8 ms while one was attached, against 0.34 s
+      before. A move that gives up still held writers for as long as it ran:
+      its copy time plus at most ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS`` of
+      lock tries per step (1.0-1.3 s in all for the 40 000-row move when a
+      long reader arrives mid-move). A long reader already there when the
+      move starts costs them nothing: the move gives up before taking the
+      parent lock.
+    * **after the commit**, nothing blocks writers: the bm25 index is built
+      concurrently (6.5 s for a million rows), then the plain secondary
+      indexes (the btrees 1.8 s, the GIN index 47 s) and the foreign keys are
+      validated (0.5 s). Until its GIN index is back, the knowledge base's
+      tsvector keyword fallback scans the partition, so keyword searches that
+      need it time out until the bm25 index is ready.
     * **readers** do not block on the SHARE locks. They can wait on the
       ACCESS EXCLUSIVE steps on DEFAULT (the check going up, the ATTACH, the
       check's drop after a failed move): new readers of DEFAULT, and queries
