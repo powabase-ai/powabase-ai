@@ -210,6 +210,51 @@ class SupabaseStorage:
         bucket_id, path = parts
         return self.download(bucket_id, path)
 
+    def download_to_file(self, storage_path: str, fileobj, chunk_size: int = 1024 * 1024) -> int:
+        """Stream a file (full ``bucket/path``) into *fileobj*; return bytes written.
+
+        ``download`` buffers the body and then joins it, so a large file costs
+        twice its size in memory at the peak. Streaming to a file costs one
+        chunk.
+        """
+        parts = storage_path.split("/", 1)
+        if len(parts) != 2:
+            raise StorageError(f"Invalid storage path: {storage_path}")
+        stream = self.stream_download(parts[0], parts[1], chunk_size)
+        next(stream)  # content-length sentinel; also raises on a bad status
+        written = 0
+        for chunk in stream:
+            fileobj.write(chunk)
+            written += len(chunk)
+        return written
+
+    def object_size(self, storage_path: str) -> int | None:
+        """Size in bytes of a file (full ``bucket/path``), None if not reported.
+
+        Asks with HEAD, which transfers no body. A storage server that does
+        not answer HEAD is asked with a GET whose body is never read.
+        """
+        parts = storage_path.split("/", 1)
+        if len(parts) != 2:
+            raise StorageError(f"Invalid storage path: {storage_path}")
+        bucket_id, path = parts
+        response = self._request("HEAD", f"/object/{bucket_id}/{path.lstrip('/')}")
+        if response.status_code in (400, 404):
+            # storage-api answers a HEAD for a missing object with 400.
+            raise StorageError(f"File not found: {storage_path}")
+        if response.status_code == 200:
+            length = response.headers.get("content-length")
+        else:
+            stream = self.stream_download(bucket_id, path)
+            try:
+                length = next(stream)
+            finally:
+                stream.close()
+        try:
+            return int(length)
+        except (TypeError, ValueError):
+            return None
+
     def delete(self, bucket_id: str, paths: list[str]) -> None:
         """Delete files from storage."""
         response = self._request(

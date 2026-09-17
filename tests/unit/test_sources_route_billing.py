@@ -88,8 +88,8 @@ def test_reextract_balance_check_blocks_status_mutation(billing_env):
     # Capture Celery dispatch attempts.
     with (
         patch.object(sources_route.db, "session", fake_session),
-        patch.object(sources_route.extract_source, "delay") as mock_extract,
-        patch.object(sources_route.extract_url_source, "delay") as mock_extract_url,
+        patch.object(sources_route.extract_source, "apply_async") as mock_extract,
+        patch.object(sources_route.extract_url_source, "apply_async") as mock_extract_url,
         patch.object(sources_route, "get_all_user_provider_keys", return_value={}),
         patch(
             "agentic_project_service.auth.decode_jwt",
@@ -145,7 +145,7 @@ def test_reextract_balance_check_propagates_503(billing_env):
 
     with (
         patch.object(sources_route.db, "session", fake_session),
-        patch.object(sources_route.extract_source, "delay") as mock_extract,
+        patch.object(sources_route.extract_source, "apply_async") as mock_extract,
         patch.object(sources_route, "get_all_user_provider_keys", return_value={}),
         patch(
             "agentic_project_service.auth.decode_jwt",
@@ -195,7 +195,7 @@ def test_reextract_dispatches_task_when_balance_check_passes(billing_env):
 
     with (
         patch.object(sources_route.db, "session", fake_session),
-        patch.object(sources_route.extract_source, "delay", return_value=fake_task) as mock_extract,
+        patch.object(sources_route.extract_source, "apply_async", return_value=fake_task) as mock_extract,
         patch.object(sources_route, "get_all_user_provider_keys", return_value={}),
         patch(
             "agentic_project_service.auth.decode_jwt",
@@ -253,7 +253,7 @@ def test_reextract_checks_balance_unconditionally(no_billing_env):
 
     with (
         patch.object(sources_route.db, "session", fake_session),
-        patch.object(sources_route.extract_source, "delay", return_value=fake_task) as mock_extract,
+        patch.object(sources_route.extract_source, "apply_async", return_value=fake_task) as mock_extract,
         patch.object(sources_route, "get_all_user_provider_keys", return_value={}),
         patch(
             "agentic_project_service.auth.decode_jwt",
@@ -296,7 +296,7 @@ def test_reextract_threads_per_call_seed_to_task(billing_env):
 
     with (
         patch.object(sources_route.db, "session", fake_session),
-        patch.object(sources_route.extract_source, "delay", return_value=fake_task) as mock_extract,
+        patch.object(sources_route.extract_source, "apply_async", return_value=fake_task) as mock_extract,
         patch.object(sources_route, "get_all_user_provider_keys", return_value={}),
         patch(
             "agentic_project_service.auth.decode_jwt",
@@ -312,7 +312,8 @@ def test_reextract_threads_per_call_seed_to_task(billing_env):
 
     assert resp.status_code == 200
     mock_extract.assert_called_once()
-    seed = mock_extract.call_args.kwargs.get("reextract_seed")
+    # Dispatched with apply_async so the task id can be written first.
+    seed = mock_extract.call_args.kwargs["kwargs"].get("reextract_seed")
     assert seed, "reextract must pass a non-empty per-call reextract_seed to the task"
     # billing_kwargs stash is gone — the route no longer passes an idempotency key.
-    assert "billing_idempotency_key" not in mock_extract.call_args.kwargs
+    assert "billing_idempotency_key" not in mock_extract.call_args.kwargs["kwargs"]
