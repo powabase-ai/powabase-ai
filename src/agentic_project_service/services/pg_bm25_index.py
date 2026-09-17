@@ -1322,6 +1322,13 @@ class Bm25IndexBuildFailed(RuntimeError):
 #: paradedb/paradedb#6211 sets in its ``postgresql.conf``. Any name with a dot
 #: is accepted by Postgres without an extension defining it, and
 #: ``current_setting(name, true)`` answers NULL on a server that does not set it.
+#:
+#: It is a statement of trust in whoever runs the server, not a proof: like
+#: any setting, ``ALTER DATABASE/ROLE ... SET`` or a session ``SET`` can turn
+#: it on for the service's sessions. A role that can do that can only put its
+#: own database at risk. The image must set it in the ``postgresql.conf`` the
+#: server actually reads -- a sample file is read only by ``initdb`` of a new
+#: cluster.
 PG_SEARCH_CIC_SAFE_MARKER = "powabase.pg_search_cic_safe"
 #: The project setting a self-hoster turns on for a pg_search they built with
 #: the fix themselves, which nothing on the server can show.
@@ -1407,6 +1414,10 @@ def concurrent_build_safety(bind) -> tuple[bool, str]:
     parsed = _parse_safety_row(_probe(bind, _CONCURRENT_BUILD_SAFETY_SQL))
     if parsed is None:
         raise RuntimeError("could not read whether a concurrent bm25 build is safe")
+    # A knowledge base created while this answers "not safe" is not given its
+    # (free, empty) partition either, so its rows land in DEFAULT: once the
+    # server can build, it needs POST /build-bm25 like a KB from before the
+    # extension. Nothing re-dispatches ``unavailable`` knowledge bases.
     if parsed[0]:
         return parsed
     if _concurrent_build_override():
@@ -1483,12 +1494,30 @@ def is_transient_db_error(exc: BaseException) -> bool:
     return sqlstate in _TRANSIENT_SQLSTATES or sqlstate[:2] in _TRANSIENT_SQLSTATE_CLASSES
 
 
+# A connection the server refused for who asked or what for: retrying the same
+# request cannot get past it. psycopg reports these with no SQLSTATE, in the
+# message, which is the server's (untranslated by default) text.
+_CONNECT_REFUSALS_NOT_TRANSIENT = re.compile(
+    r"password authentication failed|authentication failed for user|"
+    r"role \"[^\"]*\" does not exist|database \"[^\"]*\" does not exist|"
+    r"no pg_hba\.conf entry|no password supplied|permission denied for database|"
+    r"is not permitted to log in",
+    re.IGNORECASE,
+)
+
+
 def is_connect_failure(exc: BaseException) -> bool:
-    """Could a connection not be opened at all (no statement ran, no SQLSTATE)?"""
+    """Could a connection not be opened for a reason that may pass (no statement ran, no SQLSTATE)?
+
+    A server that is down, restarting or recovering. Not one that refused the
+    credentials, the role or the database: that is a configuration error, and
+    retrying it only delays the failure.
+    """
     return (
         isinstance(exc, _SQLAlchemyOperationalError)
         and getattr(exc, "statement", None) is None
         and _sqlstate(exc) is None
+        and _CONNECT_REFUSALS_NOT_TRANSIENT.search(str(getattr(exc, "orig", exc))) is None
     )
 
 
@@ -3041,7 +3070,10 @@ def create_partition(
       commit: up to ~0.6 s measured, or ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS``
       per table more when the move has to try for the lock. A writer of those
       tables that holds its lock when the move reaches them makes the move
-      give up instead of waiting for it.
+      give up instead of waiting for it -- and since those locks come after the
+      copy, delete and VALIDATE, such a give-up has already cost the item
+      table's writers the whole write block, which the retry then spends
+      again. A short write there that starts after the pre-flight is enough.
     * **after the commit**, nothing blocks writers. The bm25 index is built
       concurrently: 8-11 s per million rows before keyword search is served
       by it (see the first trade-off below). Then the plain secondary indexes
@@ -3432,10 +3464,14 @@ def ensure_bm25_index(
         name = bm25_index_name(kb_id, item_table)
         partition = partition_name(kb_id, item_table)
         outcome: dict = {"index": name, "item_table": item_table, "partition": partition}
-        dropped = _drop_indexes_on_other_item_tables(conn, kb_id, item_table)
-        if dropped:
-            outcome["dropped_indexes"] = dropped
         build_safe, _ = concurrent_build_safety(conn)
+        # A strategy change's leftover index is dropped only where an index can
+        # be built again: on a server that cannot, it is the one this knowledge
+        # base keeps if its strategy changes back.
+        if build_safe:
+            dropped = _drop_indexes_on_other_item_tables(conn, kb_id, item_table)
+            if dropped:
+                outcome["dropped_indexes"] = dropped
         unavailable = {**outcome, "status": "unavailable", "reason": "concurrent_build_unsafe"}
 
         # An unattached partition is a move that did not finish -- a crash, or a

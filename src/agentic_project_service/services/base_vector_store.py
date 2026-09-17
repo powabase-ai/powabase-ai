@@ -859,7 +859,15 @@ class BasePgVectorStore:
             if not pg_bm25_index.pg_search_installed(self.session):
                 return False
             return pg_bm25_index.partition_exists(self.session, self.kb_id, self.TABLE)
-        except Exception:
+        except Exception as exc:
+            _warn_once_per_pg_bm25_failure(
+                f"{self.kb_id}:{self.TABLE}:file-index-check:{pg_bm25_index.first_error_line(exc)[:200]}",
+                "Could not tell whether KB %s has its own partition of %s (%s); reading its "
+                "bm25s file index if it has one",
+                self.kb_id,
+                self.TABLE,
+                pg_bm25_index.first_error_line(exc),
+            )
             return False
 
     async def bm25s_search(
@@ -920,9 +928,14 @@ class BasePgVectorStore:
             # its bm25s file index, so that file is frozen at the move. While
             # the KB's own index is not usable (being built, rebuilt for a new
             # language, INVALID), answer from the live rows instead.
-            logger.debug(
-                "pg_search index for KB %s table %s is not usable; its file index is retired, "
-                "falling back to tsvector",
+            # Once per KB and table at WARNING: every search takes this path
+            # while the index is missing, and the fallback can time out on a
+            # large KB, so an index that never comes back must be visible.
+            _warn_once_per_pg_bm25_failure(
+                f"{self.kb_id}:{self.TABLE}:tsvector-fallback",
+                "pg_search index for KB %s table %s is not usable (building, INVALID, or not "
+                "built on this server); keyword search falls back to the slower tsvector scan "
+                "until it is. See the KB's bm25_status",
                 self.kb_id,
                 self.TABLE,
             )

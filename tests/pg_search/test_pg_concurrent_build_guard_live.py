@@ -21,7 +21,13 @@ from sqlalchemy import create_engine, event, text
 
 from agentic_project_service.services import pg_bm25_index as pgb
 from tests.pg_search import test_pg_bm25_live as live
-from tests.pg_search.test_pg_bm25_live import KB_A, _indexdef, _rows_in, _set_language
+from tests.pg_search.test_pg_bm25_live import (
+    KB_A,
+    _indexdef,
+    _rows_in,
+    _set_language,
+    _set_strategy,
+)
 
 migration = live.migration
 engine = live.engine
@@ -137,3 +143,36 @@ def test_a_partition_left_without_an_index_is_not_given_one(unmarked, engine, se
     with engine.connect() as conn:
         building = conn.execute(text("SELECT count(*) FROM pg_stat_progress_create_index")).scalar()
     assert building == 0
+
+
+def test_without_the_marker_a_strategy_change_keeps_the_index_it_left(unmarked, marked, session):
+    """chunk_embed -> full_document -> chunk_embed on a server that cannot build:
+    the chunks index must still be there when the strategy comes back."""
+    assert pgb.ensure_bm25_index(KB_A, engine=marked, allow_row_move=True)["status"] == "ready"
+    before = _indexdef(session)
+    assert before
+
+    _set_strategy(session, KB_A, "full_document")
+    outcome = pgb.ensure_bm25_index(KB_A, engine=unmarked)
+    assert outcome["status"] == "unavailable", outcome
+    assert "dropped_indexes" not in outcome
+    assert _indexdef(session) == before
+
+    _set_strategy(session, KB_A, "chunk_embed")
+    assert pgb.ensure_bm25_index(KB_A, engine=unmarked)["status"] == "ready"
+    assert _indexdef(session) == before
+
+
+def test_a_refused_login_is_not_retried_as_transient(engine):
+    wrong = create_engine(engine.url.set(password="not-the-password"))
+    try:
+        with wrong.connect():
+            pass
+    except Exception as exc:
+        error = exc
+    else:
+        error = None
+    finally:
+        wrong.dispose()
+    assert error is not None
+    assert pgb.is_transient_db_error(error) is False

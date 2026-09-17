@@ -179,7 +179,13 @@ def _kb_file_index_retired(kb_id: str) -> bool:
         return item_table is not None and pg_bm25_index.partition_exists(
             db.session, kb_id, item_table
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Could not tell whether KB %s has its own partition (%s); keeping its bm25s file "
+            "index up to date",
+            kb_id,
+            pg_bm25_index.first_error_line(exc),
+        )
         return False
 
 
@@ -2879,6 +2885,14 @@ def dispatch_partition_completion_at_start(engine) -> list[str]:
     keyword search but deletes a source's rows slowly, and nothing else comes
     back to it. The ensure is idempotent and moves no rows (the partition
     exists). Returns the knowledge base ids dispatched. Never raises.
+
+    It runs at every start that runs the migrations, so a partition still
+    being completed by a running ensure is dispatched again (the second run
+    finds the index lock held and records ``building`` meanwhile). A future
+    migration that adds a plain index to the DEFAULT partitions makes every
+    partition pending at once: each start then dispatches one ensure per
+    knowledge base, and those build the new index concurrently across workers.
+    Add such an index to the attached partitions in the migration instead.
     """
     try:
         pending = pg_bm25_index.partitions_needing_completion(engine)

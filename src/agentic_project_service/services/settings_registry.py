@@ -851,12 +851,15 @@ def _build_registry() -> dict[str, SettingDef]:
             default=True,
             advanced=True,
             description=(
-                "When enabled (default), the platform keeps the BM25 sparse "
-                "index up to date automatically: per-source updates during "
-                "indexing, and a one-shot rebuild when a KB's retrieval method "
-                "changes to hybrid or full_text. Disable for very large KBs "
-                "where the per-source BM25 rebuild dominates indexing time; "
-                "you'll then trigger rebuilds manually from the KB detail page."
+                "When enabled (default), the bm25s file index a knowledge base's "
+                "keyword search reads is kept up to date automatically: updated "
+                "per source during indexing, and rebuilt when the retrieval "
+                "method changes to hybrid or full_text. Disable for very large "
+                "knowledge bases where those updates dominate indexing time, and "
+                "rebuild with POST /build-bm25 instead. It does not apply to a "
+                "knowledge base served by its own pg_search index, which Postgres "
+                "keeps current on every write; that index is built when the "
+                "knowledge base is created, or by POST /build-bm25."
             ),
         ),
     ]
@@ -1125,7 +1128,9 @@ def _build_registry() -> dict[str, SettingDef]:
                 "built unless the server shows the fix: Postgres 17 or later, "
                 "pg_search 0.26.0 or later, or powabase.pg_search_cic_safe = on in "
                 "postgresql.conf. This setting is for a pg_search you built with "
-                "the fix yourself, which the server cannot show."
+                "the fix yourself, which the server cannot show. The marker is an "
+                "ordinary setting: ALTER DATABASE or ALTER ROLE can set it too, and "
+                "like this setting it is trusted, not verified."
             ),
         ),
     ]
