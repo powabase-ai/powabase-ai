@@ -244,6 +244,7 @@ def _run_task(
     attempts=None,
     run=None,
     retries=0,
+    **task_kwargs,
 ):
     from agentic_project_service.tasks import extraction as ext_mod
 
@@ -256,16 +257,26 @@ def _run_task(
     monkeypatch.setattr(
         ext_mod,
         "record_extraction_interruption",
-        lambda sid, tid, n: recorded.append((sid, tid, n)),
+        lambda sid, tid, n, unattributed=0: recorded.append((sid, tid, n, unattributed)),
     )
-    monkeypatch.setattr(ext_mod, "update_source_extraction_result", lambda *a, **kw: True)
+    writes = []
+    monkeypatch.setattr(
+        ext_mod,
+        "update_source_extraction_result",
+        lambda *a, **kw: writes.append((a, kw)) or True,
+    )
+    _run_task.writes = writes
     storage = MagicMock()
     storage.object_size.return_value = size
     monkeypatch.setattr(ext_mod, "get_storage", lambda: storage)
     monkeypatch.setattr(ext_mod, "large_extraction_gate", gate or _gate())
     monkeypatch.setattr(ext_mod, "extraction_attempts", attempts or _attempts("worker-b"))
     monkeypatch.setattr(
-        ext_mod, "_requeue", lambda task, countdown: requeued.append((task.request.id, countdown))
+        ext_mod,
+        "_requeue",
+        lambda task, countdown, source_size: requeued.append(
+            (task.request.id, countdown, source_size)
+        ),
     )
 
     async def fake_run(*a, **kw):
@@ -279,9 +290,10 @@ def _run_task(
     _run_task.statuses = statuses
     ext_mod.extract_source.push_request(id=task_id, retries=retries)
     try:
-        result = ext_mod.extract_source.run(source_id="src-1", bucket_id="sources")
+        result = ext_mod.extract_source.run(source_id="src-1", bucket_id="sources", **task_kwargs)
     finally:
         ext_mod.extract_source.pop_request()
+    _run_task.storage = storage
     return result, statuses, ran, recorded
 
 
@@ -332,7 +344,7 @@ def test_redelivery_of_an_interrupted_task_is_recorded_and_retried_once(
     mock_db_session.execute.return_value.scalar.return_value = "extracting"
     result, _statuses, ran, recorded = _run_task(monkeypatch, _task_source("extracting", "task-1"))
 
-    assert recorded == [("src-1", "task-1", 1)]
+    assert recorded == [("src-1", "task-1", 1, 0)]
     assert ran == [True]
     assert result["status"] == "success"
 
@@ -351,7 +363,7 @@ def test_repeatedly_interrupted_task_fails_without_extracting(monkeypatch, mock_
     result, statuses, ran, recorded = _run_task(monkeypatch, source)
 
     assert ran == []
-    assert recorded == [("src-1", "task-1", MAX_EXTRACTION_INTERRUPTIONS)]
+    assert recorded == [("src-1", "task-1", MAX_EXTRACTION_INTERRUPTIONS, 0)]
     assert result["status"] == "error"
     ((args, kwargs),) = statuses
     assert args[1] == "failed"
@@ -371,7 +383,7 @@ def test_interruptions_of_a_previous_task_do_not_count(monkeypatch, mock_db_sess
     )
     result, _statuses, ran, recorded = _run_task(monkeypatch, source, task_id="task-2")
 
-    assert recorded == [("src-1", "task-2", 1)]
+    assert recorded == [("src-1", "task-2", 1, 0)]
     assert ran == [True]
 
 
@@ -412,26 +424,71 @@ def test_a_smaller_task_killed_alongside_a_larger_one_is_not_charged(monkeypatch
         monkeypatch, _task_source("extracting", "task-1"), size=20_000
     )
 
-    assert recorded == []
+    # Noted, but not against the cap for tasks that caused the kill.
+    assert recorded == [("src-1", "task-1", 0, 1)]
     assert ran == [True]
     assert result["status"] == "success"
     assert all(args[1] != "failed" for args, _ in statuses)
 
 
-def test_a_bystander_is_never_failed_however_often_the_worker_dies(monkeypatch, mock_db_session):
+def test_a_bystander_is_failed_only_after_many_more_kills(monkeypatch, mock_db_session):
+    """Never charging a bystander would let a killer hide behind a stale
+    in-flight record forever; a much higher cap still ends that loop."""
+    from agentic_project_service.tasks.extraction import MAX_UNATTRIBUTED_INTERRUPTIONS
+
+    assert MAX_UNATTRIBUTED_INTERRUPTIONS == 5
     mock_db_session.execute.return_value.scalar.return_value = "extracting"
-    for kill in range(5):
+    marker = {"extraction_interruptions": 1, "extraction_interrupted_task": "task-1"}
+    for kill in range(1, MAX_UNATTRIBUTED_INTERRUPTIONS + 1):
         dead_worker = _attempts(f"worker-{kill}")
         dead_worker.begin(f"task-big-{kill}", 400_000_000, None)
         dead_worker.begin("task-1", 20_000, None)
-        source = _task_source(
-            "extracting",
-            "task-1",
-            {"extraction_interruptions": 1, "extraction_interrupted_task": "task-1"},
+        result, statuses, ran, recorded = _run_task(
+            monkeypatch, _task_source("extracting", "task-1", dict(marker)), size=20_000
         )
-        result, _statuses, _ran, recorded = _run_task(monkeypatch, source, size=20_000)
-        assert recorded == []
-        assert result["status"] == "success"
+        assert recorded == [("src-1", "task-1", 1, kill)]
+        marker["extraction_unattributed_interruptions"] = kill
+        if kill < MAX_UNATTRIBUTED_INTERRUPTIONS:
+            assert result["status"] == "success"
+            assert ran == [True]
+        else:
+            assert result["status"] == "error"
+            assert ran == []
+            ((args, kwargs),) = statuses
+            assert args[1] == "failed"
+            assert kwargs.get("error_code") == "permanent"
+
+
+def test_unattributed_interruptions_of_a_previous_task_do_not_count(monkeypatch, mock_db_session):
+    mock_db_session.execute.return_value.scalar.return_value = "extracting"
+    dead_worker = _attempts("worker-a")
+    dead_worker.begin("task-big", 400_000_000, None)
+    dead_worker.begin("task-2", 20_000, None)
+    source = _task_source(
+        "extracting",
+        "task-2",
+        {
+            "extraction_interruptions": 1,
+            "extraction_unattributed_interruptions": 4,
+            "extraction_interrupted_task": "task-1",
+        },
+    )
+    result, _s, _ran, recorded = _run_task(monkeypatch, source, task_id="task-2", size=20_000)
+
+    assert recorded == [("src-1", "task-2", 0, 1)]
+    assert result["status"] == "success"
+
+
+def test_a_charged_interruption_keeps_the_unattributed_count(monkeypatch, mock_db_session):
+    mock_db_session.execute.return_value.scalar.return_value = "extracting"
+    source = _task_source(
+        "extracting",
+        "task-1",
+        {"extraction_unattributed_interruptions": 3, "extraction_interrupted_task": "task-1"},
+    )
+    _result, _s, _ran, recorded = _run_task(monkeypatch, source)
+
+    assert recorded == [("src-1", "task-1", 1, 3)]
 
 
 def test_the_largest_task_killed_is_charged(monkeypatch, mock_db_session):
@@ -445,7 +502,7 @@ def test_the_largest_task_killed_is_charged(monkeypatch, mock_db_session):
         monkeypatch, _task_source("extracting", "task-1"), size=400_000_000
     )
 
-    assert recorded == [("src-1", "task-1", 1)]
+    assert recorded == [("src-1", "task-1", 1, 0)]
     assert ran == [True]
 
 
@@ -463,7 +520,7 @@ def test_a_worker_that_dies_running_only_small_tasks_still_charges_one(
         monkeypatch, _task_source("extracting", "task-1"), size=30_000
     )
 
-    assert recorded == [("src-1", "task-1", 1)]
+    assert recorded == [("src-1", "task-1", 1, 0)]
 
 
 def test_the_attempt_is_recorded_while_running_and_forgotten_after(monkeypatch, mock_db_session):
@@ -564,11 +621,14 @@ def test_the_slot_is_released_when_the_interruption_cap_fails_the_source(
         "task-1",
         {"extraction_interruptions": 1, "extraction_interrupted_task": "task-1"},
     )
+    _attempts("worker-a").begin("task-1", LARGE, None)  # left by the killed delivery
     result, _s, ran, _rec = _run_task(monkeypatch, source, size=LARGE)
 
     assert result["status"] == "error"
     assert ran == []
     assert _slot_is_free()
+    # The failed task's attempt record is forgotten too.
+    assert _attempts("observer").previous("task-1") is None
 
 
 def test_a_large_file_waits_by_requeueing_when_every_slot_is_taken(
@@ -587,7 +647,7 @@ def test_a_large_file_waits_by_requeueing_when_every_slot_is_taken(
     assert ran == []
     assert statuses == []
     assert recorded == []
-    assert _run_task.requeued == [("task-1", LARGE_EXTRACTION_REQUEUE_SECONDS)]
+    assert _run_task.requeued == [("task-1", LARGE_EXTRACTION_REQUEUE_SECONDS, LARGE)]
     assert LARGE_EXTRACTION_REQUEUE_SECONDS > 0
 
 
@@ -675,20 +735,38 @@ def test_requeue_keeps_the_task_id_and_does_not_spend_a_retry(monkeypatch):
 
     sent = []
     monkeypatch.setattr(
-        Signature, "apply_async", lambda self, *a, **kw: sent.append(dict(self.options))
+        Signature,
+        "apply_async",
+        lambda self, *a, **kw: sent.append((dict(self.options), list(self.args), self.kwargs)),
     )
     ext_mod.extract_source.push_request(
         id="task-1", retries=2, args=["src-1", "sources"], kwargs={"extraction_model": "auto"}
     )
     try:
-        ext_mod._requeue(ext_mod.extract_source, 45)
+        ext_mod._requeue(ext_mod.extract_source, 45, 367_000_000)
     finally:
         ext_mod.extract_source.pop_request()
 
-    (options,) = sent
+    ((options, args, kwargs),) = sent
     assert options["task_id"] == "task-1"
     assert options["retries"] == 2
     assert options["countdown"] == 45
+    # The size travels with the message, so waiting costs no storage request.
+    assert args == ["src-1", "sources"]
+    assert kwargs == {"extraction_model": "auto", "source_size": 367_000_000}
+
+
+def test_a_requeued_delivery_uses_the_size_it_carries(monkeypatch, mock_db_session, large_limits):
+    _gate().try_acquire("someone-else")
+
+    result, _s, ran, _rec = _run_task(
+        monkeypatch, _task_source("pending", "task-1"), size=SMALL, source_size=LARGE
+    )
+
+    assert result["status"] == "deferred"
+    assert ran == []
+    _run_task.storage.object_size.assert_not_called()
+    assert _run_task.requeued == [("task-1", 60, LARGE)]
 
 
 def test_a_file_whose_size_is_unknown_is_gated(monkeypatch, mock_db_session, large_limits):
@@ -982,7 +1060,9 @@ def test_engine_capability_is_detected_from_the_installed_engine(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _run_task_with_derivatives(monkeypatch, old, new, applied=True, delete_error=None):
+def _run_task_with_derivatives(
+    monkeypatch, old, new, applied=True, delete_error=None, method="fitz"
+):
     from agentic_project_service.tasks import extraction as ext_mod
 
     storage = MagicMock()
@@ -992,13 +1072,20 @@ def _run_task_with_derivatives(monkeypatch, old, new, applied=True, delete_error
     source = {**_task_source("pending", "task-1"), "derivatives": old}
     monkeypatch.setattr(ext_mod, "get_source", lambda _id: source)
     monkeypatch.setattr(ext_mod, "update_source_status", lambda *a, **kw: None)
-    monkeypatch.setattr(ext_mod, "update_source_extraction_result", lambda *a, **kw: applied)
+    writes = []
+
+    def fake_update(*a, **kw):
+        writes.append((a, kw))
+        return applied
+
+    monkeypatch.setattr(ext_mod, "update_source_extraction_result", fake_update)
     monkeypatch.setattr(ext_mod, "get_storage", lambda: storage)
     monkeypatch.setattr(ext_mod, "large_extraction_gate", _gate())
     monkeypatch.setattr(ext_mod, "extraction_attempts", _attempts("worker-b"))
+    _run_task_with_derivatives.writes = writes
 
     async def fake_run(*a, **kw):
-        return new, {"extraction_method": "fitz", "page_count": 1, "char_count": 100}
+        return new, {"extraction_method": method, "page_count": 1, "char_count": 100}
 
     monkeypatch.setattr(ext_mod, "run_extraction", fake_run)
     ext_mod.extract_source.push_request(id="task-1")
@@ -1128,3 +1215,114 @@ def test_object_size_is_none_without_a_usable_length(monkeypatch, header):
 def test_object_size_rejects_a_path_without_bucket(monkeypatch):
     with pytest.raises(StorageError):
         _client(monkeypatch).object_size("no-bucket")
+
+
+def test_the_result_is_written_only_for_the_task_that_owns_the_source(monkeypatch, mock_db_session):
+    """A re-extract dispatched while this run was going gave the source to a
+    new task; this run's result must not overwrite it or mark it extracted."""
+    mock_db_session.execute.return_value.scalar.return_value = "extracting"
+    _run_task_with_derivatives(monkeypatch, OLD_DERIVATIVES, NEW_DERIVATIVES)
+
+    ((_args, kwargs),) = _run_task_with_derivatives.writes
+    assert kwargs["task_id"] == "task-1"
+
+
+def test_a_superseded_result_is_discarded_without_charging(
+    monkeypatch, mock_db_session, recording_billing
+):
+    mock_db_session.execute.return_value.scalar.return_value = "extracting"
+    result, storage = _run_task_with_derivatives(
+        monkeypatch, OLD_DERIVATIVES, NEW_DERIVATIVES, applied=False, method="mistral_ocr"
+    )
+
+    assert result["status"] == "superseded"
+    storage.delete.assert_not_called()
+    assert recording_billing.charges == []
+
+
+def test_derivatives_that_are_not_a_mapping_do_not_fail_a_written_extraction(
+    monkeypatch, mock_db_session
+):
+    mock_db_session.execute.return_value.scalar.return_value = "extracting"
+    result, storage = _run_task_with_derivatives(monkeypatch, ["not", "a", "dict"], NEW_DERIVATIVES)
+
+    assert result["status"] == "success"
+    storage.delete.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Engine results with a partial page-image set
+# ---------------------------------------------------------------------------
+
+
+def test_a_partial_page_image_set_is_recorded_and_warned_about(monkeypatch, caplog):
+    from agentic_project_service.tasks import extraction as ext_mod
+
+    async def extract(raw):
+        result = _result([Derivative(type="markdown", content="md")])
+        result.auto_metadata["page_images_incomplete"] = True
+        return result
+
+    _use_extractor(monkeypatch, extract)
+    with caplog.at_level(logging.WARNING, logger=ext_mod.logger.name):
+        _derivatives, auto_metadata = _run(_Storage())
+
+    assert auto_metadata["page_images_incomplete"] is True
+    assert "page images" in caplog.text.lower() and "incomplete" in caplog.text.lower()
+
+
+def test_a_partial_page_image_set_needs_attention(monkeypatch, mock_db_session):
+    mock_db_session.execute.return_value.scalar.return_value = "extracting"
+
+    async def run():
+        return {}, {
+            "extraction_method": "lighton_ocr",
+            "page_count": 3,
+            "char_count": 3000,
+            "page_images_incomplete": True,
+        }
+
+    result, _s, _ran, _rec = _run_task(monkeypatch, _task_source("pending", "task-1"), run=run)
+
+    assert result["status"] == "success"
+    ((args, _kw),) = _run_task.writes
+    _source_id, _derivatives, auto_metadata, status, message = args
+    assert auto_metadata["page_images_incomplete"] is True
+    assert status == "attention_required"
+    assert "page images" in message.lower()
+
+
+def test_a_complete_page_image_set_does_not_need_attention(monkeypatch, mock_db_session):
+    mock_db_session.execute.return_value.scalar.return_value = "extracting"
+
+    async def run():
+        return {}, {"extraction_method": "lighton_ocr", "page_count": 3, "char_count": 3000}
+
+    _run_task(monkeypatch, _task_source("pending", "task-1"), run=run)
+
+    ((args, _kw),) = _run_task.writes
+    assert args[3] == "extracted"
+
+
+def test_a_storage_error_raised_for_the_task_has_no_cause_cycle(monkeypatch):
+    storage = _Storage(fail_upload_on="/image/")
+
+    async def extract(raw):
+        try:
+            raw.metadata["page_image_sink"](
+                Derivative(type="image", content=b"png", format="png", page=1)
+            )
+        except StorageError as e:
+            raise RuntimeError("page image sink failed") from e
+
+    _use_extractor(monkeypatch, extract)
+    with pytest.raises(StorageError) as info:
+        _run(storage)
+
+    seen = []
+    current = info.value
+    while current is not None:
+        assert all(current is not earlier for earlier in seen), "exception chain has a cycle"
+        seen.append(current)
+        current = current.__cause__ or current.__context__
+    assert "upload refused" in str(info.value)

@@ -95,7 +95,7 @@ def deliver(monkeypatch):
 
     observed = []
 
-    def run(source_id, task_id, outcome, worker="worker-a"):
+    def run(source_id, task_id, outcome, worker="worker-a", during=None, auto_metadata=None):
         monkeypatch.setattr(
             ext_mod,
             "extraction_attempts",
@@ -104,9 +104,16 @@ def deliver(monkeypatch):
 
         async def fake_run_extraction(*a, **kw):
             observed.append(_row(source_id).auto_metadata)
+            if during is not None:
+                during()
             if outcome == "killed":
                 raise _WorkerKilled()
-            return {}, {"extraction_method": "fitz", "page_count": 1, "char_count": 500}
+            return {}, {
+                "extraction_method": "fitz",
+                "page_count": 1,
+                "char_count": 500,
+                **(auto_metadata or {}),
+            }
 
         monkeypatch.setattr(ext_mod, "run_extraction", fake_run_extraction)
         ext_mod.extract_source.push_request(id=task_id)
@@ -147,23 +154,59 @@ class TestRecordExtractionInterruption:
             auto = _row(source_id).auto_metadata
         assert auto["extraction_interrupted_task"] == "task-2"
         assert auto["extraction_interruptions"] == 1
+        assert auto["extraction_unattributed_interruptions"] == 0
         assert auto["extraction_model"] == "auto"
+
+    def test_the_unattributed_count_is_stored(self, app, source_id):
+        with app.app_context():
+            ext_mod.record_extraction_interruption(source_id, "task-1", 1, 3)
+            auto = _row(source_id).auto_metadata
+        assert auto["extraction_interruptions"] == 1
+        assert auto["extraction_unattributed_interruptions"] == 3
 
 
 @pytest.mark.integration
 class TestUpdateSourceExtractionResult:
     def test_success_clears_the_interruption_marker(self, app, source_id):
         with app.app_context():
-            ext_mod.record_extraction_interruption(source_id, "task-1", 1)
+            ext_mod.record_extraction_interruption(source_id, "task-1", 1, 2)
             applied = ext_mod.update_source_extraction_result(
                 source_id, {}, {"extraction_method": "fitz"}
             )
             auto = _row(source_id).auto_metadata
         assert applied is True
         assert "extraction_interruptions" not in auto
+        assert "extraction_unattributed_interruptions" not in auto
         assert "extraction_interrupted_task" not in auto
         assert auto["extraction_method"] == "fitz"
         assert auto["extraction_model"] == "auto"
+
+    def test_a_partial_page_image_flag_does_not_outlive_a_complete_run(self, app, source_id):
+        with app.app_context():
+            ext_mod.update_source_extraction_result(
+                source_id, {}, {"extraction_method": "lighton_ocr", "page_images_incomplete": True}
+            )
+            assert _row(source_id).auto_metadata["page_images_incomplete"] is True
+            ext_mod.update_source_extraction_result(
+                source_id, {}, {"extraction_method": "lighton_ocr"}
+            )
+            auto = _row(source_id).auto_metadata
+        assert "page_images_incomplete" not in auto
+
+    def test_a_result_from_a_task_that_no_longer_owns_the_source_is_discarded(self, app, source_id):
+        with app.app_context():
+            _dispatch(source_id, "task-2")
+            applied = ext_mod.update_source_extraction_result(
+                source_id, {"markdown": []}, {"extraction_method": "fitz"}, task_id="task-1"
+            )
+            row = _row(source_id)
+            owned = ext_mod.update_source_extraction_result(
+                source_id, {"markdown": []}, {"extraction_method": "fitz"}, task_id="task-2"
+            )
+        assert applied is False
+        assert row.extraction_status == "pending"
+        assert "extraction_method" not in row.auto_metadata
+        assert owned is True
 
     def test_a_cancelled_source_is_left_alone_and_reported(self, app, source_id):
         with app.app_context():
@@ -234,4 +277,25 @@ class TestRedeliveryLifecycle:
             assert deliver(source_id, "task-1", "killed", worker="worker-b") == "killed"
             row = _row(source_id)
         assert row.extraction_status == "extracting"
-        assert "extraction_interruptions" not in row.auto_metadata
+        assert row.auto_metadata["extraction_interruptions"] == 0
+        assert row.auto_metadata["extraction_unattributed_interruptions"] == 1
+
+    def test_a_re_extract_dispatched_during_a_run_is_not_lost(self, app, source_id, deliver):
+        """The first run finishes after the re-extract was dispatched: its
+        result is discarded and the re-extract still runs."""
+        with app.app_context():
+            _dispatch(source_id, "task-1")
+            result = deliver(
+                source_id,
+                "task-1",
+                "success",
+                during=lambda: _dispatch(source_id, "task-2"),
+            )
+            row = _row(source_id)
+            assert result["status"] == "superseded"
+            assert (row.extraction_status, row.celery_task_id) == ("pending", "task-2")
+
+            result = deliver(source_id, "task-2", "success", worker="worker-b")
+            row = _row(source_id)
+        assert result["status"] == "success"
+        assert (row.extraction_status, row.celery_task_id) == ("extracted", "task-2")

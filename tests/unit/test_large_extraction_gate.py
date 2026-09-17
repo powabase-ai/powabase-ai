@@ -3,15 +3,21 @@ record of what was in flight when a worker died.
 
 Runs against fakeredis with Lua enabled, the same way the rate limiter's tests
 do: the semaphore is a server-side script, so a client-side fake of individual
-commands would not exercise it.
+commands would not exercise it. Set ``TEST_REDIS_URL`` (a database this suite
+may flush, e.g. ``redis://localhost:6379/15``) to run every test here against a
+real Redis as well.
 """
 
 import logging
+import os
+import socket
+import threading
 import time
 from unittest.mock import MagicMock
 
 import fakeredis
 import pytest
+import redis
 
 from agentic_project_service.services import extraction_gate as gate_mod
 from agentic_project_service.services.extraction_gate import (
@@ -19,33 +25,49 @@ from agentic_project_service.services.extraction_gate import (
     DEFAULT_MAX_CONCURRENT_LARGE,
     ExtractionAttempts,
     LargeExtractionGate,
+    LargeExtractionSlot,
+    Renewal,
     is_large_file,
     large_file_threshold,
     max_concurrent_large_extractions,
+    max_hold_seconds,
 )
 
-
-class _Clock:
-    def __init__(self, now=1_000_000.0):
-        self.now = now
-
-    def __call__(self):
-        return self.now
+_REAL_REDIS_URL = os.getenv("TEST_REDIS_URL")
 
 
-@pytest.fixture
-def client():
-    return fakeredis.FakeStrictRedis()
-
-
-@pytest.fixture
-def clock():
-    return _Clock()
+@pytest.fixture(params=["fakeredis", "redis"])
+def client(request):
+    if request.param == "fakeredis":
+        yield fakeredis.FakeStrictRedis()
+        return
+    if not _REAL_REDIS_URL:
+        pytest.skip("TEST_REDIS_URL not set")
+    real = redis.from_url(_REAL_REDIS_URL)
+    real.flushdb()
+    yield real
+    real.flushdb()
 
 
 @pytest.fixture
-def gate(client, clock):
-    return LargeExtractionGate(redis_client=client, clock=clock, heartbeat=False)
+def gate(client):
+    return LargeExtractionGate(redis_client=client, heartbeat=False)
+
+
+@pytest.fixture
+def short_lease(monkeypatch):
+    """Leases short enough to watch expire."""
+    monkeypatch.setattr(gate_mod, "LEASE_SECONDS", 0.5)
+    monkeypatch.setattr(gate_mod, "RENEW_SECONDS", 0.1)
+
+
+def _wait_until(condition, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return condition()
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +106,19 @@ class TestConfiguration:
     def test_a_file_of_unknown_size_is_treated_as_large(self, monkeypatch):
         monkeypatch.setenv("EXTRACTION_LARGE_FILE_BYTES", "100")
         assert is_large_file(None)
+
+    def test_lease_timing_is_pinned(self):
+        """A lease of minutes frees a killed holder's slot quickly; renewing
+        several times per lease survives a few failed renewals in a row."""
+        assert gate_mod.LEASE_SECONDS == 300
+        assert gate_mod.RENEW_SECONDS == 60
+        assert gate_mod.RENEW_SECONDS * 3 <= gate_mod.LEASE_SECONDS
+
+    def test_a_slot_is_held_at_most_for_the_task_time_limit(self, monkeypatch):
+        monkeypatch.delenv("CELERY_TASK_TIME_LIMIT", raising=False)
+        assert max_hold_seconds() == 21600
+        monkeypatch.setenv("CELERY_TASK_TIME_LIMIT", "7200")
+        assert max_hold_seconds() == 7200
 
 
 # ---------------------------------------------------------------------------
@@ -146,35 +181,53 @@ class TestAcquire:
         (key,) = client.keys("*large*")
         assert 0 < client.ttl(key) <= 2 * gate_mod.LEASE_SECONDS
 
+    def test_lease_times_come_from_redis_not_the_workers_clock(self, gate, monkeypatch):
+        """Two pods whose clocks disagree by more than a lease must not prune
+        each other's live slots."""
+        fast = MagicMock(wraps=time)
+        fast.time.return_value = time.time() + 100_000
+        slow = MagicMock(wraps=time)
+        slow.time.return_value = time.time() - 100_000
+
+        monkeypatch.setattr(gate_mod, "time", slow)
+        first = gate.try_acquire("task-1")
+        monkeypatch.setattr(gate_mod, "time", fast)
+        assert gate.try_acquire("task-2") is None
+        assert gate.is_live(first.token)
+        assert gate.renew(first.token) is Renewal.RENEWED
+
 
 class TestLease:
-    def test_a_crashed_holder_stops_blocking_once_its_lease_expires(self, gate, clock):
+    def test_a_crashed_holder_stops_blocking_once_its_lease_expires(self, gate, short_lease):
         crashed = gate.try_acquire("task-1")
         # Never released: the process holding it died.
         assert gate.try_acquire("task-2") is None
-        clock.now += gate_mod.LEASE_SECONDS - 1
-        assert gate.try_acquire("task-2") is None
-        clock.now += 2
+        time.sleep(0.7)
         assert gate.try_acquire("task-2") is not None
         assert not gate.is_live(crashed.token)
 
-    def test_renewal_keeps_a_long_extraction_holding_its_slot(self, gate, clock):
+    def test_renewal_keeps_a_long_extraction_holding_its_slot(self, gate, short_lease):
         slot = gate.try_acquire("task-1")
-        for _ in range(10):
-            clock.now += gate_mod.LEASE_SECONDS - 10
-            assert gate.renew(slot.token)
+        for _ in range(4):
+            time.sleep(0.3)
+            assert gate.renew(slot.token) is Renewal.RENEWED
         assert gate.is_live(slot.token)
         assert gate.try_acquire("task-2") is None
 
-    def test_an_expired_lease_is_not_renewed(self, gate, clock):
+    def test_an_expired_lease_is_reported_lost_and_not_revived(self, gate, short_lease):
         slot = gate.try_acquire("task-1")
-        clock.now += gate_mod.LEASE_SECONDS + 1
-        assert not gate.renew(slot.token)
+        time.sleep(0.7)
+        assert gate.renew(slot.token) is Renewal.LOST
         assert not gate.is_live(slot.token)
 
-    def test_the_heartbeat_renews_the_lease_and_stops_on_release(self, client, clock, monkeypatch):
-        monkeypatch.setattr(gate_mod, "RENEW_SECONDS", 0.01)
-        gate = LargeExtractionGate(redis_client=client, clock=clock, heartbeat=True)
+    def test_a_redis_error_is_not_mistaken_for_a_lost_lease(self):
+        broken = MagicMock()
+        broken.register_script.side_effect = ConnectionError("redis down")
+        gate = LargeExtractionGate(redis_client=broken, heartbeat=False)
+        assert gate.renew("token") is Renewal.ERROR
+
+    def test_the_heartbeat_renews_the_lease_and_stops_on_release(self, client, short_lease):
+        gate = LargeExtractionGate(redis_client=client, heartbeat=True)
         renewed = []
         real_renew = gate.renew
 
@@ -184,33 +237,142 @@ class TestLease:
 
         gate.renew = counting_renew
         slot = gate.try_acquire("task-1")
-        deadline = time.monotonic() + 2
-        while not renewed and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert renewed and renewed[0] == slot.token
+        assert _wait_until(lambda: len(renewed) >= 2)
+        assert renewed[0] == slot.token
         heartbeat = slot._heartbeat
         assert heartbeat is not None and heartbeat.is_alive()
         slot.release()
         assert not heartbeat.is_alive()
 
+    def test_a_failed_renewal_does_not_let_a_second_holder_in(self, client, short_lease):
+        """A Redis blip on one renewal must not end the heartbeat: the lease
+        would lapse while the first extraction is still running."""
+        gate = LargeExtractionGate(redis_client=client, heartbeat=True)
+        calls = []
+        real_script = gate._script
+
+        def flaky_script(name, source):
+            script = real_script(name, source)
+            if name != "renew":
+                return script
+
+            def run(*a, **kw):
+                calls.append(name)
+                if len(calls) == 1:
+                    raise redis.exceptions.ConnectionError("connection reset")
+                return script(*a, **kw)
+
+            return run
+
+        gate._script = flaky_script
+        holder = gate.try_acquire("task-1")
+        try:
+            other = LargeExtractionGate(redis_client=client, heartbeat=False)
+            deadline = time.monotonic() + 1.5  # three leases
+            while time.monotonic() < deadline:
+                assert other.try_acquire("task-2") is None
+                time.sleep(0.05)
+            assert len(calls) >= 3
+            assert holder._heartbeat.is_alive()
+        finally:
+            holder.release()
+
+    def test_the_heartbeat_stops_when_the_lease_is_gone(self, client, short_lease):
+        gate = LargeExtractionGate(redis_client=client, heartbeat=True)
+        slot = gate.try_acquire("task-1")
+        client.delete(gate._key())
+        assert _wait_until(lambda: not slot._heartbeat.is_alive())
+        slot.release()
+
+    def test_a_hung_holder_frees_its_slot_after_the_task_time_limit(
+        self, client, short_lease, monkeypatch
+    ):
+        monkeypatch.setattr(gate_mod, "max_hold_seconds", lambda: 0.3)
+        gate = LargeExtractionGate(redis_client=client, heartbeat=True)
+        hung = gate.try_acquire("task-1")  # never released
+        other = LargeExtractionGate(redis_client=client, heartbeat=False)
+        assert other.try_acquire("task-2") is None
+        assert _wait_until(lambda: not hung._heartbeat.is_alive(), timeout=2)
+        assert _wait_until(lambda: other.try_acquire("task-2") is not None, timeout=2)
+        hung.release()
+
 
 class TestRedisUnavailable:
-    def test_acquire_fails_open_with_a_warning(self, clock, caplog):
+    def test_acquire_fails_open_with_a_warning_and_a_metric(self, caplog):
         broken = MagicMock()
         broken.register_script.side_effect = ConnectionError("redis down")
-        gate = LargeExtractionGate(redis_client=broken, clock=clock, heartbeat=False)
+        gate = LargeExtractionGate(redis_client=broken, heartbeat=False)
+        before = gate_mod.fail_open_count("acquire")
         with caplog.at_level(logging.WARNING):
             slot = gate.try_acquire("task-1")
         assert slot is not None
         assert slot.token is None
         slot.release()
         assert "unavailable" in caplog.text
+        assert gate_mod.fail_open_count("acquire") == before + 1
 
-    def test_liveness_is_unknown_so_reported_not_live(self, clock):
+    def test_liveness_is_unknown_so_reported_not_live(self):
         broken = MagicMock()
         broken.register_script.side_effect = ConnectionError("redis down")
-        gate = LargeExtractionGate(redis_client=broken, clock=clock, heartbeat=False)
+        gate = LargeExtractionGate(redis_client=broken, heartbeat=False)
         assert gate.is_live("anything") is False
+
+
+class _SilentServer:
+    """Accepts connections and never answers: a half-open Redis."""
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.conns = []
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            self.conns.append(conn)
+
+    def close(self):
+        for conn in self.conns:
+            conn.close()
+        self.sock.close()
+
+
+class TestBrokerClient:
+    def test_the_client_has_socket_timeouts(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(
+            gate_mod.redis, "from_url", lambda url, **kw: seen.update(kw) or MagicMock()
+        )
+        gate_mod._broker_client()
+        assert seen["socket_timeout"] == gate_mod.REDIS_SOCKET_TIMEOUT_SECONDS
+        assert seen["socket_connect_timeout"] == gate_mod.REDIS_SOCKET_TIMEOUT_SECONDS
+        assert 0 < gate_mod.REDIS_SOCKET_TIMEOUT_SECONDS < gate_mod.RENEW_SECONDS
+
+    def test_release_and_end_cannot_hang_on_an_unresponsive_redis(self, monkeypatch):
+        server = _SilentServer()
+        monkeypatch.setattr(gate_mod, "REDIS_SOCKET_TIMEOUT_SECONDS", 0.3)
+        monkeypatch.setenv("CELERY_BROKER_URL", f"redis://127.0.0.1:{server.port}/0")
+        finished = []
+
+        def cleanup():
+            gate = LargeExtractionGate(heartbeat=False)
+            LargeExtractionSlot(gate, "token", heartbeat=False).release()
+            ExtractionAttempts(incarnation="worker-a").end("task-1")
+            finished.append(True)
+
+        worker = threading.Thread(target=cleanup, daemon=True)
+        try:
+            worker.start()
+            worker.join(timeout=5)
+            assert finished == [True]
+        finally:
+            server.close()
 
 
 # ---------------------------------------------------------------------------
