@@ -38,7 +38,7 @@ dependencies = [
     "bm25s[core]>=0.3.10",
     "PyStemmer>=2.2.0",
     # Cron expression parsing for workflow scheduling
-    "croniter>=1.3",
+    "croniter>=6.2.4",
     # Prometheus instrumentation (observability dashboards). prometheus-client
     # is declared explicitly: it's the registry/Counter/Histogram API used by
     # celery.py for Wave 0 worker metrics. Without an explicit pin, we'd rely
