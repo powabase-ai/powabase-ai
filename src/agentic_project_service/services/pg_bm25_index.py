@@ -2375,9 +2375,8 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
     * **after the commit**, nothing blocks writers: the bm25 index is built
       concurrently (6.5 s for a million rows), then the plain secondary
       indexes (the btrees 1.8 s, the GIN index 47 s) and the foreign keys are
-      validated (0.5 s). Until its GIN index is back, the knowledge base's
-      tsvector keyword fallback scans the partition, so keyword searches that
-      need it time out until the bm25 index is ready.
+      validated (0.5 s). See the first accepted trade-off below for what
+      keyword search does meanwhile.
     * **readers** do not block on the SHARE locks. They can wait on the
       ACCESS EXCLUSIVE steps on DEFAULT (the check going up, the ATTACH, the
       check's drop after a failed move): new readers of DEFAULT, and queries
@@ -2386,6 +2385,34 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
       ``DEFAULT_EXCLUSIVE_QUEUED_TRY_MS`` per step. Measured: 4-8 ms with no
       long reader (the ATTACH itself takes about 1 ms), 0.20 s with a long
       reader present, 44-95 ms under 8-32 overlapping readers.
+
+    Two trade-offs are accepted with this design:
+
+    * **No keyword index right after the move.** Once step 2 commits, the
+      knowledge base's rows are in a partition with no bm25 index yet and none
+      of the plain secondary indexes, the full-text GIN index among them. Until
+      the bm25 index's concurrent build finishes -- roughly 8 s per million
+      rows moved (6.5 s of it the build itself) -- its keyword leg falls back to
+      the bounded tsvector path, which scans the partition and, at that size,
+      runs out of its time budget: hybrid search answers from vectors only, and
+      full_text search returns the keyword-timeout 503. Nothing is wrong with
+      the data; the answers come back once the index is ready.
+    * **A deadlock with an ungated writer of a referenced table.** Adding the
+      foreign keys ``NOT VALID`` takes SHARE ROW EXCLUSIVE on
+      ``knowledge_bases``, ``sources`` and ``indexed_sources`` while the move
+      holds SHARE on the parent and DEFAULT. A transaction that does not take
+      the move gate and writes one of those tables and then an item table --
+      a cascade delete of a knowledge base or source is exactly that -- closes
+      a lock cycle with the move. Postgres aborts one side with SQLSTATE 40P01:
+      the side whose one-time deadlock check (``deadlock_timeout`` after it
+      began waiting) runs first once the cycle exists. That is the move when
+      it was the first to wait, or when the writer began waiting more than
+      ``deadlock_timeout`` before the move reached its keys; it is the writer
+      when the writer began waiting less than ``deadlock_timeout`` before
+      that (measured: a writer waiting 0.3 s before the keys lost; 1.5 s
+      before, the move lost). Either way the loser rolls back whole and nothing
+      is lost: the move's task retries it, and the writer's caller receives the
+      error (a re-index requeues its source).
 
     Why this order. The DEFAULT check cannot be validated while any of the
     knowledge base's rows are still in DEFAULT, so VALIDATE has to follow the
