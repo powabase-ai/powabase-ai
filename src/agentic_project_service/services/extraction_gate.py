@@ -1,0 +1,328 @@
+"""Limits on extracting large source files, shared by every worker of a project.
+
+Two things live here, both kept in the project's Redis (the Celery broker) so
+they hold across worker processes and pods:
+
+* ``LargeExtractionGate`` — a counting semaphore. At most
+  ``EXTRACTION_LARGE_MAX_CONCURRENT`` extractions of files larger than
+  ``EXTRACTION_LARGE_FILE_BYTES`` run at once. Each slot is a lease that the
+  holder renews from a heartbeat thread, so a holder that is killed stops
+  blocking the others when its lease runs out rather than never.
+
+* ``ExtractionAttempts`` — which extractions were in flight in each worker
+  process, and how large their files were. When a worker is killed, every task
+  it was running is redelivered; this record lets a redelivered task tell
+  whether it was the plausible cause of the kill (the largest file in flight)
+  or a bystander.
+
+Both fail open: Redis is also the broker, so when it is unreachable no task is
+being delivered anyway, and an extraction must not fail over bookkeeping.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import socket
+import sys
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+
+import redis
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_LARGE_FILE_BYTES = 50 * 1024 * 1024
+DEFAULT_MAX_CONCURRENT_LARGE = 1
+
+# A slot's lease, and how often its holder renews it. A killed holder blocks
+# the slot for at most LEASE_SECONDS.
+LEASE_SECONDS = 300
+RENEW_SECONDS = 60
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        logger.warning("%s=%r is not a positive integer; using %d", name, raw, default)
+        return default
+    return value
+
+
+def large_file_threshold() -> int:
+    """Files larger than this many bytes are extracted under the gate."""
+    return _positive_int_env("EXTRACTION_LARGE_FILE_BYTES", DEFAULT_LARGE_FILE_BYTES)
+
+
+def max_concurrent_large_extractions() -> int:
+    return _positive_int_env("EXTRACTION_LARGE_MAX_CONCURRENT", DEFAULT_MAX_CONCURRENT_LARGE)
+
+
+def is_large_file(size: int | None) -> bool:
+    """A file of unknown size is treated as large: the gate costs it a wait,
+    while guessing small could put several huge files in one worker."""
+    return size is None or size > large_file_threshold()
+
+
+def _project_ref() -> str:
+    return os.getenv("PROJECT_REF", "default")
+
+
+def _broker_client():
+    return redis.from_url(os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"))
+
+
+# Prunes expired leases, then takes a slot if one is free. Scores are lease
+# expiry times.
+_ACQUIRE_LUA = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local lease = tonumber(ARGV[2])
+local max_holders = tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+if redis.call('ZCARD', key) < max_holders then
+  redis.call('ZADD', key, now + lease, ARGV[4])
+  redis.call('EXPIRE', key, math.ceil(lease * 2))
+  return 1
+end
+return 0
+"""
+
+# Extends a lease that has not yet expired. An expired one is not revived:
+# its slot may already have gone to someone else.
+_RENEW_LUA = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local lease = tonumber(ARGV[2])
+local expires = redis.call('ZSCORE', KEYS[1], ARGV[3])
+if expires and tonumber(expires) > now then
+  redis.call('ZADD', key, now + lease, ARGV[3])
+  redis.call('EXPIRE', key, math.ceil(lease * 2))
+  return 1
+end
+return 0
+"""
+
+
+class LargeExtractionSlot:
+    """A held slot. ``token`` is None when the gate was unavailable and the
+    extraction runs ungated."""
+
+    def __init__(self, gate: LargeExtractionGate, token: str | None, heartbeat: bool):
+        self._gate = gate
+        self.token = token
+        self._stop = threading.Event()
+        self._heartbeat: threading.Thread | None = None
+        if token is not None and heartbeat:
+            self._heartbeat = threading.Thread(
+                target=self._renew_until_released, name="large-extraction-lease", daemon=True
+            )
+            self._heartbeat.start()
+
+    def _renew_until_released(self) -> None:
+        while not self._stop.wait(RENEW_SECONDS):
+            if not self._gate.renew(self.token):
+                logger.warning(
+                    "Large-extraction lease %s expired before it could be renewed; "
+                    "another large extraction may start alongside this one",
+                    self.token,
+                )
+                return
+
+    def release(self) -> None:
+        self._stop.set()
+        if self._heartbeat is not None:
+            self._heartbeat.join(timeout=5)
+        if self.token is not None:
+            self._gate._release(self.token)
+
+
+class LargeExtractionGate:
+    def __init__(self, redis_client=None, clock=time.time, heartbeat: bool = True):
+        self._client = redis_client
+        self._clock = clock
+        self._heartbeat = heartbeat
+        self._scripts: dict[str, object] = {}
+
+    def _key(self) -> str:
+        return f"extraction:large-slots:{_project_ref()}"
+
+    def _script(self, name: str, source: str):
+        if name not in self._scripts:
+            if self._client is None:
+                self._client = _broker_client()
+            self._scripts[name] = self._client.register_script(source)
+        return self._scripts[name]
+
+    def try_acquire(self, task_id: str) -> LargeExtractionSlot | None:
+        """Take a slot. None means every slot is held."""
+        token = f"{task_id}:{uuid.uuid4().hex}"
+        try:
+            taken = self._script("acquire", _ACQUIRE_LUA)(
+                keys=[self._key()],
+                args=[self._clock(), LEASE_SECONDS, max_concurrent_large_extractions(), token],
+            )
+        except Exception:
+            logger.warning(
+                "Large-extraction gate unavailable; extracting task %s ungated",
+                task_id,
+                exc_info=True,
+            )
+            return LargeExtractionSlot(self, None, heartbeat=False)
+        if not int(taken):
+            return None
+        return LargeExtractionSlot(self, token, heartbeat=self._heartbeat)
+
+    def renew(self, token: str) -> bool:
+        try:
+            return bool(
+                int(
+                    self._script("renew", _RENEW_LUA)(
+                        keys=[self._key()], args=[self._clock(), LEASE_SECONDS, token]
+                    )
+                )
+            )
+        except Exception:
+            logger.warning("Could not renew large-extraction lease %s", token, exc_info=True)
+            return False
+
+    def is_live(self, token: str) -> bool:
+        """Whether *token* still holds a slot. False when it cannot be told."""
+        try:
+            if self._client is None:
+                self._client = _broker_client()
+            expires = self._client.zscore(self._key(), token)
+        except Exception:
+            logger.warning("Could not read large-extraction lease %s", token, exc_info=True)
+            return False
+        return expires is not None and float(expires) > self._clock()
+
+    def _release(self, token: str) -> None:
+        try:
+            self._client.zrem(self._key(), token)
+        except Exception:
+            logger.warning(
+                "Could not release large-extraction lease %s; it expires in %ds",
+                token,
+                LEASE_SECONDS,
+                exc_info=True,
+            )
+
+
+_incarnation: tuple[int, str] | None = None
+
+
+def process_incarnation() -> str:
+    """Identifies this worker process for the life of the process. A restarted
+    worker, even with the same hostname and pid, is a new incarnation."""
+    global _incarnation
+    pid = os.getpid()
+    if _incarnation is None or _incarnation[0] != pid:
+        _incarnation = (pid, f"{socket.gethostname()}:{pid}:{uuid.uuid4().hex[:12]}")
+    return _incarnation[1]
+
+
+def _record_ttl_seconds() -> int:
+    # The broker redelivers a killed task after its visibility timeout, which
+    # is the task time limit; the record has to outlive that wait.
+    return 2 * int(os.getenv("CELERY_TASK_TIME_LIMIT") or 21600) + 3600
+
+
+@dataclass(frozen=True)
+class PreviousAttempt:
+    """What was recorded about a task's last attempt, which never finished."""
+
+    slot_token: str | None
+    size: int | None
+    largest_in_flight: int | None
+
+    @property
+    def plausible_cause(self) -> bool:
+        """True unless a strictly larger file was in flight in the same worker.
+
+        Every kill leaves at least one task for which this is True (the
+        largest), so a file that keeps killing workers is always charged.
+        """
+        if self.size is None or self.largest_in_flight is None:
+            return True
+        return self.size >= self.largest_in_flight
+
+
+class ExtractionAttempts:
+    def __init__(self, redis_client=None, incarnation: str | None = None):
+        self._client = redis_client
+        self._incarnation = incarnation
+
+    @property
+    def incarnation(self) -> str:
+        return self._incarnation or process_incarnation()
+
+    def _redis(self):
+        if self._client is None:
+            self._client = _broker_client()
+        return self._client
+
+    @staticmethod
+    def _in_flight_key(incarnation: str) -> str:
+        return f"extraction:in-flight:{_project_ref()}:{incarnation}"
+
+    @staticmethod
+    def _attempt_key(task_id: str) -> str:
+        return f"extraction:attempt:{_project_ref()}:{task_id}"
+
+    def begin(self, task_id: str, size: int | None, slot_token: str | None) -> None:
+        incarnation = self.incarnation
+        ttl = _record_ttl_seconds()
+        in_flight = self._in_flight_key(incarnation)
+        record = json.dumps({"incarnation": incarnation, "size": size, "slot_token": slot_token})
+        try:
+            pipe = self._redis().pipeline()
+            pipe.zadd(in_flight, {task_id: float("inf") if size is None else size})
+            pipe.expire(in_flight, ttl)
+            pipe.set(self._attempt_key(task_id), record, ex=ttl)
+            pipe.execute()
+        except Exception:
+            logger.warning(
+                "Could not record extraction attempt %s; if this worker dies the task "
+                "is charged for it",
+                task_id,
+                exc_info=True,
+            )
+
+    def end(self, task_id: str) -> None:
+        try:
+            pipe = self._redis().pipeline()
+            pipe.zrem(self._in_flight_key(self.incarnation), task_id)
+            pipe.delete(self._attempt_key(task_id))
+            pipe.execute()
+        except Exception:
+            logger.warning("Could not clear extraction attempt %s", task_id, exc_info=True)
+
+    def previous(self, task_id: str) -> PreviousAttempt | None:
+        try:
+            client = self._redis()
+            raw = client.get(self._attempt_key(task_id))
+            if raw is None:
+                return None
+            record = json.loads(raw)
+            peers = client.zrevrange(
+                self._in_flight_key(record["incarnation"]), 0, 0, withscores=True
+            )
+        except Exception:
+            logger.warning("Could not read extraction attempt %s", task_id, exc_info=True)
+            return None
+        largest = None
+        if peers:
+            # A file of unknown size in flight counts as larger than any known one.
+            score = peers[0][1]
+            largest = sys.maxsize if score == float("inf") else int(score)
+        return PreviousAttempt(record.get("slot_token"), record.get("size"), largest)

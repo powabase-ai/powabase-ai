@@ -228,6 +228,24 @@ class SupabaseStorage:
             written += len(chunk)
         return written
 
+    def object_size(self, storage_path: str) -> int | None:
+        """Size in bytes of a file (full ``bucket/path``), None if not reported.
+
+        Reads the response headers only; the body is never transferred.
+        """
+        parts = storage_path.split("/", 1)
+        if len(parts) != 2:
+            raise StorageError(f"Invalid storage path: {storage_path}")
+        stream = self.stream_download(parts[0], parts[1])
+        try:
+            length = next(stream)
+        finally:
+            stream.close()
+        try:
+            return int(length)
+        except (TypeError, ValueError):
+            return None
+
     def delete(self, bucket_id: str, paths: list[str]) -> None:
         """Delete files from storage."""
         response = self._request(

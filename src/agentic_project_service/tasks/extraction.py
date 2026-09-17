@@ -5,6 +5,8 @@ ingest module, and stores derivatives back to storage.
 """
 
 import asyncio
+import functools
+import importlib
 import json
 import logging
 import tempfile
@@ -15,6 +17,12 @@ from sqlalchemy import text
 
 from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
+from ..services.extraction_gate import (
+    ExtractionAttempts,
+    LargeExtractionGate,
+    PreviousAttempt,
+    is_large_file,
+)
 from ..services.storage import (
     StorageError,
     SupabaseStorage,
@@ -41,6 +49,59 @@ _ADVANCED_OCR_EXTRACTION_METHODS: frozenset[str] = frozenset({"llamaparse_ocr"})
 # the worker once will usually kill it again, taking every other task running
 # in that process with it each time.
 MAX_EXTRACTION_INTERRUPTIONS = 2
+
+# How long a large-file extraction waits before trying for a slot again.
+LARGE_EXTRACTION_REQUEUE_SECONDS = 60
+
+large_extraction_gate = LargeExtractionGate()
+extraction_attempts = ExtractionAttempts()
+
+
+class PageImageStorageError(StorageError):
+    """A page image handed over by the extractor could not be stored."""
+
+
+@functools.cache
+def engine_streams_page_images() -> bool:
+    """Whether the installed engine hands page images to ``page_image_sink``.
+
+    Releases up to 0.3.1 ignore the sink and return every page image in the
+    result, so a long scan still holds all of them in memory at once.
+    """
+    try:
+        pdf = importlib.import_module("agentic.ingest.extractor.pdf")
+    except Exception:
+        return False
+    return callable(getattr(pdf, "_page_image_sink", None))
+
+
+_engine_sink_warning_logged = False
+
+
+def _warn_if_engine_ignores_sink(source_id: str, size: int) -> None:
+    """Once per process, and for every large file: an engine that ignores the
+    sink leaves large scans without their memory bound, which must be visible."""
+    global _engine_sink_warning_logged
+    if engine_streams_page_images():
+        return
+    if _engine_sink_warning_logged and not is_large_file(size):
+        return
+    _engine_sink_warning_logged = True
+    logger.warning(
+        f"Source {source_id}: the installed engine (powabase-agentic {_engine_version()}) "
+        f"ignores page_image_sink, so every page image of this {size}-byte file is held "
+        f"in memory until extraction returns. Upgrade powabase-agentic to a release "
+        f"that streams page images."
+    )
+
+
+def _engine_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("powabase-agentic")
+    except PackageNotFoundError:
+        return "unknown"
 
 
 def resolve_api_key_for_model(
@@ -140,14 +201,20 @@ def update_source_extraction_result(
     auto_metadata: dict,
     status: str = "extracted",
     error_message: str | None = None,
-) -> None:
-    """Update source with extraction results."""
-    db.session.execute(
+) -> bool:
+    """Update source with extraction results; False if the source was cancelled.
+
+    Clears the interruption marker: it describes a task that has now finished.
+    """
+    result = db.session.execute(
         text(f"""
             UPDATE "{AI_SCHEMA}".sources
             SET extraction_status = :status,
                 derivatives = CAST(:derivatives AS jsonb),
-                auto_metadata = COALESCE(auto_metadata, '{{}}'::jsonb) || CAST(:auto_metadata AS jsonb),
+                auto_metadata = (COALESCE(auto_metadata, '{{}}'::jsonb)
+                                 - 'extraction_interruptions'
+                                 - 'extraction_interrupted_task')
+                                || CAST(:auto_metadata AS jsonb),
                 error_message = :error_message,
                 updated_at = NOW()
             WHERE id = :id
@@ -162,6 +229,50 @@ def update_source_extraction_result(
         },
     )
     db.session.commit()
+    return result.rowcount > 0
+
+
+def _delete_replaced_derivatives(
+    storage: SupabaseStorage, bucket_id: str, source_id: str, old: dict, new: dict
+) -> None:
+    """Remove stored derivatives of this source that the new result no longer lists.
+
+    Best effort: a leftover file wastes storage but breaks nothing, since
+    readers only follow the paths in the source's current derivatives.
+    """
+    prefix = f"{bucket_id}/{source_id}/derivatives/"
+
+    def paths(derivatives: dict) -> set[str]:
+        return {
+            record["storage_path"]
+            for records in (derivatives or {}).values()
+            if isinstance(records, list)
+            for record in records
+            if isinstance(record, dict) and isinstance(record.get("storage_path"), str)
+        }
+
+    stale = sorted(p for p in paths(old) - paths(new) if p.startswith(prefix))
+    if not stale:
+        return
+    try:
+        storage.delete(bucket_id, [p[len(bucket_id) + 1 :] for p in stale])
+        logger.info(f"Deleted {len(stale)} replaced derivatives of source {source_id}")
+    except Exception as e:
+        logger.warning(
+            f"Could not delete {len(stale)} replaced derivatives of source {source_id}: {e}"
+        )
+
+
+def _sink_failure_behind(exc: BaseException, sink_errors: list) -> StorageError | None:
+    """The sink error that *exc* was raised from, if any."""
+    seen = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if any(current is err for err in sink_errors):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
 
 
 async def run_extraction(
@@ -205,9 +316,19 @@ async def run_extraction(
     # that does not know the sink ignores it and returns images in the result,
     # which the loop below still stores.
     streamed_images: dict[int, dict] = {}
-    sink_errors: list[StorageError] = []
+    sink_errors: list[PageImageStorageError] = []
 
     def page_image_sink(deriv) -> None:
+        if sink_errors:
+            # Storage already failed once: every later page would fail too, and
+            # an engine that keeps rendering or OCRing pages is paying for work
+            # that cannot be kept.
+            err = PageImageStorageError(
+                f"Not storing the page image of page {deriv.page} after an earlier "
+                f"failure ({sink_errors[0]})"
+            )
+            sink_errors.append(err)
+            raise err from sink_errors[0]
         ext = deriv.format or "png"
         deriv_path = get_derivative_storage_path(
             source_id, "image", f"image_page{deriv.page}.{ext}"
@@ -220,14 +341,16 @@ async def run_extraction(
                 content_type=f"image/{ext}" if ext != "jpg" else "image/jpeg",
             )
         except StorageError as e:
-            sink_errors.append(e)
-            raise
+            err = PageImageStorageError(f"Storing the page image of page {deriv.page} failed: {e}")
+            sink_errors.append(err)
+            raise err from e
         record = {"storage_path": full_path, "format": deriv.format, "page": deriv.page}
         if deriv.metadata:
             record["metadata"] = deriv.metadata
         streamed_images[deriv.page] = record
 
     raw_content.metadata["page_image_sink"] = page_image_sink
+    _warn_if_engine_ignores_sink(source_id, len(raw_bytes))
 
     registry = ExtractorRegistry.default(provider_keys=provider_keys)
 
@@ -244,10 +367,13 @@ async def run_extraction(
     try:
         result = await extractor.extract(raw_content)
     except Exception as e:
-        # The engine may have wrapped a storage failure while trying other
-        # methods; surface it as the StorageError the task retries on.
-        if sink_errors:
-            raise sink_errors[-1] from e
+        # The engine may have wrapped a page-image storage failure; surface it
+        # as the StorageError the task retries on. Only when it is in this
+        # failure's own chain: an earlier sink error the engine recovered from
+        # did not cause this one.
+        cause = _sink_failure_behind(e, sink_errors)
+        if cause is not None and cause is not e:
+            raise cause from e
         raise
     del raw_content, raw_bytes
     logger.info(
@@ -329,6 +455,52 @@ async def run_extraction(
     return derivatives, auto_metadata
 
 
+def _requeue(task, countdown: int) -> None:
+    """Send this delivery again later, as the same task id and retry count:
+    waiting for a slot is neither a retry nor a failure, and occupies no
+    worker thread while it waits."""
+    task.signature_from_request(task.request, countdown=countdown).apply_async()
+
+
+def _count_interruption(
+    source: dict, task_id: str, previous: PreviousAttempt | None
+) -> dict | None:
+    """Record that *task_id*'s last delivery died mid-extraction.
+
+    Returns the task result when the source has now been failed. A task that
+    was not the plausible cause of the kill (a larger file was in flight in the
+    same worker) is not charged: a whole worker stopping takes every task in
+    it down, and the others did nothing wrong.
+    """
+    source_id = source["id"]
+    if previous is not None and not previous.plausible_cause:
+        logger.warning(
+            f"Source {source_id}: extraction task {task_id} was interrupted while a larger "
+            f"file ({previous.largest_in_flight} bytes, against {previous.size}) was being "
+            f"extracted in the same worker; not counting it, extracting again"
+        )
+        return None
+    auto_metadata = source.get("auto_metadata") or {}
+    count = 1
+    if auto_metadata.get("extraction_interrupted_task") == task_id:
+        count = int(auto_metadata.get("extraction_interruptions") or 0) + 1
+    record_extraction_interruption(source_id, task_id, count)
+    if count >= MAX_EXTRACTION_INTERRUPTIONS:
+        message = (
+            f"Extraction was interrupted {count} times before finishing: the worker "
+            f"stopped while processing this file, for example because it ran out of "
+            f"memory or was restarted. Not retrying automatically; re-extract to try again."
+        )
+        logger.error(f"Source {source_id}: {message}")
+        update_source_status(source_id, "failed", message, task_id, error_code="permanent")
+        return {"status": "error", "source_id": source_id, "error": message}
+    logger.warning(
+        f"Source {source_id}: extraction task {task_id} was interrupted "
+        f"({count}/{MAX_EXTRACTION_INTERRUPTIONS}); extracting again"
+    )
+    return None
+
+
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 @billing.task_context
 def extract_source(
@@ -370,6 +542,8 @@ def extract_source(
     task_id = self.request.id
     logger.info(f"Starting extraction task {task_id} for source {source_id}")
 
+    slot = None
+    forget_attempt = False
     try:
         source = get_source(source_id)
         if not source:
@@ -384,37 +558,52 @@ def extract_source(
             logger.info(f"Source {source_id} already extracted, skipping")
             return {"status": "skipped", "reason": "already_extracted"}
 
+        storage = get_storage()
+        size = storage.object_size(source["storage_path"])
+
         # Every exit from a run of this task leaves the source in some other
         # status, so finding it still `extracting` under this task's own id
         # means an earlier delivery died mid-run and this is the redelivery.
-        if (
+        redelivered = bool(
             task_id
             and source["extraction_status"] == "extracting"
             and source.get("celery_task_id") == task_id
+        )
+        previous = extraction_attempts.previous(task_id) if redelivered else None
+        if (
+            previous is not None
+            and previous.slot_token
+            and large_extraction_gate.is_live(previous.slot_token)
         ):
-            previous = source.get("auto_metadata") or {}
-            count = 1
-            if previous.get("extraction_interrupted_task") == task_id:
-                count = int(previous.get("extraction_interruptions") or 0) + 1
-            record_extraction_interruption(source_id, task_id, count)
-            if count >= MAX_EXTRACTION_INTERRUPTIONS:
-                message = (
-                    f"Extraction was interrupted {count} times before finishing: the "
-                    f"worker stopped while processing this file, most likely because "
-                    f"it ran out of memory. Not retrying automatically; re-extract to "
-                    f"try again."
-                )
-                logger.error(f"Source {source_id}: {message}")
-                update_source_status(source_id, "failed", message, task_id, error_code="permanent")
-                return {"status": "error", "source_id": source_id, "error": message}
+            # The broker redelivers after its visibility timeout even when the
+            # first delivery is still running. That run holds a live slot, so
+            # nothing died: wait for it rather than run twice or charge it.
             logger.warning(
-                f"Source {source_id}: extraction task {task_id} was interrupted "
-                f"({count}/{MAX_EXTRACTION_INTERRUPTIONS}); extracting again"
+                f"Source {source_id}: task {task_id} is still extracting in another "
+                f"worker; checking again in {LARGE_EXTRACTION_REQUEUE_SECONDS}s"
             )
+            _requeue(self, LARGE_EXTRACTION_REQUEUE_SECONDS)
+            return {"status": "deferred", "source_id": source_id, "reason": "still_running"}
 
+        if is_large_file(size):
+            slot = large_extraction_gate.try_acquire(task_id)
+            if slot is None:
+                logger.info(
+                    f"Source {source_id}: all large-file extraction slots are taken "
+                    f"({size} bytes); trying again in {LARGE_EXTRACTION_REQUEUE_SECONDS}s"
+                )
+                _requeue(self, LARGE_EXTRACTION_REQUEUE_SECONDS)
+                return {"status": "deferred", "source_id": source_id, "reason": "slots_busy"}
+
+        if redelivered:
+            failure = _count_interruption(source, task_id, previous)
+            if failure is not None:
+                forget_attempt = True
+                return failure
+
+        extraction_attempts.begin(task_id, size, slot.token if slot else None)
+        forget_attempt = True
         update_source_status(source_id, "extracting", celery_task_id=task_id)
-
-        storage = get_storage()
 
         derivatives, auto_metadata = asyncio.run(
             run_extraction(
@@ -470,7 +659,12 @@ def extract_source(
                 )
                 logger.warning(f"Source {source_id}: {warning_msg}")
 
-        update_source_extraction_result(source_id, derivatives, auto_metadata, status, warning_msg)
+        if update_source_extraction_result(
+            source_id, derivatives, auto_metadata, status, warning_msg
+        ):
+            _delete_replaced_derivatives(
+                storage, bucket_id, source_id, source.get("derivatives") or {}, derivatives
+            )
 
         # Bill OCR when OCR was performed. Non-OCR extraction (fitz, pdfplumber,
         # opendataloader, txt-native, ...) is CPU-only and not separately billed
@@ -541,3 +735,9 @@ def extract_source(
             "source_id": source_id,
             "error": str(e),
         }
+
+    finally:
+        if forget_attempt:
+            extraction_attempts.end(task_id)
+        if slot is not None:
+            slot.release()
