@@ -210,6 +210,24 @@ class SupabaseStorage:
         bucket_id, path = parts
         return self.download(bucket_id, path)
 
+    def download_to_file(self, storage_path: str, fileobj, chunk_size: int = 1024 * 1024) -> int:
+        """Stream a file (full ``bucket/path``) into *fileobj*; return bytes written.
+
+        ``download`` buffers the body and then joins it, so a large file costs
+        twice its size in memory at the peak. Streaming to a file costs one
+        chunk.
+        """
+        parts = storage_path.split("/", 1)
+        if len(parts) != 2:
+            raise StorageError(f"Invalid storage path: {storage_path}")
+        stream = self.stream_download(parts[0], parts[1], chunk_size)
+        next(stream)  # content-length sentinel; also raises on a bad status
+        written = 0
+        for chunk in stream:
+            fileobj.write(chunk)
+            written += len(chunk)
+        return written
+
     def delete(self, bucket_id: str, paths: list[str]) -> None:
         """Delete files from storage."""
         response = self._request(

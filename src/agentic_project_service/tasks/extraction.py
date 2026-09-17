@@ -7,6 +7,7 @@ ingest module, and stores derivatives back to storage.
 import asyncio
 import json
 import logging
+import tempfile
 
 from ..celery import celery_app
 from celery.exceptions import SoftTimeLimitExceeded
@@ -33,6 +34,14 @@ _OCR_EXTRACTION_METHODS: frozenset[str] = frozenset({"mistral_ocr", "paddleocr_v
 # Cloud OCR methods billed at the advanced-OCR rate (separate catalog action).
 _ADVANCED_OCR_EXTRACTION_METHODS: frozenset[str] = frozenset({"llamaparse_ocr"})
 
+# Times a task may be found to have died mid-extraction before its source is
+# failed instead of extracted again. A worker killed while extracting (out of
+# memory, most likely) never acks the message (acks_late +
+# reject_on_worker_lost), so the broker redelivers it — and a file that killed
+# the worker once will usually kill it again, taking every other task running
+# in that process with it each time.
+MAX_EXTRACTION_INTERRUPTIONS = 2
+
 
 def resolve_api_key_for_model(
     model: str,
@@ -53,7 +62,7 @@ def get_source(source_id: str) -> dict | None:
     result = db.session.execute(
         text(f"""
             SELECT id, name, file_type, storage_path, extraction_status,
-                   derivatives, metadata, auto_metadata
+                   derivatives, metadata, auto_metadata, celery_task_id
             FROM "{AI_SCHEMA}".sources
             WHERE id = :id
         """),
@@ -73,6 +82,7 @@ def get_source(source_id: str) -> dict | None:
         "derivatives": row[5] or {},
         "metadata": row[6] or {},
         "auto_metadata": row[7] or {},
+        "celery_task_id": row[8],
     }
 
 
@@ -100,6 +110,25 @@ def update_source_status(
             "error_message": error_message,
             "error_code": error_code,
             "celery_task_id": celery_task_id,
+        },
+    )
+    db.session.commit()
+
+
+def record_extraction_interruption(source_id: str, task_id: str, count: int) -> None:
+    """Persist how many times *task_id* has died mid-extraction of this source."""
+    db.session.execute(
+        text(f"""
+            UPDATE "{AI_SCHEMA}".sources
+            SET auto_metadata = COALESCE(auto_metadata, '{{}}'::jsonb) || CAST(:marker AS jsonb),
+                updated_at = NOW()
+            WHERE id = :id
+        """),
+        {
+            "id": source_id,
+            "marker": json.dumps(
+                {"extraction_interruptions": count, "extraction_interrupted_task": task_id}
+            ),
         },
     )
     db.session.commit()
@@ -151,7 +180,12 @@ async def run_extraction(
     filename = source["name"]
 
     logger.info(f"Downloading source {source_id} from {storage_path}")
-    raw_bytes = storage.download_from_path(storage_path)
+    # Spooled to disk and read back once: buffering the response in memory
+    # holds the body twice while it is joined.
+    with tempfile.TemporaryFile() as spool:
+        storage.download_to_file(storage_path, spool)
+        spool.seek(0)
+        raw_bytes = spool.read()
     logger.info(f"Downloaded {len(raw_bytes)} bytes")
 
     raw_content = RawContent(
@@ -163,6 +197,37 @@ async def run_extraction(
 
     # Pass extraction model preference so PDFExtractor can read it
     raw_content.metadata["extraction_model"] = extraction_model or "auto"
+
+    # Page images are stored as the extractor renders them instead of being
+    # returned all at once: a long scanned PDF renders to gigabytes of PNG.
+    # Keyed by page, because a method that fails part-way is followed by the
+    # next one in the chain, which delivers the same pages again. An engine
+    # that does not know the sink ignores it and returns images in the result,
+    # which the loop below still stores.
+    streamed_images: dict[int, dict] = {}
+    sink_errors: list[StorageError] = []
+
+    def page_image_sink(deriv) -> None:
+        ext = deriv.format or "png"
+        deriv_path = get_derivative_storage_path(
+            source_id, "image", f"image_page{deriv.page}.{ext}"
+        )
+        try:
+            full_path = storage.upload(
+                bucket_id=bucket_id,
+                path=deriv_path,
+                file_data=deriv.content,
+                content_type=f"image/{ext}" if ext != "jpg" else "image/jpeg",
+            )
+        except StorageError as e:
+            sink_errors.append(e)
+            raise
+        record = {"storage_path": full_path, "format": deriv.format, "page": deriv.page}
+        if deriv.metadata:
+            record["metadata"] = deriv.metadata
+        streamed_images[deriv.page] = record
+
+    raw_content.metadata["page_image_sink"] = page_image_sink
 
     registry = ExtractorRegistry.default(provider_keys=provider_keys)
 
@@ -176,13 +241,23 @@ async def run_extraction(
         extractor = TextExtractor()
 
     logger.info(f"Starting extraction for source {source_id}")
-    result = await extractor.extract(raw_content)
+    try:
+        result = await extractor.extract(raw_content)
+    except Exception as e:
+        # The engine may have wrapped a storage failure while trying other
+        # methods; surface it as the StorageError the task retries on.
+        if sink_errors:
+            raise sink_errors[-1] from e
+        raise
+    del raw_content, raw_bytes
     logger.info(
         f"Extraction complete: {len(result.derivatives)} derivatives, "
         f"method: {result.extraction_method}"
     )
 
     derivatives = {}
+    if streamed_images:
+        derivatives["image"] = [streamed_images[page] for page in sorted(streamed_images)]
 
     for i, deriv in enumerate(result.derivatives):
         if deriv.type == "text":
@@ -247,7 +322,7 @@ async def run_extraction(
         **result.auto_metadata,
         "extraction_method": result.extraction_method,
         "extracted_at": result.extracted_at.isoformat(),
-        "derivative_count": len(result.derivatives),
+        "derivative_count": len(result.derivatives) + len(streamed_images),
         "stats": result.stats,
     }
 
@@ -308,6 +383,34 @@ def extract_source(
         if source["extraction_status"] == "extracted":
             logger.info(f"Source {source_id} already extracted, skipping")
             return {"status": "skipped", "reason": "already_extracted"}
+
+        # Every exit from a run of this task leaves the source in some other
+        # status, so finding it still `extracting` under this task's own id
+        # means an earlier delivery died mid-run and this is the redelivery.
+        if (
+            task_id
+            and source["extraction_status"] == "extracting"
+            and source.get("celery_task_id") == task_id
+        ):
+            previous = source.get("auto_metadata") or {}
+            count = 1
+            if previous.get("extraction_interrupted_task") == task_id:
+                count = int(previous.get("extraction_interruptions") or 0) + 1
+            record_extraction_interruption(source_id, task_id, count)
+            if count >= MAX_EXTRACTION_INTERRUPTIONS:
+                message = (
+                    f"Extraction was interrupted {count} times before finishing: the "
+                    f"worker stopped while processing this file, most likely because "
+                    f"it ran out of memory. Not retrying automatically; re-extract to "
+                    f"try again."
+                )
+                logger.error(f"Source {source_id}: {message}")
+                update_source_status(source_id, "failed", message, task_id, error_code="permanent")
+                return {"status": "error", "source_id": source_id, "error": message}
+            logger.warning(
+                f"Source {source_id}: extraction task {task_id} was interrupted "
+                f"({count}/{MAX_EXTRACTION_INTERRUPTIONS}); extracting again"
+            )
 
         update_source_status(source_id, "extracting", celery_task_id=task_id)
 
