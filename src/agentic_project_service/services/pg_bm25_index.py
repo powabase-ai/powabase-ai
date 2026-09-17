@@ -1644,26 +1644,106 @@ def _column_signature(conn, relname: str) -> list[tuple]:
     ]
 
 
+def _check_constraint_signature(conn, relname: str, ignore: str) -> list[str]:
+    """A relation's CHECK constraint definitions, sorted, leaving out the move's own.
+
+    ``ignore`` is the name of the one check the move itself adds to that
+    relation (the clone's partition-bound check); the temporary move checks on
+    DEFAULT are left out by their prefix. ``NOT VALID`` is not compared: a clone
+    made with ``LIKE ... INCLUDING CONSTRAINTS`` carries a copied check as valid.
+    """
+    return sorted(
+        row[0].removesuffix(" NOT VALID")
+        for row in conn.execute(
+            text(
+                "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
+                "WHERE c.conrelid = to_regclass(:relation) AND c.contype = 'c' "
+                "AND c.conname <> :ignore AND c.conname NOT LIKE :prefix"
+            ),
+            {
+                "relation": _qualified(relname),
+                "ignore": ignore,
+                "prefix": f"{_DEFAULT_MOVE_CHECK_PREFIX}%",
+            },
+        ).all()
+    )
+
+
+# A stale clone's foreign keys are dropped one at a time before the clone, each
+# with this short lock_timeout and a pause between tries (see
+# ``_drop_stale_clone``).
+_STALE_CLONE_KEY_DROP_TRY_MS = 50
+_STALE_CLONE_KEY_DROP_WAIT_SECONDS = 2.0
+
+
+def _drop_clone_foreign_keys(conn, partition: str) -> None:
+    """Drop an unattached clone's foreign keys, without queueing for long on what they reference.
+
+    Dropping a foreign key takes ACCESS EXCLUSIVE on the table it references --
+    ``knowledge_bases``, ``sources``, ``indexed_sources`` -- and a request queued
+    for that lock makes every new reader of the table wait behind it. So each
+    try waits at most ``_STALE_CLONE_KEY_DROP_TRY_MS``, and a key still refused
+    after ``_STALE_CLONE_KEY_DROP_WAIT_SECONDS`` raises the last try's 55P03,
+    which is retried.
+    """
+    names = [
+        row[0]
+        for row in conn.execute(
+            text(
+                "SELECT quote_ident(conname) FROM pg_constraint "
+                "WHERE conrelid = to_regclass(:relation) AND contype = 'f' ORDER BY conname"
+            ),
+            {"relation": _qualified(partition)},
+        ).all()
+    ]
+    conn.commit()
+    for name in names:
+        deadline = time.monotonic() + _STALE_CLONE_KEY_DROP_WAIT_SECONDS
+        while True:
+            try:
+                conn.execute(text(f"SET LOCAL lock_timeout = '{_STALE_CLONE_KEY_DROP_TRY_MS}ms'"))
+                conn.execute(text(f"ALTER TABLE {_qualified(partition)} DROP CONSTRAINT {name}"))
+                conn.commit()
+                break
+            except Exception as exc:
+                conn.rollback()
+                if not is_lock_conflict(exc) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.1)
+
+
 def _drop_stale_clone(conn, kb_id: str, item_table: str) -> None:
     """Drop an unattached clone that no longer matches what the move expects.
 
-    An unattached clone is not a partition, so a column added to (or changed
-    on) the parent after a failed move left it behind never reaches it, and
-    moving into it would fail for good. A clone is also stale when it carries
-    an index or a foreign key: the move builds those itself, inside its
-    transaction, so one already there was left by an earlier layout and would
-    make that build fail. The move is one transaction, so a
+    An unattached clone is not a partition, so a column or CHECK constraint
+    added to (or changed on) the parent after a failed move left it behind
+    never reaches it, and moving into it -- or attaching it -- would fail for
+    good. A clone is also stale when it carries an index or a foreign key: the
+    move builds those itself, inside its transaction, so one already there was
+    left by an earlier layout and would make that build fail. The move is one
+    transaction, so a
     clone is empty whenever no move is in flight -- and the caller holds the
     item table's build lock, so none is. A clone that holds rows anyway is
     never dropped: the move stops with an error naming it instead.
+
+    A clone's foreign keys are dropped first, on their own and each with a
+    short lock wait (``_drop_clone_foreign_keys``): dropped with the table,
+    they would queue for ACCESS EXCLUSIVE on every table they reference for as
+    long as the move's lock timeout, holding up that table's readers
+    meanwhile. No attempt of the current design leaves such a clone -- the keys
+    are only ever added in the transaction that attaches it -- so this is for
+    one an earlier layout left.
     """
     partition = partition_name(kb_id, item_table)
     if _relkind(conn, partition) is None:
         return
-    same_columns = _column_signature(conn, partition) == _column_signature(
-        conn, default_partition_name(item_table)
-    )
-    if same_columns and not _has_indexes_or_foreign_keys(conn, partition):
+    default = default_partition_name(item_table)
+    same_shape = _column_signature(conn, partition) == _column_signature(
+        conn, default
+    ) and _check_constraint_signature(
+        conn, partition, f"{partition}_kb_check"
+    ) == _check_constraint_signature(conn, default, "")
+    if same_shape and not _has_indexes_or_foreign_keys(conn, partition):
         return
     if conn.execute(text(f"SELECT EXISTS (SELECT 1 FROM {_qualified(partition)})")).scalar():
         raise RuntimeError(
@@ -1672,11 +1752,13 @@ def _drop_stale_clone(conn, kb_id: str, item_table: str) -> None:
             "dropping it. Move its rows back or drop it, then retry"
         )
     logger.warning(
-        "Dropping the stale clone %s.%s: its columns or indexes no longer match what a move "
-        "into it expects",
+        "Dropping the stale clone %s.%s: its columns, checks, indexes or keys no longer match "
+        "what a move into it expects",
         AI_SCHEMA,
         partition,
     )
+    _drop_clone_foreign_keys(conn, partition)
+    conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
     conn.execute(text(partition_drop_ddl(kb_id, item_table)))
 
 

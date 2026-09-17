@@ -93,6 +93,59 @@ def test_a_stale_clone_missing_a_column_added_since_is_recreated(engine, session
     session.rollback()
 
 
+def test_a_stale_clone_missing_a_check_added_since_is_recreated(engine, session):
+    """A CHECK added to the parent later reaches DEFAULT but not the unattached
+    clone, and ATTACH then refuses the clone for good ("missing constraint")."""
+    with engine.connect() as conn:
+        conn.execute(text(pgb.partition_create_ddl(KB_A, "chunks")))
+        conn.execute(text(pgb.partition_check_ddl(KB_A, "chunks")))
+        conn.commit()
+        conn.execute(
+            text(
+                f"ALTER TABLE {SCHEMA}.chunks ADD CONSTRAINT text_not_blank "
+                "CHECK (text IS NULL OR length(text) > 0)"
+            )
+        )
+        conn.commit()
+
+    moved = pgb.create_partition(engine, KB_A, "chunks")
+
+    assert moved["rows_moved"] == len(KB_A_DOCS)
+    partition = pgb.partition_name(KB_A, "chunks")
+    assert pgb.partition_exists(session, KB_A, "chunks") is True
+    checks = session.execute(
+        text(
+            "SELECT conname FROM pg_constraint WHERE conrelid = to_regclass(:r) AND contype = 'c'"
+        ),
+        {"r": f"{SCHEMA}.{partition}"},
+    ).scalars()
+    assert "text_not_blank" in list(checks)
+    session.rollback()
+
+
+def test_an_up_to_date_clone_is_kept(engine, session, monkeypatch):
+    """Comparing CHECKs must not make every clone look stale: its own
+    partition-bound check, and a copied check that is NOT VALID on DEFAULT, match."""
+    with engine.connect() as conn:
+        conn.execute(
+            text(
+                f"ALTER TABLE {SCHEMA}.chunks ADD CONSTRAINT text_not_blank "
+                "CHECK (text IS NULL OR length(text) > 0) NOT VALID"
+            )
+        )
+        conn.execute(text(pgb.partition_create_ddl(KB_A, "chunks")))
+        conn.execute(text(pgb.partition_check_ddl(KB_A, "chunks")))
+        conn.commit()
+    dropped: list = []
+    real_drop = pgb.partition_drop_ddl
+    monkeypatch.setattr(
+        pgb, "partition_drop_ddl", lambda *a, **k: dropped.append(a) or real_drop(*a, **k)
+    )
+
+    assert pgb.create_partition(engine, KB_A, "chunks")["rows_moved"] == len(KB_A_DOCS)
+    assert dropped == []
+
+
 def test_a_stale_clone_that_somehow_holds_rows_is_not_dropped(engine, session):
     """A clone is empty whenever no move is in flight (the move is one
     transaction). One that is not is left for a person to look at, never
