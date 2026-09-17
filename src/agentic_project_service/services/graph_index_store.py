@@ -31,13 +31,15 @@ class GraphIndexStore(BaseTocStore):
     NODES_TABLE = "graph_index_nodes"
 
     # The ToC and its nodes are written in one transaction, and the nodes'
-    # foreign key references the ToC, so the move gate goes first in both.
+    # foreign key references the ToC, so the move gate goes first in both. Only
+    # graph_index_nodes' gate: this transaction stays open through the LLM and
+    # embedding stages, and must not hold off moves on the other item tables.
     def store_toc(self, *args, **kwargs) -> str:
-        pg_bm25_index.hold_move_gate_shared(self.session)
+        pg_bm25_index.hold_move_gate_shared(self.session, self.NODES_TABLE)
         return super().store_toc(*args, **kwargs)
 
     def delete_by_indexed_source(self, indexed_source_id: str) -> int:
-        pg_bm25_index.hold_move_gate_shared(self.session)
+        pg_bm25_index.hold_move_gate_shared(self.session, self.NODES_TABLE)
         return super().delete_by_indexed_source(indexed_source_id)
 
     def store_nodes(
@@ -58,7 +60,7 @@ class GraphIndexStore(BaseTocStore):
         """
         if not nodes:
             return 0, []
-        pg_bm25_index.hold_move_gate_shared(self.session)
+        pg_bm25_index.hold_move_gate_shared(self.session, self.NODES_TABLE)
 
         stmt = text(f"""
             INSERT INTO "{AI_SCHEMA}".graph_index_nodes (

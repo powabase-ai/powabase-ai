@@ -1615,9 +1615,11 @@ def _run_index_body(
         # First in this transaction, before the reads of the ids below: a
         # partition move and this cleanup take turns, so the cleanup never holds
         # a DEFAULT partition into the move's lock tries (see
-        # ``pg_bm25_index.move_gate_relation``). The stores take it again at the
-        # start of each transaction of their own.
-        pg_bm25_index.hold_move_gate_shared(db.session)
+        # ``pg_bm25_index.move_gate_relation``). It deletes from every item
+        # table, so it takes every table's gate, in one call. The stores take
+        # their own table's gate again at the start of each transaction of their
+        # own.
+        pg_bm25_index.hold_move_gate_shared(db.session, pg_bm25_index.PARTITIONED_ITEM_TABLES)
         db.session.execute(
             text(f"""
                 DELETE FROM "{AI_SCHEMA}".embeddings
@@ -2722,13 +2724,19 @@ def _bm25_failure_reason(exc: BaseException) -> str:
     if pg_bm25_index.is_lock_conflict(exc):
         holders = [h for h in getattr(exc, "bm25_lock_holders", None) or [] if h.get("granted")]
         kind = "a deadlock" if sqlstate == "40P01" else "a lock"
+        # Graph indexing holds graph_index_nodes' move gate for a whole run.
+        why = (
+            "; a graph_index source is indexing into this table, and the move retries after it"
+            if step == "move gate" and getattr(exc, "bm25_item_table", None) == "graph_index_nodes"
+            else ""
+        )
         if holders:
             oldest = max(holders, key=lambda h: h.get("xact_seconds") or 0)
             return (
                 f"gave up on {kind}{at}, held by another transaction "
-                f"(pid {oldest.get('pid')}, open {oldest.get('xact_seconds')} s)"
+                f"(pid {oldest.get('pid')}, open {oldest.get('xact_seconds')} s){why}"
             )
-        return f"gave up on {kind}{at}"
+        return f"gave up on {kind}{at}{why}"
     if sqlstate == "57014":
         return f"cancelled by a statement timeout{at}"
     if getattr(exc, "connection_invalidated", False) or (sqlstate or "").startswith(("08", "57P")):

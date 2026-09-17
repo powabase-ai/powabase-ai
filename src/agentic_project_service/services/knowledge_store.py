@@ -50,7 +50,7 @@ class PgVectorKnowledgeStore(BasePgVectorStore):
             return 0, []
 
         # First, before any row: a partition move and this write take turns.
-        pg_bm25_index.hold_move_gate_shared(self.session)
+        pg_bm25_index.hold_move_gate_shared(self.session, "chunks")
         inserted = 0
         chunk_ids: list[str] = []
         for chunk in chunks:
@@ -118,7 +118,7 @@ class PgVectorKnowledgeStore(BasePgVectorStore):
 
         Does NOT commit — see ``store_chunks``.
         """
-        pg_bm25_index.hold_move_gate_shared(self.session)
+        pg_bm25_index.hold_move_gate_shared(self.session, "chunks")
         result = self.session.execute(
             text(f"""
                 DELETE FROM "{self.schema}".chunks

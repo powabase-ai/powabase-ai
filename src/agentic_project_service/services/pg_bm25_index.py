@@ -42,6 +42,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Iterable
 from typing import Any
 
 from sqlalchemy import text
@@ -543,14 +544,27 @@ def move_gate_relation(item_table: str) -> str:
       drops -- on one item table with each other;
     * the **move gate** (this: ``ai.chunks#move``) serialises a move with
       indexing. Indexing takes it shared, transaction-scoped
-      (``hold_move_gate_shared``), as the first statement of each transaction
-      it opens on an item table; the move takes it exclusively
-      (``_acquire_move_gate``) before it checks DEFAULT or takes any table
-      lock, and holds it until it commits. So an indexing transaction runs
-      entirely before a move or entirely after it, and never holds DEFAULT
-      into the move's lock tries. A queued exclusive request makes later
-      shared requests queue behind it, so a stream of overlapping indexing
+      (``hold_move_gate_shared``), for each item table a transaction writes,
+      before it first reads or writes that table; the move -- and the empty
+      knowledge base's attach -- takes it exclusively (``_acquire_move_gate``)
+      before it checks DEFAULT or takes any table lock, and holds it until it
+      commits. So an indexing transaction on that table runs entirely before
+      a move or entirely after it, and never holds DEFAULT into the move's
+      lock tries. A queued exclusive request makes later shared requests for
+      the same table queue behind it, so a stream of overlapping indexing
       transactions cannot starve a move once it is waiting.
+
+    One gate per item table, so a transaction that writes only one table waits
+    only for moves on that table: a chunks move neither waits for a graph_index
+    run nor stalls it. The accepted trade-off is on ``graph_index_nodes``
+    itself: a graph_index run writes its nodes in one transaction that stays
+    open through its LLM enrichment and embedding stages (minutes), so a move on
+    that table gives up (SQLSTATE 55P03 after ``MOVE_GATE_WAIT_SECONDS``) while
+    a graph_index source is indexing -- stalling graph_index indexing for that
+    wait -- and its task retries later. A transaction that takes the gates of
+    several tables takes them in one call, in name order; one that took a
+    second table's gate later, while holding locks a move on that table waits
+    for, would deadlock with it (detected, SQLSTATE 40P01, and retried).
 
     Other writers (API writes, enrichment, graph updates) do not take the gate;
     the parent SHARE lock and the ``NOWAIT`` tries remain their protection.
@@ -558,26 +572,36 @@ def move_gate_relation(item_table: str) -> str:
     return f"{partition_build_lock_relation(item_table)}#move"
 
 
-def move_gate_shared_sql() -> tuple[str, dict]:
-    """The statement that takes the move gate shared for every item table."""
+def _gate_tables(item_tables: str | Iterable[str]) -> list[str]:
+    tables = [item_tables] if isinstance(item_tables, str) else list(item_tables)
+    validated = sorted({_validated_partitioned_table(t) for t in tables})
+    if not validated:
+        raise ValueError("the move gate needs at least one item table")
+    return validated
+
+
+def move_gate_shared_sql(item_tables: str | Iterable[str]) -> tuple[str, dict]:
+    """The statement that takes the move gates of these item tables shared, in name order."""
     return (
         "SELECT pg_advisory_xact_lock_shared(hashtextextended(r.relation, 0)) "
         "FROM unnest(CAST(:relations AS text[])) WITH ORDINALITY AS r(relation, position) "
         "ORDER BY r.position",
-        {"relations": [move_gate_relation(t) for t in sorted(PARTITIONED_ITEM_TABLES)]},
+        {"relations": [move_gate_relation(t) for t in _gate_tables(item_tables)]},
     )
 
 
-def hold_move_gate_shared(session) -> None:
-    """Take the move gate shared until the caller's transaction ends.
+def hold_move_gate_shared(session, item_tables: str | Iterable[str]) -> None:
+    """Take the move gate of each item table shared until the caller's transaction ends.
 
-    For indexing: call it as the first statement of every transaction that
-    reads or writes an item table (taking it again in the same transaction is
-    harmless). It waits while a move holds the gate -- holding no table lock
-    meanwhile -- and raises whatever the wait raises (a lock timeout the caller
-    set, typically), which indexing requeues as a lock conflict.
+    For indexing: call it before the first statement of a transaction that
+    reads or writes one of ``item_tables`` -- only the tables it writes, so it
+    waits for no move on any other (taking a gate again in the same
+    transaction is harmless). It waits while a move holds a gate -- holding no
+    lock on these tables meanwhile -- and raises whatever the wait raises (a
+    lock timeout the caller set, typically), which indexing requeues as a lock
+    conflict.
     """
-    sql, params = move_gate_shared_sql()
+    sql, params = move_gate_shared_sql(item_tables)
     session.execute(text(sql), params)
 
 
@@ -1346,12 +1370,25 @@ def is_partition_move_race(exc: BaseException) -> bool:
 
 
 def _lock_holders_sql() -> str:
+    """Locks on the parent, on DEFAULT, and on the item table's move gate.
+
+    An advisory lock on a bigint key appears in ``pg_locks`` split into
+    ``classid`` (high 32 bits) and ``objid`` (low 32 bits), with ``objsubid`` 1.
+    """
     return (
-        "SELECT l.pid, l.mode, l.granted, pg_blocking_pids(l.pid) AS blocked_by, "
+        "WITH gate AS (SELECT hashtextextended(:gate, 0) AS k) "
+        "SELECT l.pid, "
+        "CASE WHEN l.locktype = 'advisory' THEN 'move gate' "
+        "ELSE l.relation::regclass::text END AS lock_on, "
+        "l.mode, l.granted, pg_blocking_pids(l.pid) AS blocked_by, "
         "a.state, round(extract(epoch FROM now() - a.xact_start)::numeric, 1) AS xact_seconds, "
         "left(a.query, 200) AS query "
-        "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
-        "WHERE l.relation IN (to_regclass(:parent), to_regclass(:default)) "
+        "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid CROSS JOIN gate "
+        "WHERE (l.relation IN (to_regclass(:parent), to_regclass(:default)) "
+        "OR (l.locktype = 'advisory' AND l.objsubid = 1 AND l.database = ("
+        "SELECT oid FROM pg_database WHERE datname = current_database()) "
+        "AND l.classid = ((gate.k >> 32) & 4294967295)::oid "
+        "AND l.objid = (gate.k & 4294967295)::oid)) "
         "AND l.pid <> pg_backend_pid() AND NOT (l.pid = ANY(CAST(:exclude AS int[]))) "
         "ORDER BY l.granted DESC, l.pid LIMIT 20"
     )
@@ -1365,7 +1402,7 @@ def _backend_pid(conn) -> int | None:
 
 
 def _lock_holders(engine, item_table: str, exclude: list[int | None]) -> list[dict]:
-    """Sessions holding or awaiting locks on the parent and DEFAULT. Never raises.
+    """Sessions holding or awaiting locks on the parent, DEFAULT or the move gate. Never raises.
 
     Read on a connection of its own, so it can run while the failed move's
     transaction is still open: its locks -- and whoever refused them -- are
@@ -1382,6 +1419,7 @@ def _lock_holders(engine, item_table: str, exclude: list[int | None]) -> list[di
                         {
                             "parent": _qualified(item_table),
                             "default": _qualified(default_partition_name(item_table)),
+                            "gate": move_gate_relation(item_table),
                             "exclude": [pid for pid in exclude if pid is not None],
                         },
                     ).all()
@@ -1418,6 +1456,7 @@ def _fail_move(
     try:
         exc.bm25_lock_holders = holders
         exc.bm25_move_step = step
+        exc.bm25_item_table = item_table
     except Exception:
         pass
     if not transient:
@@ -1473,7 +1512,8 @@ def _acquire_move_gate(conn, item_table: str) -> None:
 
     Session-scoped, like the build lock: it has to outlive the transactions
     before the move's. A timeout raises SQLSTATE 55P03 (retried) having taken
-    no table lock at all.
+    no table lock at all. The failed transaction is left for the caller's
+    ``_fail_move``, which names the gate's holders before rolling it back.
     """
     conn.execute(text(f"SET LOCAL lock_timeout = '{int(MOVE_GATE_WAIT_SECONDS * 1000)}ms'"))
     try:
@@ -1482,16 +1522,36 @@ def _acquire_move_gate(conn, item_table: str) -> None:
             {"relation": move_gate_relation(item_table)},
         )
     except Exception:
-        conn.rollback()
         logger.warning(
             "A move on %s.%s could not take the move gate within %.0f s: indexing "
-            "transactions on the table kept it; retryable",
+            "transactions on that table kept it%s; retryable",
             AI_SCHEMA,
             item_table,
             MOVE_GATE_WAIT_SECONDS,
+            " (a graph_index run holds it for the length of its run)"
+            if item_table == "graph_index_nodes"
+            else "",
         )
         raise
     conn.commit()
+
+
+class _MoveGate:
+    """The move gate held on one connection, released once, however the move ends."""
+
+    def __init__(self, conn, item_table: str):
+        self.conn = conn
+        self.item_table = item_table
+        self.held = False
+
+    def acquire(self) -> None:
+        _acquire_move_gate(self.conn, self.item_table)
+        self.held = True
+
+    def release(self) -> None:
+        if self.held:
+            self.held = False
+            _release_advisory_lock(self.conn, move_gate_relation(self.item_table))
 
 
 def _release_partition_build_lock(conn, item_table: str) -> None:

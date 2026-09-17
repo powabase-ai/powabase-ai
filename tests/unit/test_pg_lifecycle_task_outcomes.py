@@ -232,3 +232,11 @@ def test_a_failure_to_delete_the_file_index_does_not_fail_the_build(task, monkey
     ):
         assert ensure.run(KB)["status"] == "ready"
     assert recorded[-1][0] == "ready"
+
+
+def test_a_graph_nodes_move_that_gives_up_on_its_gate_says_graph_indexing_holds_it():
+    error = _lock_timeout(step="move gate")
+    error.bm25_item_table = "graph_index_nodes"
+    assert "graph_index source is indexing" in indexing._bm25_failure_reason(error)
+    error.bm25_item_table = "chunks"
+    assert "graph_index" not in indexing._bm25_failure_reason(error)

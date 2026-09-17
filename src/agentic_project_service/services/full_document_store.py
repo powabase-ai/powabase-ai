@@ -111,7 +111,7 @@ class FullDocumentStore(BasePgVectorStore):
         dims = len(summary_embedding)
 
         try:
-            pg_bm25_index.hold_move_gate_shared(self.session)
+            pg_bm25_index.hold_move_gate_shared(self.session, "full_documents")
             self.session.execute(
                 text(f"""
                     INSERT INTO "{self.schema}".full_documents (
@@ -186,7 +186,7 @@ class FullDocumentStore(BasePgVectorStore):
         """
         try:
             # First, before the read: a partition move and this write take turns.
-            pg_bm25_index.hold_move_gate_shared(self.session)
+            pg_bm25_index.hold_move_gate_shared(self.session, "full_documents")
             # Query storage paths before deleting rows
             storage_paths: list[str] = []
             if self.storage:

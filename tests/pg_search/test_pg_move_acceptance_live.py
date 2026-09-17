@@ -75,7 +75,7 @@ class _Traffic:
         """index_source's cleanup and write: gate, read ids, (work), delete, insert."""
         with self.engine.connect() as conn:
             try:
-                pgb.hold_move_gate_shared(conn)
+                pgb.hold_move_gate_shared(conn, "chunks")
                 ids = conn.execute(
                     text(
                         f"SELECT id FROM {SCHEMA}.chunks "

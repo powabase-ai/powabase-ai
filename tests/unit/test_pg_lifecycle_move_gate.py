@@ -34,7 +34,10 @@ def _recording_session():
     session.log = []
 
     def execute(statement, params=None):
-        session.log.append(getattr(statement, "text", str(statement)))
+        sql = getattr(statement, "text", str(statement))
+        if _GATE in sql:
+            sql = f"{sql} -- gates: {' '.join((params or {}).get('relations', []))}"
+        session.log.append(sql)
         result = MagicMock()
         result.rowcount = 0
         result.fetchall.return_value = []
@@ -49,30 +52,55 @@ def _recording_session():
     return session
 
 
-def _assert_gate_opens_every_transaction_on_an_item_table(log):
-    """Each run of statements between commits that touches an item table starts
-    with the gate, before its first item-table statement."""
+# The gate that covers each table a statement can touch; the ToC's rows are
+# written with their nodes, under the nodes' gate.
+_GATE_OF = {
+    "chunks": "chunks",
+    "full_documents": "full_documents",
+    "graph_index_nodes": "graph_index_nodes",
+    "graph_index_toc": "graph_index_nodes",
+}
+
+
+def _assert_gate_opens_every_transaction_on_an_item_table(log) -> set[str]:
+    """Before each statement on an item table, its transaction has taken that
+    table's gate. Returns every gate taken."""
     transaction: list[str] = []
     checked = 0
+    taken_anywhere: set[str] = set()
     for entry in [*log, "COMMIT"]:
         if entry in ("COMMIT", "ROLLBACK"):
-            touching = [i for i, sql in enumerate(transaction) if _ITEM_TABLE.search(sql)]
-            if touching:
-                gates = [i for i, sql in enumerate(transaction) if _GATE in sql]
-                assert gates and gates[0] < touching[0], transaction
-                checked += 1
             transaction = []
-        else:
-            transaction.append(entry)
+            continue
+        transaction.append(entry)
+        if _GATE in entry:
+            taken_anywhere.update(entry.split("-- gates: ", 1)[1].split())
+            continue
+        for table in _ITEM_TABLE.findall(entry):
+            held = {
+                relation
+                for sql in transaction
+                if _GATE in sql
+                for relation in sql.split("-- gates: ", 1)[1].split()
+            }
+            assert pgb.move_gate_relation(_GATE_OF[table]) in held, transaction
+            checked += 1
     assert checked, log
+    return taken_anywhere
 
 
-def test_the_gate_names_every_partitioned_item_table():
-    sql, params = pgb.move_gate_shared_sql()
+def test_the_gate_names_only_the_tables_asked_for_in_name_order():
+    sql, params = pgb.move_gate_shared_sql("graph_index_nodes")
     assert _GATE in sql
-    assert sorted(params["relations"]) == sorted(
-        pgb.move_gate_relation(t) for t in pgb.PARTITIONED_ITEM_TABLES
-    )
+    assert params["relations"] == [pgb.move_gate_relation("graph_index_nodes")]
+    _, params = pgb.move_gate_shared_sql(pgb.PARTITIONED_ITEM_TABLES)
+    assert params["relations"] == [
+        pgb.move_gate_relation(t) for t in sorted(pgb.PARTITIONED_ITEM_TABLES)
+    ]
+    with pytest.raises(ValueError):
+        pgb.move_gate_shared_sql([])
+    with pytest.raises(ValueError):
+        pgb.move_gate_shared_sql("doc2json_documents")
     # Its own key: never the build lock that serialises moves with each other.
     for table in pgb.PARTITIONED_ITEM_TABLES:
         assert pgb.move_gate_relation(table) != pgb.partition_build_lock_relation(table)
@@ -84,14 +112,16 @@ def test_chunk_writes_take_the_gate_first():
     asyncio.run(store.delete_chunks(IS_ID))
     session.log.append("COMMIT")
     asyncio.run(store.store_chunks(IS_ID, [{"text": "t", "source_id": SRC}]))
-    _assert_gate_opens_every_transaction_on_an_item_table(session.log)
+    gates = _assert_gate_opens_every_transaction_on_an_item_table(session.log)
+    assert gates == {pgb.move_gate_relation("chunks")}
 
 
 def test_full_document_writes_take_the_gate_first():
     session = _recording_session()
     store = FullDocumentStore(db_session=session, knowledge_base_id=KB, storage=MagicMock())
     store.delete_by_indexed_source(IS_ID)
-    _assert_gate_opens_every_transaction_on_an_item_table(session.log)
+    gates = _assert_gate_opens_every_transaction_on_an_item_table(session.log)
+    assert gates == {pgb.move_gate_relation("full_documents")}
 
 
 def test_graph_writes_take_the_gate_first():
@@ -105,7 +135,10 @@ def test_graph_writes_take_the_gate_first():
         SRC,
         [{"node_id": "n1", "title": "t", "text": "x", "depth": 1, "meta": {}}],
     )
-    _assert_gate_opens_every_transaction_on_an_item_table(session.log)
+    gates = _assert_gate_opens_every_transaction_on_an_item_table(session.log)
+    # Only its own table's: a graph_index run's transaction stays open through
+    # its LLM stages, and must not hold off moves on the other item tables.
+    assert gates == {pgb.move_gate_relation("graph_index_nodes")}
 
 
 @pytest.fixture

@@ -45,7 +45,7 @@ def _reindex_shaped_transaction(
     """What index_source's cleanup and write do, in one transaction."""
     with engine.connect() as conn:
         try:
-            pgb.hold_move_gate_shared(conn)
+            pgb.hold_move_gate_shared(conn, "chunks")
             ids = conn.execute(
                 text(
                     f"SELECT id FROM {SCHEMA}.chunks WHERE knowledge_base_id = CAST(:kb AS uuid) "
@@ -86,8 +86,8 @@ def test_a_reindex_transaction_that_holds_default_does_not_make_the_move_give_up
     started = threading.Event()
     real_hold = pgb.hold_move_gate_shared
 
-    def hold_and_signal(conn):
-        real_hold(conn)
+    def hold_and_signal(conn, item_tables):
+        real_hold(conn, item_tables)
         started.set()
 
     monkeypatch.setattr(pgb, "hold_move_gate_shared", hold_and_signal)
@@ -161,7 +161,8 @@ def test_the_move_gives_up_on_the_gate_after_its_bound_without_locking_the_table
         lambda *a, **k: parent_locks.append(1) or real_parent_lock(*a, **k),
     )
     holder = engine.connect()
-    pgb.hold_move_gate_shared(holder)
+    pgb.hold_move_gate_shared(holder, "chunks")
+    holder_pid = holder.execute(text("SELECT pg_backend_pid()")).scalar()
     try:
         started = time.monotonic()
         try:
@@ -176,6 +177,12 @@ def test_the_move_gives_up_on_the_gate_after_its_bound_without_locking_the_table
         holder.close()
 
     assert error is not None and pgb.is_transient_db_error(error)
+    assert error.bm25_move_step == "move gate"
+    # The give-up names who held the gate, not only who held a table.
+    assert any(
+        h["pid"] == holder_pid and h["lock_on"] == "move gate" and h["granted"]
+        for h in error.bm25_lock_holders
+    ), error.bm25_lock_holders
     assert took < 3.0
     assert parent_locks == []
     assert _rows_in(session, "chunks_default", KB_A) == len(KB_A_DOCS)
@@ -204,3 +211,96 @@ def test_indexing_waits_for_the_move_instead_of_failing(engine, session, monkeyp
     partition = pgb.partition_name(KB_A, "chunks")
     assert _rows_in(session, "chunks_default", KB_A) == 0
     assert _rows_in(session, partition) == 2_000 + len(KB_A_DOCS)
+
+
+# ---------------------------------------------------------------------------
+# One gate per item table
+# ---------------------------------------------------------------------------
+
+
+def _open_graph_index_run(engine, kb_id):
+    """A graph_index run's transaction, as it stands during its LLM stages.
+
+    It took graph_index_nodes' gate and wrote its nodes, and stays open (for
+    minutes, in a real run) while the nodes are enriched and embedded.
+    """
+    conn = engine.connect()
+    pgb.hold_move_gate_shared(conn, "graph_index_nodes")
+    conn.execute(
+        text(
+            f"INSERT INTO {SCHEMA}.graph_index_nodes (knowledge_base_id, source_id, title, text) "
+            "VALUES (CAST(:kb AS uuid), CAST(:src AS uuid), 'Titel', 'Knoten')"
+        ),
+        {"kb": kb_id, "src": SOURCE_1},
+    )
+    return conn
+
+
+def test_a_long_graph_index_run_does_not_hold_off_a_chunks_move(engine, session):
+    _seed(session, KB_A, 2_000)
+    graph_run = _open_graph_index_run(engine, KB_B)
+    try:
+        started = time.monotonic()
+        moved = pgb.create_partition(engine, KB_A, "chunks")
+        took = time.monotonic() - started
+    finally:
+        graph_run.rollback()
+        graph_run.close()
+
+    assert moved["rows_moved"] == 2_000 + len(KB_A_DOCS)
+    assert took < 5.0
+
+
+def test_chunk_indexing_does_not_queue_behind_a_graph_move_waiting_for_its_gate(
+    engine, session, monkeypatch
+):
+    """A move on graph_index_nodes waits for a graph_index run and gives up;
+    chunk indexing meanwhile goes straight through."""
+    from agentic_project_service.tasks.indexing import _bm25_failure_reason
+
+    monkeypatch.setattr(pgb, "MOVE_GATE_WAIT_SECONDS", 4.0)
+    graph_run = _open_graph_index_run(engine, KB_B)
+    result: dict = {}
+
+    def move_graph_nodes():
+        try:
+            result["outcome"] = pgb.create_partition(engine, KB_A, "graph_index_nodes")
+        except Exception as exc:
+            result["error"] = exc
+
+    mover = threading.Thread(target=move_graph_nodes, daemon=True)
+    try:
+        mover.start()
+        deadline = time.monotonic() + 10
+        with engine.connect() as probe:
+            while time.monotonic() < deadline:
+                waiting = probe.execute(
+                    text(
+                        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
+                        "AND mode = 'ExclusiveLock' AND NOT granted"
+                    )
+                ).scalar()
+                probe.rollback()
+                if waiting:
+                    break
+                time.sleep(0.05)
+        assert waiting, "the graph move never queued for its gate"
+
+        errors: list = []
+        started = time.monotonic()
+        _reindex_shaped_transaction(engine, KB_A, 0.0, errors, body="während des Wartens")
+        chunk_indexing_took = time.monotonic() - started
+        mover.join(timeout=30)
+    finally:
+        graph_run.rollback()
+        graph_run.close()
+        mover.join(timeout=30)
+
+    assert errors == []
+    assert chunk_indexing_took < 1.0
+    error = result.get("error")
+    assert error is not None and pgb.is_lock_conflict(error), result
+    assert error.bm25_move_step == "move gate"
+    reason = _bm25_failure_reason(error)
+    assert "graph_index source is indexing" in reason, reason
+
