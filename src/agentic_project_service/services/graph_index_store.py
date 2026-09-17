@@ -12,6 +12,7 @@ import uuid
 from sqlalchemy import text
 
 from ..db import AI_SCHEMA
+from . import pg_bm25_index
 from .base_toc_store import BaseTocStore
 from .base_vector_store import ensure_embedding_index
 
@@ -28,6 +29,18 @@ class GraphIndexStore(BaseTocStore):
 
     TOC_TABLE = "graph_index_toc"
     NODES_TABLE = "graph_index_nodes"
+
+    # The ToC and its nodes are written in one transaction, and the nodes'
+    # foreign key references the ToC, so the move gate goes first in both. Only
+    # graph_index_nodes' gate: this transaction stays open through the LLM and
+    # embedding stages, and must not hold off moves on the other item tables.
+    def store_toc(self, *args, **kwargs) -> str:
+        pg_bm25_index.hold_move_gate_shared(self.session, self.NODES_TABLE)
+        return super().store_toc(*args, **kwargs)
+
+    def delete_by_indexed_source(self, indexed_source_id: str) -> int:
+        pg_bm25_index.hold_move_gate_shared(self.session, self.NODES_TABLE)
+        return super().delete_by_indexed_source(indexed_source_id)
 
     def store_nodes(
         self,
@@ -47,6 +60,7 @@ class GraphIndexStore(BaseTocStore):
         """
         if not nodes:
             return 0, []
+        pg_bm25_index.hold_move_gate_shared(self.session, self.NODES_TABLE)
 
         stmt = text(f"""
             INSERT INTO "{AI_SCHEMA}".graph_index_nodes (
@@ -131,9 +145,10 @@ class GraphIndexStore(BaseTocStore):
             text(f"""
                 UPDATE "{AI_SCHEMA}".graph_index_nodes
                 SET meta = CAST(:meta AS jsonb)
-                WHERE toc_id = :toc_id AND node_id = :node_id
+                WHERE knowledge_base_id = :kb_id AND toc_id = :toc_id AND node_id = :node_id
             """),
             {
+                "kb_id": self.kb_id,
                 "toc_id": toc_id,
                 "node_id": node_id,
                 "meta": json.dumps(meta),
@@ -146,9 +161,9 @@ class GraphIndexStore(BaseTocStore):
             text(f"""
                 UPDATE "{AI_SCHEMA}".graph_index_nodes
                 SET enrichment_error = :error
-                WHERE toc_id = :toc_id AND node_id = :node_id
+                WHERE knowledge_base_id = :kb_id AND toc_id = :toc_id AND node_id = :node_id
             """),
-            {"toc_id": toc_id, "node_id": node_id, "error": error},
+            {"kb_id": self.kb_id, "toc_id": toc_id, "node_id": node_id, "error": error},
         )
 
     def update_node_embedding(
@@ -167,9 +182,9 @@ class GraphIndexStore(BaseTocStore):
             text(f"""
                 SELECT id, indexed_source_id, knowledge_base_id, source_id
                 FROM "{AI_SCHEMA}".graph_index_nodes
-                WHERE toc_id = :toc_id AND node_id = :node_id
+                WHERE knowledge_base_id = :kb_id AND toc_id = :toc_id AND node_id = :node_id
             """),
-            {"toc_id": toc_id, "node_id": node_id},
+            {"kb_id": self.kb_id, "toc_id": toc_id, "node_id": node_id},
         ).fetchone()
 
         if not row:
@@ -298,10 +313,11 @@ class GraphIndexStore(BaseTocStore):
                        parent_node_id, line_num, meta, source_id,
                        enrichment_error, indexed_source_id
                 FROM "{AI_SCHEMA}".graph_index_nodes
-                WHERE toc_id = :toc_id
+                WHERE knowledge_base_id = :kb_id AND toc_id = :toc_id
                 ORDER BY node_id ASC
             """),
-            {"toc_id": toc_id},
+            # Every statement here names the KB, so each prunes to its partition.
+            {"kb_id": self.kb_id, "toc_id": toc_id},
         )
 
         nodes = []

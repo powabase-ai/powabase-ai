@@ -1,4 +1,9 @@
-"""Tests for POST /api/knowledge-bases/<kb_id>/build-bm25."""
+"""Tests for POST /api/knowledge-bases/<kb_id>/build-bm25.
+
+These cover the request guards and a KB whose keyword leg reads the bm25s
+file index. Which task runs on the pg_search path is covered in
+test_routes_keyword_index_dispatch.py.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +21,12 @@ def _make_test_app():
     app = Flask(__name__)
     app.register_blueprint(kb_route.knowledge_bases_bp)
     return app
+
+
+@pytest.fixture(autouse=True)
+def _file_index_backend():
+    with patch.object(kb_route, "_keyword_index_backend", return_value="bm25s"):
+        yield
 
 
 def _auth_headers():
@@ -45,7 +56,7 @@ def test_build_bm25_dispatches_task_for_hybrid_kb(mock_task, mock_fetch, _jwt):
         resp = client.post(f"/api/knowledge-bases/{kb_id}/build-bm25", headers=_auth_headers())
     assert resp.status_code == 202
     body = resp.get_json()
-    assert body == {"task_id": "task-abc", "knowledge_base_id": kb_id}
+    assert (body["task_id"], body["knowledge_base_id"]) == ("task-abc", kb_id)
     mock_task.delay.assert_called_once_with(kb_id)
 
 
@@ -173,7 +184,8 @@ def test_build_bm25_parses_a_string_retrieval_config(mock_task, mock_fetch, _jwt
     with _make_test_app().test_client() as client:
         resp = client.post(f"/api/knowledge-bases/{kb_id}/build-bm25", headers=_auth_headers())
     assert resp.status_code == 202
-    assert resp.get_json() == {"task_id": "task-str", "knowledge_base_id": kb_id}
+    body = resp.get_json()
+    assert (body["task_id"], body["knowledge_base_id"]) == ("task-str", kb_id)
     mock_task.delay.assert_called_once_with(kb_id)
 
 

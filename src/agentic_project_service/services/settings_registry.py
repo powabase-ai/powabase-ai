@@ -851,12 +851,15 @@ def _build_registry() -> dict[str, SettingDef]:
             default=True,
             advanced=True,
             description=(
-                "When enabled (default), the platform keeps the BM25 sparse "
-                "index up to date automatically: per-source updates during "
-                "indexing, and a one-shot rebuild when a KB's retrieval method "
-                "changes to hybrid or full_text. Disable for very large KBs "
-                "where the per-source BM25 rebuild dominates indexing time; "
-                "you'll then trigger rebuilds manually from the KB detail page."
+                "When enabled (default), the bm25s file index a knowledge base's "
+                "keyword search reads is kept up to date automatically: updated "
+                "per source during indexing, and rebuilt when the retrieval "
+                "method changes to hybrid or full_text. Disable for very large "
+                "knowledge bases where those updates dominate indexing time, and "
+                "rebuild with POST /build-bm25 instead. It does not apply to a "
+                "knowledge base served by its own pg_search index, which Postgres "
+                "keeps current on every write; that index is built when the "
+                "knowledge base is created, or by POST /build-bm25."
             ),
         ),
     ]
@@ -1091,6 +1094,43 @@ def _build_registry() -> dict[str, SettingDef]:
                 "while the query keeps running, which is the pile-up this "
                 "bound exists to prevent. Note it bounds the keyword leg only, "
                 "not the whole request."
+            ),
+        ),
+        SettingDef(
+            key="BM25_MOVE_LONG_HOLDER_SECONDS",
+            category=cat,
+            label="BM25 Move Long-Holder Timeout (s)",
+            type="int",
+            default=5,
+            min=1,
+            max=300,
+            advanced=True,
+            description=(
+                "A transaction that has been open for longer than this and holds "
+                "a lock a knowledge base's partition move needs (on the shared "
+                "default partition, the item table, or a table its foreign keys "
+                "reference) makes the move give up and retry later instead of "
+                "blocking writes behind it."
+            ),
+        ),
+        SettingDef(
+            key="BM25_PG_SEARCH_CONCURRENT_BUILD_SAFE",
+            category=cat,
+            label="pg_search Concurrent Index Builds Are Safe",
+            type="bool",
+            default=False,
+            advanced=True,
+            description=(
+                "Turn on only if this database's pg_search build contains the fix "
+                "from paradedb/paradedb#6211. Without that fix, on Postgres 15 and "
+                "16, building a knowledge base's BM25 index while its table takes "
+                "writes fails or crashes the database server, so no BM25 index is "
+                "built unless the server shows the fix: Postgres 17 or later, "
+                "pg_search 0.26.0 or later, or powabase.pg_search_cic_safe = on in "
+                "postgresql.conf. This setting is for a pg_search you built with "
+                "the fix yourself, which the server cannot show. The marker is an "
+                "ordinary setting: ALTER DATABASE or ALTER ROLE can set it too, and "
+                "like this setting it is trusted, not verified."
             ),
         ),
     ]

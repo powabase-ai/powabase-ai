@@ -8,6 +8,8 @@ import asyncio
 import json
 import logging
 import os
+import random
+import re
 import traceback
 
 from ..celery import celery_app
@@ -27,6 +29,8 @@ from ..services.knowledge_store import PgVectorKnowledgeStore
 from ..services.doc2json_store import Doc2JSONStore
 from ..services.full_document_store import FullDocumentStore
 from ..services.graph_index_store import GraphIndexStore
+from ..services import pg_bm25_index
+from ..services.bm25_build_outcome import record_bm25_build_outcome
 from ..services.page_index_store import PageIndexStore
 from ..services.storage import StorageError, SupabaseStorage, get_storage
 from ..services.settings_registry import get_setting
@@ -45,6 +49,14 @@ logger = logging.getLogger(__name__)
 # counter running alongside this one multiplies the ceiling instead of sharing
 # it.
 MAX_ATTEMPTS = int(os.getenv("INDEXING_MAX_ATTEMPTS", "3"))
+
+# How long a source waits before it is re-queued after a lock conflict or a
+# partition move race. Re-queued at once, an attempt would meet the same
+# conflict and spend the attempts bound in a tight loop. 10 s outlasts a failed
+# move's own give-up and check cleanup (up to about 2 s for its locks plus 5 s
+# of cleanup tries), yet stays short of the 30 s the BM25 index build waits
+# before its first retry.
+MOVE_CONFLICT_REQUEUE_COUNTDOWN_SECONDS = 10
 
 # Indexing strategy -> billing action, per the credits catalog seeded in
 # migration 0006_credit_ledger. ``full_document`` is not in the catalog as a
@@ -96,19 +108,85 @@ def _get_kb_retrieval_method(kb_id: str) -> str | None:
     return row[0] if row else None
 
 
+def _get_kb_indexing_strategy(kb_id: str) -> str:
+    """indexing_config.strategy for a KB, defaulting to chunk_embed as search does."""
+    row = db.session.execute(
+        text(
+            f"SELECT COALESCE(indexing_config->>'strategy', 'chunk_embed') "
+            f'FROM "{AI_SCHEMA}".knowledge_bases WHERE id = :id'
+        ),
+        {"id": kb_id},
+    ).fetchone()
+    return row[0] if row else "chunk_embed"
+
+
+def _kb_served_by_pg_search(kb_id: str) -> bool:
+    """Is this KB's keyword leg answered by its own pg_search index, not the file index?
+
+    Per knowledge base, not per item table: a KB that predates the extension
+    keeps its rows in DEFAULT and is searched through its bm25s file index
+    until its own index is ready, so that file index has to stay current.
+
+    False when that cannot be determined: skipping the file-index append on a
+    guess could leave a KB with no keyword index at all.
+    """
+    try:
+        strategy = _get_kb_indexing_strategy(kb_id)
+        return pg_bm25_index.pg_search_serves_kb(db.session, kb_id, strategy)
+    except Exception:
+        logger.warning(
+            "Could not tell whether pg_search serves KB %s; keeping the bm25s file index "
+            "up to date",
+            kb_id,
+            exc_info=True,
+        )
+        return False
+
+
 def _should_build_bm25_now(kb_id: str) -> bool:
     """Decide whether `sparse_store.add_and_save(...)` should run for this KB.
 
     Returns False when:
       - the KB's retrieval method does not use BM25 (vector_search, None, unknown), OR
-      - the project-level BM25_AUTO_INDEXING setting is disabled.
+      - the project-level BM25_AUTO_INDEXING setting is disabled, OR
+      - this KB's own pg_search index is ready and serves its keyword leg, or
+        the KB has its own partition (search then falls back to the tsvector
+        path, never the file index), so nothing reads the file index and
+        appending every source to it is wasted tokenising.
     """
     method = _get_kb_retrieval_method(kb_id)
     if method not in ("hybrid", "full_text"):
         return False
     if not get_setting("BM25_AUTO_INDEXING"):
         return False
+    if _kb_served_by_pg_search(kb_id) or _kb_file_index_retired(kb_id):
+        return False
     return True
+
+
+def _kb_file_index_retired(kb_id: str) -> bool:
+    """Does this KB have its own partition, so search never reads its file index?
+
+    Search falls back to the tsvector path, not the file index, while such a
+    KB's own index is not usable (``BasePgVectorStore._file_index_retired``).
+    False when that cannot be determined.
+    """
+    try:
+        strategy = _get_kb_indexing_strategy(kb_id)
+        if pg_bm25_index.keyword_index_backend(db.session, strategy) != "pg_search":
+            return False
+        item_table = pg_bm25_index.pg_bm25_item_table(strategy)
+        return item_table is not None and pg_bm25_index.partition_exists(
+            db.session, kb_id, item_table
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not tell whether KB %s has its own partition (%s); keeping its bm25s file "
+            "index up to date",
+            kb_id,
+            pg_bm25_index.first_error_line(exc),
+        )
+        return False
 
 
 def _fetch_kb_for_bm25_build(kb_id: str) -> dict:
@@ -123,13 +201,17 @@ def _fetch_kb_for_bm25_build(kb_id: str) -> dict:
 
 
 def _iter_items_for_kb_bm25(kb_id: str, item_table: str, batch_size: int = 10_000):
-    """Yield batches of {id, text} for the right item_table for this KB."""
+    """Yield batches of {id, text} for the right item_table for this KB.
+
+    The item table's own ``knowledge_base_id`` predicate is what prunes the scan
+    to the KB's partition; the join alone would read every partition.
+    """
     if item_table == "chunks":
         sql = text(
             f"SELECT c.id::text, c.text "
             f'FROM "{AI_SCHEMA}".chunks c '
             f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = c.indexed_source_id '
-            f"WHERE i.knowledge_base_id = :kb "
+            f"WHERE c.knowledge_base_id = :kb AND i.knowledge_base_id = :kb "
             f"ORDER BY c.id"
         )
     elif item_table == "full_documents":
@@ -137,7 +219,7 @@ def _iter_items_for_kb_bm25(kb_id: str, item_table: str, batch_size: int = 10_00
             f"SELECT d.id::text, d.summary "
             f'FROM "{AI_SCHEMA}".full_documents d '
             f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = d.indexed_source_id '
-            f"WHERE i.knowledge_base_id = :kb "
+            f"WHERE d.knowledge_base_id = :kb AND i.knowledge_base_id = :kb "
             f"ORDER BY d.id"
         )
     elif item_table == "graph_index_nodes":
@@ -145,7 +227,7 @@ def _iter_items_for_kb_bm25(kb_id: str, item_table: str, batch_size: int = 10_00
             f"SELECT n.id::text, COALESCE(n.title, '') || ' ' || COALESCE(n.text, '') "
             f'FROM "{AI_SCHEMA}".graph_index_nodes n '
             f'JOIN "{AI_SCHEMA}".indexed_sources i ON i.id = n.indexed_source_id '
-            f"WHERE i.knowledge_base_id = :kb "
+            f"WHERE n.knowledge_base_id = :kb AND i.knowledge_base_id = :kb "
             f"ORDER BY n.id"
         )
     else:
@@ -422,12 +504,16 @@ def _handle_storage_error(
     provider_keys: dict[str, str] | None,
     idempotency_action: str | None = None,
     idempotency_parts: list | None = None,
+    cause: str = "persistent storage error",
+    countdown: float | None = None,
 ) -> None:
-    """Transient StorageError recovery, folded into the single attempts bound.
+    """Transient-error recovery (StorageError, or a write that raced a
+    partition move), folded into the single attempts bound.
 
     Under the bound: reset to 'pending' and re-dispatch (the re-dispatch
-    re-claims, incrementing attempts). At/over the bound: mark 'failed'. No
-    Celery self.retry -- that would run a second, uncomposed counter.
+    re-claims, incrementing attempts), after ``countdown`` seconds when given.
+    At/over the bound: mark 'failed'. No Celery self.retry -- that would run a
+    second, uncomposed counter.
     """
     db.session.rollback()  # discard partial indexing data
     row = db.session.execute(
@@ -448,14 +534,20 @@ def _handle_storage_error(
         # Only re-dispatch if we still owned the row (fence). A superseded task
         # matched 0 rows and must NOT spawn a spurious duplicate.
         if result.rowcount:
-            index_source.delay(
-                knowledge_base_id,
-                source_id,
-                indexed_source_id=indexed_source_id,
-                provider_keys=provider_keys,
-                idempotency_action=idempotency_action,
-                idempotency_parts=idempotency_parts,
-            )
+            requeue_kwargs = {
+                "indexed_source_id": indexed_source_id,
+                "provider_keys": provider_keys,
+                "idempotency_action": idempotency_action,
+                "idempotency_parts": idempotency_parts,
+            }
+            if countdown is None:
+                index_source.delay(knowledge_base_id, source_id, **requeue_kwargs)
+            else:
+                index_source.apply_async(
+                    args=[knowledge_base_id, source_id],
+                    kwargs=requeue_kwargs,
+                    countdown=countdown,
+                )
     else:
         # Cause is known here (a persistent storage error), so name it -- unlike
         # the reconciler path where the cause is not observable. FENCED: a
@@ -463,7 +555,7 @@ def _handle_storage_error(
         _fenced_mark_failed(
             indexed_source_id,
             task_id,
-            f"Indexing failed after {attempts} attempts (persistent storage error).",
+            f"Indexing failed after {attempts} attempts ({cause}).",
         )
 
 
@@ -1468,6 +1560,81 @@ async def run_doc2json_indexing(
     return stats
 
 
+# Does an item table hold rows of this indexed source? graph_index rows are
+# deleted through their ToC (the nodes cascade), so a ToC row counts too.
+_SOURCE_ROWS_EXIST_SQL = {
+    "chunks": (
+        'SELECT EXISTS (SELECT 1 FROM "{schema}".chunks '
+        "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id)"
+    ),
+    "full_documents": (
+        'SELECT EXISTS (SELECT 1 FROM "{schema}".full_documents '
+        "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id)"
+    ),
+    "graph_index_nodes": (
+        'SELECT EXISTS (SELECT 1 FROM "{schema}".graph_index_nodes '
+        "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id) "
+        'OR EXISTS (SELECT 1 FROM "{schema}".graph_index_toc WHERE indexed_source_id = :is_id)'
+    ),
+}
+
+
+def _clear_source_item_rows(session, knowledge_base_id, indexed_source_id, deleters) -> dict:
+    """Delete one indexed source's rows from each item table, each in a transaction of its own.
+
+    ``deleters`` maps an item table to the call that deletes the source's rows
+    from it. Returns the ids deleted, per table, for the sparse index cleanup.
+
+    Each table takes turns with a partition move on that table alone: its
+    transaction takes only that table's move gate
+    (``pg_bm25_index.hold_move_gate_shared``), before reading the ids it is
+    about to delete, and commits before the next table's. And it takes the gate
+    only when the table holds rows of the source, which a probe in a
+    transaction of its own finds out first (a "no rows" answer is asked twice;
+    see below): a move queued for a gate makes every
+    later request for that gate wait behind it -- up to
+    ``pg_bm25_index.MOVE_GATE_WAIT_SECONDS`` while a graph_index run keeps
+    graph_index_nodes' gate -- and a chunk source has nothing there to wait
+    for. The probe is one short read that commits at once, so it holds nothing
+    into a move's lock tries.
+    """
+    removed: dict[str, list[str]] = {}
+    for item_table, delete in deleters.items():
+        params = {"kb_id": knowledge_base_id, "is_id": indexed_source_id}
+        probe = _SOURCE_ROWS_EXIST_SQL[item_table].format(schema=AI_SCHEMA)
+        has_rows = session.execute(text(probe), params).scalar()
+        session.commit()
+        if not has_rows:
+            # Asked again, in a transaction of its own, before believing "no
+            # rows". A probe planned while a move of this knowledge base held
+            # DEFAULT for its ATTACH read the table's old layout (DEFAULT
+            # only), waited for the move's commit, and then found the rows
+            # gone from DEFAULT: the delete was skipped and the re-index
+            # duplicated them. The first probe returns only after any such
+            # move committed, and a knowledge base's partition of a table is
+            # attached only once, so this one plans against the layout the
+            # rows are in.
+            has_rows = session.execute(text(probe), params).scalar()
+            session.commit()
+        if not has_rows:
+            removed[item_table] = []
+            continue
+        pg_bm25_index.hold_move_gate_shared(session, item_table)
+        removed[item_table] = [
+            str(row[0])
+            for row in session.execute(
+                text(
+                    f'SELECT id FROM "{AI_SCHEMA}".{item_table} '
+                    "WHERE knowledge_base_id = :kb_id AND indexed_source_id = :is_id"
+                ),
+                params,
+            ).fetchall()
+        ]
+        delete()
+        session.commit()
+    return removed
+
+
 def _run_index_body(
     *,
     knowledge_base_id: str,
@@ -1517,15 +1684,12 @@ def _run_index_body(
         # Clean up all embeddings for this indexed source FIRST
         # (prevents search queries from finding embeddings with missing content)
         #
-        # This DELETE does NOT ride the fenced transaction below, despite
-        # carrying no commit of its own: the ToC store's
-        # delete_by_indexed_source further down commits unconditionally, and
-        # that commit flushes this statement and delete_chunks along with it.
-        # So the destructive half of a re-index is durable well before the
-        # fence decides anything -- only the INSERT side is fenced. A task that
-        # then loses the fence rolls back what it wrote but not what it
-        # deleted. Deliberate residual: losing the fence means a sibling
-        # re-claimed the row and is re-indexing the same source, so the
+        # None of these deletes rides the fenced transaction below: each
+        # commits on its own. So the destructive half of a re-index is durable
+        # well before the fence decides anything -- only the INSERT side is
+        # fenced. A task that then loses the fence rolls back what it wrote but
+        # not what it deleted. Deliberate residual: losing the fence means a
+        # sibling re-claimed the row and is re-indexing the same source, so the
         # artifacts are on their way back.
         db.session.execute(
             text(f"""
@@ -1534,61 +1698,43 @@ def _run_index_body(
             """),
             {"indexed_source_id": indexed_source_id},
         )
+        db.session.commit()
 
-        # Delete artifacts from ALL strategy tables unconditionally.
-        # Each call is a no-op (0 rows deleted) if no artifacts exist for that type.
-
-        # First, query IDs before deletion for sparse index cleanup
-        chunk_ids_to_remove = [
-            str(r[0])
-            for r in db.session.execute(
-                text(f'SELECT id FROM "{AI_SCHEMA}".chunks WHERE indexed_source_id = :is_id'),
-                {"is_id": indexed_source_id},
-            ).fetchall()
-        ]
-        fd_ids_to_remove = [
-            str(r[0])
-            for r in db.session.execute(
-                text(
-                    f'SELECT id FROM "{AI_SCHEMA}".full_documents WHERE indexed_source_id = :is_id'
-                ),
-                {"is_id": indexed_source_id},
-            ).fetchall()
-        ]
-        gi_ids_to_remove = [
-            str(r[0])
-            for r in db.session.execute(
-                text(
-                    f'SELECT id FROM "{AI_SCHEMA}".graph_index_nodes WHERE indexed_source_id = :is_id'
-                ),
-                {"is_id": indexed_source_id},
-            ).fetchall()
-        ]
-
+        # Delete artifacts from ALL strategy tables unconditionally, one item
+        # table per transaction (see ``_clear_source_item_rows``), collecting
+        # the ids for the sparse index cleanup after the fenced commit.
         store = PgVectorKnowledgeStore(
             db_session=db.session,
             knowledge_base_id=knowledge_base_id,
         )
-        asyncio.run(store.delete_chunks(indexed_source_id))
+        fd_store = FullDocumentStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+            storage=get_storage(),
+        )
+        gi_store = GraphIndexStore(
+            db_session=db.session,
+            knowledge_base_id=knowledge_base_id,
+        )
+        removed_ids = _clear_source_item_rows(
+            db.session,
+            knowledge_base_id,
+            indexed_source_id,
+            {
+                "chunks": lambda: asyncio.run(store.delete_chunks(indexed_source_id)),
+                "full_documents": lambda: fd_store.delete_by_indexed_source(indexed_source_id),
+                "graph_index_nodes": lambda: gi_store.delete_by_indexed_source(indexed_source_id),
+            },
+        )
+        chunk_ids_to_remove = removed_ids["chunks"]
+        fd_ids_to_remove = removed_ids["full_documents"]
+        gi_ids_to_remove = removed_ids["graph_index_nodes"]
 
         pi_store = PageIndexStore(
             db_session=db.session,
             knowledge_base_id=knowledge_base_id,
         )
         pi_store.delete_by_indexed_source(indexed_source_id)
-
-        fd_store = FullDocumentStore(
-            db_session=db.session,
-            knowledge_base_id=knowledge_base_id,
-            storage=get_storage(),
-        )
-        fd_store.delete_by_indexed_source(indexed_source_id)
-
-        gi_store = GraphIndexStore(
-            db_session=db.session,
-            knowledge_base_id=knowledge_base_id,
-        )
-        gi_store.delete_by_indexed_source(indexed_source_id)
 
         d2j_store = Doc2JSONStore(
             db_session=db.session,
@@ -2059,7 +2205,49 @@ def index_source(
         )
         return {"status": "retrying_or_failed", "source_id": source_id}
 
-    except Exception:
+    except Exception as exc:
+        if (
+            claimed
+            and indexed_source_id
+            and (pg_bm25_index.is_partition_move_race(exc) or pg_bm25_index.is_lock_conflict(exc))
+        ):
+            # This KB's rows were being moved into its own partition while this
+            # run wrote them (SQLSTATE 23514 from the partition constraint or
+            # the move's temporary check), or this run lost a deadlock or lock
+            # timeout (40P01, 55P03) to another transaction -- a move holding
+            # the item table, typically. Nothing is wrong with the source:
+            # re-queue it within the attempts bound instead of failing it.
+            sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+            logger.warning(
+                "Indexing of source %s in KB %s hit %s (SQLSTATE %s); retried in %d s while "
+                "attempts remain: %s",
+                source_id,
+                knowledge_base_id,
+                {"23514": "a partition move race", "40P01": "a deadlock"}.get(
+                    sqlstate, "a lock conflict"
+                ),
+                sqlstate,
+                MOVE_CONFLICT_REQUEUE_COUNTDOWN_SECONDS,
+                pg_bm25_index.first_error_line(exc),
+            )
+            if pg_bm25_index.is_partition_move_race(exc):
+                # A move check left on DEFAULT by a move that could not drop
+                # it would refuse every retry too. Roll back first: this
+                # session's failed write still holds a lock on DEFAULT.
+                db.session.rollback()
+                pg_bm25_index.clear_move_check_after_refusal(db.engine, exc)
+            _handle_storage_error(
+                knowledge_base_id=knowledge_base_id,
+                source_id=source_id,
+                indexed_source_id=indexed_source_id,
+                task_id=task_id,
+                provider_keys=provider_keys,
+                idempotency_action=idempotency_action,
+                idempotency_parts=idempotency_parts,
+                cause="writes kept racing a partition move or losing a lock conflict",
+                countdown=MOVE_CONFLICT_REQUEUE_COUNTDOWN_SECONDS,
+            )
+            return {"status": "retrying_or_failed", "source_id": source_id}
         logger.error(f"Indexing failed for source {source_id}", exc_info=True)
         db.session.rollback()  # Discard partial indexing data
         if indexed_source_id:
@@ -2497,7 +2685,9 @@ def reenrich_graph_references(
         }
 
 
-@celery_app.task(bind=True, max_retries=2, default_retry_delay=300)
+# No max_retries/default_retry_delay: this task never calls self.retry, so
+# they only suggested a retry policy that does not exist.
+@celery_app.task(bind=True)
 @billing.no_billing_context
 def build_bm25_for_kb(self, kb_id: str) -> dict:
     """One-shot BM25 rebuild for a KB.
@@ -2542,3 +2732,360 @@ def build_bm25_for_kb(self, kb_id: str) -> dict:
         len(item_ids),
     )
     return {"item_table": item_table, "item_count": len(item_ids)}
+
+
+# Retry budget for the pg_search index tasks. Their retryable failures are
+# contention -- another move holding the item table's build lock, a
+# lock_timeout, a deadlock -- and interruptions: a cancelled statement, a lost
+# connection, a failed concurrent bm25 build. A few spaced-out attempts cover a
+# burst of builds (a rollout dispatches one per KB) without retrying for ever.
+PG_BM25_TASK_MAX_RETRIES = 6
+
+
+def _pg_bm25_retry_countdown(retries: int) -> int:
+    """30 s, 60 s, 120 s ... capped at 10 min, each stretched by up to 25 %.
+
+    The jitter spreads the retries of builds that lost to the same move, so
+    they do not all wake at once.
+    """
+    base = min(30 * (2**retries), 600)
+    return int(base * random.uniform(1.0, 1.25))
+
+
+def _outcome_bind():
+    """The engine outcomes are recorded through, or None outside an app."""
+    try:
+        return db.engine
+    except Exception:
+        return None
+
+
+# The recorded reason for an automatic build that found rows to move.
+ROW_MOVE_NOT_ALLOWED_REASON = (
+    "not built yet: the knowledge base has rows in the item table's shared DEFAULT "
+    "partition, and moving them into its own partition blocks writes to the whole table "
+    "for the length of the move, so only an operator starts it: POST /build-bm25. Until "
+    "then keyword search keeps the path it uses now"
+)
+
+# What each skip reason ``ensure_bm25_index`` returns means, for the record.
+_SKIP_REASON_TEXT = {
+    "extension_absent": "the pg_search extension is not installed in this database",
+    "kb_not_found": "the knowledge base no longer exists",
+    "retrieval_method": "the knowledge base's retrieval method runs no keyword search",
+    "strategy": "the knowledge base's indexing strategy keeps no keyword text",
+    "table_not_partitioned": (
+        "the item table is not partitioned by knowledge base yet; the service's database "
+        "migrations have not reached it"
+    ),
+    "default_partition_absent": (
+        "the item table has no DEFAULT partition to move this knowledge base's rows from, "
+        "which the service's migrations create; the database schema is not what this "
+        "service expects"
+    ),
+}
+
+
+def skip_reason_text(reason: str | None) -> str:
+    """The recorded reason for a build ``ensure_bm25_index`` skipped, in words."""
+    return f"not built: {_SKIP_REASON_TEXT.get(reason or '', 'skipped by the service')}"
+
+
+# What each step a move or build reports was doing, for a failure's reason.
+MOVE_STEP_DESCRIPTIONS = {
+    "prepare": "preparing the knowledge base's partition",
+    "move gate": "waiting for indexing on the item table to pause",
+    "pre-flight check of DEFAULT": "checking that the item table could be locked",
+    "parent lock": "holding writes to the item table off",
+    "referenced tables": (
+        "locking the tables the partition's foreign keys reference "
+        "(knowledge_bases, sources, indexed_sources)"
+    ),
+    "check on DEFAULT": "fencing the knowledge base's rows in the shared DEFAULT partition",
+    "fence": "fencing the knowledge base's rows in the shared DEFAULT partition",
+    "DEFAULT lock": "locking the shared DEFAULT partition",
+    "copy": "copying the rows into the partition",
+    "delete from DEFAULT": "deleting the moved rows from the shared DEFAULT partition",
+    "validate the check on DEFAULT": (
+        "checking that no row of the knowledge base was left in the shared DEFAULT partition"
+    ),
+    "validate": "checking that the shared DEFAULT partition holds no row of the knowledge base",
+    "key, unique indexes and foreign keys": "adding the partition's key and foreign keys",
+    "indexes, keys and attach": "adding the partition's indexes and keys and attaching it",
+    "attach": "attaching the partition",
+    "mirror settings": "copying the table's grants and row-level security to the partition",
+    "commit": "committing the move",
+    "detach": "detaching the partition",
+}
+
+
+def _sqlstate_name(sqlstate: str) -> str:
+    try:
+        import psycopg.errors
+
+        name = psycopg.errors.lookup(sqlstate).__name__
+    except Exception:
+        return "database error"
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+def _bm25_failure_reason(exc: BaseException) -> str:
+    """A short, client-safe reason for a failed move or build: no SQL, no query text.
+
+    Says what was being done in words (``MOVE_STEP_DESCRIPTIONS``), never an
+    internal step name or a bare SQLSTATE, and keeps the instructions of an
+    error written for a person (``PartitionMoveRefused``).
+    """
+    step = getattr(exc, "bm25_move_step", None)
+    at = f" while {MOVE_STEP_DESCRIPTIONS.get(step, 'moving or building')}" if step else ""
+    log = "; the worker log has the details"
+    if isinstance(exc, pg_bm25_index.PartitionBuildInProgress):
+        return "another partition build on the item table is in progress; retried automatically"
+    if isinstance(exc, pg_bm25_index.Bm25IndexBuildFailed):
+        return (
+            "the concurrent bm25 index build failed inside pg_search, likely the bug fixed by "
+            "paradedb/paradedb#6211 (check the Postgres image); the next attempt rebuilds it"
+        )
+    if isinstance(exc, pg_bm25_index.PartitionMoveRefused):
+        return f"stopped{at}: {pg_bm25_index.first_error_line(exc)}"
+    sqlstate = getattr(getattr(exc, "orig", exc), "sqlstate", None)
+    if pg_bm25_index.is_lock_conflict(exc):
+        holders = [h for h in getattr(exc, "bm25_lock_holders", None) or [] if h.get("granted")]
+        kind = "a deadlock" if sqlstate == "40P01" else "gave up waiting for a lock"
+        head = f"lost {kind}{at}" if sqlstate == "40P01" else f"{kind}{at}"
+        # Graph indexing holds graph_index_nodes' move gate for a whole run.
+        why = (
+            "; a graph_index source is indexing into this table, and the move retries after it"
+            if step == "move gate" and getattr(exc, "bm25_item_table", None) == "graph_index_nodes"
+            else ""
+        )
+        if holders:
+            oldest = max(holders, key=lambda h: h.get("xact_seconds") or 0)
+            return (
+                f"{head}, held by another transaction "
+                f"(pid {oldest.get('pid')}, open {oldest.get('xact_seconds')} s){why}"
+            )
+        return f"{head}{why}"
+    if sqlstate == "57014":
+        return f"cancelled by a statement timeout{at}; retried automatically"
+    if pg_bm25_index.is_connect_failure(exc):
+        return f"could not connect to the database{at}; retried automatically"
+    if getattr(exc, "connection_invalidated", False) or (sqlstate or "").startswith(("08", "57P")):
+        return f"lost the database connection{at}; retried automatically"
+    if sqlstate:
+        return f"failed{at} with a database error ({_sqlstate_name(sqlstate)}, SQLSTATE {sqlstate}){log}"
+    return f"failed{at} with an unexpected error ({type(exc).__name__}){log}"
+
+
+def dispatch_partition_completion_at_start(engine) -> list[str]:
+    """Start-up: dispatch an ensure for every knowledge base whose partition has work left.
+
+    A worker killed after a move committed -- during a secondary index build or
+    before its foreign keys were validated -- leaves a partition that serves
+    keyword search but deletes a source's rows slowly, and nothing else comes
+    back to it. The ensure is idempotent and moves no rows (the partition
+    exists). Returns the knowledge base ids dispatched. Never raises.
+
+    It runs at every start that runs the migrations, so a partition still
+    being completed by a running ensure is dispatched again (the second run
+    finds the index lock held and records ``building`` meanwhile). A future
+    migration that adds a plain index to the DEFAULT partitions makes every
+    partition pending at once: each start then dispatches one ensure per
+    knowledge base, and those build the new index concurrently across workers.
+    Add such an index to the attached partitions in the migration instead.
+    """
+    try:
+        pending = pg_bm25_index.partitions_needing_completion(engine)
+    except Exception:
+        logger.warning("Could not look for unfinished BM25 partitions at start-up", exc_info=True)
+        return []
+    dispatched: list[str] = []
+    for kb_id, _item_table in pending:
+        if kb_id in dispatched:
+            continue
+        try:
+            ensure_pg_bm25_index.delay(kb_id)
+        except Exception:
+            logger.warning(
+                "Could not dispatch the completion of KB %s's partition at start-up",
+                kb_id,
+                exc_info=True,
+            )
+            continue
+        dispatched.append(kb_id)
+    if dispatched:
+        logger.info("Dispatched the completion of unfinished BM25 partitions: %s", dispatched)
+    return dispatched
+
+
+def _retire_file_index(kb_id: str, item_table: str) -> None:
+    """Delete a KB's bm25s file index once its own pg_search index is ready.
+
+    Safe: with the partition in place search never reads the file (it falls
+    back to the tsvector path) and indexing no longer maintains it, so all it
+    holds is a copy of the keyword index frozen at the move. Best effort.
+    """
+    try:
+        SparseIndexStore(knowledge_base_id=kb_id).delete_index(item_table=item_table)
+    except Exception as exc:
+        logger.warning(
+            "Could not delete the retired bm25s file index of KB %s on %s: %s",
+            kb_id,
+            item_table,
+            exc,
+        )
+
+
+@celery_app.task(bind=True, max_retries=PG_BM25_TASK_MAX_RETRIES)
+@billing.no_billing_context
+def ensure_pg_bm25_index(self, kb_id: str, allow_row_move: bool = False) -> dict:
+    """Give this KB its own partition and pg_search BM25 index.
+
+    Dispatched for a new knowledge base when it is created, from a PATCH only
+    when that cannot move rows (the KB's partition already exists, or DEFAULT
+    holds none of its rows), at start-up for a partition whose post-move work
+    never finished, and by the operator's ``POST /build-bm25`` -- the only
+    caller that passes ``allow_row_move=True``. Without it, a KB found with
+    rows in DEFAULT is not moved -- not even when they are its own sources,
+    indexed while this run waited or retried -- and the run records
+    ``needs_build`` with a reason that points at ``POST /build-bm25``. With it,
+    the first run for a KB with rows in DEFAULT moves them into a partition of
+    its own, in one transaction: writes to the whole item table (every KB on
+    it) wait for the move, and indexing on the table waits while the move
+    queues for its gate -- see ``pg_bm25_index.create_partition`` for measured
+    numbers -- while readers of DEFAULT wait a fraction of a second for each of
+    its ACCESS EXCLUSIVE steps. A KB with no rows in DEFAULT is attached
+    without holding writers. Later runs are cheap and idempotent. Returns the
+    service's own outcome dict.
+
+    Each run records its progress in ``ai.bm25_index_builds``: ``queued`` when
+    it starts, then ``moving``, ``building`` and ``completing`` as the service
+    reaches them, and ``ready``, ``retrying`` (with the reason), ``failed``,
+    ``needs_build`` (only an operator may move the rows) or ``unavailable``
+    (the server cannot build a bm25 index safely; see
+    ``pg_bm25_index.concurrent_build_safety``). Retries, with jittered backoff
+    up to ``PG_BM25_TASK_MAX_RETRIES``, on the failures
+    ``is_transient_db_error`` accepts and while another build holds the item
+    table; any other error, or the last retry, fails the run at ERROR.
+    """
+    attempt = self.request.retries + 1
+    bind = _outcome_bind()
+    resolved: dict = {}
+
+    def record(status: str, reason: str | None = None) -> None:
+        # Resolved again until it is known: a run that starts while the server
+        # is unreachable must still record how it ends once it is back.
+        if bind is None:
+            return
+        if resolved.get("item_table") is None:
+            resolved["item_table"] = pg_bm25_index.keyword_item_table(bind, kb_id)
+        if resolved["item_table"] is not None:
+            record_bm25_build_outcome(bind, kb_id, resolved["item_table"], status, reason, attempt)
+
+    def retry_or_give_up(reason: str, exc: BaseException | None):
+        if self.request.retries >= self.max_retries:
+            record("failed", reason)
+            logger.error(
+                "Giving up on the BM25 index build for KB %s after %d attempts: %s. Sessions "
+                "holding or awaiting locks on the item table: %s. POST /build-bm25 to try again",
+                kb_id,
+                attempt,
+                reason,
+                getattr(exc, "bm25_lock_holders", None) or [],
+            )
+            return None
+        countdown = _pg_bm25_retry_countdown(self.request.retries)
+        record("retrying", reason)
+        # throw=False: schedule the retry and hand back the exception, so the
+        # log line follows the decision and precedes the raise.
+        retry = self.retry(exc=exc, countdown=countdown, throw=False)
+        logger.info(
+            "Retrying the BM25 index build for KB %s in %d s (attempt %d of %d): %s",
+            kb_id,
+            countdown,
+            attempt + 1,
+            self.max_retries + 1,
+            reason,
+        )
+        return retry
+
+    record("queued")
+    try:
+        outcome = pg_bm25_index.ensure_bm25_index(
+            kb_id, on_progress=record, allow_row_move=allow_row_move
+        )
+    except Exception as exc:
+        reason = _bm25_failure_reason(exc)
+        if pg_bm25_index.is_transient_db_error(exc):
+            retry = retry_or_give_up(reason, exc)
+            if retry is not None:
+                raise retry from exc
+            raise
+        record("failed", reason)
+        logger.error("The BM25 index build for KB %s failed: %s", kb_id, reason, exc_info=exc)
+        raise
+    status, skip_reason = outcome.get("status"), outcome.get("reason")
+    if skip_reason == "partition_build_in_progress":
+        retry = retry_or_give_up("another partition build on the item table is in progress", None)
+        if retry is not None:
+            raise retry
+        return outcome
+    if status == "ready" and outcome.get("item_table"):
+        _retire_file_index(kb_id, outcome["item_table"])
+    if status in ("ready", "building"):
+        record(status)
+    elif status == "unavailable":
+        # Not an alarm and not retried: the server cannot build the index
+        # safely, and nothing about that changes until an operator acts.
+        record("unavailable", pg_bm25_index.CONCURRENT_BUILD_UNSAFE_REASON)
+    elif skip_reason == "row_move_not_allowed":
+        # Deliberate, not a failure: moving rows is an operator's decision.
+        record("needs_build", ROW_MOVE_NOT_ALLOWED_REASON)
+        logger.info(
+            "Not building the BM25 index of KB %s: its rows are in the item table's DEFAULT "
+            "partition, and this build was dispatched automatically. POST /build-bm25 to move them",
+            kb_id,
+        )
+    elif status == "skipped":
+        record("failed", skip_reason_text(skip_reason))
+    return outcome
+
+
+@celery_app.task(bind=True, max_retries=PG_BM25_TASK_MAX_RETRIES)
+@billing.no_billing_context
+def drop_pg_bm25_index(self, kb_id: str, drop_partitions: bool = True) -> dict:
+    """Drop this KB's BM25 indexes, and by default its partitions.
+
+    KB delete relies on the default: a relation named after a knowledge base
+    that no longer exists has nothing to hold, and any row still in one is
+    returned to the DEFAULT partition first. A KB leaving hybrid/full_text
+    passes ``drop_partitions=False``: it keeps its partition, only the index
+    (which Postgres would otherwise keep maintaining) goes.
+
+    Retries on contention, so a partition is not orphaned by a busy table; the
+    last retry gives up at ERROR.
+    """
+    try:
+        return pg_bm25_index.drop_bm25_index(kb_id, drop_partitions=drop_partitions)
+    except Exception as exc:
+        if not (
+            isinstance(exc, pg_bm25_index.PartitionBuildInProgress)
+            or pg_bm25_index.is_transient_db_error(exc)
+        ):
+            raise
+        reason = _bm25_failure_reason(exc)
+        if self.request.retries >= self.max_retries:
+            logger.error(
+                "Giving up on dropping the BM25 index%s of KB %s after %d attempts: %s. "
+                "Sessions holding or awaiting locks on the item table: %s",
+                " and partitions" if drop_partitions else "",
+                kb_id,
+                self.request.retries + 1,
+                reason,
+                getattr(exc, "bm25_lock_holders", None) or [],
+            )
+            raise
+        countdown = _pg_bm25_retry_countdown(self.request.retries)
+        retry = self.retry(exc=exc, countdown=countdown, throw=False)
+        logger.info("Retrying the BM25 index drop for KB %s in %d s: %s", kb_id, countdown, reason)
+        raise retry from exc

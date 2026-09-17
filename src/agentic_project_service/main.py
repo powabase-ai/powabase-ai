@@ -16,6 +16,7 @@ from sqlalchemy import text
 from flask_cors import CORS
 from sqlalchemy import inspect
 
+from ._pg_search_extension import ensure_pg_search_extension, quiet_pg_search_planner_warnings
 from .celery import init_celery
 from .db import db, get_database_url
 from .migrate import migrate
@@ -248,6 +249,9 @@ def create_app(testing: bool = False):
         app.config["JWT_SECRET"] = os.getenv("JWT_SECRET")
         return app
 
+    with app.app_context():
+        quiet_pg_search_planner_warnings(db.engine)
+
     # Migrate CHECK constraint for existing projects to allow 'completed_with_errors'
     with app.app_context():
         try:
@@ -368,6 +372,37 @@ def create_app(testing: bool = False):
                         logger.info(
                             "No ai schema tables found — skipping migrations "
                             "(db-init Job will create them)"
+                        )
+
+                    # After the migrations, and on every start rather than once:
+                    # revision 0030 only runs once per database, so a server that
+                    # gains pg_search later still gets it enabled here. Idempotent
+                    # and never raises; a failure is logged at ERROR.
+                    ensure_pg_search_extension(db.engine)
+                    # A partition move killed part-way can leave its temporary
+                    # check on a DEFAULT partition, refusing one knowledge base's
+                    # writes. Clear it without ever waiting for a lock.
+                    try:
+                        from .services import pg_bm25_index
+
+                        pg_bm25_index.clear_leftover_move_checks_at_start(db.engine)
+                    except Exception:
+                        logger.warning(
+                            "Start-up sweep for leftover partition move checks failed",
+                            exc_info=True,
+                        )
+                    # A worker killed after a move committed can leave a
+                    # partition whose foreign keys or secondary indexes were
+                    # never finished; nothing else comes back to it. Dispatch
+                    # its (idempotent) ensure. Never raises.
+                    try:
+                        from .tasks.indexing import dispatch_partition_completion_at_start
+
+                        dispatch_partition_completion_at_start(db.engine)
+                    except Exception:
+                        logger.warning(
+                            "Start-up sweep for unfinished BM25 partitions failed",
+                            exc_info=True,
                         )
                 finally:
                     db.session.execute(text("SELECT pg_advisory_unlock(43)"))

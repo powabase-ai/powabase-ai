@@ -141,3 +141,39 @@ def test_storage_error_retries_via_delay_not_celery_retry(app, test_knowledge_ba
     delay.assert_called_once()          # a retry DID happen ...
     retry.assert_not_called()           # ... and not through Celery's own counter
     assert row.index_status == "pending"  # ... leaving the row claimable again
+
+
+def test_a_requeue_with_a_countdown_is_delayed_and_keeps_every_argument(
+    app, test_knowledge_base, mocker
+):
+    """A lock conflict or a move race requeues after a short delay, so a
+    conflict that clears in seconds does not spend every attempt at once."""
+    from agentic_project_service.tasks import indexing
+
+    src_id, is_id = _seed_indexing(app, test_knowledge_base["id"], "owner-B", attempts=1)
+    delay = mocker.patch.object(indexing.index_source, "delay")
+    apply_async = mocker.patch.object(indexing.index_source, "apply_async")
+
+    with app.app_context():
+        indexing._handle_storage_error(
+            knowledge_base_id=test_knowledge_base["id"], source_id=src_id,
+            indexed_source_id=is_id, task_id="owner-B", provider_keys={"openai": "k"},
+            idempotency_action="indexing", idempotency_parts=["a"], countdown=10,
+        )
+        row = db.session.execute(
+            text("SELECT index_status FROM ai.indexed_sources WHERE id = :id"),
+            {"id": is_id},
+        ).fetchone()
+
+    delay.assert_not_called()
+    apply_async.assert_called_once_with(
+        args=[test_knowledge_base["id"], src_id],
+        kwargs={
+            "indexed_source_id": is_id,
+            "provider_keys": {"openai": "k"},
+            "idempotency_action": "indexing",
+            "idempotency_parts": ["a"],
+        },
+        countdown=10,
+    )
+    assert row.index_status == "pending"

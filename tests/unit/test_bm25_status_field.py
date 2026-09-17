@@ -40,7 +40,7 @@ def _mock_db_counts_empty():
 
 
 @_AUTH_PATCH
-@patch("agentic_project_service.routes.knowledge_bases._compute_bm25_status")
+@patch("agentic_project_service.routes.knowledge_bases._bm25_status_detail")
 @patch("agentic_project_service.routes.knowledge_bases._fetch_kb_or_404")
 @patch("agentic_project_service.routes.knowledge_bases._compute_drift")
 @patch("agentic_project_service.routes.knowledge_bases.db", new_callable=MagicMock)
@@ -57,7 +57,7 @@ def test_bm25_status_included_when_present(mock_db, mock_drift, mock_fetch, mock
         "updated_at": None,
     }
     mock_drift.return_value = "none"
-    mock_status.return_value = "absent"
+    mock_status.return_value = ("absent", None)
 
     with _make_test_app().test_client() as client:
         resp = client.get(f"/api/knowledge-bases/{kb_id}", headers=_auth_headers())
@@ -67,12 +67,12 @@ def test_bm25_status_included_when_present(mock_db, mock_drift, mock_fetch, mock
 
 
 @_AUTH_PATCH
-@patch("agentic_project_service.routes.knowledge_bases._compute_bm25_status")
+@patch("agentic_project_service.routes.knowledge_bases._bm25_status_detail")
 @patch("agentic_project_service.routes.knowledge_bases._fetch_kb_or_404")
 @patch("agentic_project_service.routes.knowledge_bases._compute_drift")
 @patch("agentic_project_service.routes.knowledge_bases.db", new_callable=MagicMock)
 def test_bm25_status_omitted_when_none(mock_db, mock_drift, mock_fetch, mock_status, _jwt):
-    """If _compute_bm25_status returns None, the field is omitted from the response."""
+    """If _bm25_status_detail returns no status, the field is omitted from the response."""
     mock_db.session.execute.return_value = iter([])
     kb_id = "22222222-2222-2222-2222-222222222222"
     mock_fetch.return_value = {
@@ -85,7 +85,7 @@ def test_bm25_status_omitted_when_none(mock_db, mock_drift, mock_fetch, mock_sta
         "updated_at": None,
     }
     mock_drift.return_value = "none"
-    mock_status.return_value = None
+    mock_status.return_value = (None, None)
 
     with _make_test_app().test_client() as client:
         resp = client.get(f"/api/knowledge-bases/{kb_id}", headers=_auth_headers())

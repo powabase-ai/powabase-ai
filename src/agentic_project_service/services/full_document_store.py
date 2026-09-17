@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import AI_SCHEMA
+from . import pg_bm25_index
 from .base_vector_store import BasePgVectorStore
 from .knowledge_store import RetrievedItem
 from .storage import SOURCES_BUCKET, SupabaseStorage, get_derivative_storage_path
@@ -110,6 +111,7 @@ class FullDocumentStore(BasePgVectorStore):
         dims = len(summary_embedding)
 
         try:
+            pg_bm25_index.hold_move_gate_shared(self.session, "full_documents")
             self.session.execute(
                 text(f"""
                     INSERT INTO "{self.schema}".full_documents (
@@ -183,24 +185,29 @@ class FullDocumentStore(BasePgVectorStore):
         storage blobs so they don't accumulate as orphans across re-indexes.
         """
         try:
+            # First, before the read: a partition move and this write take turns.
+            pg_bm25_index.hold_move_gate_shared(self.session, "full_documents")
             # Query storage paths before deleting rows
             storage_paths: list[str] = []
             if self.storage:
                 paths_result = self.session.execute(
                     text(f"""
                         SELECT full_text_path FROM "{self.schema}".full_documents
-                        WHERE indexed_source_id = :indexed_source_id
+                        WHERE knowledge_base_id = :kb_id
+                          AND indexed_source_id = :indexed_source_id
                     """),
-                    {"indexed_source_id": indexed_source_id},
+                    {"kb_id": self.kb_id, "indexed_source_id": indexed_source_id},
                 )
                 storage_paths = [row[0] for row in paths_result if row[0]]
 
             result = self.session.execute(
                 text(f"""
                     DELETE FROM "{self.schema}".full_documents
-                    WHERE indexed_source_id = :indexed_source_id
+                    WHERE knowledge_base_id = :kb_id
+                      AND indexed_source_id = :indexed_source_id
                 """),
-                {"indexed_source_id": indexed_source_id},
+                # The KB predicate prunes both statements to this KB's partition.
+                {"kb_id": self.kb_id, "indexed_source_id": indexed_source_id},
             )
             self.session.commit()
 

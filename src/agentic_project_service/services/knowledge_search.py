@@ -444,8 +444,9 @@ def _run_full_text_search(
 ) -> list[RetrievedItem]:
     """Run BM25-scored full-text keyword search.
 
-    Uses pre-built bm25s index when available, falls back to PostgreSQL
-    tsvector search otherwise.
+    Uses the KB's pg_search BM25 index when it is ready, otherwise the
+    pre-built bm25s file index or the bounded PostgreSQL tsvector fallback
+    (``BasePgVectorStore.bm25s_search`` decides which).
     """
     # Use keyword_query if provided (already includes chat context)
     search_text = keyword_query or query
@@ -475,7 +476,9 @@ def _run_hybrid_search(
 ) -> list[RetrievedItem]:
     """Run hybrid search (vector + BM25 fused with RRF).
 
-    Uses bm25s pre-indexed search for the keyword component when available.
+    The keyword component is ``keyword_search_for_hybrid``: the KB's pg_search
+    BM25 index when it is ready, otherwise the bm25s file index or the tsvector
+    fallback.
     """
     from agentic.knowledge.retrieval.fusion import reciprocal_rank_fusion
     from litellm import embedding as litellm_embedding
@@ -502,7 +505,9 @@ def _run_hybrid_search(
         )
     )
 
-    # bm25s search (tsvector fallback if no index; empty if that times out)
+    # Keyword leg: the KB's pg_search BM25 index when it is ready, otherwise the
+    # bm25s file index or the tsvector fallback (bm25s_search decides which);
+    # empty if the fallback times out.
     text_results = asyncio.run(
         store.keyword_search_for_hybrid(
             search_text,

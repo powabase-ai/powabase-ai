@@ -1,0 +1,519 @@
+# ParadeDB pull request #6211, commit f4b1f65e25f5ebeda6744e1e1fd00f962ba89260
+# https://github.com/paradedb/paradedb/pull/6211 (fixes paradedb/paradedb#6208)
+#
+# Applied by ci/pg_search/Dockerfile on top of pg_search v0.25.9. No 0.25.x
+# release contains it. Without it, on Postgres 15 and 16, a bm25
+# CREATE INDEX CONCURRENTLY that runs while another backend writes to the table
+# fails with "buffer ... is not owned by resource owner" (XX000, leaving the
+# index INVALID) or crashes the server.
+#
+# This file is ParadeDB's upstream commit, unmodified below this header.
+# pg_search is licensed under the GNU Affero General Public License v3.0
+# (https://github.com/paradedb/paradedb/blob/main/LICENSE); this patch, and any
+# binary built with it, is covered by that license, not by this repository's.
+# `git apply` skips everything before the first "diff --git" line.
+#
+From f4b1f65e25f5ebeda6744e1e1fd00f962ba89260 Mon Sep 17 00:00:00 2001
+From: Moe <mdashti@gmail.com>
+Date: Fri, 4 Sep 2026 20:27:22 -0700
+Subject: [PATCH] fix: clean up the pg15/pg16 insert states before a commit
+ (#6211)
+
+## Ticket(s) Closed
+
+- Closes #6208
+
+## What
+
+This PR runs the pg15/pg16 `aminsertcleanup` polyfill's cleanup before a
+commit, instead of at the end of the utility statement.
+
+## Why
+
+`CREATE INDEX CONCURRENTLY` on a `bm25` index fails on Postgres 15 and
+16 when another backend writes to the table during the build:
+
+```
+WARNING:  buffer refcount leak: [11388] (rel=base/460123/462610, blockNum=582, ...)
+ERROR:  buffer 11388 is not owned by resource owner TopTransaction
+```
+
+An `InsertState` pins buffers, and a pin belongs to the resource owner
+of the transaction that took it. The polyfill keeps every state in a
+frame that a `ProcessUtility` or `ExecutorRun` hook opens, and cleans
+that frame up when the hook returns. `CREATE INDEX CONCURRENTLY` commits
+between its phases while the frame is still open, so the state its
+validation pass builds outlives the owner of its pins. One local run
+went further and ended in a segfault.
+
+pg17 added `index_insert_cleanup`, and `validate_index` calls it before
+it returns. So 17 and 18 never reach this, and the polyfill is compiled
+out there.
+
+A subtransaction abort is the other way a state can outlive its owner,
+and it's worse. A statement that fails part way, say a multi-row
+`INSERT` that trips the primary key on its third row inside a PL/pgSQL
+`EXCEPTION` block, leaves its frame behind: the guard sees the unwind
+and steps aside. The next guard to exit then pops that stale frame
+instead of its own and runs the cleanup on it, which commits the rows
+the rollback discarded over pins the aborting owner has already given
+up. With `global_mutable_segment_rows = 0` that takes the backend down
+with `SIGABRT`.
+
+## How
+
+A `PreCommit` xact callback drains every open frame, beside the `Abort`
+and `Commit` ones already registered. The frames themselves stay on the
+stack, because only a `FrameGuard` may pop one and every guard is still
+live.
+
+Each frame now records the nesting level it was pushed at, and an
+`AbortSub` callback drops every frame at the aborting level or deeper,
+without cleanup. Those frames can only belong to hooks that left through
+an error, and the callback runs before the subtransaction's resource
+owner releases its pins, the same order the top-level abort path already
+relies on.
+
+This also reverts a9cab39e4, which held #6146's concurrent-build tests
+to pg17 and newer while this was open.
+
+## Tests
+
+`tests/tests/concurrent_build_writes.rs` races a writer against a plain
+build. It declares no `partition_by`, so it covers the bug on its own.
+
+Step 1: seed a table with about 60k rows.
+
+Step 2: run the build on one connection.
+
+```sql
+CREATE INDEX CONCURRENTLY cic_writes_idx ON cic_writes
+USING bm25 (id, body) WITH (key_field = 'id');
+```
+
+Step 3: on a second connection, loop `UPDATE`s and `INSERT`s until the
+build returns.
+
+Verified on `PGVER=15.15` and `PGVER=16.11`, where it fails before the
+change and passes after, and on `PGVER=18.1`.
+
+`a_subtransaction_abort_drops_its_insert_state` in `insert.rs` runs the
+failing-`INSERT`-inside-`EXCEPTION` shape above with immutable inserts,
+then checks the index holds exactly the surviving rows. It crashes the
+backend on 16 before the fix and passes after; it also runs on 17 and
+18, where the native `aminsertcleanup` handles the same case.
+---
+ docs/changelog/unreleased/6211.stability.mdx  |   5 +
+ .../src/postgres/fake_aminsertcleanup.rs      | 119 +++++++++++++-----
+ pg_search/src/postgres/insert.rs              |  39 ++++++
+ tests/tests/concurrent_build_writes.rs        | 116 +++++++++++++++++
+ .../partitioned_build_concurrent_writes.rs    |   9 --
+ 5 files changed, 250 insertions(+), 38 deletions(-)
+ create mode 100644 docs/changelog/unreleased/6211.stability.mdx
+ create mode 100644 tests/tests/concurrent_build_writes.rs
+
+diff --git a/docs/changelog/unreleased/6211.stability.mdx b/docs/changelog/unreleased/6211.stability.mdx
+new file mode 100644
+index 00000000000..4c4dbfbe17c
+--- /dev/null
++++ b/docs/changelog/unreleased/6211.stability.mdx
+@@ -0,0 +1,5 @@
++---
++header: stability
++---
++
++`CREATE INDEX CONCURRENTLY` and `REINDEX CONCURRENTLY` no longer fail on Postgres 15 and 16 when another backend writes to the table during the build.
+diff --git a/pg_search/src/postgres/fake_aminsertcleanup.rs b/pg_search/src/postgres/fake_aminsertcleanup.rs
+index 7af08a55c6a..3c8243644fd 100644
+--- a/pg_search/src/postgres/fake_aminsertcleanup.rs
++++ b/pg_search/src/postgres/fake_aminsertcleanup.rs
+@@ -55,14 +55,32 @@
+ //!   `ProcessUtility` hook can push a frame on top of an active `ExecutorRun` frame. This is
+ //!   fine — each frame is independent and cleaned up by its own guard.
+ //!
++//! # Transaction boundaries
++//!
++//! An [`InsertState`] pins buffers, and a pin belongs to the resource owner of the transaction
++//! that took it. A hook invocation normally sits inside one transaction, so the guard's drop is
++//! early enough. `CREATE INDEX CONCURRENTLY` breaks that: it commits between its phases while
++//! our `ProcessUtility` frame is still open, so a state its validation pass builds would outlive
++//! the owner of its pins. pg17 gained `index_insert_cleanup`, which the same pass calls before
++//! it returns; here the commit itself is the deadline, so a pre-commit callback drains every
++//! frame while the pins are still the committing transaction's to release.
++//!
++//! A subtransaction abort is the other way a state can outlive its owner. A statement that
++//! fails part way leaves its frame behind: the guard sees the unwind and steps aside, and no
++//! later guard may pop it, or it would commit rows the rollback discarded. Each frame records
++//! the nesting level it was pushed at, and the subtransaction abort callback drops every frame
++//! at its level or deeper. That callback runs before the aborting resource owner gives up its
++//! pins, so the states' own drops still release them cleanly.
++//!
+ //! # Panic / unwind safety
+ //!
+ //! `insertcleanup` can panic (e.g. if called with `InsertMode::Completed`, or via `.expect()`
+ //! calls inside the inner cleanup functions). If `FrameGuard::drop` ran cleanup during an
+ //! already-active unwind, a second panic would abort the process. To prevent this, `Drop` checks
+-//! `std::thread::panicking()` and skips cleanup when already unwinding. The transaction-abort
+-//! xact callback registered in `push_insert_state` clears the stack in that case, which is safe
+-//! because Postgres rolls back all storage changes on error anyway.
++//! `std::thread::panicking()` and skips cleanup when already unwinding. The abort callbacks
++//! registered in `push_insert_state` drop the frame in that case, whether the whole transaction
++//! or only a subtransaction rolls back, which is safe because Postgres discards the storage
++//! changes either way.
+ 
+ #![allow(static_mut_refs)]
+ 
+@@ -81,6 +99,10 @@ use std::collections::hash_map::Entry;
+ /// Pushed onto [`EXECUTOR_RUN_STACK`] by [`FrameGuard::new`] and popped by [`FrameGuard::drop`].
+ /// Starts empty; `aminsert` calls populate it via [`push_insert_state`].
+ struct InsertFrame {
++    /// The transaction nesting level the hook was entered at. A subtransaction abort discards
++    /// every frame at its level or deeper, since those hooks can only have left through an
++    /// error.
++    nest_level: i32,
+     active: HashMap<pg_sys::Oid, InsertFrameEntry>,
+ }
+ 
+@@ -95,27 +117,80 @@ struct InsertFrameEntry {
+ /// **Only [`FrameGuard`] is allowed to push or pop this stack.**
+ static mut EXECUTOR_RUN_STACK: Vec<InsertFrame> = Vec::new();
+ 
+-/// Whether the transaction-local abort cleanup callback has been registered.
+-static mut ABORT_CALLBACK_REGISTERED: bool = false;
++/// Whether the transaction-local cleanup callbacks have been registered.
++static mut XACT_CALLBACKS_REGISTERED: bool = false;
+ 
+-unsafe fn ensure_abort_callback_registered() {
+-    if ABORT_CALLBACK_REGISTERED {
++unsafe fn ensure_xact_callbacks_registered() {
++    if XACT_CALLBACKS_REGISTERED {
+         return;
+     }
+ 
+-    ABORT_CALLBACK_REGISTERED = true;
++    XACT_CALLBACKS_REGISTERED = true;
++    pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::PreCommit, || unsafe {
++        cleanup_before_commit();
++    });
+     pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Abort, || unsafe {
+         // If a Postgres ERROR unwinds through FrameGuard::drop, drop every frame without running
+         // insertcleanup. Postgres will roll back all storage changes, so there is nothing to
+         // commit. clear() drops each InsertFrame via normal Drop impls, which is safe here.
+         EXECUTOR_RUN_STACK.clear();
+-        ABORT_CALLBACK_REGISTERED = false;
++        XACT_CALLBACKS_REGISTERED = false;
+     });
+     pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Commit, || unsafe {
+-        ABORT_CALLBACK_REGISTERED = false;
++        XACT_CALLBACKS_REGISTERED = false;
++    });
++    pgrx::register_subxact_callback(pgrx::PgSubXactCallbackEvent::AbortSub, |_, _| unsafe {
++        discard_aborted_frames();
+     });
+ }
+ 
++/// Drops, without cleanup, every frame the aborting subtransaction orphaned.
++///
++/// A frame at the aborting level or deeper has no live guard left: its hook exited through an
++/// error, and only this abort follows. A guard still on the C stack sits at a shallower level,
++/// so its frame survives.
++unsafe fn discard_aborted_frames() {
++    let level = pg_sys::GetCurrentTransactionNestLevel();
++    EXECUTOR_RUN_STACK.retain(|frame| frame.nest_level < level);
++}
++
++/// Clean up every state the open frames hold, leaving the frames themselves to their guards.
++///
++/// See the "Transaction boundaries" note above for why a commit is a deadline. The frames stay
++/// on the stack because only a [`FrameGuard`] may pop one, and every guard here is still live.
++unsafe fn cleanup_before_commit() {
++    // Take all the maps up front: `insertcleanup` runs arbitrary index code, and holding a
++    // borrow of the stack across it would be unsound if anything pushed a frame.
++    let pending = EXECUTOR_RUN_STACK
++        .iter_mut()
++        .map(|frame| std::mem::take(&mut frame.active))
++        .collect::<Vec<_>>();
++
++    for active in pending {
++        cleanup_frame(active);
++    }
++}
++
++/// Run `insertcleanup` for every state in `active`.
++unsafe fn cleanup_frame(active: HashMap<pg_sys::Oid, InsertFrameEntry>) {
++    for (_, mut entry) in active {
++        // The pg15/pg16 shim stores a sentinel in ii_AmCache because the real InsertState
++        // lives in the frame. Once the frame is cleaned up, clear the sentinel so a later
++        // aminsert with the same IndexInfo creates a fresh state instead of looking for
++        // one that is no longer there.
++        if let Some(index_info) = entry.index_info.as_mut() {
++            index_info.ii_AmCache = std::ptr::null_mut();
++        }
++
++        // Replace the mode with Completed *before* calling insertcleanup.  If
++        // insertcleanup panics partway through, the xact-abort callback will clear the
++        // remaining frames; having Completed in place prevents a double-cleanup if the
++        // same state were somehow encountered again (it won't be, but this is defensive).
++        let mode = std::mem::replace(&mut entry.insert_state.mode, InsertMode::Completed);
++        insertcleanup(&entry.insert_state, mode);
++    }
++}
++
+ // ---------------------------------------------------------------------------
+ // RAII frame guard
+ // ---------------------------------------------------------------------------
+@@ -135,6 +210,7 @@ impl FrameGuard {
+     /// Must be called from within a Postgres executor hook (main thread, valid memory context).
+     unsafe fn new() -> Self {
+         EXECUTOR_RUN_STACK.push(InsertFrame {
++            nest_level: pg_sys::GetCurrentTransactionNestLevel(),
+             active: HashMap::default(),
+         });
+ 
+@@ -149,8 +225,8 @@ impl Drop for FrameGuard {
+         unsafe {
+             if std::thread::panicking() {
+                 // We are already unwinding.  Calling insertcleanup now risks a second panic,
+-                // which would abort the process.  Leave the frame in place; the xact-abort
+-                // callback registered above will clear the stack when the transaction rolls back.
++                // which would abort the process.  Leave the frame in place; whichever abort
++                // follows, of the transaction or of a subtransaction, drops it.
+                 return;
+             }
+ 
+@@ -158,22 +234,7 @@ impl Drop for FrameGuard {
+                 .pop()
+                 .expect("FrameGuard::drop: stack underflow — frame was never pushed");
+ 
+-            for (_, mut entry) in frame.active {
+-                // The pg15/pg16 shim stores a sentinel in ii_AmCache because the real InsertState
+-                // lives in this frame. Once the frame is cleaned up, clear the sentinel so a later
+-                // ExecutorRun with the same IndexInfo creates a fresh state instead of looking for
+-                // one in an empty frame.
+-                if let Some(index_info) = entry.index_info.as_mut() {
+-                    index_info.ii_AmCache = std::ptr::null_mut();
+-                }
+-
+-                // Replace the mode with Completed *before* calling insertcleanup.  If
+-                // insertcleanup panics partway through, the xact-abort callback will clear the
+-                // remaining frames; having Completed in place prevents a double-cleanup if the
+-                // same state were somehow encountered again (it won't be, but this is defensive).
+-                let mode = std::mem::replace(&mut entry.insert_state.mode, InsertMode::Completed);
+-                insertcleanup(&entry.insert_state, mode);
+-            }
++            cleanup_frame(frame.active);
+         }
+     }
+ }
+@@ -219,7 +280,7 @@ pub unsafe fn get_insert_state(indexrelid: pg_sys::Oid) -> Option<&'static mut I
+ /// Must be called from within a live executor hook invocation.
+ #[inline]
+ pub unsafe fn push_insert_state(index_info: *mut pg_sys::IndexInfo, insert_state: InsertState) {
+-    ensure_abort_callback_registered();
++    ensure_xact_callbacks_registered();
+ 
+     let frame = EXECUTOR_RUN_STACK.last_mut().expect(
+         "push_insert_state: called outside of an executor hook — EXECUTOR_RUN_STACK is empty",
+diff --git a/pg_search/src/postgres/insert.rs b/pg_search/src/postgres/insert.rs
+index 08c84aa8ea8..39a5ff97afd 100644
+--- a/pg_search/src/postgres/insert.rs
++++ b/pg_search/src/postgres/insert.rs
+@@ -446,3 +446,42 @@ unsafe fn insertcleanup_mutable(indexrel: &PgSearchRelation, mode: InsertModeMut
+ 
+     true
+ }
++
++#[cfg(any(test, feature = "pg_test"))]
++#[pgrx::pg_schema]
++mod tests {
++    use pgrx::{Spi, pg_test};
++
++    /// A statement that fails part way through leaves index state behind for the rows it did
++    /// insert. When a subtransaction swallows that failure, the state must go with the rollback
++    /// and not ride along to the next cleanup, which would commit rows the heap never kept.
++    #[pg_test]
++    fn a_subtransaction_abort_drops_its_insert_state() {
++        Spi::run(
++            r#"
++            SET paradedb.global_mutable_segment_rows = 0;
++            CREATE TABLE subxact_frame (id BIGINT PRIMARY KEY, body TEXT);
++            CREATE INDEX subxact_frame_idx ON subxact_frame USING bm25 (id, body)
++                WITH (key_field = 'id');
++            INSERT INTO subxact_frame VALUES (1, 'seed');
++            DO $$
++            BEGIN
++                BEGIN
++                    -- Two rows reach the index before the primary key rejects the third.
++                    INSERT INTO subxact_frame VALUES (100, 'a'), (101, 'b'), (1, 'dup');
++                EXCEPTION WHEN unique_violation THEN
++                    NULL;
++                END;
++                INSERT INTO subxact_frame VALUES (200, 'kept');
++            END $$;
++            "#,
++        )
++        .unwrap();
++        assert_eq!(
++            Spi::get_one::<i64>("SELECT count(*) FROM subxact_frame WHERE id @@@ pdb.all();")
++                .unwrap()
++                .unwrap(),
++            2
++        );
++    }
++}
+diff --git a/tests/tests/concurrent_build_writes.rs b/tests/tests/concurrent_build_writes.rs
+new file mode 100644
+index 00000000000..92cbd998c77
+--- /dev/null
++++ b/tests/tests/concurrent_build_writes.rs
+@@ -0,0 +1,116 @@
++// Copyright (c) 2023-2026 ParadeDB, Inc.
++//
++// This file is part of ParadeDB - Postgres for Search and Analytics
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU Affero General Public License as published by
++// the Free Software Foundation, either version 3 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++// GNU Affero General Public License for more details.
++//
++// You should have received a copy of the GNU Affero General Public License
++// along with this program. If not, see <http://www.gnu.org/licenses/>.
++
++//! `CREATE INDEX CONCURRENTLY` commits between its phases, so anything the validation pass
++//! leaves behind outlives the transaction that owns it. Rows have to reach the index through
++//! `aminsert` for that pass to run at all, which takes a second backend writing during the
++//! build.
++
++use anyhow::Result;
++use rstest::*;
++use sqlx::PgConnection;
++use tests::fixtures::*;
++
++const ROWS: i64 = 60_000;
++
++async fn setup(conn: &mut PgConnection) {
++    sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_search CASCADE;")
++        .execute(&mut *conn)
++        .await
++        .expect("create extension");
++
++    sqlx::query(
++        r#"
++        CREATE TABLE cic_writes (
++            id BIGSERIAL PRIMARY KEY,
++            body TEXT,
++            touched BIGINT DEFAULT 0
++        );
++        "#,
++    )
++    .execute(&mut *conn)
++    .await
++    .expect("create table");
++
++    sqlx::query(
++        r#"
++        INSERT INTO cic_writes (body)
++        SELECT 'lorem ipsum ' || i || ' ' || repeat('padding here ', 8)
++        FROM generate_series(1, $1) i;
++        "#,
++    )
++    .bind(ROWS)
++    .execute(&mut *conn)
++    .await
++    .expect("seed rows");
++}
++
++#[rstest]
++#[async_std::test]
++async fn writes_during_a_concurrent_build(database: Db) -> Result<()> {
++    let mut builder = database.connection().await;
++    let mut writer = database.connection().await;
++    setup(&mut builder).await;
++
++    let build = async {
++        sqlx::query(
++            r#"
++            CREATE INDEX CONCURRENTLY cic_writes_idx ON cic_writes
++            USING bm25 (id, body) WITH (key_field = 'id');
++            "#,
++        )
++        .execute(&mut builder)
++        .await
++        .expect("concurrent build");
++    };
++
++    let churn = async {
++        for round in 0..40 {
++            sqlx::query("UPDATE cic_writes SET body = body || ' revised' WHERE id % 53 = $1;")
++                .bind(round % 53)
++                .execute(&mut writer)
++                .await
++                .expect("indexed update");
++            sqlx::query(
++                "INSERT INTO cic_writes (body) SELECT 'late row ' || g
++                 FROM generate_series(1, 50) g;",
++            )
++            .execute(&mut writer)
++            .await
++            .expect("insert");
++        }
++    };
++
++    futures::join!(build, churn);
++
++    let mut conn = database.connection().await;
++    let (indexed,): (i64,) =
++        sqlx::query_as("SELECT count(*) FROM cic_writes WHERE id @@@ pdb.all();")
++            .fetch_one(&mut conn)
++            .await
++            .expect("count via index");
++    let (actual,): (i64,) = sqlx::query_as("SELECT count(*) FROM cic_writes;")
++        .fetch_one(&mut conn)
++        .await
++        .expect("count via heap");
++    assert_eq!(
++        indexed, actual,
++        "the index has to hold exactly the table's rows"
++    );
++
++    Ok(())
++}
+diff --git a/tests/tests/partitioned_build_concurrent_writes.rs b/tests/tests/partitioned_build_concurrent_writes.rs
+index 2ec0edf59cd..bcd85f1990b 100644
+--- a/tests/tests/partitioned_build_concurrent_writes.rs
++++ b/tests/tests/partitioned_build_concurrent_writes.rs
+@@ -20,9 +20,6 @@
+ //! writing, so the re-read has to land on the versions the scan chose, not on whatever the
+ //! chain holds by then. These tests race real writers against the build and check the index
+ //! against the table.
+-//!
+-//! They need PG 17 or newer. On 15 and 16 a `CONCURRENTLY` build under a writer fails on a
+-//! leaked buffer pin, which #6208 tracks and which no `partition_by` option can reach.
+ 
+ use anyhow::Result;
+ use rstest::*;
+@@ -102,9 +99,6 @@ async fn assert_index_matches_table(conn: &mut PgConnection) {
+ #[async_std::test]
+ async fn hot_updates_during_a_concurrent_build(database: Db) -> Result<()> {
+     let mut builder = database.connection().await;
+-    if pg_major_version(&mut builder) < 17 {
+-        return Ok(());
+-    }
+     let mut writer = database.connection().await;
+     setup(&mut builder).await;
+ 
+@@ -145,9 +139,6 @@ async fn hot_updates_during_a_concurrent_build(database: Db) -> Result<()> {
+ #[async_std::test]
+ async fn writes_during_a_concurrent_build(database: Db) -> Result<()> {
+     let mut builder = database.connection().await;
+-    if pg_major_version(&mut builder) < 17 {
+-        return Ok(());
+-    }
+     let mut writer = database.connection().await;
+     setup(&mut builder).await;
+ 

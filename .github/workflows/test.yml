@@ -98,5 +98,180 @@ jobs:
 
       # The `app` fixture creates the ai schema, the vector extension and the
       # ORM tables itself, so no migration step is needed here.
+      #
+      # tests/test_index_source_retry.py runs here too: it pins how indexing
+      # requeues a source (the single attempts bound, and the countdown a lock
+      # conflict or partition-move race requeues with) against real rows, and
+      # needs only this job's database -- no pg_search.
       - name: Run store tests
-        run: uv run --no-sync pytest tests/test_graph_index_store.py tests/test_full_text_search_timeout_live.py tests/test_extraction_redelivery_store.py -q
+        run: >-
+          uv run --no-sync pytest
+          tests/test_graph_index_store.py
+          tests/test_full_text_search_timeout_live.py
+          tests/test_extraction_redelivery_store.py
+          tests/test_index_source_retry.py
+          -q
+
+  # tests/pg_search exercises the Postgres-native BM25 path for real: the
+  # partitioning and extension migrations, row-level security through the
+  # partitioned parents, and pg_search index builds and queries. It needs a
+  # server with pg_search preloaded (shared_preload_libraries) and vector
+  # available, which the store job's image does not have.
+  #
+  # PG_SEARCH_REQUIRED=1 turns every "pg_search is unavailable" skip into a
+  # failure, and the run step also fails on any skip at all: a job whose only
+  # purpose is this extension must not go green by skipping it.
+  #
+  # The server is NOT the stock paradedb/paradedb:0.25.9-pg15 image. Stock
+  # pg_search 0.25.9 on Postgres 15 and 16 fails a bm25 CREATE INDEX
+  # CONCURRENTLY while another backend writes to the table -- XX000 "buffer ...
+  # is not owned by resource owner", or a server crash.
+  # Before the service checked for that fix, the whole suite passed on the
+  # stock image: nothing else builds an index while the same partition takes
+  # writes. test_pg_bm25_build_under_writes_live.py does (with the service's
+  # check overridden), and fails on the stock image every time. The service
+  # itself builds no index on a server without the image's
+  # powabase.pg_search_cic_safe marker (Postgres 15/16, pg_search < 0.26), so
+  # on the stock image most build tests would fail on that instead.
+  # ci/pg_search/Dockerfile rebuilds pg_search from the v0.25.9 source with
+  # ParadeDB's fix (paradedb/paradedb#6211, in no 0.25.x release) on top of
+  # that image, and sets the marker; everything else in the image is upstream's.
+  # A deployment on Postgres 15 or 16 needs a pg_search build with that fix too.
+  #
+  # The pg_search.so built here is not a production binary: it is compiled
+  # against this image's Debian PostgreSQL 15 server headers, not the headers
+  # of whatever Postgres a deployment runs, so the two are different files. A
+  # green run says the code works with a pg_search that has the fix; it says
+  # nothing about the binary in any other image. Test that image itself.
+  #
+  # The compile is slow: 8 minutes with 16 parallel jobs on a workstation, so
+  # expect upwards of 30 on a hosted runner's 4 CPUs. Its layers go to the GitHub Actions cache
+  # (buildx, type=gha), so only a run that changes ci/pg_search/ or finds no
+  # usable cache pays for it; the rest restore it in a minute or two (locally, a build from a warm cache
+  # took 20 s). A pull
+  # request reads the cache its base branch wrote, so a push to main is what
+  # keeps it warm for everyone. A service container cannot use an image built
+  # by the job's own steps, so the server is started with docker run after the
+  # build.
+  #
+  # This image is NOT the production Postgres image either, and the differences
+  # are visible to these tests:
+  # - supautils: production runs it, and it lets ordinary roles create
+  #   privileged extensions such as pg_search. Here nothing does, so a test that
+  #   makes CREATE EXTENSION fail by withholding a role's privilege passes here
+  #   and fails in production. Inject such failures server-independently (a
+  #   read-only transaction, a monkeypatch).
+  # - roles: this image has only supabase_admin; production also has
+  #   authenticated, anon, service_role and the other Supabase roles.
+  # - preload order: this image loads pg_search first in
+  #   shared_preload_libraries, production loads it last, after a dozen others. That
+  #   decides whether a check-constraint violation (23514) arrives with its
+  #   diag fields (constraint and table name) -- here it does not, in production
+  #   it does -- so the two branches of code that reads them are each exercised
+  #   on only one of the two images. Run this suite on the production image too
+  #   before changing that code.
+  #
+  # Hangs: tests/pg_search/conftest.py gives every test there a pytest-timeout
+  # limit, so a lock wait that never returns fails that test instead of the
+  # run; timeout-minutes bounds the whole job as a backstop, sized for a cold
+  # compile and cache upload (30-40 minutes) plus the suite (2-3).
+  pg_search:
+    name: pytest tests/pg_search (Postgres 15 + pg_search 0.25.9 with paradedb#6211)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DATABASE_URL: postgresql+psycopg://supabase_admin:postgres@localhost:5432/pg_search_test
+      PG_SEARCH_REQUIRED: "1"
+      PG_IMAGE: pg-search-ci:0.25.9-paradedb-6211
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # A cache scope of its own, so no other image built here overwrites this
+      # one's cache entry. mode=max keeps the builder stage's layers (toolchain,
+      # compile), not only the final image's.
+      - name: Build Postgres with the patched pg_search
+        uses: docker/build-push-action@v6
+        with:
+          context: ci/pg_search
+          load: true
+          tags: ${{ env.PG_IMAGE }}
+          cache-from: type=gha,scope=pg-search-0.25.9-paradedb-6211
+          cache-to: type=gha,scope=pg-search-0.25.9-paradedb-6211,mode=max
+
+      # Readiness is checked over TCP from the runner: the image's init scripts
+      # run a temporary server on the Unix socket only, which pg_isready inside
+      # the container would report ready before the real one starts.
+      - name: Start Postgres
+        run: |
+          docker run -d --name postgres -p 5432:5432 \
+            -e POSTGRES_USER=supabase_admin \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=postgres_test \
+            "$PG_IMAGE"
+          for _ in $(seq 1 60); do
+            if pg_isready -h localhost -p 5432 -U supabase_admin -d postgres_test -q; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs postgres
+          echo "::error::Postgres did not become ready"
+          exit 1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      # A fresh database from template0, so no extension comes pre-created
+      # from the image's template1; vector first, because pg_search requires it.
+      - name: Create the test database
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U supabase_admin -d postgres_test -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE pg_search_test TEMPLATE template0"
+          psql -h localhost -U supabase_admin -d pg_search_test -v ON_ERROR_STOP=1 \
+            -c "CREATE EXTENSION vector" \
+            -c "CREATE EXTENSION pg_search"
+          # The image's marker that its pg_search can build a bm25 index under
+          # writes; without it the service builds none, and the suite fails.
+          marker=$(psql -h localhost -U supabase_admin -d pg_search_test -tA \
+            -c "SELECT current_setting('powabase.pg_search_cic_safe', true)")
+          if [ "$marker" != "on" ]; then
+            echo "::error::the image does not set powabase.pg_search_cic_safe = on (got '$marker')"
+            exit 1
+          fi
+
+      - name: Run pg_search tests
+        run: |
+          set -o pipefail
+          uv run --no-sync pytest tests/pg_search -q -rs | tee pytest-pg-search.log
+          if grep -Eq "[0-9]+ skipped" pytest-pg-search.log; then
+            echo "::error::tests/pg_search skipped tests; this job must run all of them"
+            exit 1
+          fi
+
+      # A backend that crashed restarts the server and fails whatever test was
+      # running, but a crash between tests, or one the retries absorbed, would
+      # not fail the run. The server's own log says so either way -- and it
+      # also records the pg_search bug's failures that crash nothing (XX000
+      # "buffer ... is not owned by resource owner", and the warning a leaked
+      # buffer pin leaves at commit).
+      - name: Check the server log for crashed backends and pg_search buffer errors
+        if: always()
+        run: |
+          if docker logs postgres 2>&1 \
+              | grep -E "terminated by signal|not owned by resource owner|buffer refcount leak"; then
+            echo "::error::a Postgres backend crashed, or pg_search reported a buffer error"
+            exit 1
+          fi
+
+      - name: Postgres log
+        if: failure()
+        run: docker logs postgres 2>&1 | tail -n 300

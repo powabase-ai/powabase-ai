@@ -18,6 +18,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from ..db import AI_SCHEMA
+from . import pg_bm25_index
 from .kb_search_config import HNSW_ITERATIVE_SCAN_MODE
 from .settings_registry import SETTINGS_REGISTRY, get_setting
 
@@ -135,6 +136,14 @@ class KeywordSearchTimeout(RuntimeError):
 # bad values, which is bounded by how often someone writes the setting.
 _WARNED_TIMEOUT_OVERRIDES: set[str] = set()
 
+# pg_search keyword-search failures already reported at WARNING, keyed by KB,
+# table and the failure's first line, so a different cause of the same
+# exception type is reported too. One per knowledge base can add up, so the
+# set is cleared when it reaches the bound: a persisting failure then warns
+# again, once.
+_WARNED_PG_BM25_FAILURES: set[str] = set()
+_WARNED_PG_BM25_FAILURES_MAX = 1024
+
 
 def _warn_once_per_bad_value(key: str, message: str, *args: Any) -> None:
     """WARNING the first time this exact bad value is seen, DEBUG afterwards."""
@@ -142,6 +151,17 @@ def _warn_once_per_bad_value(key: str, message: str, *args: Any) -> None:
         logger.debug(message, *args)
         return
     _WARNED_TIMEOUT_OVERRIDES.add(key)
+    logger.warning(message, *args)
+
+
+def _warn_once_per_pg_bm25_failure(key: str, message: str, *args: Any) -> None:
+    """WARNING the first time this failure is seen (within the bound), DEBUG afterwards."""
+    if key in _WARNED_PG_BM25_FAILURES:
+        logger.debug(message, *args)
+        return
+    if len(_WARNED_PG_BM25_FAILURES) >= _WARNED_PG_BM25_FAILURES_MAX:
+        _WARNED_PG_BM25_FAILURES.clear()
+    _WARNED_PG_BM25_FAILURES.add(key)
     logger.warning(message, *args)
 
 
@@ -717,6 +737,139 @@ class BasePgVectorStore:
             logger.error(f"Full-text search failed: {e}")
             raise
 
+    async def pg_bm25_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        filter_metadata: dict | None = None,
+        item_ids: set[str] | None = None,
+        _resolve: bool = True,
+        source_ids: list[str] | None = None,
+    ) -> list[RetrievedItem]:
+        """BM25 search answered by this KB's pg_search index.
+
+        The query names the knowledge base's **partition** of the item table,
+        not the table. pg_search refuses a scored query against a partitioned
+        parent outright ("does not contain a `USING bm25` index"), whatever
+        predicate would have pruned it to one indexed partition — so the
+        partition is the only relation that can answer, and its LIST bound is
+        what restricts the result to this knowledge base. No
+        ``knowledge_base_id`` predicate is therefore needed.
+
+        The relation name is the one interpolated value, and it is built from a
+        UUID that has been through ``uuid.UUID()``, so nothing a caller supplies
+        reaches SQL as an identifier. Every other value, the query text
+        included, is bound. Requires the partition's index to exist and be valid
+        — see ``pg_bm25_index.bm25_index_ready``.
+
+        Matching differs from the tsvector fallback: ``|||`` matches a row
+        containing ANY of the query's terms and lets the BM25 score rank rows
+        with more of them higher (like the bm25s file index), while the
+        fallback's ``websearch_to_tsquery`` requires ALL terms. So a multi-word
+        query can return rows here that the fallback would not.
+        """
+        partition = pg_bm25_index.partition_name(self.kb_id, self.TABLE)
+        normalized = pg_bm25_index.normalize_bm25_query(query)
+        if not normalized:
+            return []
+
+        match_expression = pg_bm25_index.bm25_text_expression(self.TABLE, alias="c")
+        search_query = f"""
+            SELECT
+                c.id,
+                c.{self.TEXT_COL},
+                pdb.score(c.id) AS score,
+                c.source_id,
+                c.meta
+            FROM "{self.schema}".{partition} c
+            WHERE {match_expression} ||| :bm25_query
+        """
+        params: dict[str, Any] = {"bm25_query": normalized}
+
+        if item_ids is not None:
+            search_query += " AND c.id = ANY(CAST(:item_ids AS uuid[]))"
+            params["item_ids"] = "{" + ",".join(item_ids) + "}"
+
+        if source_ids is not None:
+            search_query += " AND c.source_id = ANY(CAST(:source_ids AS uuid[]))"
+            params["source_ids"] = "{" + ",".join(source_ids) + "}"
+
+        if filter_metadata:
+            for key, value in filter_metadata.items():
+                search_query += f" AND c.meta @> CAST(:filter_{key} AS jsonb)"
+                params[f"filter_{key}"] = json.dumps({key: value})
+
+        search_query += """
+            ORDER BY pdb.score(c.id) DESC
+            LIMIT :top_k
+        """
+        params["top_k"] = top_k
+
+        # Inside a savepoint so a failure leaves the caller's session usable.
+        # Without it, a rejected query aborts the whole transaction and the
+        # keyword fallback dies too with "current transaction is aborted" —
+        # which is exactly the case this path has to degrade through.
+        with self.session.begin_nested():
+            rows = self.session.execute(text(search_query), params).fetchall()
+
+        items = [
+            RetrievedItem(
+                item_id=str(row[0]),
+                text=row[1],
+                score=float(row[2]) if row[2] is not None else 0.0,
+                source_id=str(row[3]) if row[3] else None,
+                knowledge_base_id=self.kb_id,
+                meta=row[4] or {},
+            )
+            for row in rows
+        ]
+        return self._resolve_results(items) if _resolve else items
+
+    def _pg_bm25_is_usable(self) -> bool:
+        """Can this KB's keyword leg be served by pg_search right now?
+
+        Never raises: this runs on the search path, where an unanswerable
+        question has to mean "keep the old path". Readiness is only probed
+        once the extension is known to be installed, and both answers are
+        cached, so the common case costs nothing.
+        """
+        try:
+            if not pg_bm25_index.pg_search_installed(self.session):
+                return False
+            return pg_bm25_index.bm25_index_ready(self.session, self.kb_id, self.TABLE)
+        except Exception as exc:
+            logger.debug(
+                "Could not determine pg_search availability for KB %s: %s; "
+                "using the existing keyword path",
+                self.kb_id,
+                exc,
+            )
+            return False
+
+    def _file_index_retired(self) -> bool:
+        """Has this KB's keyword index moved to pg_search for good? Never raises.
+
+        True once the extension is installed and the KB has its own attached
+        partition of this table: from then on nothing maintains the bm25s file
+        index. "Can't tell" is False, which keeps today's behaviour.
+        """
+        try:
+            if self.TABLE not in pg_bm25_index.PARTITIONED_ITEM_TABLES:
+                return False
+            if not pg_bm25_index.pg_search_installed(self.session):
+                return False
+            return pg_bm25_index.partition_exists(self.session, self.kb_id, self.TABLE)
+        except Exception as exc:
+            _warn_once_per_pg_bm25_failure(
+                f"{self.kb_id}:{self.TABLE}:file-index-check:{pg_bm25_index.first_error_line(exc)[:200]}",
+                "Could not tell whether KB %s has its own partition of %s (%s); reading its "
+                "bm25s file index if it has one",
+                self.kb_id,
+                self.TABLE,
+                pg_bm25_index.first_error_line(exc),
+            )
+            return False
+
     async def bm25s_search(
         self,
         query: str,
@@ -726,10 +879,12 @@ class BasePgVectorStore:
         _resolve: bool = True,
         source_ids: list[str] | None = None,
     ) -> list[RetrievedItem]:
-        """BM25 search using pre-built bm25s index.
+        """BM25 keyword search: pg_search index, else bm25s file index, else SQL.
 
-        Uses the sparse_retrieval package for fast pre-indexed BM25 search.
-        Falls back to legacy full_text_search() if no index exists.
+        Prefers this KB's pg_search index when the extension is installed and
+        that index is ready. Otherwise the pre-built bm25s file index -- unless
+        the KB already has its own partition, whose file index is no longer
+        maintained -- and failing that the bounded tsvector fallback.
 
         Args:
             query: Search query (may include conversation context).
@@ -743,6 +898,55 @@ class BasePgVectorStore:
             List of RetrievedItem ordered by BM25 score.
         """
         from .sparse_retrieval import SparseIndexStore
+
+        if self._pg_bm25_is_usable():
+            try:
+                return await self.pg_bm25_search(
+                    query,
+                    top_k=top_k,
+                    filter_metadata=filter_metadata,
+                    item_ids=item_ids,
+                    _resolve=_resolve,
+                    source_ids=source_ids,
+                )
+            except Exception as exc:
+                # Once per KB, table and cause at WARNING, without a traceback:
+                # this runs on every search for as long as the cause lasts (a
+                # readiness answer cached past a dropped index, say).
+                cause = pg_bm25_index.first_error_line(exc)
+                _warn_once_per_pg_bm25_failure(
+                    f"{self.kb_id}:{self.TABLE}:{cause[:200]}",
+                    "pg_search keyword search failed for KB %s table %s (%s); "
+                    "falling back to the existing keyword path",
+                    self.kb_id,
+                    self.TABLE,
+                    cause,
+                )
+
+        if self._file_index_retired():
+            # Once this KB has its own partition, indexing no longer maintains
+            # its bm25s file index, so that file is frozen at the move. While
+            # the KB's own index is not usable (being built, rebuilt for a new
+            # language, INVALID), answer from the live rows instead.
+            # Once per KB and table at WARNING: every search takes this path
+            # while the index is missing, and the fallback can time out on a
+            # large KB, so an index that never comes back must be visible.
+            _warn_once_per_pg_bm25_failure(
+                f"{self.kb_id}:{self.TABLE}:tsvector-fallback",
+                "pg_search index for KB %s table %s is not usable (building, INVALID, or not "
+                "built on this server); keyword search falls back to the slower tsvector scan "
+                "until it is. See the KB's bm25_status",
+                self.kb_id,
+                self.TABLE,
+            )
+            return await self.full_text_search(
+                query,
+                top_k,
+                filter_metadata,
+                item_ids,
+                _resolve=_resolve,
+                source_ids=source_ids,
+            )
 
         sparse_store = SparseIndexStore(knowledge_base_id=self.kb_id)
 
@@ -835,10 +1039,13 @@ class BasePgVectorStore:
         query = f"""
             SELECT id, {self.TEXT_COL}, source_id, meta
             FROM "{self.schema}".{self.TABLE}
-            WHERE id IN ({placeholders})
+            WHERE knowledge_base_id = :kb_id AND id IN ({placeholders})
         """
 
-        params = {f"id_{i}": id for i, id in enumerate(item_ids)}
+        # The KB predicate prunes to one partition, and ids are only unique per
+        # partition once the table is partitioned by knowledge base.
+        params: dict[str, Any] = {f"id_{i}": id for i, id in enumerate(item_ids)}
+        params["kb_id"] = self.kb_id
 
         try:
             result = self.session.execute(text(query), params)

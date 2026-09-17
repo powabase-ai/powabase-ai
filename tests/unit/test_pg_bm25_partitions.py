@@ -1,0 +1,368 @@
+"""Unit specs for the per-knowledge-base partition layer.
+
+``pg_search`` allows one ``USING bm25`` index per relation, so every knowledge
+base can only have its own index if every knowledge base has its own relation.
+The item tables are therefore partitioned ``BY LIST (knowledge_base_id)``, and
+these specs pin the part that is pure string work: which tables are
+partitioned, what a partition is called, and the exact DDL that creates,
+attaches, fills, detaches and indexes one.
+"""
+
+from __future__ import annotations
+
+import re
+import uuid
+
+import pytest
+
+from agentic_project_service.services import pg_bm25_index as pgb
+
+KB = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+KB2 = "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+KB_HEX = uuid.UUID(KB).hex
+
+
+# ---------------------------------------------------------------------------
+# Which tables are partitioned
+# ---------------------------------------------------------------------------
+
+
+def test_the_three_bm25_backed_tables_are_partitioned():
+    assert pgb.PARTITIONED_ITEM_TABLES == frozenset(
+        {"chunks", "full_documents", "graph_index_nodes"}
+    )
+
+
+def test_doc2json_documents_is_neither_indexed_nor_partitioned():
+    """It keeps the tsvector fallback keyword path, so it is never given a
+    bm25 index or a partition."""
+    assert "doc2json_documents" not in pgb.BM25_ITEM_TABLES
+    assert "doc2json_documents" not in pgb.PARTITIONED_ITEM_TABLES
+
+
+def test_every_partitioned_table_is_a_bm25_item_table():
+    assert pgb.PARTITIONED_ITEM_TABLES <= pgb.BM25_ITEM_TABLES
+
+
+# ---------------------------------------------------------------------------
+# Partition naming
+# ---------------------------------------------------------------------------
+
+
+def test_partition_name_is_deterministic_and_derived_from_the_kb_uuid():
+    assert pgb.partition_name(KB, "chunks") == f"chunks_kb_{KB_HEX}"
+    assert pgb.partition_name(KB, "chunks") == pgb.partition_name(KB, "chunks")
+    assert pgb.partition_name(KB, "chunks") != pgb.partition_name(KB2, "chunks")
+    assert pgb.partition_name(KB, "chunks") != pgb.partition_name(KB, "full_documents")
+
+
+def test_partition_name_accepts_a_uuid_object_and_any_uuid_spelling():
+    braced = "{3F2504E0-4F89-11D3-9A0C-0305E82C3301}"
+    assert pgb.partition_name(uuid.UUID(KB), "chunks") == pgb.partition_name(KB, "chunks")
+    assert pgb.partition_name(braced, "chunks") == pgb.partition_name(KB, "chunks")
+
+
+def test_partition_name_is_a_bare_lowercase_identifier():
+    """No dashes, no quoting needed, no case-folding surprises."""
+    for item_table in pgb.PARTITIONED_ITEM_TABLES:
+        name = pgb.partition_name(KB, item_table)
+        assert re.fullmatch(r"[a-z][a-z0-9_]*", name), name
+
+
+def test_partition_name_fits_the_postgres_identifier_limit_for_every_table():
+    for item_table in pgb.PARTITIONED_ITEM_TABLES:
+        name = pgb.partition_name(KB, item_table)
+        assert len(name.encode("utf-8")) <= 63, (item_table, name)
+
+
+def test_partition_name_rejects_anything_that_is_not_a_uuid():
+    for bad in ["kb'; DROP TABLE ai.chunks; --", "", None, "chunks_kb_x"]:
+        with pytest.raises(ValueError):
+            pgb.partition_name(bad, "chunks")
+
+
+def test_partition_name_rejects_a_table_that_is_not_partitioned():
+    with pytest.raises(ValueError):
+        pgb.partition_name(KB, "doc2json_documents")
+    with pytest.raises(ValueError):
+        pgb.partition_name(KB, "not_an_item_table")
+
+
+def test_default_partition_name_is_the_table_plus_default():
+    assert pgb.default_partition_name("chunks") == "chunks_default"
+    assert pgb.default_partition_name("graph_index_nodes") == "graph_index_nodes_default"
+    with pytest.raises(ValueError):
+        pgb.default_partition_name("doc2json_documents")
+
+
+# ---------------------------------------------------------------------------
+# Index DDL — now on the partition, and no longer partial
+# ---------------------------------------------------------------------------
+
+
+def test_index_ddl_targets_the_partition_and_has_no_predicate():
+    ddl = pgb.bm25_index_ddl(KB, "chunks", "german")
+
+    assert f'ON "ai".chunks_kb_{KB_HEX} ' in ddl
+    assert "WHERE" not in ddl
+    assert "knowledge_base_id" not in ddl
+    assert ddl.startswith(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS bm25_chunks_{KB_HEX} ")
+    assert "USING bm25 (id, (text::pdb.simple('stemmer=german')), source_id, meta)" in ddl
+    assert "WITH (key_field = 'id')" in ddl
+
+
+def test_index_ddl_for_the_expression_table_keeps_its_alias():
+    ddl = pgb.bm25_index_ddl(KB, "graph_index_nodes", "french")
+
+    assert f'ON "ai".graph_index_nodes_kb_{KB_HEX} ' in ddl
+    assert "'alias=bm25_text'" in ddl
+    assert "'stemmer=french'" in ddl
+    assert "WHERE" not in ddl
+
+
+def test_index_ddl_for_full_documents_indexes_the_summary():
+    ddl = pgb.bm25_index_ddl(KB, "full_documents", None)
+
+    assert f'ON "ai".full_documents_kb_{KB_HEX} ' in ddl
+    assert "(summary::pdb.simple)" in ddl
+    assert "stemmer" not in ddl
+
+
+def test_index_ddl_refuses_an_unpartitioned_table():
+    """An index on ``doc2json_documents`` has nowhere to live."""
+    with pytest.raises(ValueError):
+        pgb.bm25_index_ddl(KB, "doc2json_documents", "english")
+
+
+def test_drop_index_ddl_is_unchanged_and_concurrent():
+    assert pgb.bm25_drop_ddl(KB, "chunks") == (
+        f'DROP INDEX CONCURRENTLY IF EXISTS "ai".bm25_chunks_{KB_HEX}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Partition lifecycle DDL
+# ---------------------------------------------------------------------------
+
+
+def test_create_partition_ddl_clones_the_default_partition_as_a_bare_heap():
+    """No indexes: the rows are copied into a bare heap and indexed in bulk."""
+    ddl = pgb.partition_create_ddl(KB, "chunks")
+
+    assert ddl == (
+        f'CREATE TABLE IF NOT EXISTS "ai".chunks_kb_{KB_HEX} '
+        '(LIKE "ai".chunks_default '
+        "INCLUDING DEFAULTS INCLUDING CONSTRAINTS "
+        "INCLUDING STORAGE INCLUDING COMMENTS)"
+    )
+
+
+def test_attach_partition_ddl_binds_exactly_this_kb():
+    ddl = pgb.partition_attach_ddl(KB, "chunks")
+
+    assert ddl == (
+        f'ALTER TABLE "ai".chunks ATTACH PARTITION "ai".chunks_kb_{KB_HEX} FOR VALUES IN (\'{KB}\')'
+    )
+
+
+def test_detach_and_drop_partition_ddl():
+    assert pgb.partition_detach_ddl(KB, "full_documents") == (
+        f'ALTER TABLE "ai".full_documents DETACH PARTITION "ai".full_documents_kb_{KB_HEX}'
+    )
+    assert pgb.partition_drop_ddl(KB, "full_documents") == (
+        f'DROP TABLE IF EXISTS "ai".full_documents_kb_{KB_HEX}'
+    )
+
+
+def test_the_move_copies_then_deletes_and_binds_the_kb():
+    insert_sql, delete_sql = pgb.move_rows_sql(KB, "chunks", ["id", "knowledge_base_id", "text"])
+
+    # Identifiers are interpolated (validated); values are bound. The columns
+    # are named on both sides: a clone left by an earlier failed move does not
+    # receive a column added to the parent since, and ``SELECT *`` would then
+    # hand it more values than it has columns.
+    assert insert_sql == (
+        f'INSERT INTO "ai".chunks_kb_{KB_HEX} (id, knowledge_base_id, text) '
+        'SELECT id, knowledge_base_id, text FROM "ai".chunks_default '
+        "WHERE knowledge_base_id = CAST(:kb AS uuid)"
+    )
+    assert delete_sql == (
+        'DELETE FROM "ai".chunks_default WHERE knowledge_base_id = CAST(:kb AS uuid)'
+    )
+    assert KB not in insert_sql + delete_sql, "the KB id must be bound, not interpolated"
+
+
+def test_the_partition_carries_a_check_constraint_matching_its_bound():
+    """What lets the ATTACH skip its validation scan of the new partition.
+
+    Postgres skips the scan when the table being attached already has a CHECK
+    constraint that implies the partition constraint. Without it, ATTACH reads
+    every row of the partition while holding ACCESS EXCLUSIVE -- exactly the
+    window this design is trying to keep short.
+    """
+    ddl = pgb.partition_check_ddl(KB, "chunks")
+
+    assert ddl == (
+        f'ALTER TABLE "ai".chunks_kb_{KB_HEX} '
+        f"ADD CONSTRAINT chunks_kb_{KB_HEX}_kb_check "
+        f"CHECK (knowledge_base_id = '{KB}')"
+    )
+
+
+def test_the_check_constraint_name_fits_the_identifier_limit():
+    for item_table in pgb.PARTITIONED_ITEM_TABLES:
+        ddl = pgb.partition_check_ddl(KB, item_table)
+        name = ddl.split("ADD CONSTRAINT ")[1].split(" ")[0]
+        assert len(name.encode("utf-8")) <= 63, (item_table, name)
+
+
+def test_check_ddl_refuses_an_unpartitioned_table():
+    with pytest.raises(ValueError):
+        pgb.partition_check_ddl(KB, "doc2json_documents")
+
+
+# ---------------------------------------------------------------------------
+# Serialising partition builds per item table
+# ---------------------------------------------------------------------------
+
+
+def test_the_build_lock_is_a_try_lock_keyed_on_the_qualified_table():
+    """Two moves out of the same DEFAULT partition deadlock each other.
+
+    Each holds SHARE on ``<table>_default`` and then asks to upgrade to the
+    ACCESS EXCLUSIVE its own ATTACH needs, so each waits for the other's SHARE:
+    ``deadlock detected``, observed on a real project. A Postgres advisory lock
+    keyed on the item table serialises the whole move instead, and the *try*
+    form is what makes the wait bounded -- a caller that cannot get it is told
+    to retry rather than left blocking.
+    """
+    sql = pgb.partition_build_lock_sql()
+
+    assert "pg_try_advisory_lock" in sql
+    assert "hashtextextended(:relation, 0)" in sql
+    assert "ai" not in sql, "the relation is bound, not interpolated"
+
+
+def test_the_build_lock_is_released_by_name_not_by_transaction():
+    """It has to outlive the transactions: preparing the clone, the move and the
+    index build are separate ones."""
+    assert "pg_advisory_unlock" in pgb.partition_build_unlock_sql()
+    assert "hashtextextended(:relation, 0)" in pgb.partition_build_unlock_sql()
+
+
+def test_the_build_lock_relation_is_schema_qualified():
+    assert pgb.partition_build_lock_relation("chunks") == "ai.chunks"
+    with pytest.raises(ValueError):
+        pgb.partition_build_lock_relation("doc2json_documents")
+
+
+def test_a_contended_build_is_a_named_error_not_a_bare_exception():
+    assert issubclass(pgb.PartitionBuildInProgress, Exception)
+
+
+def test_the_parent_is_locked_against_writers_not_readers():
+    """SHARE on the parent itself, which is what makes a mid-move write safe.
+
+    A write through the parent resolves its partitions when it is planned. One
+    that only waited on the DEFAULT partition's lock would already have planned
+    against the old partition list, and after the ATTACH it would find the
+    moved rows gone: an UPDATE or DELETE silently matching nothing. Waiting on
+    the parent's own lock instead, it plans after the ATTACH commits and reaches
+    the rows in their new partition. ``ONLY``, because a LOCK on a partitioned
+    table otherwise recurses into every partition. SHARE conflicts with ROW
+    EXCLUSIVE and not with ACCESS SHARE, so readers carry on.
+    """
+    assert pgb.partition_lock_parent_ddl("chunks") == ('LOCK TABLE ONLY "ai".chunks IN SHARE MODE')
+    with pytest.raises(ValueError):
+        pgb.partition_lock_parent_ddl("doc2json_documents")
+
+
+def test_the_default_partition_is_locked_against_writers_not_readers():
+    """Also SHARE on DEFAULT, for any writer that names the partition directly."""
+    sql = pgb.partition_lock_default_ddl("chunks")
+
+    assert sql == 'LOCK TABLE "ai".chunks_default IN SHARE MODE'
+    with pytest.raises(ValueError):
+        pgb.partition_lock_default_ddl("doc2json_documents")
+
+
+def test_move_sql_refuses_an_unpartitioned_table():
+    with pytest.raises(ValueError):
+        pgb.move_rows_sql(KB, "doc2json_documents", ["id"])
+
+
+def test_move_sql_refuses_an_empty_column_list():
+    with pytest.raises(ValueError):
+        pgb.move_rows_sql(KB, "chunks", [])
+
+
+def test_mirror_relation_settings_sql_copies_owner_grants_and_rls():
+    sql = pgb.mirror_relation_settings_sql('"ai".chunks', '"ai".chunks_kb_x')
+
+    assert "OWNER TO" in sql
+    assert "GRANT" in sql
+    assert "ROW LEVEL SECURITY" in sql
+    assert '"ai".chunks' in sql
+    assert '"ai".chunks_kb_x' in sql
+
+
+def test_copy_policies_sql_recreates_every_policy_of_the_source_on_the_target():
+    """A new relation starts with RLS policies of its own -- none.
+
+    With RLS enabled and no policy, a role without BYPASSRLS reads nothing, and
+    the search path reads partitions by name. Every clause of each policy is
+    carried: permissive or restrictive, command, roles, USING, WITH CHECK.
+    """
+    sql = pgb.copy_policies_sql('"ai".chunks', '"ai".chunks_kb_x')
+
+    assert "pg_policy" in sql
+    assert "'\"ai\".chunks'::regclass" in sql
+    assert 'CREATE POLICY %I ON "ai".chunks_kb_x' in sql
+    # A policy already on the target by that name is left alone.
+    assert "'\"ai\".chunks_kb_x'::regclass" in sql
+    assert "NOT EXISTS" in sql
+    for clause in ("polpermissive", "polcmd", "polroles", "polqual", "polwithcheck"):
+        assert clause in sql, clause
+
+
+def test_mirroring_a_relation_also_copies_its_policies():
+    sql = pgb.mirror_relation_settings_sql('"ai".chunks', '"ai".chunks_kb_x')
+    assert pgb.copy_policies_sql('"ai".chunks', '"ai".chunks_kb_x') in sql
+
+
+def test_every_bm25_item_table_is_partitioned():
+    """A bm25 index needs a relation per knowledge base; ensure_bm25_index no
+    longer has a "not partitionable" branch to fall back on."""
+    assert pgb.BM25_ITEM_TABLES <= pgb.PARTITIONED_ITEM_TABLES
+
+
+class _SqlRecorder:
+    def __init__(self):
+        self.sql: list[str] = []
+
+    def execute(self, statement, params=None):
+        from unittest.mock import MagicMock
+
+        self.sql.append(" ".join(getattr(statement, "text", str(statement)).split()))
+        result = MagicMock()
+        result.scalar.return_value = False
+        return result
+
+
+def test_the_waiting_holder_check_only_counts_locks_in_this_database():
+    """``pg_locks`` covers the whole cluster, and relation OIDs are only unique
+    within one database: a database copied from a template shares its OIDs.
+    So the DEFAULT lock is matched as a relation lock of *this* database, and
+    the waiting row, found through the same backend, is either a lock with no
+    database (a transaction id, say) or one of this database or a shared
+    catalog -- never another database's relation that happens to share the OID.
+    """
+    conn = _SqlRecorder()
+
+    assert pgb._default_holder_is_waiting(conn, "chunks") is False
+
+    (sql,) = conn.sql
+    this_database = "(SELECT oid FROM pg_database WHERE datname = current_database())"
+    assert "held.locktype = 'relation'" in sql
+    assert f"held.database = {this_database}" in sql
+    assert f"waiting.database IS NULL OR waiting.database IN (0, {this_database})" in sql
