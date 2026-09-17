@@ -1219,7 +1219,6 @@ def test_creating_a_vector_only_kb_dispatches_nothing(mock_db, mock_ensure, _jwt
 @patch(
     "agentic_project_service.routes.knowledge_bases._pg_ensure_cannot_move_rows",
     new=MagicMock(return_value=True),
-    create=True,
 )
 @patch(
     "agentic_project_service.routes.knowledge_bases._keyword_index_backend",
@@ -1251,7 +1250,6 @@ def test_changing_ts_language_dispatches_a_rebuild(
 @patch(
     "agentic_project_service.routes.knowledge_bases._pg_ensure_cannot_move_rows",
     new=MagicMock(return_value=True),
-    create=True,
 )
 @patch(
     "agentic_project_service.routes.knowledge_bases._keyword_index_backend",

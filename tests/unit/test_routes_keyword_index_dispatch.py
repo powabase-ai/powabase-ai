@@ -53,14 +53,13 @@ def tasks():
 
 class _gate:
     """Patch the two catalog reads that decide whether a PATCH may dispatch the
-    ensure. ``kb_has_rows_in_default`` is created if the service does not
-    define it yet."""
+    ensure."""
 
     def __init__(self, partition, rows_in_default):
         self._patches = {
             "partition_exists": patch(f"{S}.partition_exists", return_value=partition),
             "kb_has_rows_in_default": patch(
-                f"{S}.kb_has_rows_in_default", return_value=rows_in_default, create=True
+                f"{S}.kb_has_rows_in_default", return_value=rows_in_default
             ),
         }
 
