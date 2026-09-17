@@ -2712,6 +2712,14 @@ def _outcome_bind():
         return None
 
 
+# The recorded reason for an automatic build that found rows to move.
+ROW_MOVE_NOT_ALLOWED_REASON = (
+    "not built: the knowledge base has rows in the item table's shared DEFAULT partition, "
+    "and moving them blocks writes to the whole table, so only an operator starts it: "
+    "POST /build-bm25"
+)
+
+
 def _bm25_failure_reason(exc: BaseException) -> str:
     """A short, client-safe reason for a failed move or build: no SQL, no query text."""
     step = getattr(exc, "bm25_move_step", None)
@@ -2766,12 +2774,16 @@ def _retire_file_index(kb_id: str, item_table: str) -> None:
 
 @celery_app.task(bind=True, max_retries=PG_BM25_TASK_MAX_RETRIES)
 @billing.no_billing_context
-def ensure_pg_bm25_index(self, kb_id: str) -> dict:
+def ensure_pg_bm25_index(self, kb_id: str, allow_row_move: bool = False) -> dict:
     """Give this KB its own partition and pg_search BM25 index.
 
     Dispatched for a new knowledge base when it is created, from a PATCH only
     when that cannot move rows (the KB's partition already exists, or DEFAULT
-    holds none of its rows), and by the operator's ``POST /build-bm25``. The
+    holds none of its rows), and by the operator's ``POST /build-bm25`` -- the
+    only caller that passes ``allow_row_move=True``. Without it, a KB found
+    with rows in DEFAULT is not moved -- not even when they are its own
+    sources, indexed while this run waited or retried -- and the run records
+    ``failed`` with a reason that points at ``POST /build-bm25``. With it, the
     first run for a KB with rows in DEFAULT moves them into a partition of its
     own, in one transaction: writes to the whole item table (every KB on it)
     wait for the move -- see ``pg_bm25_index.create_partition`` for measured
@@ -2824,7 +2836,9 @@ def ensure_pg_bm25_index(self, kb_id: str) -> dict:
 
     record("queued")
     try:
-        outcome = pg_bm25_index.ensure_bm25_index(kb_id, on_progress=record)
+        outcome = pg_bm25_index.ensure_bm25_index(
+            kb_id, on_progress=record, allow_row_move=allow_row_move
+        )
     except Exception as exc:
         reason = _bm25_failure_reason(exc)
         if pg_bm25_index.is_transient_db_error(exc):
@@ -2845,6 +2859,13 @@ def ensure_pg_bm25_index(self, kb_id: str) -> dict:
         _retire_file_index(kb_id, outcome["item_table"])
     if status in ("ready", "building"):
         record(status)
+    elif skip_reason == "row_move_not_allowed":
+        record("failed", ROW_MOVE_NOT_ALLOWED_REASON)
+        logger.warning(
+            "Not building the BM25 index of KB %s: its rows are in the item table's DEFAULT "
+            "partition, and this build was dispatched automatically. POST /build-bm25 to move them",
+            kb_id,
+        )
     elif status == "skipped":
         record("failed", f"not built: {skip_reason}")
     return outcome

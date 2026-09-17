@@ -304,3 +304,58 @@ def test_chunk_indexing_does_not_queue_behind_a_graph_move_waiting_for_its_gate(
     reason = _bm25_failure_reason(error)
     assert "graph_index source is indexing" in reason, reason
 
+
+def test_a_failed_move_lets_indexing_back_in_before_it_finishes_cleaning_up(
+    engine, session, monkeypatch
+):
+    """A reader that arrives mid-move makes the ATTACH give up and keeps DEFAULT
+    through the first tries to drop the move's check. The gate is released
+    then, not after the whole cleanup wait, so indexing on the table is not
+    held off while the rest of the cleanup waits for the reader."""
+    _seed(session, KB_A, 2_000)
+    monkeypatch.setattr(pgb, "MOVE_CHECK_CLEANUP_WAIT_SECONDS", 4.0)
+    reader_holds_seconds = 3.0
+    real_keys = pgb._build_move_indexes_and_keys
+    reader_started = threading.Event()
+
+    def a_reader_arrives(conn, kb_id, item_table, **kwargs):
+        def read():
+            with engine.connect() as reader:
+                reader.execute(text(f"SELECT count(*) FROM {SCHEMA}.chunks_default"))
+                reader_started.set()
+                time.sleep(reader_holds_seconds)
+                reader.rollback()
+
+        threading.Thread(target=read, daemon=True).start()
+        reader_started.wait(timeout=10)
+        return real_keys(conn, kb_id, item_table, **kwargs)
+
+    monkeypatch.setattr(pgb, "_build_move_indexes_and_keys", a_reader_arrives)
+    released: list[float] = []
+    real_release = pgb._MoveGate.release
+
+    def spy_release(self):
+        if self.held:
+            released.append(time.monotonic())
+        real_release(self)
+
+    monkeypatch.setattr(pgb._MoveGate, "release", spy_release)
+
+    started = time.monotonic()
+    try:
+        pgb.create_partition(engine, KB_A, "chunks")
+    except Exception as exc:
+        error = exc
+    else:
+        error = None
+    failed_at = time.monotonic()
+
+    assert error is not None and pgb.is_lock_conflict(error), error
+    assert error.bm25_move_step == "attach"
+    assert len(released) == 1
+    # Released well before the cleanup ended: the cleanup ran on for at least
+    # a second after it, until the reader let DEFAULT go.
+    assert failed_at - released[0] > 1.0, (released[0] - started, failed_at - started)
+    assert live._move_check_names(session) == []
+    session.rollback()
+    assert _rows_in(session, "chunks_default", KB_A) == 2_000 + len(KB_A_DOCS)

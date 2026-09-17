@@ -58,7 +58,7 @@ def _statuses(recorded):
 def test_a_run_records_queued_first_then_the_services_progress_then_ready(task):
     ensure, _retry, recorded = task
 
-    def service(kb_id, engine=None, on_progress=None):
+    def service(kb_id, engine=None, on_progress=None, allow_row_move=True):
         on_progress("moving")
         on_progress("building")
         return {"status": "ready", "item_table": "chunks"}
@@ -232,6 +232,44 @@ def test_a_failure_to_delete_the_file_index_does_not_fail_the_build(task, monkey
     ):
         assert ensure.run(KB)["status"] == "ready"
     assert recorded[-1][0] == "ready"
+
+
+def test_an_automatic_run_does_not_allow_a_row_move_and_the_operator_run_does(task):
+    ensure, _retry, _recorded = task
+    seen: list[bool] = []
+
+    def service(kb_id, engine=None, on_progress=None, allow_row_move=True):
+        seen.append(allow_row_move)
+        return {"status": "ready", "item_table": "chunks"}
+
+    with patch(f"{SERVICE}.ensure_bm25_index", side_effect=service):
+        ensure.run(KB)
+        ensure.run(KB, allow_row_move=True)
+
+    assert seen == [False, True]
+
+
+def test_rows_found_by_an_automatic_run_record_failed_pointing_at_build_bm25(task, caplog):
+    ensure, retry, recorded = task
+
+    with (
+        caplog.at_level(logging.WARNING),
+        patch(
+            f"{SERVICE}.ensure_bm25_index",
+            return_value={
+                "status": "skipped",
+                "reason": "row_move_not_allowed",
+                "item_table": "chunks",
+            },
+        ),
+    ):
+        ensure.run(KB)
+
+    status, reason, _, _ = recorded[-1]
+    assert status == "failed"
+    assert "POST /build-bm25" in reason and "DEFAULT" in reason
+    retry.assert_not_called()
+    assert "POST /build-bm25" in caplog.text
 
 
 def test_a_graph_nodes_move_that_gives_up_on_its_gate_says_graph_indexing_holds_it():

@@ -270,3 +270,81 @@ def test_the_move_completes_under_the_reindex_mix_and_loses_nothing(engine, sess
     for source, (kb_id, rows) in traffic.expected_sources.items():
         assert counts.get(source) == rows, (source, kb_id, counts.get(source), rows)
     assert _rows_in(session, partition) >= 20_000 + len(KB_A_DOCS)
+
+
+KB_NEW = "7d444840-9dc0-11d1-b245-5ffdce74fad2"
+KB_LATE = "0b9f7c3e-6f1d-4d6a-9a53-2d1e8f4c7b21"
+
+
+def _add_kb(session, kb_id):
+    session.execute(
+        text(
+            f"INSERT INTO {SCHEMA}.knowledge_bases (id, indexing_config, retrieval_config) "
+            'VALUES (CAST(:id AS uuid), \'{"strategy": "chunk_embed"}\'::jsonb, '
+            '\'{"method": "hybrid", "ts_language": "german"}\'::jsonb)'
+        ),
+        {"id": kb_id},
+    )
+    session.commit()
+
+
+def _ensure_within_the_retry_budget(kb_id, engine, attempts):
+    for _ in range(RETRY_BUDGET + 1):
+        try:
+            outcome = pgb.ensure_bm25_index(kb_id, engine=engine, allow_row_move=False)
+            attempts.append(
+                f"{outcome.get('reason') or outcome['status']} rows_moved={outcome.get('rows_moved')}"
+            )
+            return outcome
+        except Exception as exc:
+            assert pgb.is_transient_db_error(exc), str(exc)
+            attempts.append(pgb.first_error_line(exc))
+            time.sleep(1.0)
+    return None
+
+
+def test_an_automatic_ensure_attaches_a_new_kb_under_the_mix_and_never_moves_rows(
+    engine, session, traffic
+):
+    """What KB creation dispatches, under the same traffic. The empty knowledge
+    base is attached within the retry budget -- the gate drains the indexing
+    transactions its lock tries on DEFAULT could not find a gap between -- and a
+    knowledge base whose own rows reached DEFAULT first is not moved at all."""
+    _seed(session, KB_A, 5_000)
+    _add_kb(session, KB_NEW)
+    _add_kb(session, KB_LATE)
+    session.execute(
+        text(
+            f"INSERT INTO {SCHEMA}.chunks (knowledge_base_id, text) "
+            "SELECT CAST(:kb AS uuid), 'neue Quelle ' || g FROM generate_series(1, 3000) g"
+        ),
+        {"kb": KB_LATE},
+    )
+    session.commit()
+    traffic.short_reindexer(KB_A)
+    traffic.short_reindexer(KB_B)
+    traffic.other_writer(KB_B)
+    traffic.other_writer(KB_C)
+    traffic.long_reindexers()
+    time.sleep(3.0)
+
+    new_attempts: list[str] = []
+    late_attempts: list[str] = []
+    new = _ensure_within_the_retry_budget(KB_NEW, engine, new_attempts)
+    late = _ensure_within_the_retry_budget(KB_LATE, engine, late_attempts)
+    assert traffic.finish() == []
+    print(f"automatic ensure: new={new_attempts} late={late_attempts}")
+
+    assert traffic.errors == []
+    assert new is not None and new["status"] == "ready", new_attempts
+    # Attached by one attempt (a later one may only have built the index).
+    assert pgb.partition_exists(session, KB_NEW, "chunks") is True
+    session.rollback()
+    assert late is not None, late_attempts
+    assert (late["status"], late["reason"]) == ("skipped", "row_move_not_allowed")
+    # Zero unscheduled moves: no attempt moved a row, and KB_LATE's rows are all
+    # still in DEFAULT, unattached.
+    assert all("rows_moved=None" in a or "rows_moved=0" in a for a in new_attempts + late_attempts)
+    assert _rows_in(session, "chunks_default", KB_LATE) == 3000
+    assert pgb.partition_exists(session, KB_LATE, "chunks") is False
+    session.rollback()

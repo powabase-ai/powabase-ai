@@ -596,7 +596,7 @@ class TestBuildEndpoint:
         body = resp.get_json()
         assert (body["task_id"], body["knowledge_base_id"]) == ("task-ensure", kb_id)
         assert set(body) == {"task_id", "knowledge_base_id", "note"}
-        tasks["ensure"].delay.assert_called_once_with(kb_id)
+        tasks["ensure"].delay.assert_called_once_with(kb_id, allow_row_move=True)
         tasks["build"].delay.assert_not_called()
 
     def test_without_the_extension_dispatches_only_the_file_build(self, tasks):

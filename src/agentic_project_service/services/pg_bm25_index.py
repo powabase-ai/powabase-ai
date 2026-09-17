@@ -2355,7 +2355,9 @@ def clear_move_check_after_refusal(engine, exc: BaseException) -> list[str]:
     return dropped
 
 
-def _drop_failed_move_check(conn, kb_id: str, item_table: str) -> None:
+def _drop_failed_move_check(
+    conn, kb_id: str, item_table: str, gate: _MoveGate | None = None
+) -> None:
     """After a failed move, keep trying to drop its check for a bounded time.
 
     Never raises: the move's own error is the one the caller needs. A check
@@ -2363,9 +2365,26 @@ def _drop_failed_move_check(conn, kb_id: str, item_table: str) -> None:
     DEFAULT until ``clear_leftover_move_checks`` runs -- after the next
     indexing write it refuses, at the next ``ensure_bm25_index`` on the item
     table, or at start-up.
+
+    With the move ``gate`` still held, the first tries (up to
+    ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS``) run under it, when no indexing
+    transaction on the table can be holding DEFAULT, so they usually succeed at
+    once. If they do not -- an ungated reader is in the way, the usual reason
+    the move failed -- the gate is released before the rest of the wait, so
+    the table's indexing is not held off for it. That is safe: the gate only
+    keeps indexing out of the move, and the move is over. An indexing write of
+    this knowledge base routed to DEFAULT meanwhile is refused by the check
+    (SQLSTATE 23514) and requeued, as it would be after the gate.
     """
     fence = default_move_check_name(kb_id)
     try:
+        if gate is not None and gate.held:
+            try:
+                _drop_move_checks(conn, item_table, [fence], DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
+                return
+            except Exception:
+                conn.rollback()
+                gate.release()
         _drop_move_checks(conn, item_table, [fence], MOVE_CHECK_CLEANUP_WAIT_SECONDS)
     except Exception as exc:
         conn.rollback()
@@ -2394,37 +2413,55 @@ def _kb_rows_in_default(conn, kb_id: str, item_table: str) -> bool:
     )
 
 
-def _attach_empty_partition(engine, conn, kb_id: str, item_table: str) -> dict | None:
+class RowMoveNotAllowed(RuntimeError):
+    """The knowledge base has rows in DEFAULT, and this caller may not move them.
+
+    Moving rows holds writes to the whole item table for the length of the
+    move, so it is only done when an operator asked for it (``POST
+    /build-bm25``). An ensure dispatched automatically -- at knowledge base
+    creation, or by a PATCH -- only ever attaches an empty knowledge base's
+    partition, and raises this when rows turned up in the meantime (its
+    sources were indexed while it waited or retried).
+    """
+
+
+def _attach_empty_partition(
+    engine, conn, kb_id: str, item_table: str, gate: _MoveGate
+) -> dict | None:
     """Attach the partition of a knowledge base with no rows in DEFAULT.
 
     Nothing has to move, so nothing needs writers held off the parent: the
     check that lets ATTACH skip its scan of DEFAULT is added ``NOT VALID`` and
     committed (a brief ACCESS EXCLUSIVE try on DEFAULT), validated in a
     transaction of its own (SHARE UPDATE EXCLUSIVE: readers and writers carry
-    on while DEFAULT is scanned), and then the ATTACH takes a second brief
-    ACCESS EXCLUSIVE try, drops the check and commits. A write of this
-    knowledge base routed to DEFAULT in the meantime is refused by the check
-    (SQLSTATE 23514, which indexing requeues). Every index is built on the
-    empty clone first, and the foreign keys added valid -- both free there.
+    on while DEFAULT is scanned), and then the attaching transaction builds
+    every index on the still-empty clone and adds its foreign keys (both free
+    there), takes a second brief ACCESS EXCLUSIVE try on DEFAULT, attaches,
+    drops the check and commits. A write of this knowledge base routed to
+    DEFAULT in the meantime is refused by the check (SQLSTATE 23514, which
+    indexing requeues).
+
+    Runs under the move gate (``gate``, held by the caller), like a move: the
+    lock tries on DEFAULT would otherwise have to find a gap between the
+    table's indexing transactions, and under steady indexing they find none.
+
+    The indexes and keys are added only in the attaching transaction, so an
+    attempt that gives up at any step leaves a bare clone behind: dropping a
+    clone with foreign keys would take ACCESS EXCLUSIVE on the tables they
+    reference, which holds up their readers.
 
     Returns ``None`` when a row of the knowledge base reached DEFAULT before
-    the check went up (it then fails to validate): the check and the clone
-    are dropped, and the caller prepares a bare clone again and moves the rows
-    the ordinary way. Called under the item table's
-    build lock, with the clone prepared.
+    the check went up (it then fails to validate): the check is dropped, and
+    the caller moves the rows the ordinary way. Called under the item table's
+    build lock, with the bare clone prepared.
     """
     partition = partition_name(kb_id, item_table)
     fence = default_move_check_name(kb_id)
     fence_sql = default_move_check_add_ddl(kb_id, item_table)
     fence_committed = False
     blocked = 0.0
-    step = "build"
+    step = "fence"
     try:
-        conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
-        _build_move_indexes_and_keys(conn, kb_id, item_table, every_index=True)
-        conn.commit()
-
-        step = "fence"
         started = time.monotonic()
         _lock_default_exclusively(conn, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
         conn.execute(text(fence_sql))
@@ -2442,23 +2479,24 @@ def _attach_empty_partition(engine, conn, kb_id: str, item_table: str) -> dict |
                 raise
             conn.rollback()
             logger.info(
-                "A row of KB %s reached %s.%s before its check went up; moving its rows instead",
+                "A row of KB %s reached %s.%s before its check went up; not attaching an "
+                "empty partition",
                 kb_id,
                 AI_SCHEMA,
                 default_partition_name(item_table),
             )
             _drop_move_checks(conn, item_table, [fence])
-            # The clone carries every index now; the move wants it bare.
-            conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
-            conn.execute(text(partition_drop_ddl(kb_id, item_table)))
-            conn.commit()
             return None
         conn.commit()
 
-        step = "attach"
+        step = "indexes, keys and attach"
         attach_sql = partition_attach_ddl(kb_id, item_table)
-        started = time.monotonic()
         conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
+        # Before DEFAULT's lock, not after: adding the keys waits (bounded) for
+        # SHARE ROW EXCLUSIVE on the tables they reference, and must not do that
+        # while holding every reader off DEFAULT.
+        _build_move_indexes_and_keys(conn, kb_id, item_table, every_index=True)
+        started = time.monotonic()
         _lock_default_exclusively(conn, item_table, DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS)
         conn.execute(text(attach_sql))
         conn.execute(text(default_move_check_drop_ddl(item_table, fence)))
@@ -2478,7 +2516,7 @@ def _attach_empty_partition(engine, conn, kb_id: str, item_table: str) -> dict |
             action="Attaching the empty partition of",
         )
         if fence_committed:
-            _drop_failed_move_check(conn, kb_id, item_table)
+            _drop_failed_move_check(conn, kb_id, item_table, gate)
         raise
     logger.info(
         "Attached empty partition %s.%s without moving rows; writes to its DEFAULT partition "
@@ -2490,10 +2528,18 @@ def _attach_empty_partition(engine, conn, kb_id: str, item_table: str) -> dict |
     return {"rows_moved": 0, "writes_blocked_seconds": blocked}
 
 
-def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
+def create_partition(
+    engine, knowledge_base_id: Any, item_table: str, *, allow_row_move: bool = True
+) -> dict:
     """Move one knowledge base into a partition of its own, atomically.
 
     Returns ``{"rows_moved": int, "writes_blocked_seconds": float}``.
+
+    A knowledge base with no rows in DEFAULT is attached without a move
+    (``_attach_empty_partition``). With ``allow_row_move=False`` that is all
+    this does: a knowledge base with rows in DEFAULT raises
+    ``RowMoveNotAllowed`` instead of being moved. Both paths start by taking
+    the item table's move gate (see ``move_gate_relation``).
 
     1. **prepare** (own transaction) -- clone the DEFAULT partition into an
        unattached bare heap (no index, no foreign key) with a CHECK matching
@@ -2631,6 +2677,7 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
 
     with engine.connect() as conn:
         _acquire_partition_build_lock(conn, item_table)
+        gate = _MoveGate(conn, item_table)
         try:
             # Under the build lock no other move is in flight, so every move
             # check still on DEFAULT is a crashed move's leftover -- and one
@@ -2639,25 +2686,35 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
             if _partition_is_attached(conn, kb_id, item_table):
                 return {"rows_moved": 0, "writes_blocked_seconds": 0.0}
 
-            _prepare_partition(conn, kb_id, item_table)
-            if not _kb_rows_in_default(conn, kb_id, item_table):
-                conn.commit()
-                attached = _attach_empty_partition(engine, conn, kb_id, item_table)
+            step = "prepare"
+            try:
+                _prepare_partition(conn, kb_id, item_table)
+                step = "move gate"
+                gate.acquire()
+            except Exception as exc:
+                _fail_move(engine, conn, kb_id, item_table, exc, step=step)
+                raise
+            # Under the gate, so no indexing transaction on the table adds rows
+            # of this knowledge base between this check and the attach.
+            has_rows = _kb_rows_in_default(conn, kb_id, item_table)
+            conn.commit()
+            if not has_rows:
+                attached = _attach_empty_partition(engine, conn, kb_id, item_table, gate)
                 if attached is not None:
                     return attached
-                _prepare_partition(conn, kb_id, item_table)
+            if not allow_row_move:
+                raise RowMoveNotAllowed(
+                    f"knowledge base {kb_id} has rows in {AI_SCHEMA}.{default}; moving them "
+                    "blocks writes to the whole item table, and this build was not asked to"
+                )
             insert_sql, delete_sql = move_rows_sql(
                 kb_id, item_table, _insertable_columns(conn, default)
             )
             conn.commit()
 
             fence_committed = False
-            gate_held = False
-            step = "move gate"
+            step = "pre-flight check of DEFAULT"
             try:
-                _acquire_move_gate(conn, item_table)
-                gate_held = True
-                step = "pre-flight check of DEFAULT"
                 _probe_default_before_moving(conn, item_table)
                 step = "parent lock"
                 conn.execute(text(f"SET LOCAL lock_timeout = '{MOVE_LOCK_TIMEOUT_MS}ms'"))
@@ -2713,12 +2770,10 @@ def create_partition(engine, knowledge_base_id: Any, item_table: str) -> dict:
                 # Only a check that was committed needs dropping; trying anyway
                 # would take DEFAULT's lock again for nothing.
                 if fence_committed:
-                    _drop_failed_move_check(conn, kb_id, item_table)
+                    _drop_failed_move_check(conn, kb_id, item_table, gate)
                 raise
-            finally:
-                if gate_held:
-                    _release_advisory_lock(conn, move_gate_relation(item_table))
         finally:
+            gate.release()
             _release_partition_build_lock(conn, item_table)
 
         # Statistics for the new partition straight away, outside the build
@@ -2839,7 +2894,9 @@ def keyword_item_table(bind, knowledge_base_id: str) -> str | None:
     return item_table if item_table in PARTITIONED_ITEM_TABLES else None
 
 
-def ensure_bm25_index(knowledge_base_id: str, engine=None, on_progress=None) -> dict:
+def ensure_bm25_index(
+    knowledge_base_id: str, engine=None, on_progress=None, *, allow_row_move: bool = True
+) -> dict:
     """Give this KB a partition and a BM25 index on it, reporting what happened.
 
     Idempotent, and a no-op whenever a BM25 index is not the right answer: no
@@ -2858,6 +2915,13 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None, on_progress=None) -> 
     it blocks writes to the whole item table for the length of the move (see
     ``create_partition``), so it is an operator step, scheduled per knowledge
     base: ``POST /knowledge-bases/<id>/build-bm25`` dispatches this.
+
+    ``allow_row_move=False`` is for every other caller. Such an ensure attaches
+    the partition of a knowledge base with no rows in DEFAULT and builds or
+    repairs the index on an existing partition, but a knowledge base with rows
+    in DEFAULT -- including one whose own sources were indexed while this
+    waited or retried -- is returned as ``skipped`` with reason
+    ``row_move_not_allowed``, and nothing is moved.
 
     ``on_progress(status)`` is called with ``"moving"`` before a partition is
     created or its rows are moved, and ``"building"`` before the bm25 index
@@ -2945,9 +3009,14 @@ def ensure_bm25_index(knowledge_base_id: str, engine=None, on_progress=None) -> 
                     "status": "skipped",
                     "reason": "default_partition_absent",
                 }
+            if not allow_row_move and _kb_rows_in_default(conn, kb_id, item_table):
+                return {**outcome, "status": "skipped", "reason": "row_move_not_allowed"}
             progress("moving")
             try:
-                move = create_partition(engine, kb_id, item_table)
+                move = create_partition(engine, kb_id, item_table, allow_row_move=allow_row_move)
+            except RowMoveNotAllowed as exc:
+                logger.info("Not moving the rows of KB %s: %s", kb_id, exc)
+                return {**outcome, "status": "skipped", "reason": "row_move_not_allowed"}
             except PartitionBuildInProgress as exc:
                 logger.info("Deferring the BM25 index build for KB %s: %s", kb_id, exc)
                 return {

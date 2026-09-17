@@ -1148,7 +1148,7 @@ def test_build_endpoint_ensures_the_pg_index_when_available(
         "task_id": "task-pg",
         "knowledge_base_id": KB,
     }
-    mock_ensure.delay.assert_called_once_with(KB)
+    mock_ensure.delay.assert_called_once_with(KB, allow_row_move=True)
     mock_bm25s.delay.assert_not_called()
 
 

@@ -401,7 +401,12 @@ def _dispatch_ensure_pg_bm25_index(kb_id: str) -> None:
 
     The task itself decides whether there is anything to do at all: no
     extension, a strategy with no keyword table, an item table that is not
-    partitioned, a partition and index that already match.
+    partitioned, a partition and index that already match. Dispatched without
+    ``allow_row_move``, so neither caller can start a move whatever happens
+    after the dispatch: a KB whose rows reach DEFAULT before the run attaches
+    its partition (its first sources indexed while the run waits or retries, or
+    rows committed after a PATCH's probe) is recorded ``failed`` with a reason
+    pointing at ``POST /build-bm25``.
     """
     try:
         ensure_pg_bm25_index.delay(kb_id)
@@ -2193,13 +2198,13 @@ def build_bm25_endpoint(kb_id: str):
             }
         ), 400
 
-    task = (
-        ensure_pg_bm25_index
-        if _keyword_index_backend(strategy) == "pg_search"
-        else build_bm25_for_kb
-    )
+    on_pg_search = _keyword_index_backend(strategy) == "pg_search"
     try:
-        t = task.delay(kb_id)
+        if on_pg_search:
+            # The operator's request is what may move the KB's rows.
+            t = ensure_pg_bm25_index.delay(kb_id, allow_row_move=True)
+        else:
+            t = build_bm25_for_kb.delay(kb_id)
     except Exception:
         logger.exception("Failed to dispatch build-bm25 task for KB %s", kb_id)
         return jsonify({"error": "Failed to start BM25 build task"}), 503
