@@ -210,3 +210,21 @@ def test_an_unfinished_partition_is_reported_and_found_by_the_start_up_sweep(eng
     again: list[str] = []
     pgb.ensure_bm25_index(KB_A, engine=engine, on_progress=again.append)
     assert again == []
+
+
+def test_a_role_with_the_schema_on_its_search_path_can_move(engine, session):
+    """With the schema on the search path, pg_get_indexdef names DEFAULT without
+    its schema, and reading an index's definition by the qualified name failed
+    every move for good."""
+    from sqlalchemy import create_engine
+
+    _add_production_like_indexes(engine)
+    on_path = create_engine(engine.url, connect_args={"options": f"-c search_path={SCHEMA},public"})
+    try:
+        outcome = pgb.ensure_bm25_index(KB_A, engine=on_path, allow_row_move=True)
+    finally:
+        on_path.dispose()
+
+    assert outcome["status"] == "ready", outcome
+    partition = pgb.partition_name(KB_A, "chunks")
+    assert _index_shapes(session, partition) == _index_shapes(session, "chunks_default")

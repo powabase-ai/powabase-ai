@@ -1300,11 +1300,12 @@ class PartitionMoveRefused(RuntimeError):
 
 
 class Bm25IndexBuildFailed(RuntimeError):
-    """pg_search's own ``CREATE INDEX CONCURRENTLY`` failed with an internal error.
+    """A bm25 ``CREATE INDEX CONCURRENTLY`` failed with an internal error (XX000).
 
-    Seen with stock pg_search 0.25.9 on Postgres 15/16 under concurrent writes
-    (``XX000: buffer ... is not owned by resource owner``), fixed by
-    paradedb/paradedb#6211. It leaves an INVALID index that the next
+    Most likely the bug stock pg_search 0.25.9 has on Postgres 15/16 under
+    concurrent writes (``XX000: buffer ... is not owned by resource owner``),
+    fixed by paradedb/paradedb#6211 -- but XX000 is any internal error, so the
+    server log has the last word. It leaves an INVALID index that the next
     ``ensure_bm25_index`` drops and rebuilds, so it is retried. The same bug can
     crash the server instead; the build then fails with a lost connection,
     which is retried as well (see ``_reset_statement_timeout``).
@@ -1596,6 +1597,9 @@ def _lock_holders(engine, item_table: str, exclude: list[int | None]) -> list[di
         return []
 
 
+_PARTITIONING_ACTION = "Giving its own partition to"
+
+
 def _fail_move(
     engine,
     conn,
@@ -1624,6 +1628,22 @@ def _fail_move(
         exc.bm25_item_table = item_table
     except Exception:
         pass
+    if step == "move gate" and is_lock_conflict(exc):
+        logger.warning(
+            "%s KB %s on %s.%s gave up at step 'move gate' after %.0f s: indexing transactions "
+            "on the table kept holding the move gate%s; nothing was locked or moved, retryable. "
+            "Sessions holding or awaiting locks on the table: %s",
+            action,
+            knowledge_base_id,
+            AI_SCHEMA,
+            item_table,
+            MOVE_GATE_WAIT_SECONDS,
+            " (a graph_index run holds it for the length of its run)"
+            if item_table == "graph_index_nodes"
+            else "",
+            holders,
+        )
+        return
     if not transient:
         logger.warning(
             "%s KB %s on %s.%s failed at step %r (SQLSTATE %s): %s; rolled back",
@@ -1681,23 +1701,12 @@ def _acquire_move_gate(conn, item_table: str) -> None:
     ``_fail_move``, which names the gate's holders before rolling it back.
     """
     conn.execute(text(f"SET LOCAL lock_timeout = '{int(MOVE_GATE_WAIT_SECONDS * 1000)}ms'"))
-    try:
-        conn.execute(
-            text("SELECT pg_advisory_lock(hashtextextended(:relation, 0))"),
-            {"relation": move_gate_relation(item_table)},
-        )
-    except Exception:
-        logger.warning(
-            "A move on %s.%s could not take the move gate within %.0f s: indexing "
-            "transactions on that table kept it%s; retryable",
-            AI_SCHEMA,
-            item_table,
-            MOVE_GATE_WAIT_SECONDS,
-            " (a graph_index run holds it for the length of its run)"
-            if item_table == "graph_index_nodes"
-            else "",
-        )
-        raise
+    # Whatever this raises -- the lock timeout, or anything else, such as a lost
+    # connection -- the caller's ``_fail_move`` logs, once, with the gate's holders.
+    conn.execute(
+        text("SELECT pg_advisory_lock(hashtextextended(:relation, 0))"),
+        {"relation": move_gate_relation(item_table)},
+    )
     conn.commit()
 
 
@@ -1963,8 +1972,10 @@ def _default_index_definitions(conn, item_table: str) -> list[dict]:
     One entry per valid index that is not a bm25 index, in index-name order:
     ``constraint`` (``PRIMARY KEY (id)``, ``UNIQUE ...``, ``EXCLUDE ...``) for an
     index that backs a constraint, else ``unique`` and ``tail`` -- the part of
-    ``pg_get_indexdef`` after the relation name (``USING btree (source_id)``),
-    which does not depend on the index's or the table's name.
+    ``pg_get_indexdef`` from ``USING`` on (``USING btree (source_id)``), which
+    does not depend on the index's or the table's name. Read from ``USING``
+    rather than after the relation name: ``pg_get_indexdef`` qualifies the name
+    by the reader's search_path, so it cannot be matched reliably.
     """
     default = _qualified(default_partition_name(item_table))
     rows = conn.execute(
@@ -1981,15 +1992,19 @@ def _default_index_definitions(conn, item_table: str) -> list[dict]:
         {"default": default},
     ).all()
     definitions = []
-    for indexdef, regclass, unique, constraint in rows:
+    for indexdef, _regclass, unique, constraint in rows:
         if constraint is not None:
             definitions.append({"constraint": constraint})
             continue
-        marker = f" ON {regclass} "
-        if marker not in indexdef:
-            raise RuntimeError(f"cannot read the definition of an index on {default}: {indexdef}")
-        definitions.append({"unique": bool(unique), "tail": indexdef.split(marker, 1)[1]})
+        definitions.append({"unique": bool(unique), "tail": _index_tail(indexdef, default)})
     return definitions
+
+
+def _index_tail(indexdef: str, relation: str) -> str:
+    """``USING ...`` onwards of a ``pg_get_indexdef``. Its access method is never quoted."""
+    if " USING " not in indexdef:
+        raise RuntimeError(f"cannot read the definition of an index on {relation}")
+    return "USING " + indexdef.split(" USING ", 1)[1]
 
 
 def _partition_index_state(conn, partition: str) -> tuple[set, set, set]:
@@ -2013,7 +2028,7 @@ def _partition_index_state(conn, partition: str) -> tuple[set, set, set]:
         elif not valid:
             invalid.add(name)
         else:
-            shapes.add((bool(unique), indexdef.split(f" ON {regclass} ", 1)[-1]))
+            shapes.add((bool(unique), _index_tail(indexdef, partition)))
     return constraints, shapes, invalid
 
 
@@ -3095,7 +3110,11 @@ def create_partition(
                 gate.acquire()
                 gate_wait = time.monotonic() - gate_started
             except Exception as exc:
-                _fail_move(engine, conn, kb_id, item_table, exc, step=step)
+                # Not yet known whether rows will move or an empty partition
+                # is attached.
+                _fail_move(
+                    engine, conn, kb_id, item_table, exc, step=step, action=_PARTITIONING_ACTION
+                )
                 raise
             # Under the gate, so no indexing transaction on the table adds rows
             # of this knowledge base between this check and the attach.
@@ -3602,8 +3621,9 @@ def _ensure_index_locked(
     except Exception as exc:
         if _sqlstate(exc) == "XX000":
             raise Bm25IndexBuildFailed(
-                f"the concurrent build of {AI_SCHEMA}.{name} failed inside pg_search "
-                f"({first_error_line(exc)}); the next ensure rebuilds it"
+                f"the concurrent build of {AI_SCHEMA}.{name} failed with an internal error "
+                f"({first_error_line(exc)}), likely the pg_search bug fixed by "
+                "paradedb/paradedb#6211; the next ensure rebuilds it"
             ) from exc
         raise
     finally:

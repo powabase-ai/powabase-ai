@@ -444,3 +444,29 @@ def test_ensure_passes_the_gate_wait_on(engine, session):
     assert outcome["status"] == "ready"
     assert outcome["gate_wait_seconds"] >= 0
     assert "writes_blocked_seconds" in outcome
+
+
+def test_a_gate_give_up_logs_one_warning_that_says_what_held_it(
+    engine, session, monkeypatch, caplog
+):
+    monkeypatch.setattr(pgb, "MOVE_GATE_WAIT_SECONDS", 0.5)
+    holder = engine.connect()
+    pgb.hold_move_gate_shared(holder, "chunks")
+    try:
+        with caplog.at_level("INFO", logger=pgb.logger.name):
+            try:
+                pgb.create_partition(engine, KB_A, "chunks")
+            except Exception as exc:
+                error = exc
+            else:
+                error = None
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert error is not None and pgb.is_lock_conflict(error)
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1, warnings
+    assert "move gate" in warnings[0] and "indexing" in warnings[0]
+    # Not yet known to be a move of rows: it may have been an empty attach.
+    assert "Moving the rows" not in warnings[0]
