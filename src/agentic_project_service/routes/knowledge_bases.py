@@ -3,6 +3,7 @@
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from flask import Blueprint, jsonify, make_response, request
@@ -477,7 +478,8 @@ def _build_bm25_required_note(kb_id: str, strategy: str | None) -> str:
         f"{AI_SCHEMA}.{item_table} table -- every knowledge base on it -- for the "
         "duration of the move. Build it when that is acceptable with "
         f"POST /api/knowledge-bases/{kb_id}/build-bm25. Until then keyword search "
-        "keeps its existing path."
+        "uses the knowledge base's bm25s file index if it has one, and otherwise the "
+        "bounded full-text fallback, which can time out on a large knowledge base."
     )
 
 
@@ -548,6 +550,30 @@ _STALE_BM25_SKIP_REASONS = frozenset(
 )
 
 
+# A recorded ``moving`` or ``building`` older than this is reported ``stale``.
+# The longest legitimate run -- a move of millions of rows, then its bm25 index
+# and the partition's plain indexes (the GIN index is 47 s per million rows)
+# -- takes minutes; each step records its progress as it starts.
+BM25_BUILD_OUTCOME_STALE_SECONDS = 3600
+
+
+def _stale_or_recorded_status(outcome: dict) -> tuple[str, str | None]:
+    """The recorded status and reason, or ``stale`` for an in-progress one long silent."""
+    status, reason = outcome["status"], outcome.get("reason")
+    updated_at = outcome.get("updated_at")
+    if status not in ("moving", "building") or not isinstance(updated_at, datetime):
+        return status, reason
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - updated_at).total_seconds()
+    if age < BM25_BUILD_OUTCOME_STALE_SECONDS:
+        return status, reason
+    return "stale", (
+        f"recorded {status!r} {int(age // 60)} min ago and not updated since: the run that "
+        "recorded it most likely stopped. POST /build-bm25 to run it again"
+    )
+
+
 def _compute_bm25_status(kb) -> str | None:
     """The ``bm25_status`` field of the KB detail response, or None to omit it.
 
@@ -556,8 +582,11 @@ def _compute_bm25_status(kb) -> str | None:
     return _bm25_status_detail(kb)[0]
 
 
-def _bm25_status_detail(kb) -> tuple[str | None, str | None]:
+def _bm25_status_detail(kb, recorded: dict | None = None) -> tuple[str | None, str | None]:
     """``(bm25_status, bm25_status_reason)`` for the KB detail response.
+
+    When the status comes from a recorded outcome and ``recorded`` is a dict,
+    the record's ``updated_at`` is put in it, for ``bm25_status_updated_at``.
 
     A None status means "omit the field"; a None reason means "omit the
     reason". Values of ``bm25_status``:
@@ -573,7 +602,11 @@ def _bm25_status_detail(kb) -> tuple[str | None, str | None]:
         only, the recorded outcome of the move/build that gives the KB its
         own index (``ai.bm25_index_builds``) -- dispatched, moving its rows
         out of DEFAULT, waiting to retry, or given up. These come with
-        ``bm25_status_reason`` when the worker recorded one.
+        ``bm25_status_reason`` when the worker recorded one;
+      - ``"stale"`` (pg_search): a recorded ``moving`` or ``building`` that has
+        not been updated for ``BM25_BUILD_OUTCOME_STALE_SECONDS`` -- the run
+        that recorded it most likely stopped (a worker killed mid-move, or a
+        run that found another holding the index's lock). The reason says so.
 
     The index reported is the one the keyword leg actually uses (see
     ``_keyword_index_backend``): the pg_search index when that is the
@@ -611,7 +644,9 @@ def _bm25_status_detail(kb) -> tuple[str | None, str | None]:
                 kb_id, pg_bm25_item_table(strategy or "chunk_embed")
             )
             if outcome is not None:
-                return outcome["status"], outcome.get("reason")
+                if recorded is not None:
+                    recorded["updated_at"] = outcome.get("updated_at")
+                return _stale_or_recorded_status(outcome)
         if pg_state is not None and pg_state != "absent":
             return pg_state, None
         if pg_state == "absent":
@@ -860,11 +895,14 @@ def get_knowledge_base(kb_id: str):
         "drift": drift,
     }
 
-    bm25_status, bm25_status_reason = _bm25_status_detail(kb)
+    recorded: dict = {}
+    bm25_status, bm25_status_reason = _bm25_status_detail(kb, recorded)
     if bm25_status is not None:
         response_body["bm25_status"] = bm25_status
         if bm25_status_reason is not None:
             response_body["bm25_status_reason"] = bm25_status_reason
+        if recorded.get("updated_at") is not None:
+            response_body["bm25_status_updated_at"] = recorded["updated_at"]
 
     return jsonify(response_body)
 

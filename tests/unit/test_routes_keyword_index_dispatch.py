@@ -355,6 +355,9 @@ class TestUpdateDoesNotStartAMove:
         assert f"POST /api/knowledge-bases/{kb_id}/build-bm25" in note
         assert "blocks writes" in note
         assert "chunks" in note
+        # Not "keeps its existing path": a KB with no file index has none.
+        assert "bm25s file index if it has one" in note
+        assert "bounded full-text fallback" in note
 
     @pytest.mark.parametrize(
         "partition, rows_in_default, dispatched",
@@ -866,6 +869,43 @@ class TestStatusReportsThePersistedBuildOutcome:
         with patch(f"{R}._bm25_status_detail", return_value=("failed", "why")):
             assert kb_route._compute_bm25_status(self.KB) == "failed"
 
+    def _detail_recorded(self, outcome):
+        recorded: dict = {}
+        with (
+            patch(f"{R}.db"),
+            patch(f"{R}._keyword_index_backend", return_value="pg_search"),
+            patch(f"{R}.pg_bm25_status", return_value="absent"),
+            patch(f"{R}.read_bm25_build_outcome", return_value=outcome),
+        ):
+            return kb_route._bm25_status_detail(self.KB, recorded), recorded
+
+    @pytest.mark.parametrize("status", ["moving", "building"])
+    def test_an_in_progress_outcome_silent_for_too_long_is_reported_stale(self, status):
+        """A worker killed mid-move, or a run that found the index lock held,
+        leaves its last status behind for ever."""
+        from datetime import datetime, timedelta, timezone
+
+        long_ago = datetime.now(timezone.utc) - timedelta(
+            seconds=kb_route.BM25_BUILD_OUTCOME_STALE_SECONDS + 60
+        )
+        outcome = self._outcome(status)
+        outcome["updated_at"] = long_ago
+        (got, reason), recorded = self._detail_recorded(outcome)
+        assert got == "stale"
+        assert repr(status) in reason and "POST /build-bm25" in reason
+        assert recorded["updated_at"] == long_ago
+
+    @pytest.mark.parametrize("status", ["moving", "failed", "retrying"])
+    def test_a_recent_or_terminal_outcome_is_reported_as_recorded(self, status):
+        from datetime import datetime, timedelta, timezone
+
+        outcome = self._outcome(status, reason="why")
+        outcome["updated_at"] = datetime.now(timezone.utc) - timedelta(
+            seconds=kb_route.BM25_BUILD_OUTCOME_STALE_SECONDS + 60 if status != "moving" else 5
+        )
+        (got, reason), _ = self._detail_recorded(outcome)
+        assert (got, reason) == (status, "why")
+
 
 class TestStatusField:
     def _get(self, detail):
@@ -898,3 +938,31 @@ class TestStatusField:
         body = self._get(("ready", None))
         assert body["bm25_status"] == "ready"
         assert "bm25_status_reason" not in body
+        assert "bm25_status_updated_at" not in body
+
+    def test_a_recorded_status_carries_when_it_was_recorded(self):
+        def detail(kb, recorded=None):
+            recorded["updated_at"] = "2026-09-16T10:00:00+00:00"
+            return "moving", None
+
+        kb_id = "11111111-1111-1111-1111-111111111111"
+        kb = {
+            "id": kb_id,
+            "name": "kb",
+            "description": None,
+            "indexing_config": {"strategy": "chunk_embed"},
+            "retrieval_config": {"method": "hybrid"},
+            "created_at": None,
+            "updated_at": None,
+        }
+        with (
+            _AUTH,
+            patch(f"{R}.db") as db,
+            patch(f"{R}._fetch_kb_or_404", return_value=kb),
+            patch(f"{R}._compute_drift", return_value="none"),
+            patch(f"{R}._bm25_status_detail", side_effect=detail),
+        ):
+            db.session.execute.return_value = iter([])
+            body = _client().get(f"/api/knowledge-bases/{kb_id}", headers=_headers()).get_json()
+        assert body["bm25_status"] == "moving"
+        assert body["bm25_status_updated_at"] == "2026-09-16T10:00:00+00:00"
