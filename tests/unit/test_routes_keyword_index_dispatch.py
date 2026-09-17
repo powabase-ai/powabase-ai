@@ -815,6 +815,44 @@ class TestStatusReportsThePersistedBuildOutcome:
         assert got == "ready"
         read.assert_not_called()
 
+    def test_an_extension_absent_record_never_reaches_a_file_index_backend(self):
+        """The worker records a skipped build as ``failed`` with ``not built:
+        extension_absent``. On the bm25s backend that record must not become
+        the KB's status: the file index is what search reads."""
+        (got, reason), read = self._detail(
+            pg_state="absent",
+            outcome=self._outcome("failed", "not built: extension_absent"),
+            backend="bm25s",
+            auto_indexing=False,
+        )
+        assert (got, reason) == ("ready", None)
+        read.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "not built: extension_absent",
+            "not built: table_not_partitioned",
+            "not built: retrieval_method",
+            "not built: strategy",
+        ],
+    )
+    def test_a_skip_whose_precondition_now_holds_is_not_reported(self, reason):
+        """Once pg_search serves the KB's table, a record saying the extension
+        was absent (or the table unpartitioned, or the method not keyword) is
+        from before that changed, not the state of a build still to run."""
+        (got, got_reason), _ = self._detail(
+            pg_state="absent", outcome=self._outcome("failed", reason), auto_indexing=False
+        )
+        assert (got, got_reason) == ("ready", None)
+
+    def test_a_skip_for_a_missing_default_partition_is_reported(self):
+        (got, reason), _ = self._detail(
+            pg_state="absent",
+            outcome=self._outcome("failed", "not built: default_partition_absent"),
+        )
+        assert (got, reason) == ("failed", "not built: default_partition_absent")
+
     def test_an_unreadable_outcome_falls_back_to_the_index_state(self):
         """Outside an app context even ``db.session`` raises; the status must
         still come back."""

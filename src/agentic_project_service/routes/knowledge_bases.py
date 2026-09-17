@@ -520,7 +520,27 @@ def _unfinished_bm25_build_outcome(kb_id: str, item_table: str | None) -> dict |
         return None
     if outcome.get("status") not in _UNFINISHED_BM25_BUILD_STATUSES:
         return None
+    if outcome.get("reason") in _STALE_BM25_SKIP_REASONS:
+        return None
     return outcome
+
+
+# A build the worker skipped records ``failed`` with ``not built: <why>``. These
+# reasons are preconditions the caller has already found to hold -- it only
+# reads the outcome when pg_search serves a keyword method on a partitioned
+# item table -- so such a record predates the fix (the extension was created
+# since, the table partitioned, the method or strategy changed) and says
+# nothing about the build still to run.
+_STALE_BM25_SKIP_REASONS = frozenset(
+    f"not built: {reason}"
+    for reason in (
+        "extension_absent",
+        "table_not_partitioned",
+        "retrieval_method",
+        "strategy",
+        "kb_not_found",
+    )
+)
 
 
 def _compute_bm25_status(kb) -> str | None:
