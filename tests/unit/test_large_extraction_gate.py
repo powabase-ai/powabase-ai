@@ -21,6 +21,8 @@ import redis
 
 from agentic_project_service.services import extraction_gate as gate_mod
 from agentic_project_service.services.extraction_gate import (
+    WAITING_STALE_SECONDS,
+    WaitingExtractions,
     DEFAULT_LARGE_FILE_BYTES,
     DEFAULT_MAX_CONCURRENT_LARGE,
     ExtractionAttempts,
@@ -114,11 +116,16 @@ class TestConfiguration:
         assert gate_mod.RENEW_SECONDS == 60
         assert gate_mod.RENEW_SECONDS * 3 <= gate_mod.LEASE_SECONDS
 
-    def test_a_slot_is_held_at_most_for_the_task_time_limit(self, monkeypatch):
+    def test_a_slot_is_held_a_little_less_than_the_task_time_limit(self, monkeypatch):
+        """The broker redelivers an unfinished task after the task time limit.
+        The lease must have fully lapsed by then, so the redelivery is judged
+        as an interruption instead of first waiting on a lease that is about
+        to vanish and then running beside the original."""
         monkeypatch.delenv("CELERY_TASK_TIME_LIMIT", raising=False)
-        assert max_hold_seconds() == 21600
+        assert max_hold_seconds() == 21600 - 300 - 60
         monkeypatch.setenv("CELERY_TASK_TIME_LIMIT", "7200")
-        assert max_hold_seconds() == 7200
+        assert max_hold_seconds() == 7200 - 300 - 60
+        assert max_hold_seconds() + gate_mod.LEASE_SECONDS < 7200
 
 
 # ---------------------------------------------------------------------------
@@ -485,3 +492,78 @@ class TestExtractionAttempts:
             ExtractionAttempts(redis_client=MagicMock()).incarnation
         )
         assert gate_mod.process_incarnation() == gate_mod.process_incarnation()
+
+
+# ---------------------------------------------------------------------------
+# Deliveries sitting in a worker, waiting to run
+# ---------------------------------------------------------------------------
+
+
+class _ServerClock:
+    """Shifts what the store believes Redis's clock says, to age records."""
+
+    def __init__(self, client, monkeypatch):
+        self.offset = 0.0
+        real_time = client.time
+
+        def shifted():
+            seconds, micros = real_time()
+            return int(seconds + self.offset), micros
+
+        monkeypatch.setattr(client, "time", shifted)
+
+
+class TestWaitingExtractions:
+    DISPATCH = {"args": ["src-1", "sources"], "kwargs": {"source_size": 10}, "retries": 1}
+
+    def test_the_stale_threshold_is_pinned(self):
+        assert WAITING_STALE_SECONDS == 600
+        assert WAITING_STALE_SECONDS >= 5 * 60  # several requeue intervals
+
+    def test_a_recorded_wait_can_be_read_back_and_cleared(self, client):
+        waiting = WaitingExtractions(redis_client=client)
+        waiting.touch("task-1", "src-1", self.DISPATCH)
+        assert waiting.get("task-1") == {"source_id": "src-1", "dispatch": self.DISPATCH}
+        waiting.clear("task-1")
+        assert waiting.get("task-1") is None
+        assert waiting.stale(0) == []
+
+    def test_only_waits_not_refreshed_recently_are_stale(self, client, monkeypatch):
+        clock = _ServerClock(client, monkeypatch)
+        waiting = WaitingExtractions(redis_client=client)
+        waiting.touch("old", "src-1", self.DISPATCH)
+        clock.offset = WAITING_STALE_SECONDS + 5
+        waiting.touch("fresh", "src-2", self.DISPATCH)
+        assert [task_id for task_id, _ in waiting.stale(WAITING_STALE_SECONDS)] == ["old"]
+
+    def test_touching_again_restarts_the_clock(self, client, monkeypatch):
+        clock = _ServerClock(client, monkeypatch)
+        waiting = WaitingExtractions(redis_client=client)
+        waiting.touch("task-1", "src-1", self.DISPATCH)
+        clock.offset = WAITING_STALE_SECONDS + 5
+        waiting.touch("task-1", "src-1", self.DISPATCH)
+        assert waiting.stale(WAITING_STALE_SECONDS) == []
+
+    def test_projects_are_independent(self, client, monkeypatch):
+        waiting = WaitingExtractions(redis_client=client)
+        monkeypatch.setenv("PROJECT_REF", "proj-a")
+        waiting.touch("task-1", "src-1", self.DISPATCH)
+        monkeypatch.setenv("PROJECT_REF", "proj-b")
+        assert waiting.get("task-1") is None
+        assert waiting.stale(0) == []
+
+    def test_records_expire_on_their_own(self, client):
+        WaitingExtractions(redis_client=client).touch("task-1", "src-1", self.DISPATCH)
+        assert all(client.ttl(key) > 0 for key in client.keys("*"))
+
+    def test_redis_failures_never_raise(self):
+        broken = MagicMock()
+        broken.pipeline.side_effect = ConnectionError("redis down")
+        broken.time.side_effect = ConnectionError("redis down")
+        broken.get.side_effect = ConnectionError("redis down")
+        broken.zrangebyscore.side_effect = ConnectionError("redis down")
+        waiting = WaitingExtractions(redis_client=broken)
+        waiting.touch("task-1", "src-1", self.DISPATCH)
+        waiting.clear("task-1")
+        assert waiting.get("task-1") is None
+        assert waiting.stale(0) == []

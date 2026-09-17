@@ -244,6 +244,7 @@ def _run_task(
     attempts=None,
     run=None,
     retries=0,
+    claimed=True,
     **task_kwargs,
 ):
     from agentic_project_service.tasks import extraction as ext_mod
@@ -253,7 +254,9 @@ def _run_task(
     recorded = []
     requeued = []
     monkeypatch.setattr(ext_mod, "get_source", lambda _id: source)
-    monkeypatch.setattr(ext_mod, "update_source_status", lambda *a, **kw: statuses.append((a, kw)))
+    monkeypatch.setattr(
+        ext_mod, "update_source_status", lambda *a, **kw: statuses.append((a, kw)) or True
+    )
     monkeypatch.setattr(
         ext_mod,
         "record_extraction_interruption",
@@ -271,6 +274,12 @@ def _run_task(
     monkeypatch.setattr(ext_mod, "get_storage", lambda: storage)
     monkeypatch.setattr(ext_mod, "large_extraction_gate", gate or _gate())
     monkeypatch.setattr(ext_mod, "extraction_attempts", attempts or _attempts("worker-b"))
+    monkeypatch.setattr(ext_mod, "waiting_extractions", _waiting())
+    claims = []
+    monkeypatch.setattr(
+        ext_mod, "claim_source", lambda sid, tid: claims.append((sid, tid)) or claimed
+    )
+    _run_task.claims = claims
     monkeypatch.setattr(
         ext_mod,
         "_requeue",
@@ -281,6 +290,7 @@ def _run_task(
 
     async def fake_run(*a, **kw):
         ran.append(True)
+        _run_task.run_kwargs = kw
         if run is not None:
             return await run()
         return {}, {"extraction_method": "fitz", "page_count": 1, "char_count": 100}
@@ -319,6 +329,12 @@ def _gate():
     from agentic_project_service.services.extraction_gate import LargeExtractionGate
 
     return LargeExtractionGate(redis_client=_redis(), heartbeat=False)
+
+
+def _waiting():
+    from agentic_project_service.services.extraction_gate import WaitingExtractions
+
+    return WaitingExtractions(redis_client=_redis())
 
 
 def _attempts(incarnation):
@@ -395,17 +411,20 @@ def test_the_interruption_cap_is_two():
     assert MAX_EXTRACTION_INTERRUPTIONS == 2
 
 
-def test_extracting_under_another_task_id_is_not_an_interruption(monkeypatch, mock_db_session):
-    """The source is being extracted by some other task (a re-extract raced
-    this delivery): nothing about *this* task died."""
-    mock_db_session.execute.return_value.scalar.return_value = "extracting"
-    result, _statuses, ran, recorded = _run_task(
-        monkeypatch, _task_source("extracting", "task-other"), task_id="task-1"
+def test_a_source_owned_by_another_task_is_superseded_at_once(monkeypatch, mock_db_session):
+    """A re-extract gave the source to another task: nothing about *this*
+    task died, and this task must not extract it, wait for a slot, or even ask
+    storage for its size."""
+    gate = MagicMock()
+    result, statuses, ran, recorded = _run_task(
+        monkeypatch, _task_source("extracting", "task-other"), task_id="task-1", gate=gate
     )
 
-    assert recorded == []
-    assert ran == [True]
-    assert result["status"] == "success"
+    assert result["status"] == "superseded"
+    assert (statuses, ran, recorded) == ([], [], [])
+    assert _run_task.claims == []
+    gate.try_acquire.assert_not_called()
+    _run_task.storage.object_size.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +572,8 @@ def test_the_attempt_is_forgotten_after_an_extraction_error(monkeypatch, mock_db
 # ---------------------------------------------------------------------------
 # At most N large extractions at once, across every worker of the project
 # ---------------------------------------------------------------------------
+
+from agentic_project_service.tasks.extraction import LARGE_EXTRACTION_REQUEUE_SECONDS  # noqa: E402
 
 LARGE = 60 * 1024 * 1024
 SMALL = 1024 * 1024
@@ -726,6 +747,8 @@ def test_a_duplicate_delivery_of_a_task_still_running_waits_instead_of_counting(
 
     assert result["status"] == "deferred"
     assert (statuses, ran, recorded) == ([], [], [])
+    # It must come back: if the running delivery then dies, this is the only copy.
+    assert _run_task.requeued == [("task-1", LARGE_EXTRACTION_REQUEUE_SECONDS, LARGE)]
 
 
 def test_requeue_keeps_the_task_id_and_does_not_spend_a_retry(monkeypatch):
@@ -860,10 +883,9 @@ def test_a_sink_failure_in_the_implicit_context_is_still_found(monkeypatch):
         _run(storage)
 
 
-def test_a_page_image_failure_fails_the_source_with_a_clear_error_and_retries(
-    monkeypatch, mock_db_session
-):
-    """Retried through the task's bounded retry budget, never re-run forever."""
+def test_between_retries_the_source_is_not_failed(monkeypatch, mock_db_session):
+    """A poller treats `failed` as final, so a failure that will be retried
+    leaves the source pending, with the error and the attempt in the message."""
     from agentic_project_service.tasks import extraction as ext_mod
 
     async def run():
@@ -873,12 +895,114 @@ def test_a_page_image_failure_fails_the_source_with_a_clear_error_and_retries(
 
     # Called directly, Task.retry re-raises the exception instead of enqueueing.
     with pytest.raises(ext_mod.PageImageStorageError):
+        _run_task(monkeypatch, _task_source("pending", "task-1"), run=run, retries=0)
+
+    assert [a[1] for a, _kw in _run_task.statuses] == ["pending"]
+    ((args, kwargs),) = _run_task.statuses
+    assert "attempt 1 of 4" in args[2].lower()
+    assert "retrying" in args[2].lower()
+    assert "page image of page 3 failed: upload refused" in args[2]
+    assert args[3] == "task-1"
+    assert kwargs.get("error_code") is None
+    assert ext_mod.extract_source.max_retries == 3
+
+
+def test_a_retry_is_recorded_as_waiting_so_a_lost_message_can_be_recovered(
+    monkeypatch, mock_db_session
+):
+    from agentic_project_service.tasks import extraction as ext_mod
+
+    async def run():
+        raise StorageError("storage down")
+
+    with pytest.raises(StorageError):
         _run_task(monkeypatch, _task_source("pending", "task-1"), run=run)
 
-    failed = [args for args, _kw in _run_task.statuses if args[1] == "failed"]
-    assert len(failed) == 1
-    assert "page image of page 3 failed: upload refused" in failed[0][2]
-    assert ext_mod.extract_source.max_retries == 3
+    record = ext_mod.waiting_extractions.get("task-1")
+    assert record is not None and record["source_id"] == "src-1"
+
+
+def test_when_retries_run_out_the_source_fails_with_a_retryable_code(monkeypatch, mock_db_session):
+    from agentic_project_service.tasks import extraction as ext_mod
+
+    async def run():
+        raise ext_mod.PageImageStorageError(
+            "Storing the page image of page 3 failed: upload refused"
+        )
+
+    result, statuses, _ran, _rec = _run_task(
+        monkeypatch, _task_source("pending", "task-1"), run=run, retries=3
+    )
+
+    assert result["status"] == "error"
+    ((args, kwargs),) = statuses
+    assert args[1] == "failed"
+    assert "after 4 attempts" in args[2]
+    assert "page image of page 3 failed: upload refused" in args[2]
+    assert kwargs.get("error_code") == "transient"
+
+
+def test_a_task_that_loses_the_source_before_it_starts_is_superseded(
+    monkeypatch, mock_db_session, large_limits
+):
+    """The atomic claim is the authoritative check: a re-extract can land
+    between reading the source and starting."""
+    result, statuses, ran, _rec = _run_task(
+        monkeypatch, _task_source("pending", "task-1"), size=LARGE, claimed=False
+    )
+
+    assert result["status"] == "superseded"
+    assert ran == []
+    assert statuses == []
+    assert _run_task.claims == [("src-1", "task-1")]
+    assert _slot_is_free()
+    assert _attempts("observer").previous("task-1") is None
+
+
+def test_the_claim_comes_before_the_extraction(monkeypatch, mock_db_session):
+    mock_db_session.execute.return_value.scalar.return_value = "extracting"
+    order = []
+
+    async def run():
+        order.append(("run", list(_run_task.claims)))
+        return {}, {"extraction_method": "fitz", "page_count": 1, "char_count": 100}
+
+    _run_task(monkeypatch, _task_source("pending", "task-1"), run=run)
+
+    assert order == [("run", [("src-1", "task-1")])]
+    assert all(a[1] != "extracting" for a, _ in _run_task.statuses)
+
+
+def test_a_run_that_loses_the_source_mid_extraction_is_superseded(
+    monkeypatch, mock_db_session, recording_billing
+):
+    from agentic_project_service.tasks import extraction as ext_mod
+
+    async def run():
+        raise ext_mod.ExtractionSuperseded("re-dispatched")
+
+    result, statuses, _ran, _rec = _run_task(
+        monkeypatch, _task_source("pending", "task-1"), run=run
+    )
+
+    assert result["status"] == "superseded"
+    assert statuses == []
+    assert recording_billing.charges == []
+
+
+def test_the_task_passes_an_ownership_check_to_the_extraction(monkeypatch, mock_db_session):
+    from agentic_project_service.tasks import extraction as ext_mod
+
+    mock_db_session.execute.return_value.scalar.return_value = "extracting"
+    asked = []
+    monkeypatch.setattr(
+        ext_mod, "source_is_owned_by", lambda sid, tid: asked.append((sid, tid)) or False
+    )
+
+    _run_task(monkeypatch, _task_source("pending", "task-1"))
+
+    assert _run_task.run_kwargs["still_owned"]() is False
+    assert asked == [("src-1", "task-1")]
 
 
 # ---------------------------------------------------------------------------
@@ -1071,7 +1195,7 @@ def _run_task_with_derivatives(
         storage.delete.side_effect = delete_error
     source = {**_task_source("pending", "task-1"), "derivatives": old}
     monkeypatch.setattr(ext_mod, "get_source", lambda _id: source)
-    monkeypatch.setattr(ext_mod, "update_source_status", lambda *a, **kw: None)
+    monkeypatch.setattr(ext_mod, "update_source_status", lambda *a, **kw: True)
     writes = []
 
     def fake_update(*a, **kw):
@@ -1082,6 +1206,8 @@ def _run_task_with_derivatives(
     monkeypatch.setattr(ext_mod, "get_storage", lambda: storage)
     monkeypatch.setattr(ext_mod, "large_extraction_gate", _gate())
     monkeypatch.setattr(ext_mod, "extraction_attempts", _attempts("worker-b"))
+    monkeypatch.setattr(ext_mod, "waiting_extractions", _waiting())
+    monkeypatch.setattr(ext_mod, "claim_source", lambda sid, tid: True)
     _run_task_with_derivatives.writes = writes
 
     async def fake_run(*a, **kw):
@@ -1166,11 +1292,45 @@ def test_a_failed_cleanup_does_not_fail_the_extraction(monkeypatch, mock_db_sess
 # ---------------------------------------------------------------------------
 
 
-def _client(monkeypatch):
+def _client(monkeypatch, head_status=405, head_length=None):
+    """A storage client whose HEAD request answers with *head_status*."""
     from agentic_project_service.services import storage as storage_mod
 
     monkeypatch.setenv("SERVICE_ROLE_KEY", "k")
-    return storage_mod.SupabaseStorage(url="http://storage.test")
+    client = storage_mod.SupabaseStorage(url="http://storage.test")
+    calls = []
+
+    def request(method, path, **kw):
+        calls.append((method, path))
+        response = MagicMock()
+        response.status_code = head_status
+        response.headers = {} if head_length is None else {"content-length": head_length}
+        return response
+
+    monkeypatch.setattr(client, "_request", request)
+    client.requests = calls
+    return client
+
+
+def test_object_size_asks_with_head_and_downloads_nothing(monkeypatch):
+    client = _client(monkeypatch, head_status=200, head_length="367000000")
+    monkeypatch.setattr(
+        client, "stream_download", MagicMock(side_effect=AssertionError("no GET expected"))
+    )
+
+    assert client.object_size("sources/a/b.pdf") == 367000000
+    assert client.requests == [("HEAD", "/object/sources/a/b.pdf")]
+
+
+@pytest.mark.parametrize("status", [400, 404])
+def test_object_size_of_a_missing_object_is_a_storage_error(monkeypatch, status):
+    """storage-api answers a HEAD for a missing object with 400."""
+    client = _client(monkeypatch, head_status=status)
+    monkeypatch.setattr(
+        client, "stream_download", MagicMock(side_effect=AssertionError("no GET expected"))
+    )
+    with pytest.raises(StorageError, match="not found"):
+        client.object_size("sources/a/b.pdf")
 
 
 def test_object_size_reads_the_length_without_the_body(monkeypatch):
@@ -1326,3 +1486,163 @@ def test_a_storage_error_raised_for_the_task_has_no_cause_cycle(monkeypatch):
         seen.append(current)
         current = current.__cause__ or current.__context__
     assert "upload refused" in str(info.value)
+
+
+# ---------------------------------------------------------------------------
+# Round 3: memory, ownership inside the extraction, cause chains
+# ---------------------------------------------------------------------------
+
+
+class _TrackedBytes(bytearray):
+    """A byte buffer that can be weakly referenced, to see when the source is
+    freed (``bytes`` itself cannot be)."""
+
+
+def test_the_source_bytes_are_released_before_derivatives_upload(monkeypatch):
+    """A 365 MiB source held while derivatives upload is 365 MiB of headroom
+    the worker does not have."""
+    import gc
+    import weakref
+
+    from agentic_project_service.tasks import extraction as ext_mod
+
+    refs = []
+
+    class _Spool:
+        def __init__(self, *a, **kw):
+            self.buf = io.BytesIO()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def write(self, data):
+            self.buf.write(data)
+
+        def seek(self, pos):
+            self.buf.seek(pos)
+
+        def read(self):
+            data = _TrackedBytes(self.buf.read())
+            refs.append(weakref.ref(data))
+            return data
+
+    monkeypatch.setattr(ext_mod.tempfile, "TemporaryFile", _Spool)
+    alive_at_upload = []
+    storage = _Storage(data=b"%PDF-1.4 " + b"x" * 2048)
+    real_upload = storage.upload
+
+    def upload(bucket_id, path, file_data, **kw):
+        gc.collect()
+        alive_at_upload.append(refs[0]() is not None)
+        return real_upload(bucket_id, path, file_data, **kw)
+
+    storage.upload = upload
+
+    async def extract(raw):
+        return _result([Derivative(type="markdown", content="md")], method="fitz")
+
+    _use_extractor(monkeypatch, extract)
+    _run(storage)
+
+    assert alive_at_upload == [False]
+
+
+def test_derivatives_are_not_uploaded_by_a_run_that_no_longer_owns_the_source(monkeypatch):
+    from agentic_project_service.tasks import extraction as ext_mod
+
+    storage = _Storage()
+
+    async def extract(raw):
+        return _result([Derivative(type="markdown", content="md")], method="fitz")
+
+    _use_extractor(monkeypatch, extract)
+    with pytest.raises(ext_mod.ExtractionSuperseded):
+        asyncio.run(
+            ext_mod.run_extraction(
+                storage, dict(SOURCE), "sources", extraction_model="auto", still_owned=lambda: False
+            )
+        )
+
+    assert storage.uploads == []
+
+
+def test_page_images_of_a_failed_attempt_are_deleted(monkeypatch):
+    from agentic_project_service.tasks import extraction as ext_mod
+
+    storage = _Storage()
+    deleted = []
+    storage.delete = lambda bucket, paths: deleted.append((bucket, sorted(paths)))
+
+    async def extract(raw):
+        sink = raw.metadata["page_image_sink"]
+        for page in (1, 2):
+            sink(Derivative(type="image", content=b"png", format="png", page=page))
+        raise ExtractionError("OCR endpoint refused", extractor_name="pdf")
+
+    _use_extractor(monkeypatch, extract)
+    source = {**SOURCE, "derivatives": {}}
+    with pytest.raises(ExtractionError):
+        asyncio.run(ext_mod.run_extraction(storage, source, "sources", extraction_model="auto"))
+
+    assert len(storage.uploads) == 2
+    assert deleted == [("sources", sorted(path for path, _n in storage.uploads))]
+
+
+def test_page_images_still_referenced_by_the_source_are_kept(monkeypatch):
+    from agentic_project_service.tasks import extraction as ext_mod
+    from agentic_project_service.services.storage import get_derivative_storage_path
+
+    storage = _Storage()
+    deleted = []
+    storage.delete = lambda bucket, paths: deleted.append((bucket, sorted(paths)))
+    page1 = get_derivative_storage_path("src-1", "image", "image_page1.png")
+    source = dict(SOURCE)
+    source["derivatives"] = {"image": [{"storage_path": f"sources/{page1}", "page": 1}]}
+
+    async def extract(raw):
+        sink = raw.metadata["page_image_sink"]
+        for page in (1, 2):
+            sink(Derivative(type="image", content=b"png", format="png", page=page))
+        raise ExtractionError("OCR endpoint refused", extractor_name="pdf")
+
+    _use_extractor(monkeypatch, extract)
+    with pytest.raises(ExtractionError):
+        asyncio.run(ext_mod.run_extraction(storage, source, "sources", extraction_model="auto"))
+
+    page2 = get_derivative_storage_path("src-1", "image", "image_page2.png")
+    assert deleted == [("sources", [page2])]
+
+
+def test_a_cyclic_cause_chain_does_not_hang_the_worker():
+    """The heartbeat keeps the only slot while this runs: a loop here would
+    stall every large file of the project."""
+    import threading
+
+    from agentic_project_service.tasks.extraction import _sink_failure_behind
+
+    first = RuntimeError("first")
+    second = RuntimeError("second")
+    first.__cause__ = second
+    second.__cause__ = first
+    outcome = []
+    worker = threading.Thread(
+        target=lambda: outcome.append(_sink_failure_behind(first, [])), daemon=True
+    )
+    worker.start()
+    worker.join(timeout=2)
+
+    assert outcome == [None]
+
+
+def test_an_unknown_size_is_logged_when_it_is_gated(monkeypatch, mock_db_session, caplog):
+    from agentic_project_service.tasks import extraction as ext_mod
+
+    monkeypatch.setenv("EXTRACTION_LARGE_FILE_BYTES", str(50 * 1024 * 1024))
+    _gate().try_acquire("someone-else")
+    with caplog.at_level(logging.WARNING, logger=ext_mod.logger.name):
+        _run_task(monkeypatch, _task_source("pending", "task-1"), size=None)
+
+    assert "size" in caplog.text.lower() and "unknown" in caplog.text.lower()
