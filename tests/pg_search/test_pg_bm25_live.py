@@ -130,12 +130,17 @@ def _drop_scratch_schema(engine) -> None:
     the server is touched.
     """
     for attempt in range(1, _SCHEMA_DROP_ATTEMPTS + 1):
-        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        with engine.connect() as conn:
             try:
-                conn.execute(text("SET lock_timeout = '5s'"))
+                # LOCAL, in the drop's own transaction: a session-level SET would
+                # stay on the pooled connection and cut short a later test's
+                # lock waits.
+                conn.execute(text("SET LOCAL lock_timeout = '5s'"))
                 conn.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
+                conn.commit()
                 return
             except Exception as exc:
+                conn.rollback()
                 if attempt == _SCHEMA_DROP_ATTEMPTS or not pgb.is_lock_conflict(exc):
                     raise
             conn.execute(
@@ -148,6 +153,7 @@ def _drop_scratch_schema(engine) -> None:
                 ),
                 {"schema": SCHEMA},
             )
+            conn.commit()
         time.sleep(0.5)
 
 
