@@ -1103,9 +1103,11 @@ def _build_registry() -> dict[str, SettingDef]:
             max=300,
             advanced=True,
             description=(
-                "A transaction holding the default partition for longer than "
-                "this makes a knowledge base's partition move give up and "
-                "retry later instead of blocking writes behind it."
+                "A transaction that has been open for longer than this and holds "
+                "a lock a knowledge base's partition move needs (on the shared "
+                "default partition, the item table, or a table its foreign keys "
+                "reference) makes the move give up and retry later instead of "
+                "blocking writes behind it."
             ),
         ),
         SettingDef(

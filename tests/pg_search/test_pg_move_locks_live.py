@@ -541,3 +541,63 @@ def test_a_long_writer_through_the_parent_stops_the_move_before_it_holds_writers
     assert taken == []
     assert took < 2.0, took
     assert any(h["pid"] == holder_pid for h in error.bm25_lock_holders), error.bm25_lock_holders
+
+
+def test_a_cascade_delete_during_the_move_wins_and_leaves_nothing_orphaned(
+    engine, session, monkeypatch
+):
+    """A source deleted mid-move holds indexed_sources while its cascade waits
+    for DEFAULT: the move gives up on the referenced table's lock instead of
+    waiting for it, and the cascade then deletes the rows where they are."""
+    source_ids = _reference_indexed_sources(engine)
+    with engine.connect() as conn:
+        conn.execute(
+            text(
+                f"INSERT INTO {SCHEMA}.chunks (knowledge_base_id, indexed_source_id, text) "
+                "SELECT CAST(:kb AS uuid), CAST(:src AS uuid), 'weg ' || g "
+                "FROM generate_series(1, 50) g"
+            ),
+            {"kb": KB_A, "src": source_ids[0]},
+        )
+        conn.commit()
+    monkeypatch.setattr(pgb, "MOVE_CHECK_CLEANUP_WAIT_SECONDS", 1.0)
+    real_validate = pgb.default_move_check_validate_ddl
+    deleter: dict = {}
+
+    def delete_the_source():
+        started = time.monotonic()
+        with engine.connect() as conn:
+            conn.execute(
+                text(f"DELETE FROM {SCHEMA}.indexed_sources WHERE id = CAST(:id AS uuid)"),
+                {"id": source_ids[0]},
+            )
+            conn.commit()
+        deleter["waited"] = time.monotonic() - started
+
+    def a_source_is_deleted_mid_move(*args, **kwargs):
+        if "thread" not in deleter:
+            deleter["thread"] = threading.Thread(target=delete_the_source, daemon=True)
+            deleter["thread"].start()
+            time.sleep(0.3)
+        return real_validate(*args, **kwargs)
+
+    monkeypatch.setattr(pgb, "default_move_check_validate_ddl", a_source_is_deleted_mid_move)
+    try:
+        pgb.create_partition(engine, KB_A, "chunks")
+    except Exception as exc:
+        error = exc
+    else:
+        error = None
+    deleter["thread"].join(timeout=30)
+
+    assert error is not None and pgb.is_transient_db_error(error), error
+    assert deleter["waited"] < 3.0, deleter
+    with engine.connect() as conn:
+        orphans = conn.execute(
+            text(
+                f"SELECT count(*) FROM {SCHEMA}.chunks WHERE indexed_source_id = CAST(:id AS uuid)"
+            ),
+            {"id": source_ids[0]},
+        ).scalar()
+    assert orphans == 0
+    assert _rows_in(session, "chunks", KB_A) == len(KB_A_DOCS)

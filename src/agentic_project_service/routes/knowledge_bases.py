@@ -387,28 +387,26 @@ def _pg_bm25_inputs_changed(old_config: dict, new_config: dict) -> bool:
 def _dispatch_ensure_pg_bm25_index(kb_id: str) -> None:
     """Ask a worker to reconcile this KB's pg_search partition and index.
 
-    Never fatal, and always off the request path. For a KB whose rows are
-    still in the item table's DEFAULT partition, the run moves them into the
-    KB's own partition in one transaction, and writes to that whole item
-    table -- every KB on it -- are blocked for the full move. Readers do not
-    wait on its SHARE locks; readers of the DEFAULT partition wait at most a
-    fraction of a second for each of its ACCESS EXCLUSIVE steps (see
-    ``create_partition``).
+    Never fatal, and always off the request path, and it never moves rows: it
+    is dispatched without ``allow_row_move``. It attaches the partition of a
+    KB with no rows in the item table's DEFAULT partition -- without holding
+    writers off (see ``pg_bm25_index.create_partition``) -- and builds or
+    rebuilds the bm25 index on a partition that exists.
 
-    So only two callers dispatch it: KB creation, before the KB has any rows
-    (which is what keeps the move free for every KB created from here on),
-    and a PATCH that ``_pg_ensure_cannot_move_rows`` clears; the operator's
-    ``POST /build-bm25`` dispatches the task directly. A PATCH on a KB with
-    rows in DEFAULT dispatches nothing and points at ``/build-bm25`` instead.
+    Two callers dispatch it: KB creation, before the KB has any rows (which is
+    what keeps the move free for every KB created from here on), and a PATCH
+    that ``_pg_ensure_cannot_move_rows`` clears; the operator's
+    ``POST /build-bm25`` dispatches the task itself, allowing a move. A PATCH on
+    a KB with rows in DEFAULT dispatches nothing and points at ``/build-bm25``
+    instead.
 
     The task itself decides whether there is anything to do at all: no
     extension, a strategy with no keyword table, an item table that is not
-    partitioned, a partition and index that already match. Dispatched without
-    ``allow_row_move``, so neither caller can start a move whatever happens
-    after the dispatch: a KB whose rows reach DEFAULT before the run attaches
-    its partition (its first sources indexed while the run waits or retries, or
-    rows committed after a PATCH's probe) is recorded ``failed`` with a reason
-    pointing at ``POST /build-bm25``.
+    partitioned, a partition and index that already match, a server that
+    cannot build the index safely (``unavailable``). A KB whose rows reach
+    DEFAULT before the run attaches its partition (its first sources indexed
+    while the run waits or retries, or rows committed after a PATCH's probe)
+    is recorded ``needs_build`` with a reason pointing at ``POST /build-bm25``.
     """
     try:
         ensure_pg_bm25_index.delay(kb_id)
@@ -2237,12 +2235,16 @@ def build_bm25_endpoint(kb_id: str):
       blocks writes to that whole item table -- every knowledge base on it --
       for its duration: about 5.5 s per million rows moved (4.2-8.8 s measured
       on the production schema), about 0.4-0.8 s for a 40 000-row knowledge
-      base. A KB that already has its partition, or has no rows in DEFAULT,
-      blocks no writes. After the move commits, the moved KB has no keyword
-      index until its bm25 index is built, roughly 8 s per million rows:
-      meanwhile hybrid search answers from vectors only and full_text search
-      returns the keyword-timeout 503. See ``pg_bm25_index.create_partition``
-      for the measurements.
+      base. Before that, while the move waits for indexing transactions in
+      flight on the table (up to 30 s), indexing that starts on the table waits
+      too: 6-9 s measured under steady indexing, also for a KB with no rows
+      in DEFAULT, which otherwise blocks no writes. After the move commits,
+      the moved KB has no keyword index until its bm25 index is built, 8-11 s
+      per million rows: meanwhile hybrid search answers from vectors only and
+      full_text search returns the keyword-timeout 503. Its secondary indexes
+      follow, another 60-90 s per million rows, during which deleting a
+      source's rows is slow (``bm25_status`` ``completing``). See
+      ``pg_bm25_index.create_partition`` for the measurements.
     - The pg_search extension is created when the project service starts. After
       swapping in a Postgres image that provides it, restart the project
       service first; until then this builds the bm25s file index instead.
@@ -2362,10 +2364,14 @@ def _build_bm25_note(item_table: str) -> str:
         f"partition, which blocks writes to the whole {AI_SCHEMA}.{item_table} table "
         "(every knowledge base on it) for the duration of the move: about 5.5 s per "
         "million rows moved, about 0.4-0.8 s for a 40,000-row knowledge base, and no "
-        "write block for a knowledge base with no rows in DEFAULT. After the move, the "
-        "knowledge base has no keyword index for roughly 8 s per million rows while its "
-        "bm25 index builds: hybrid search answers from vectors only and full_text search "
-        "returns 503 until it is ready. pg_search is enabled when the project service starts: "
+        "write block for a knowledge base with no rows in DEFAULT. Before it, while the "
+        "move waits for indexing already running on the table (up to 30 s), indexing that "
+        "starts on the table waits too. After the move, the knowledge base has no keyword "
+        "index for 8-11 s per million rows while its bm25 index builds: hybrid search "
+        "answers from vectors only and full_text search returns 503 until it is ready. Its "
+        "secondary indexes then take another 60-90 s per million rows, during which "
+        "deleting a source's rows is slow (bm25_status completing). pg_search is enabled "
+        "when the project service starts: "
         "after swapping in a Postgres image that provides it, restart the project "
         "service before building, or this builds the bm25s file index instead. "
         "Poll bm25_status on the knowledge base for progress."

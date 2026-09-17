@@ -146,14 +146,15 @@ _EXCLUSIVE_LOCK_QUEUED_TRY_AFTER_SECONDS = 0.1
 _EXCLUSIVE_LOCK_FIRST_SLEEP_SECONDS = 0.01
 _EXCLUSIVE_LOCK_MAX_SLEEP_SECONDS = 0.25
 
-# Before it takes the parent lock, the move checks that DEFAULT can be locked
-# at all: ``NOWAIT`` tries of ACCESS EXCLUSIVE, each released at once, for up to
-# this long. If every try is refused and a transaction that has been open for
-# longer than ``BM25_MOVE_LONG_HOLDER_SECONDS`` (a project setting, 5 s by
-# default) holds DEFAULT -- a reader idle in its transaction, typically -- it
-# would refuse every lock try the move makes on DEFAULT too, so the move gives
-# up there (SQLSTATE 55P03) instead of holding writers off the parent for those
-# tries first. Ordinary requests and overlapping short transactions refuse the
+# Before it takes the parent lock, the move checks that what it will lock can be
+# locked at all -- SHARE on the parent, ACCESS EXCLUSIVE on DEFAULT, SHARE ROW
+# EXCLUSIVE on each table the foreign keys reference: ``NOWAIT`` tries, each
+# released at once, for up to this long per relation. If every try is refused
+# and a transaction that has been open for longer than
+# ``BM25_MOVE_LONG_HOLDER_SECONDS`` (a project setting, 5 s by default) holds a
+# conflicting lock on it -- a reader idle in its transaction, or a long ungated
+# writer, typically -- it would refuse the move's lock too, so the move gives up
+# there (SQLSTATE 55P03) instead of holding writers off the parent first. Ordinary requests and overlapping short transactions refuse the
 # tries as well, but are younger than that, so the move goes ahead and its
 # bounded tries wait them out. Only a heuristic: a long reader can still arrive
 # after the probe, and the bounded tries remain the guard for that.
@@ -574,8 +575,10 @@ def move_gate_relation(item_table: str) -> str:
     order (``move_gate_shared_sql``) -- and would queue for every one of them
     while holding the first.
 
-    Other writers (API writes, enrichment, graph updates) do not take the gate;
-    the parent SHARE lock and the ``NOWAIT`` tries remain their protection.
+    Other writers (API writes, enrichment, graph updates such as
+    ``reenrich_graph_references``) do not take the gate; the parent SHARE lock,
+    the ``NOWAIT`` tries and the pre-flight (which gives up on a long one of
+    them before holding writers off) remain their protection.
     """
     return f"{partition_build_lock_relation(item_table)}#move"
 
@@ -604,10 +607,12 @@ def hold_move_gate_shared(session, item_tables: str | Iterable[str]) -> None:
     For indexing: call it before the first statement of a transaction that
     reads or writes one of ``item_tables`` -- only the tables it writes, so it
     waits for no move on any other (taking a gate again in the same
-    transaction is harmless). It waits while a move holds a gate -- holding no
-    lock on these tables meanwhile -- and raises whatever the wait raises (a
-    lock timeout the caller set, typically), which indexing requeues as a lock
-    conflict.
+    transaction is harmless). It waits while a move holds a gate, or queues
+    for one (at most ``MOVE_GATE_WAIT_SECONDS``, after which that move gives
+    up), holding no lock on these tables meanwhile unless its transaction
+    already took some. No caller sets a lock_timeout for it: a move holds the
+    gate only for its own bounded run. Whatever the wait raises, indexing
+    requeues as a lock conflict.
     """
     sql, params = move_gate_shared_sql(item_tables)
     session.execute(text(sql), params)
@@ -668,17 +673,14 @@ def move_rows_sql(knowledge_base_id: Any, item_table: str, columns: list[str]) -
 
     Foreign keys *from* these tables (to ``knowledge_bases``, ``sources``,
     ``indexed_sources``) do cascade into them while a move runs: Postgres'
-    referential triggers delete from DEFAULT and from the new partition by
-    name, never through the parent, so they wait on the move's SHARE lock on
-    DEFAULT (or the move waits on them) instead of on the parent. Such a
-    cascade and a move can deadlock; Postgres detects it and rolls one side
-    back whole, so no row is lost -- the move is one transaction and its task
-    retries, a re-index that loses re-queues its source. The move's ACCESS
-    EXCLUSIVE tries on DEFAULT never queue, but its SHARE lock on DEFAULT and
-    the ATTACH's lock on the new partition still do, so the cascade is not
-    guaranteed to be the side that survives. In the measured case (a source
-    deleted while the move was about to ATTACH) the delete waited 1.0 s and
-    both committed with no orphaned rows.
+    referential triggers delete from DEFAULT by name, never through the
+    parent, so a cascade delete waits on the move's SHARE lock on DEFAULT
+    (after the copy has started) instead of on the parent, holding its lock on
+    the referenced table meanwhile. The move then cannot take that table's lock
+    for its foreign keys: its tries do not queue, so it gives up (SQLSTATE
+    55P03) and its task retries, and the cascade completes. Should Postgres
+    find a deadlock instead (SQLSTATE 40P01), the move is one transaction and
+    rolls back whole just the same: no row is lost, duplicated or orphaned.
 
     ``columns`` are DEFAULT's insertable columns, already quoted
     (``_insertable_columns``), and are named on both sides: a column added to
@@ -2836,8 +2838,9 @@ def _attach_empty_partition(
     transaction of its own (SHARE UPDATE EXCLUSIVE: readers and writers carry
     on while DEFAULT is scanned), and then the attaching transaction builds
     every index on the still-empty clone and adds its foreign keys (both free
-    there), takes a second brief ACCESS EXCLUSIVE try on DEFAULT, attaches,
-    drops the check and commits. A write of this knowledge base routed to
+    there) after taking the referenced tables' locks the move's way
+    (``_lock_referenced_tables``), takes a second brief ACCESS EXCLUSIVE try on
+    DEFAULT, attaches, drops the check and commits. A write of this knowledge base routed to
     DEFAULT in the meantime is refused by the check (SQLSTATE 23514, which
     indexing requeues).
 
@@ -2852,8 +2855,10 @@ def _attach_empty_partition(
 
     Returns ``None`` when a row of the knowledge base reached DEFAULT before
     the check went up (it then fails to validate): the check is dropped, and
-    the caller moves the rows the ordinary way. Called under the item table's
-    build lock, with the bare clone prepared.
+    the caller either moves the rows the ordinary way or, when it may not move
+    rows (``allow_row_move=False``), raises ``RowMoveNotAllowed``. Called under
+    the item table's build lock and the move gate, with the bare clone
+    prepared.
     """
     partition = partition_name(kb_id, item_table)
     fence = default_move_check_name(kb_id)
@@ -2947,35 +2952,53 @@ def create_partition(
     ``RowMoveNotAllowed`` instead of being moved. Both paths start by taking
     the item table's move gate (see ``move_gate_relation``).
 
-    1. **prepare** (own transaction) -- clone the DEFAULT partition into an
-       unattached bare heap (no index, no foreign key) with a CHECK matching
-       the partition bound (so ATTACH skips its scan of the new partition).
-       Any temporary DEFAULT check a failed or killed move left is dropped,
-       and so is a stale clone (``_drop_stale_clone``).
-    2. **move** (one transaction) -- SHARE on the parent; meanwhile, on a
-       second connection, add ``CHECK (knowledge_base_id <> kb) NOT VALID`` to
-       DEFAULT (a catalog change) and commit it; SHARE on DEFAULT; copy the
-       KB's rows into the clone and delete them from DEFAULT; VALIDATE the
-       DEFAULT check (one scan of DEFAULT, which does not block readers);
-       build the primary key and any UNIQUE index in bulk and add the foreign
-       keys ``NOT VALID`` (``_build_move_indexes_and_keys``); ATTACH, which
-       now needs neither of its scans; drop the DEFAULT check under the lock
-       the ATTACH already holds; mirror ownership, grants, RLS and policies;
-       commit.
-    3. **complete** (``ensure_bm25_index``, after the bm25 index) -- validate
-       the foreign keys and build the plain secondary indexes ``CONCURRENTLY``
-       (``_complete_partition``); neither blocks writes.
+    In the order the code runs them:
+
+    1. **prepare** (own transaction, under the item table's build lock) --
+       drop any temporary DEFAULT check a failed or killed move left; clone
+       the DEFAULT partition into an unattached bare heap (no index, no
+       foreign key) with a CHECK matching the partition bound (so ATTACH skips
+       its scan of the new partition), dropping a stale clone first
+       (``_drop_stale_clone``).
+    2. **gate** -- take the move gate exclusively (``gate_wait_seconds``), then
+       check whether the knowledge base has rows in DEFAULT. None: attach the
+       empty partition (``_attach_empty_partition``) and stop here.
+    3. **pre-flight** (no lock held) -- ``_probe_default_before_moving``: give
+       up if a long transaction holds the parent, DEFAULT or a referenced
+       table.
+    4. **move** (one transaction) -- SHARE on the parent; on a second
+       connection, add ``CHECK (knowledge_base_id <> kb) NOT VALID`` to DEFAULT
+       (a catalog change) and commit it -- the fence goes up before the copy;
+       SHARE on DEFAULT; copy the KB's rows into the clone and delete them
+       from DEFAULT; VALIDATE the DEFAULT check (one scan of DEFAULT, which
+       does not block readers); SHARE ROW EXCLUSIVE on the tables the foreign
+       keys reference (``_lock_referenced_tables``); build the primary key and
+       any UNIQUE index in bulk and add the foreign keys ``NOT VALID``
+       (``_build_move_indexes_and_keys``); ATTACH, which now needs neither of
+       its scans; drop the DEFAULT check under the lock the ATTACH already
+       holds; mirror ownership, grants, RLS and policies; commit. Then release
+       the gate and the build lock, and ANALYZE the partition.
+    5. **after the commit** (``ensure_bm25_index``) -- build the bm25 index
+       ``CONCURRENTLY``; then, once it is ready, validate the foreign keys and
+       build the plain secondary indexes ``CONCURRENTLY``
+       (``_complete_partition``, recorded as ``completing``). None of it
+       blocks writes.
 
     Every ACCESS EXCLUSIVE lock on DEFAULT (adding the check, the ATTACH) is
     taken by ``_lock_default_exclusively``: ``NOWAIT`` tries for up to
     ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS`` and at most one short queued try,
-    never while a holder of DEFAULT is waiting for a lock. A reader that stays
-    in the way makes the *move* give up (SQLSTATE 55P03), instead of stalling
-    new readers for long or deadlocking a transaction that read DEFAULT and
-    then writes through the parent. And before step 2 takes the parent lock,
-    ``_probe_default_before_moving`` checks for a transaction that already
-    holds DEFAULT and would refuse all of those tries: with one there, the move
-    gives up the same way without holding writers off at all.
+    never while a holder of DEFAULT is waiting for a lock; the referenced
+    tables' locks are taken the same way. A reader or writer that stays in the
+    way makes the *move* give up (SQLSTATE 55P03), instead of stalling new
+    readers for long or deadlocking a transaction that read DEFAULT and then
+    writes through the parent. And before step 4 takes the parent lock, the
+    pre-flight checks for a transaction that already holds one of those
+    relations and would refuse the move's locks: with one there, the move gives
+    up the same way without holding writers off at all. That includes an
+    ungated long writer of another, already partitioned, knowledge base --
+    ``reenrich_graph_references`` keeps its graph_index_nodes writes open for
+    its whole run, holding the parent -- which the parent's SHARE lock would
+    otherwise wait for with every writer of the table queued behind it.
 
     The bm25 index is built afterwards with CREATE INDEX CONCURRENTLY, outside
     any of this.
@@ -3013,11 +3036,20 @@ def create_partition(
       long reader arrives mid-move). A long reader already there when the
       move starts costs them nothing: the move gives up before taking the
       parent lock.
-    * **after the commit**, nothing blocks writers: the bm25 index is built
-      concurrently (6.5 s for a million rows), then the plain secondary
-      indexes (the btrees 1.8 s, the GIN index 47 s) and the foreign keys are
-      validated (0.5 s). See the first accepted trade-off below for what
-      keyword search does meanwhile.
+    * **writers of** ``knowledge_bases``, ``sources`` and ``indexed_sources``
+      (any knowledge base), from the referenced tables' locks in step 4 to the
+      commit: up to ~0.6 s measured, or ``DEFAULT_EXCLUSIVE_LOCK_WAIT_SECONDS``
+      per table more when the move has to try for the lock. A writer of those
+      tables that holds its lock when the move reaches them makes the move
+      give up instead of waiting for it.
+    * **after the commit**, nothing blocks writers. The bm25 index is built
+      concurrently: 8-11 s per million rows before keyword search is served
+      by it (see the first trade-off below). Then the plain secondary indexes
+      are built and the foreign keys validated, another 60-90 s per million
+      rows (the full-text GIN index ~59 s of it); until they are in place a
+      delete of one source's rows scans the whole partition (measured 277 ms
+      against 8.7 ms with the indexes), and ``bm25_status`` reports
+      ``completing``.
     * **readers** do not block on the SHARE locks. They can wait on the
       ACCESS EXCLUSIVE steps on DEFAULT (the check going up, the ATTACH, the
       check's drop after a failed move): new readers of DEFAULT, and queries
@@ -3032,28 +3064,23 @@ def create_partition(
     * **No keyword index right after the move.** Once step 2 commits, the
       knowledge base's rows are in a partition with no bm25 index yet and none
       of the plain secondary indexes, the full-text GIN index among them. Until
-      the bm25 index's concurrent build finishes -- roughly 8 s per million
-      rows moved (6.5 s of it the build itself) -- its keyword leg falls back to
+      the bm25 index's concurrent build finishes -- 8-11 s per million rows
+      moved, longer while a long snapshot (a running ``pg_dump``, say) makes
+      the concurrent build wait for it -- its keyword leg falls back to
       the bounded tsvector path, which scans the partition and, at that size,
       runs out of its time budget: hybrid search answers from vectors only, and
       full_text search returns the keyword-timeout 503. Nothing is wrong with
       the data; the answers come back once the index is ready.
-    * **A deadlock with an ungated writer of a referenced table.** Adding the
-      foreign keys ``NOT VALID`` takes SHARE ROW EXCLUSIVE on
-      ``knowledge_bases``, ``sources`` and ``indexed_sources`` while the move
-      holds SHARE on the parent and DEFAULT. A transaction that does not take
-      the move gate and writes one of those tables and then an item table --
-      a cascade delete of a knowledge base or source is exactly that -- closes
-      a lock cycle with the move. Postgres aborts one side with SQLSTATE 40P01:
-      the side whose one-time deadlock check (``deadlock_timeout`` after it
-      began waiting) runs first once the cycle exists. That is the move when
-      it was the first to wait, or when the writer began waiting more than
-      ``deadlock_timeout`` before the move reached its keys; it is the writer
-      when the writer began waiting less than ``deadlock_timeout`` before
-      that (measured: a writer waiting 0.3 s before the keys lost; 1.5 s
-      before, the move lost). Either way the loser rolls back whole and nothing
-      is lost: the move's task retries it, and the writer's caller receives the
-      error (a re-index requeues its source).
+    * **A lost move against an ungated writer of a referenced table.** A
+      transaction that does not take the move gate and writes
+      ``knowledge_bases``, ``sources`` or ``indexed_sources`` and then an item
+      table -- a cascade delete of a knowledge base or source is exactly that
+      -- holds what the move's referenced-table locks need while it waits for
+      the move's SHARE locks. The move's tries for those locks do not queue (and
+      make no queued try while such a holder waits), so the move gives up
+      (SQLSTATE 55P03) and its task retries; should Postgres find a deadlock
+      first (SQLSTATE 40P01), one side rolls back the same way. The move rolls
+      back whole and nothing is lost.
 
     Why this order. The DEFAULT check cannot be validated while any of the
     knowledge base's rows are still in DEFAULT, so VALIDATE has to follow the
@@ -3074,7 +3101,8 @@ def create_partition(
     UPDATEs and DELETEs.
 
     Serialised per item table by a session-scoped advisory lock: two
-    concurrent moves out of one DEFAULT partition deadlock each other.
+    concurrent moves out of one DEFAULT partition could not both finish (see
+    ``partition_build_lock_sql``).
 
     Re-entrant: a failure in step 2 rolls the move back, leaving the clone
     empty. If the check had already been committed, the move keeps trying to
