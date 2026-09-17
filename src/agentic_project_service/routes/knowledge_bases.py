@@ -2113,10 +2113,14 @@ def build_bm25_endpoint(kb_id: str):
     - For a KB whose rows are still in the item table's shared DEFAULT
       partition, the move into its own partition runs in one transaction that
       blocks writes to that whole item table -- every knowledge base on it --
-      for its duration. The block grows with the number of rows moved (on the
-      order of seconds per hundred thousand rows; see the measurements in
-      ``pg_bm25_index.create_partition``), so schedule it. A KB that already
-      has its partition, or has no rows, blocks nothing.
+      for its duration: about 5.5 s per million rows moved (4.2-8.8 s measured
+      on the production schema), about 0.4-0.8 s for a 40 000-row knowledge
+      base. A KB that already has its partition, or has no rows in DEFAULT,
+      blocks no writes. After the move commits, the moved KB has no keyword
+      index until its bm25 index is built, roughly 8 s per million rows:
+      meanwhile hybrid search answers from vectors only and full_text search
+      returns the keyword-timeout 503. See ``pg_bm25_index.create_partition``
+      for the measurements.
     - The pg_search extension is created when the project service starts. After
       swapping in a Postgres image that provides it, restart the project
       service first; until then this builds the bm25s file index instead.
@@ -2209,8 +2213,12 @@ def _build_bm25_note(item_table: str) -> str:
         "On a Postgres server with pg_search, the first build for a knowledge base "
         "whose rows are still in the shared DEFAULT partition moves them into its own "
         f"partition, which blocks writes to the whole {AI_SCHEMA}.{item_table} table "
-        "(every knowledge base on it) for the duration of the move; it grows with the "
-        "number of rows moved. pg_search is enabled when the project service starts: "
+        "(every knowledge base on it) for the duration of the move: about 5.5 s per "
+        "million rows moved, about 0.4-0.8 s for a 40,000-row knowledge base, and no "
+        "write block for a knowledge base with no rows in DEFAULT. After the move, the "
+        "knowledge base has no keyword index for roughly 8 s per million rows while its "
+        "bm25 index builds: hybrid search answers from vectors only and full_text search "
+        "returns 503 until it is ready. pg_search is enabled when the project service starts: "
         "after swapping in a Postgres image that provides it, restart the project "
         "service before building, or this builds the bm25s file index instead. "
         "Poll bm25_status on the knowledge base for progress."
