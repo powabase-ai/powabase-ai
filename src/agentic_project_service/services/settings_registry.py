@@ -1108,6 +1108,24 @@ def _build_registry() -> dict[str, SettingDef]:
                 "retry later instead of blocking writes behind it."
             ),
         ),
+        SettingDef(
+            key="BM25_PG_SEARCH_CONCURRENT_BUILD_SAFE",
+            category=cat,
+            label="pg_search Concurrent Index Builds Are Safe",
+            type="bool",
+            default=False,
+            advanced=True,
+            description=(
+                "Turn on only if this database's pg_search build contains the fix "
+                "from paradedb/paradedb#6211. Without that fix, on Postgres 15 and "
+                "16, building a knowledge base's BM25 index while its table takes "
+                "writes fails or crashes the database server, so no BM25 index is "
+                "built unless the server shows the fix: Postgres 17 or later, "
+                "pg_search 0.26.0 or later, or powabase.pg_search_cic_safe = on in "
+                "postgresql.conf. This setting is for a pg_search you built with "
+                "the fix yourself, which the server cannot show."
+            ),
+        ),
     ]
 
     # =========================================================================

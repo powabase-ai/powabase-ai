@@ -30,10 +30,14 @@ fix paradedb/paradedb#6211 (no 0.25.x release does). Indexes here are built
 with ``CREATE INDEX CONCURRENTLY`` while the item table keeps being written to,
 and without the fix that build fails inside pg_search -- XX000 "buffer ... is
 not owned by resource owner", leaving the index INVALID -- or crashes the
-server, ending every session on it. Both are retried (``Bm25IndexBuildFailed``,
-and a lost connection), and the retry rebuilds the INVALID index, but under
-steady writes they recur. Postgres 17 and 18 are not affected.
-``ci/pg_search/Dockerfile`` builds 0.25.9 with the fix.
+server, ending every session on it. Postgres 17 and 18 are not affected.
+Nothing pg_search reports tells a build with the fix from one without, so no
+bm25 index is built -- and no rows are moved for one -- unless the server shows
+it (``concurrent_build_safety``): the image sets ``powabase.pg_search_cic_safe
+= on``, the server is Postgres 17+, pg_search is 0.26.0+, or the
+``BM25_PG_SEARCH_CONCURRENT_BUILD_SAFE`` setting vouches for it. Otherwise the
+knowledge base keeps the keyword path it has and reports ``unavailable``.
+``ci/pg_search/Dockerfile`` builds 0.25.9 with the fix and sets the marker.
 """
 
 from __future__ import annotations
@@ -1293,6 +1297,134 @@ class Bm25IndexBuildFailed(RuntimeError):
     crash the server instead; the build then fails with a lost connection,
     which is retried as well (see ``_reset_statement_timeout``).
     """
+
+
+# ---------------------------------------------------------------------------
+# Is a concurrent bm25 build safe on this server?
+# ---------------------------------------------------------------------------
+
+#: A placeholder setting a Postgres image whose pg_search contains
+#: paradedb/paradedb#6211 sets in its ``postgresql.conf``. Any name with a dot
+#: is accepted by Postgres without an extension defining it, and
+#: ``current_setting(name, true)`` answers NULL on a server that does not set it.
+PG_SEARCH_CIC_SAFE_MARKER = "powabase.pg_search_cic_safe"
+#: The project setting a self-hoster turns on for a pg_search they built with
+#: the fix themselves, which nothing on the server can show.
+CONCURRENT_BUILD_SAFE_SETTING = "BM25_PG_SEARCH_CONCURRENT_BUILD_SAFE"
+#: Postgres 17 and later are not affected.
+UNAFFECTED_SERVER_VERSION_NUM = 170000
+#: The first pg_search release line that contains the fix: v0.26.0-rc.1 is a
+#: descendant of the fix's merge commit, and no 0.25.x release contains it.
+FIXED_PG_SEARCH_VERSION = (0, 26)
+
+_CONCURRENT_BUILD_SAFETY_SQL = (
+    f"SELECT current_setting('{PG_SEARCH_CIC_SAFE_MARKER}', true), "
+    "current_setting('server_version_num')::int, "
+    "(SELECT extversion FROM pg_extension WHERE extname = 'pg_search')"
+)
+
+#: Why a build was not started, for logs, the recorded outcome and the API.
+CONCURRENT_BUILD_UNSAFE_REASON = (
+    "not built: nothing shows that this server's pg_search contains the fix for "
+    "building a bm25 index while the table takes writes (paradedb/paradedb#6211). "
+    "Without it, on Postgres 15 and 16 that build fails or crashes the database "
+    "server, so no index was built, no rows were moved and no existing index was "
+    "dropped; keyword search keeps the path it uses now. To enable it, run a "
+    f"Postgres image that sets {PG_SEARCH_CIC_SAFE_MARKER} = on in postgresql.conf, "
+    "Postgres 17 or later, or pg_search 0.26.0 or later -- or, if your pg_search "
+    f"build contains the fix, turn on the {CONCURRENT_BUILD_SAFE_SETTING} setting -- "
+    "then POST /build-bm25"
+)
+
+_unsafe_build_warning_logged = False
+
+
+def _read_concurrent_build_override() -> bool:
+    """``BM25_PG_SEARCH_CONCURRENT_BUILD_SAFE``; off outside an application context."""
+    if not _has_app_context():
+        return False
+    try:
+        from . import settings_registry
+
+        return bool(settings_registry.get_setting(CONCURRENT_BUILD_SAFE_SETTING))
+    except Exception:
+        logger.warning(
+            "Could not read %s; treating it as off", CONCURRENT_BUILD_SAFE_SETTING, exc_info=True
+        )
+        return False
+
+
+def _concurrent_build_override() -> bool:
+    return _read_concurrent_build_override()
+
+
+def _parse_safety_row(row) -> tuple[bool, str] | None:
+    """``(safe, basis)`` from the probe's row, or None when it cannot be read."""
+    if row is None or len(row) != 3:
+        return None
+    marker, server_version_num, extversion = row
+    if marker is not None and not isinstance(marker, str):
+        return None
+    if not isinstance(server_version_num, int) or isinstance(server_version_num, bool):
+        return None
+    if extversion is not None and not isinstance(extversion, str):
+        return None
+    if (marker or "").strip().lower() == "on":
+        return True, f"marker {PG_SEARCH_CIC_SAFE_MARKER}"
+    if server_version_num >= UNAFFECTED_SERVER_VERSION_NUM:
+        return True, f"postgres {server_version_num}"
+    match = re.match(r"(\d+)\.(\d+)", extversion or "")
+    if match and (int(match.group(1)), int(match.group(2))) >= FIXED_PG_SEARCH_VERSION:
+        return True, f"pg_search {extversion}"
+    return False, "unverified"
+
+
+def concurrent_build_safety(bind) -> tuple[bool, str]:
+    """Can a bm25 index be built concurrently here without the pg_search bug?
+
+    Safe when any of these holds: the server sets ``PG_SEARCH_CIC_SAFE_MARKER``
+    to ``on``; it is Postgres 17 or later; its pg_search is 0.26.0 or later; or
+    the project setting ``CONCURRENT_BUILD_SAFE_SETTING`` vouches for it.
+    Returns ``(safe, basis)``, the basis being what made it safe or
+    ``"unverified"``. Raises if the server cannot be asked (the build path's
+    caller retries a transient error).
+    """
+    parsed = _parse_safety_row(_probe(bind, _CONCURRENT_BUILD_SAFETY_SQL))
+    if parsed is None:
+        raise RuntimeError("could not read whether a concurrent bm25 build is safe")
+    if parsed[0]:
+        return parsed
+    if _concurrent_build_override():
+        return True, "setting"
+    return parsed
+
+
+def concurrent_build_known_unsafe(bind) -> bool:
+    """For a request path: True only on a clear "not safe" answer. Never raises."""
+    try:
+        parsed = _parse_safety_row(_probe(bind, _CONCURRENT_BUILD_SAFETY_SQL))
+        if parsed is None or parsed[0]:
+            return False
+        return not _concurrent_build_override()
+    except Exception:
+        logger.debug("Could not tell whether a concurrent bm25 build is safe", exc_info=True)
+        return False
+
+
+def _warn_unsafe_build_once(kb_id: str) -> None:
+    """One WARNING per process: every knowledge base's ensure would repeat it."""
+    global _unsafe_build_warning_logged
+    if _unsafe_build_warning_logged:
+        logger.info(
+            "Not building the BM25 index of KB %s: concurrent build not verified safe", kb_id
+        )
+        return
+    _unsafe_build_warning_logged = True
+    logger.warning(
+        "Not building BM25 indexes (first: KB %s): %s. Logged once per process",
+        kb_id,
+        CONCURRENT_BUILD_UNSAFE_REASON,
+    )
 
 
 def first_error_line(exc: BaseException) -> str:
@@ -2976,6 +3108,8 @@ def ensure_bm25_index(
         dropped = _drop_indexes_on_other_item_tables(conn, kb_id, item_table)
         if dropped:
             outcome["dropped_indexes"] = dropped
+        build_safe, _ = concurrent_build_safety(conn)
+        unavailable = {**outcome, "status": "unavailable", "reason": "concurrent_build_unsafe"}
 
         # An unattached partition is a move that did not finish -- a crash, or a
         # move that timed out waiting for its locks. Resuming it is the same call.
@@ -2996,6 +3130,12 @@ def ensure_bm25_index(
                     first_error_line(exc),
                 )
         else:
+            if not build_safe:
+                # A move only exists to be followed by a bm25 build: without
+                # one, the moved knowledge base loses its file index to the
+                # slow tsvector fallback and gains nothing.
+                _warn_unsafe_build_once(kb_id)
+                return unavailable
             if _relkind(conn, default_partition_name(item_table)) is None:
                 logger.warning(
                     "Not building a BM25 index for KB %s: %s.%s has no DEFAULT partition "
@@ -3036,11 +3176,17 @@ def ensure_bm25_index(
         if not conn.execute(text(partition_build_lock_sql()), {"relation": index_lock}).scalar():
             return {**outcome, "status": "building"}
         try:
-            outcome = _ensure_index_locked(conn, outcome, kb_id, item_table, ts_language, progress)
+            outcome = _ensure_index_locked(
+                conn, outcome, kb_id, item_table, ts_language, progress, build_safe=build_safe
+            )
+            if outcome.get("status") == "unavailable":
+                _warn_unsafe_build_once(kb_id)
             # After the bm25 index, which is what serves this knowledge base's
             # keyword search: until then the plain indexes (the full-text GIN
-            # above all, the one slow build) would only delay it.
-            if outcome.get("status") == "ready":
+            # above all, the one slow build) would only delay it. A partition
+            # whose bm25 build is not safe here is still completed: its plain
+            # indexes are what keep its source-scoped deletes fast.
+            if outcome.get("status") in ("ready", "unavailable"):
                 completed = _complete_partition(conn, kb_id, item_table)
                 if completed:
                     outcome["completed"] = completed
@@ -3103,11 +3249,26 @@ def _index_build_in_progress(conn, partition: str) -> bool:
 
 
 def _ensure_index_locked(
-    conn, outcome: dict, kb_id: str, item_table: str, ts_language, progress=lambda status: None
+    conn,
+    outcome: dict,
+    kb_id: str,
+    item_table: str,
+    ts_language,
+    progress=lambda status: None,
+    *,
+    build_safe: bool = True,
 ) -> dict:
+    """Build, repair or keep this KB's bm25 index, under the index's own lock.
+
+    Without ``build_safe`` (``concurrent_build_safety``) nothing is built or
+    dropped: an index that matches still reports its state, and every other
+    case -- no index, an INVALID one, one tokenized for another language, which
+    keeps serving -- is ``unavailable``.
+    """
     name = bm25_index_name(kb_id, item_table)
     partition = partition_name(kb_id, item_table)
     cast = bm25_tokenizer_cast(item_table, ts_language)
+    unavailable = {**outcome, "status": "unavailable", "reason": "concurrent_build_unsafe"}
     existing = conn.execute(
         text(
             "SELECT pg_get_indexdef(c.oid), i.indisvalid FROM pg_class c "
@@ -3122,6 +3283,8 @@ def _ensure_index_locked(
     if existing_def and not existing[1]:
         if _index_build_in_progress(conn, partition):
             return {**outcome, "status": "building"}
+        if not build_safe:
+            return unavailable
         # INVALID with nothing building it: what a cancelled, killed or failed
         # CREATE INDEX CONCURRENTLY leaves behind. Its definition still matches,
         # and ``IF NOT EXISTS`` would make a re-run a no-op, so without this the
@@ -3140,6 +3303,8 @@ def _ensure_index_locked(
     if existing_def and indexdef_matches_tokenizer(existing_def, cast):
         return {**outcome, "status": bm25_index_state(conn, kb_id, item_table)}
 
+    if not build_safe:
+        return unavailable
     if existing_def:
         logger.info("Rebuilding BM25 index %s: tokenizer changed to %s", name, cast)
         conn.execute(text(bm25_drop_ddl(kb_id, item_table)))

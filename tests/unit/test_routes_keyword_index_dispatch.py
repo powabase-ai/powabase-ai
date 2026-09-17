@@ -768,6 +768,16 @@ class TestStatusReportsThePersistedBuildOutcome:
         assert got == status
         assert reason == "lock_not_available"
 
+    def test_a_kb_the_server_cannot_build_reports_unavailable_with_the_remedy(self):
+        from agentic_project_service.services import pg_bm25_index
+
+        (got, reason), _ = self._detail(
+            pg_state="absent",
+            outcome=self._outcome("unavailable", pg_bm25_index.CONCURRENT_BUILD_UNSAFE_REASON),
+        )
+        assert got == "unavailable"
+        assert "BM25_PG_SEARCH_CONCURRENT_BUILD_SAFE" in reason
+
     def test_the_status_is_reported_with_auto_indexing_on(self):
         """Auto-indexing on used to omit the field for a file-served KB."""
         (got, _), _ = self._detail(

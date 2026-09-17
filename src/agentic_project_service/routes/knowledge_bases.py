@@ -506,7 +506,9 @@ def _dispatch_drop_pg_bm25_index(kb_id: str) -> None:
 # gave up. A recorded "ready" is not in here: once the index serves, its own
 # state is reported, and a "ready" without a ready index is history (the index
 # was dropped or is being rebuilt since).
-_UNFINISHED_BM25_BUILD_STATUSES = frozenset({"queued", "moving", "building", "retrying", "failed"})
+_UNFINISHED_BM25_BUILD_STATUSES = frozenset(
+    {"queued", "moving", "building", "retrying", "failed", "unavailable"}
+)
 
 
 def _unfinished_bm25_build_outcome(kb_id: str, item_table: str | None) -> dict | None:
@@ -603,6 +605,10 @@ def _bm25_status_detail(kb, recorded: dict | None = None) -> tuple[str | None, s
         own index (``ai.bm25_index_builds``) -- dispatched, moving its rows
         out of DEFAULT, waiting to retry, or given up. These come with
         ``bm25_status_reason`` when the worker recorded one;
+      - ``"unavailable"`` (pg_search): the server cannot show that a bm25
+        index can be built there without the pg_search bug fixed by
+        paradedb/paradedb#6211, so none was built or moved; the reason names
+        the marker and the setting that enable it;
       - ``"stale"`` (pg_search): a recorded ``moving`` or ``building`` that has
         not been updated for ``BM25_BUILD_OUTCOME_STALE_SECONDS`` -- the run
         that recorded it most likely stopped (a worker killed mid-move, or a
@@ -2170,8 +2176,11 @@ def build_bm25_endpoint(kb_id: str):
     - On Postgres 15 and 16 the image's pg_search must contain
       paradedb/paradedb#6211. The index is built concurrently while the item
       table takes writes, and without that fix the build fails or crashes the
-      Postgres server (stock 0.25.9 does both). The task retries either way, but
-      under steady writes the failures recur.
+      Postgres server (stock 0.25.9 does both). Nothing pg_search reports tells
+      the two apart, so this refuses with 409 unless the server shows the fix
+      (``pg_bm25_index.concurrent_build_safety``: the image sets
+      ``powabase.pg_search_cic_safe = on``, Postgres 17+, pg_search 0.26.0+) or
+      the ``BM25_PG_SEARCH_CONCURRENT_BUILD_SAFE`` setting vouches for it.
 
     Returns 202 + the Celery task id. Caller can poll ``bm25_status`` (and
     ``bm25_status_reason``) on the KB to observe completion.
@@ -2237,6 +2246,10 @@ def build_bm25_endpoint(kb_id: str):
         ), 400
 
     on_pg_search = _keyword_index_backend(strategy) == "pg_search"
+    if on_pg_search and pg_bm25_index.concurrent_build_known_unsafe(db.session):
+        return jsonify(
+            {"error": _CONCURRENT_BUILD_UNSAFE_ERROR, "code": "pg_search_concurrent_build_unsafe"}
+        ), 409
     try:
         if on_pg_search:
             # The operator's request is what may move the KB's rows.
@@ -2253,6 +2266,19 @@ def build_bm25_endpoint(kb_id: str):
             "note": _build_bm25_note(_STRATEGY_TO_ITEM_TABLE[strategy]),
         }
     ), 202
+
+
+_CONCURRENT_BUILD_UNSAFE_ERROR = (
+    "No BM25 index was built: nothing shows that this database's pg_search contains "
+    "the fix for building a bm25 index while the table takes writes "
+    "(paradedb/paradedb#6211), and without it that build fails or crashes the database "
+    "server on Postgres 15 and 16. Nothing was moved, and keyword search keeps the path "
+    "it uses now. To enable it, run a Postgres image that sets "
+    f"{pg_bm25_index.PG_SEARCH_CIC_SAFE_MARKER} = on in postgresql.conf, Postgres 17 or "
+    "later, or pg_search 0.26.0 or later -- or, if your pg_search build contains the "
+    f"fix, turn on the {pg_bm25_index.CONCURRENT_BUILD_SAFE_SETTING} setting -- then "
+    "call this endpoint again."
+)
 
 
 def _build_bm25_note(item_table: str) -> str:

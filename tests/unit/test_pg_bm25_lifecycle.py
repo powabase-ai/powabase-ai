@@ -66,7 +66,9 @@ class _FakeConn:
         partition_foreign_keys=(),
         build_in_progress=False,
         default_rows=True,
+        build_safe=True,
     ):
+        self.build_safe = build_safe
         self.extension = extension
         self.kb_row = kb_row
         self.indexdef = indexdef
@@ -106,7 +108,9 @@ class _FakeConn:
         result.rowcount = 0
         row = None
         rows: list = []
-        if "pg_extension" in sql:
+        if "pg_search_cic_safe" in sql:
+            row = ("on" if self.build_safe else None, 150008, "0.25.9")
+        elif "pg_extension" in sql:
             row = (1,) if self.extension else None
         elif "knowledge_bases" in sql and "pg_class" not in sql:
             row = self.kb_row

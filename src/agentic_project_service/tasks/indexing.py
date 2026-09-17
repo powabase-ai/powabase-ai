@@ -2859,6 +2859,10 @@ def ensure_pg_bm25_index(self, kb_id: str, allow_row_move: bool = False) -> dict
         _retire_file_index(kb_id, outcome["item_table"])
     if status in ("ready", "building"):
         record(status)
+    elif status == "unavailable":
+        # Not an alarm and not retried: the server cannot build the index
+        # safely, and nothing about that changes until an operator acts.
+        record("unavailable", pg_bm25_index.CONCURRENT_BUILD_UNSAFE_REASON)
     elif skip_reason == "row_move_not_allowed":
         record("failed", ROW_MOVE_NOT_ALLOWED_REASON)
         logger.warning(

@@ -5,7 +5,7 @@ the index build that follows it) can retry several times before it succeeds
 or gives up. Nothing survived a restart of that bookkeeping until now: this
 table lets the pg tasks record, per (knowledge_base_id, item_table), the
 latest status (``queued``, ``moving``, ``building``, ``ready``, ``retrying``,
-``failed``), the reason for a retry or failure, and how many attempts it took
+``failed``, or ``unavailable`` when the server cannot build one safely), the reason for a retry or failure, and how many attempts it took
 -- so a KB's ``bm25_status`` can be reported even after the worker restarts.
 
 Class-B (service-only), same posture as the other backend-only ``ai`` tables
@@ -37,7 +37,8 @@ def upgrade():
                     REFERENCES ai.knowledge_bases(id) ON DELETE CASCADE,
                 item_table TEXT NOT NULL,
                 status TEXT NOT NULL
-                    CHECK (status IN ('queued', 'moving', 'building', 'ready', 'retrying', 'failed')),
+                    CHECK (status IN ('queued', 'moving', 'building', 'ready', 'retrying',
+                                      'failed', 'unavailable')),
                 reason TEXT,
                 attempts INTEGER,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),

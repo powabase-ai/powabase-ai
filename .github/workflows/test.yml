@@ -209,6 +209,14 @@ jobs:
           psql -h localhost -U supabase_admin -d pg_search_test -v ON_ERROR_STOP=1 \
             -c "CREATE EXTENSION vector" \
             -c "CREATE EXTENSION pg_search"
+          # The image's marker that its pg_search can build a bm25 index under
+          # writes; without it the service builds none, and the suite fails.
+          marker=$(psql -h localhost -U supabase_admin -d pg_search_test -tA \
+            -c "SELECT current_setting('powabase.pg_search_cic_safe', true)")
+          if [ "$marker" != "on" ]; then
+            echo "::error::the image does not set powabase.pg_search_cic_safe = on (got '$marker')"
+            exit 1
+          fi
 
       - name: Run pg_search tests
         run: |

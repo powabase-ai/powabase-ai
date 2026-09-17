@@ -73,4 +73,11 @@ RUN --mount=type=cache,target=/src/target \
 FROM ${PARADEDB_IMAGE}
 COPY --from=builder /out/pg_search-pg15/usr/lib/postgresql/15/lib/pg_search.so /usr/lib/postgresql/15/lib/pg_search.so
 COPY --from=builder /out/pg_search-pg15/usr/share/postgresql/15/extension/ /usr/share/postgresql/15/extension/
+# The marker the service reads before it builds a bm25 index concurrently
+# (pg_bm25_index.concurrent_build_safety): nothing pg_search itself reports
+# tells this build from stock 0.25.9. initdb copies the sample into the data
+# directory, so a new cluster starts with it; a custom setting with a dot in
+# its name needs no extension to define it.
+RUN printf '\n# pg_search here contains paradedb/paradedb#6211\npowabase.pg_search_cic_safe = on\n' \
+        >> /usr/share/postgresql/postgresql.conf.sample
 LABEL org.opencontainers.image.description="paradedb 0.25.9-pg15 with pg_search rebuilt from v0.25.9 + paradedb#6211, for tests only"
