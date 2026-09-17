@@ -116,6 +116,40 @@ def engine():
 
 _KB_LANGUAGES = {KB_A: "german", KB_B: "french", KB_C: "german"}
 
+_SCHEMA_DROP_ATTEMPTS = 5
+
+
+def _drop_scratch_schema(engine) -> None:
+    """Drop the scratch schema even if a session a test left behind still uses it.
+
+    A test that fails part-way can leave a thread's session holding locks in
+    the schema; the drop then waits on it or deadlocks with it (40P01), and
+    every later test here errors in setup. So the drop waits a bounded time,
+    and after a lock conflict ends the sessions holding locks on the schema's
+    relations and tries again. Only this schema's lock holders: nothing else on
+    the server is touched.
+    """
+    for attempt in range(1, _SCHEMA_DROP_ATTEMPTS + 1):
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            try:
+                conn.execute(text("SET lock_timeout = '5s'"))
+                conn.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
+                return
+            except Exception as exc:
+                if attempt == _SCHEMA_DROP_ATTEMPTS or not pgb.is_lock_conflict(exc):
+                    raise
+            conn.execute(
+                text(
+                    "SELECT pg_terminate_backend(l.pid) FROM pg_locks l "
+                    "JOIN pg_class c ON c.oid = l.relation "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = :schema AND l.pid <> pg_backend_pid() "
+                    "GROUP BY l.pid"
+                ),
+                {"schema": SCHEMA},
+            )
+        time.sleep(0.5)
+
 
 @pytest.fixture(autouse=True)
 def scratch_schema(engine, migration, monkeypatch):
@@ -129,8 +163,8 @@ def scratch_schema(engine, migration, monkeypatch):
     """
     monkeypatch.setattr(pgb, "AI_SCHEMA", SCHEMA)
     pgb.reset_pg_bm25_caches()
+    _drop_scratch_schema(engine)
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
         conn.execute(text(f"CREATE SCHEMA {SCHEMA}"))
         conn.execute(
             text(f"""
@@ -208,8 +242,7 @@ def scratch_schema(engine, migration, monkeypatch):
                 )
         migration.partition_item_tables(conn, schema=SCHEMA)
     yield
-    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(text(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"))
+    _drop_scratch_schema(engine)
     pgb.reset_pg_bm25_caches()
 
 

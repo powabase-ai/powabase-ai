@@ -8,6 +8,11 @@ finish within its task's retry budget, and every write that committed has to
 be there afterwards, exactly once.
 
 Same database and scratch schema as ``test_pg_bm25_live``.
+
+The traffic runs on an engine of its own. The long re-indexers alone hold up to
+ten connections at a time, and on the engine under test they exhausted its pool
+(5 + 10 overflow), so the move failed for want of a connection -- a starvation
+the test caused, not one the move has in a worker, whose pool is its own.
 """
 
 from __future__ import annotations
@@ -17,7 +22,9 @@ import threading
 import time
 import uuid
 
-from sqlalchemy import text
+import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
 
 from agentic_project_service.services import pg_bm25_index as pgb
 from tests.pg_search import test_pg_bm25_live as live
@@ -29,6 +36,12 @@ scratch_schema = live.scratch_schema
 session = live.session
 
 RETRY_BUDGET = 6
+
+# Tags the traffic's backends, so teardown can find any that outlive their thread.
+TRAFFIC_APPLICATION_NAME = "bm25_acceptance_traffic"
+# A long re-index holds its connection for up to 10 s, so this covers the
+# slowest one still running when the traffic is told to stop.
+TRAFFIC_STOP_SECONDS = 30
 
 
 class _Traffic:
@@ -150,8 +163,9 @@ class _Traffic:
         thread.start()
 
     def finish(self):
+        """Stop the traffic and wait for every thread; return any still alive."""
         self.stop.set()
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + TRAFFIC_STOP_SECONDS
         while True:
             with self.lock:
                 alive = [t for t in self.threads if t.is_alive()]
@@ -160,9 +174,43 @@ class _Traffic:
             alive[0].join(timeout=1)
 
 
-def test_the_move_completes_under_the_reindex_mix_and_loses_nothing(engine, session):
+def _terminate_traffic_backends(engine) -> None:
+    """End any traffic session still connected, so the schema drop cannot meet it."""
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(
+            text(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE application_name = :name AND datname = current_database() "
+                "AND pid <> pg_backend_pid()"
+            ),
+            {"name": TRAFFIC_APPLICATION_NAME},
+        )
+
+
+@pytest.fixture
+def traffic(engine, scratch_schema):
+    """The traffic mix, stopped and gone before the scratch schema is dropped.
+
+    Depends on ``scratch_schema`` so it is torn down first. A test that fails
+    mid-move would otherwise leave threads writing while that teardown runs
+    ``DROP SCHEMA ... CASCADE``, which then deadlocks with them.
+    """
+    traffic_engine = create_engine(
+        engine.url,
+        poolclass=NullPool,
+        connect_args={"application_name": TRAFFIC_APPLICATION_NAME},
+    )
+    traffic = _Traffic(traffic_engine)
+    try:
+        yield traffic
+    finally:
+        traffic.finish()
+        _terminate_traffic_backends(engine)
+        traffic_engine.dispose()
+
+
+def test_the_move_completes_under_the_reindex_mix_and_loses_nothing(engine, session, traffic):
     _seed(session, KB_A, 20_000)
-    traffic = _Traffic(engine)
     traffic.short_reindexer(KB_A)
     traffic.short_reindexer(KB_B)
     traffic.other_writer(KB_B)
