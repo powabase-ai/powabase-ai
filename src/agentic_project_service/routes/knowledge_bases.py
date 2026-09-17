@@ -902,7 +902,7 @@ def get_knowledge_base(kb_id: str):
         if bm25_status_reason is not None:
             response_body["bm25_status_reason"] = bm25_status_reason
         if recorded.get("updated_at") is not None:
-            response_body["bm25_status_updated_at"] = recorded["updated_at"]
+            response_body["bm25_status_updated_at"] = recorded["updated_at"].isoformat()
 
     return jsonify(response_body)
 

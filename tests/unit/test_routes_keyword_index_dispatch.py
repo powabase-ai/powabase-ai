@@ -11,6 +11,7 @@ index exists to remove.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -942,7 +943,7 @@ class TestStatusField:
 
     def test_a_recorded_status_carries_when_it_was_recorded(self):
         def detail(kb, recorded=None):
-            recorded["updated_at"] = "2026-09-16T10:00:00+00:00"
+            recorded["updated_at"] = datetime(2026, 9, 16, 10, 0, tzinfo=timezone.utc)
             return "moving", None
 
         kb_id = "11111111-1111-1111-1111-111111111111"
