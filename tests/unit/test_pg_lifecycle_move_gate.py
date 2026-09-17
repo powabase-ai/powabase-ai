@@ -236,4 +236,10 @@ def test_the_reindex_cleanup_takes_no_gate_for_a_table_holding_none_of_the_sourc
     log = _run_cleanup(run_body)
     assert not [entry for entry in log if _GATE in entry], log
     probes = [entry for entry in log if entry.startswith(_PROBE)]
-    assert len(probes) == 3, probes
+    # Each table is probed twice, each probe alone in its transaction: a probe
+    # planned while a move of this KB held DEFAULT for its ATTACH reads the
+    # table's old layout and answers "no rows" wrongly; the second is planned
+    # after that move committed.
+    assert len(probes) == 6, probes
+    for table in ("chunks", "full_documents", "graph_index_nodes"):
+        assert len([p for p in probes if f".{table} " in p]) == 2, (table, probes)

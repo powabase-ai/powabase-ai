@@ -1584,7 +1584,8 @@ def _clear_source_item_rows(session, knowledge_base_id, indexed_source_id, delet
     (``pg_bm25_index.hold_move_gate_shared``), before reading the ids it is
     about to delete, and commits before the next table's. And it takes the gate
     only when the table holds rows of the source, which a probe in a
-    transaction of its own finds out first: a move queued for a gate makes every
+    transaction of its own finds out first (a "no rows" answer is asked twice;
+    see below): a move queued for a gate makes every
     later request for that gate wait behind it -- up to
     ``pg_bm25_index.MOVE_GATE_WAIT_SECONDS`` while a graph_index run keeps
     graph_index_nodes' gate -- and a chunk source has nothing there to wait
@@ -1597,6 +1598,18 @@ def _clear_source_item_rows(session, knowledge_base_id, indexed_source_id, delet
         probe = _SOURCE_ROWS_EXIST_SQL[item_table].format(schema=AI_SCHEMA)
         has_rows = session.execute(text(probe), params).scalar()
         session.commit()
+        if not has_rows:
+            # Asked again, in a transaction of its own, before believing "no
+            # rows". A probe planned while a move of this knowledge base held
+            # DEFAULT for its ATTACH read the table's old layout (DEFAULT
+            # only), waited for the move's commit, and then found the rows
+            # gone from DEFAULT: the delete was skipped and the re-index
+            # duplicated them. The first probe returns only after any such
+            # move committed, and a knowledge base's partition of a table is
+            # attached only once, so this one plans against the layout the
+            # rows are in.
+            has_rows = session.execute(text(probe), params).scalar()
+            session.commit()
         if not has_rows:
             removed[item_table] = []
             continue

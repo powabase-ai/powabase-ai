@@ -204,3 +204,60 @@ def test_a_graph_sources_cleanup_still_waits_for_a_graph_move(engine, session):
 
     assert len(removed["graph_index_nodes"]) == 1
     assert released_at and finished >= released_at[0]
+
+
+def test_a_cleanup_that_races_the_kbs_attach_still_deletes_the_sources_rows(engine, monkeypatch):
+    """A probe planned while the move holds DEFAULT for its ATTACH prunes to
+    DEFAULT only, then runs after the commit and finds DEFAULT empty: it said
+    "no rows", the delete was skipped and the re-index duplicated the rows."""
+    real_lock = pgb._lock_default_exclusively
+    calls: list[str] = []
+    in_attach = threading.Event()
+
+    def pause_inside_the_attach(conn, item_table, wait_seconds):
+        real_lock(conn, item_table, wait_seconds)
+        calls.append(item_table)
+        if len(calls) == 2:  # the fence's lock first, then the ATTACH's
+            in_attach.set()
+            time.sleep(1.5)
+
+    monkeypatch.setattr(pgb, "_lock_default_exclusively", pause_inside_the_attach)
+    result: dict = {}
+
+    def move():
+        try:
+            result["outcome"] = pgb.create_partition(engine, KB_A, "chunks", allow_row_move=True)
+        except Exception as exc:
+            result["error"] = exc
+
+    mover = threading.Thread(target=move, daemon=True)
+    mover.start()
+    try:
+        assert in_attach.wait(timeout=20), result
+        time.sleep(0.1)
+        with Session(engine) as cleanup:
+            removed = indexing._clear_source_item_rows(
+                cleanup,
+                KB_A,
+                INDEXED_SOURCE,
+                {
+                    "chunks": lambda: _delete_chunks(cleanup),
+                    "full_documents": lambda: None,
+                    "graph_index_nodes": lambda: None,
+                },
+            )
+    finally:
+        mover.join(timeout=30)
+
+    assert "outcome" in result, result
+    assert pgb.partition_exists(engine, KB_A, "chunks") is True
+    with engine.connect() as conn:
+        left = conn.execute(
+            text(
+                f"SELECT count(*) FROM {SCHEMA}.chunks "
+                "WHERE indexed_source_id = CAST(:is_id AS uuid)"
+            ),
+            {"is_id": INDEXED_SOURCE},
+        ).scalar()
+    assert left == 0, f"the cleanup skipped the delete: {left} old rows of the source remain"
+    assert len(removed["chunks"]) == 5
