@@ -21,6 +21,7 @@ being delivered anyway, and an extraction must not fail over bookkeeping.
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import os
@@ -39,9 +40,44 @@ DEFAULT_LARGE_FILE_BYTES = 50 * 1024 * 1024
 DEFAULT_MAX_CONCURRENT_LARGE = 1
 
 # A slot's lease, and how often its holder renews it. A killed holder blocks
-# the slot for at most LEASE_SECONDS.
+# the slot for at most LEASE_SECONDS; renewing several times per lease rides
+# out a few failed renewals in a row.
 LEASE_SECONDS = 300
 RENEW_SECONDS = 60
+
+# Bounds every Redis call made here, so a half-open connection cannot hang a
+# heartbeat, or the release in a task's `finally`.
+REDIS_SOCKET_TIMEOUT_SECONDS = 10
+
+try:
+    from prometheus_client import Counter
+
+    _fail_open_total = Counter(
+        "extraction_gate_fail_open_total",
+        "Large-extraction gate operations that could not reach Redis and let "
+        "extraction proceed ungated or unrecorded",
+        ["operation"],
+    )
+except ImportError:  # pragma: no cover - prometheus is an optional dependency
+    _fail_open_total = None
+
+
+def _count_fail_open(operation: str) -> None:
+    if _fail_open_total is not None:
+        _fail_open_total.labels(operation=operation).inc()
+
+
+def fail_open_count(operation: str) -> float:
+    """Current value of the fail-open counter for *operation* (0 without prometheus)."""
+    if _fail_open_total is None:
+        return 0.0
+    return _fail_open_total.labels(operation=operation)._value.get()
+
+
+class Renewal(enum.Enum):
+    RENEWED = "renewed"
+    LOST = "lost"  # the lease had expired or was removed; the slot is not ours
+    ERROR = "error"  # Redis could not be asked; the lease may well still be live
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -78,39 +114,73 @@ def _project_ref() -> str:
 
 
 def _broker_client():
-    return redis.from_url(os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"))
+    return redis.from_url(
+        os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"),
+        socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+        socket_connect_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+    )
+
+
+def max_hold_seconds() -> int:
+    """Longest a slot is kept renewed: the task time limit, read the same way
+    the Celery configuration reads it. The threads pool does not enforce that
+    limit, so without this a hung extraction would hold its slot forever."""
+    return int(os.getenv("CELERY_TASK_TIME_LIMIT") or 21600)
+
+
+# Lease times come from the Redis server clock, never a worker's: pods whose
+# clocks disagree would otherwise prune each other's live leases.
+_REDIS_NOW = """
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
+"""
 
 
 # Prunes expired leases, then takes a slot if one is free. Scores are lease
 # expiry times.
-_ACQUIRE_LUA = """
+_ACQUIRE_LUA = (
+    _REDIS_NOW
+    + """
 local key = KEYS[1]
-local now = tonumber(ARGV[1])
-local lease = tonumber(ARGV[2])
-local max_holders = tonumber(ARGV[3])
+local lease = tonumber(ARGV[1])
+local max_holders = tonumber(ARGV[2])
 redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
 if redis.call('ZCARD', key) < max_holders then
-  redis.call('ZADD', key, now + lease, ARGV[4])
-  redis.call('EXPIRE', key, math.ceil(lease * 2))
-  return 1
-end
-return 0
-"""
-
-# Extends a lease that has not yet expired. An expired one is not revived:
-# its slot may already have gone to someone else.
-_RENEW_LUA = """
-local key = KEYS[1]
-local now = tonumber(ARGV[1])
-local lease = tonumber(ARGV[2])
-local expires = redis.call('ZSCORE', KEYS[1], ARGV[3])
-if expires and tonumber(expires) > now then
   redis.call('ZADD', key, now + lease, ARGV[3])
   redis.call('EXPIRE', key, math.ceil(lease * 2))
   return 1
 end
 return 0
 """
+)
+
+# Extends a lease that has not yet expired. An expired one is not revived:
+# its slot may already have gone to someone else.
+_RENEW_LUA = (
+    _REDIS_NOW
+    + """
+local key = KEYS[1]
+local lease = tonumber(ARGV[1])
+local expires = redis.call('ZSCORE', key, ARGV[2])
+if expires and tonumber(expires) > now then
+  redis.call('ZADD', key, now + lease, ARGV[2])
+  redis.call('EXPIRE', key, math.ceil(lease * 2))
+  return 1
+end
+return 0
+"""
+)
+
+_LIVE_LUA = (
+    _REDIS_NOW
+    + """
+local expires = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if expires and tonumber(expires) > now then
+  return 1
+end
+return 0
+"""
+)
 
 
 class LargeExtractionSlot:
@@ -129,14 +199,27 @@ class LargeExtractionSlot:
             self._heartbeat.start()
 
     def _renew_until_released(self) -> None:
+        give_up_at = time.monotonic() + max_hold_seconds()
         while not self._stop.wait(RENEW_SECONDS):
-            if not self._gate.renew(self.token):
+            if time.monotonic() >= give_up_at:
+                logger.error(
+                    "Large-extraction slot %s has been held longer than the task time "
+                    "limit (%ss); no longer renewing it, so it frees within %ss",
+                    self.token,
+                    max_hold_seconds(),
+                    LEASE_SECONDS,
+                )
+                return
+            outcome = self._gate.renew(self.token)
+            if outcome is Renewal.LOST:
                 logger.warning(
                     "Large-extraction lease %s expired before it could be renewed; "
                     "another large extraction may start alongside this one",
                     self.token,
                 )
                 return
+            # Renewal.ERROR: already logged; the lease is probably still live,
+            # so keep trying on schedule.
 
     def release(self) -> None:
         self._stop.set()
@@ -147,20 +230,22 @@ class LargeExtractionSlot:
 
 
 class LargeExtractionGate:
-    def __init__(self, redis_client=None, clock=time.time, heartbeat: bool = True):
+    def __init__(self, redis_client=None, heartbeat: bool = True):
         self._client = redis_client
-        self._clock = clock
         self._heartbeat = heartbeat
         self._scripts: dict[str, object] = {}
 
     def _key(self) -> str:
         return f"extraction:large-slots:{_project_ref()}"
 
+    def _redis(self):
+        if self._client is None:
+            self._client = _broker_client()
+        return self._client
+
     def _script(self, name: str, source: str):
         if name not in self._scripts:
-            if self._client is None:
-                self._client = _broker_client()
-            self._scripts[name] = self._client.register_script(source)
+            self._scripts[name] = self._redis().register_script(source)
         return self._scripts[name]
 
     def try_acquire(self, task_id: str) -> LargeExtractionSlot | None:
@@ -169,7 +254,7 @@ class LargeExtractionGate:
         try:
             taken = self._script("acquire", _ACQUIRE_LUA)(
                 keys=[self._key()],
-                args=[self._clock(), LEASE_SECONDS, max_concurrent_large_extractions(), token],
+                args=[LEASE_SECONDS, max_concurrent_large_extractions(), token],
             )
         except Exception:
             logger.warning(
@@ -177,38 +262,34 @@ class LargeExtractionGate:
                 task_id,
                 exc_info=True,
             )
+            _count_fail_open("acquire")
             return LargeExtractionSlot(self, None, heartbeat=False)
         if not int(taken):
             return None
         return LargeExtractionSlot(self, token, heartbeat=self._heartbeat)
 
-    def renew(self, token: str) -> bool:
+    def renew(self, token: str) -> Renewal:
         try:
-            return bool(
-                int(
-                    self._script("renew", _RENEW_LUA)(
-                        keys=[self._key()], args=[self._clock(), LEASE_SECONDS, token]
-                    )
-                )
+            renewed = self._script("renew", _RENEW_LUA)(
+                keys=[self._key()], args=[LEASE_SECONDS, token]
             )
         except Exception:
             logger.warning("Could not renew large-extraction lease %s", token, exc_info=True)
-            return False
+            return Renewal.ERROR
+        return Renewal.RENEWED if int(renewed) else Renewal.LOST
 
     def is_live(self, token: str) -> bool:
         """Whether *token* still holds a slot. False when it cannot be told."""
         try:
-            if self._client is None:
-                self._client = _broker_client()
-            expires = self._client.zscore(self._key(), token)
+            live = self._script("live", _LIVE_LUA)(keys=[self._key()], args=[token])
         except Exception:
             logger.warning("Could not read large-extraction lease %s", token, exc_info=True)
             return False
-        return expires is not None and float(expires) > self._clock()
+        return bool(int(live))
 
     def _release(self, token: str) -> None:
         try:
-            self._client.zrem(self._key(), token)
+            self._redis().zrem(self._key(), token)
         except Exception:
             logger.warning(
                 "Could not release large-extraction lease %s; it expires in %ds",
@@ -234,7 +315,7 @@ def process_incarnation() -> str:
 def _record_ttl_seconds() -> int:
     # The broker redelivers a killed task after its visibility timeout, which
     # is the task time limit; the record has to outlive that wait.
-    return 2 * int(os.getenv("CELERY_TASK_TIME_LIMIT") or 21600) + 3600
+    return 2 * max_hold_seconds() + 3600
 
 
 @dataclass(frozen=True)
@@ -297,6 +378,7 @@ class ExtractionAttempts:
                 task_id,
                 exc_info=True,
             )
+            _count_fail_open("record_attempt")
 
     def end(self, task_id: str) -> None:
         try:

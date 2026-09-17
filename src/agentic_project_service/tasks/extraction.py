@@ -50,6 +50,11 @@ _ADVANCED_OCR_EXTRACTION_METHODS: frozenset[str] = frozenset({"llamaparse_ocr"})
 # in that process with it each time.
 MAX_EXTRACTION_INTERRUPTIONS = 2
 
+# Deaths of a task that was not the likely cause (a larger file was in flight
+# beside it) are counted separately, against a much higher cap: never counting
+# them would let a real killer loop forever behind a stale in-flight record.
+MAX_UNATTRIBUTED_INTERRUPTIONS = 5
+
 # How long a large-file extraction waits before trying for a slot again.
 LARGE_EXTRACTION_REQUEUE_SECONDS = 60
 
@@ -176,8 +181,11 @@ def update_source_status(
     db.session.commit()
 
 
-def record_extraction_interruption(source_id: str, task_id: str, count: int) -> None:
-    """Persist how many times *task_id* has died mid-extraction of this source."""
+def record_extraction_interruption(
+    source_id: str, task_id: str, count: int, unattributed: int = 0
+) -> None:
+    """Persist how many times *task_id* has died mid-extraction of this source:
+    *count* as the likely cause, *unattributed* beside a larger file."""
     db.session.execute(
         text(f"""
             UPDATE "{AI_SCHEMA}".sources
@@ -188,7 +196,11 @@ def record_extraction_interruption(source_id: str, task_id: str, count: int) -> 
         {
             "id": source_id,
             "marker": json.dumps(
-                {"extraction_interruptions": count, "extraction_interrupted_task": task_id}
+                {
+                    "extraction_interruptions": count,
+                    "extraction_unattributed_interruptions": unattributed,
+                    "extraction_interrupted_task": task_id,
+                }
             ),
         },
     )
@@ -201,10 +213,16 @@ def update_source_extraction_result(
     auto_metadata: dict,
     status: str = "extracted",
     error_message: str | None = None,
+    task_id: str | None = None,
 ) -> bool:
-    """Update source with extraction results; False if the source was cancelled.
+    """Update source with extraction results.
 
-    Clears the interruption marker: it describes a task that has now finished.
+    Returns False, writing nothing, when the source was cancelled or, given
+    *task_id*, when it now belongs to another task: a re-extract dispatched
+    during this run owns it, and this run's result must not stand in for it.
+
+    Clears the interruption marker and the partial page-image flag: both
+    describe an earlier run.
     """
     result = db.session.execute(
         text(f"""
@@ -213,15 +231,19 @@ def update_source_extraction_result(
                 derivatives = CAST(:derivatives AS jsonb),
                 auto_metadata = (COALESCE(auto_metadata, '{{}}'::jsonb)
                                  - 'extraction_interruptions'
-                                 - 'extraction_interrupted_task')
+                                 - 'extraction_unattributed_interruptions'
+                                 - 'extraction_interrupted_task'
+                                 - 'page_images_incomplete')
                                 || CAST(:auto_metadata AS jsonb),
                 error_message = :error_message,
                 updated_at = NOW()
             WHERE id = :id
               AND extraction_status != 'cancelled'
+              AND (CAST(:task_id AS text) IS NULL OR celery_task_id = CAST(:task_id AS text))
         """),
         {
             "id": source_id,
+            "task_id": task_id,
             "derivatives": json.dumps(derivatives),
             "auto_metadata": json.dumps(auto_metadata),
             "status": status,
@@ -242,25 +264,25 @@ def _delete_replaced_derivatives(
     """
     prefix = f"{bucket_id}/{source_id}/derivatives/"
 
-    def paths(derivatives: dict) -> set[str]:
+    def paths(derivatives) -> set[str]:
+        if not isinstance(derivatives, dict):
+            return set()
         return {
             record["storage_path"]
-            for records in (derivatives or {}).values()
+            for records in derivatives.values()
             if isinstance(records, list)
             for record in records
             if isinstance(record, dict) and isinstance(record.get("storage_path"), str)
         }
 
-    stale = sorted(p for p in paths(old) - paths(new) if p.startswith(prefix))
-    if not stale:
-        return
     try:
+        stale = sorted(p for p in paths(old) - paths(new) if p.startswith(prefix))
+        if not stale:
+            return
         storage.delete(bucket_id, [p[len(bucket_id) + 1 :] for p in stale])
         logger.info(f"Deleted {len(stale)} replaced derivatives of source {source_id}")
     except Exception as e:
-        logger.warning(
-            f"Could not delete {len(stale)} replaced derivatives of source {source_id}: {e}"
-        )
+        logger.warning(f"Could not delete replaced derivatives of source {source_id}: {e}")
 
 
 def _sink_failure_behind(exc: BaseException, sink_errors: list) -> StorageError | None:
@@ -373,7 +395,9 @@ async def run_extraction(
         # did not cause this one.
         cause = _sink_failure_behind(e, sink_errors)
         if cause is not None and cause is not e:
-            raise cause from e
+            # A new exception: re-raising `cause` from `e` would link the
+            # chain back to itself, since `e` already leads to `cause`.
+            raise PageImageStorageError(str(cause)) from e
         raise
     del raw_content, raw_bytes
     logger.info(
@@ -444,6 +468,12 @@ async def run_extraction(
             derivatives[deriv.type] = []
         derivatives[deriv.type].append(deriv_record)
 
+    if result.auto_metadata.get("page_images_incomplete"):
+        logger.warning(
+            f"Source {source_id}: page images are incomplete; rendering failed after "
+            f"{len(streamed_images)} pages had been stored"
+        )
+
     auto_metadata = {
         **result.auto_metadata,
         "extraction_method": result.extraction_method,
@@ -455,11 +485,13 @@ async def run_extraction(
     return derivatives, auto_metadata
 
 
-def _requeue(task, countdown: int) -> None:
+def _requeue(task, countdown: int, source_size: int | None) -> None:
     """Send this delivery again later, as the same task id and retry count:
     waiting for a slot is neither a retry nor a failure, and occupies no
-    worker thread while it waits."""
-    task.signature_from_request(task.request, countdown=countdown).apply_async()
+    worker thread while it waits. The file size goes with it, so a waiting
+    task does not ask storage again on every wake-up."""
+    kwargs = {**(task.request.kwargs or {}), "source_size": source_size}
+    task.signature_from_request(task.request, kwargs=kwargs, countdown=countdown).apply_async()
 
 
 def _count_interruption(
@@ -469,36 +501,46 @@ def _count_interruption(
 
     Returns the task result when the source has now been failed. A task that
     was not the plausible cause of the kill (a larger file was in flight in the
-    same worker) is not charged: a whole worker stopping takes every task in
-    it down, and the others did nothing wrong.
+    same worker) is counted separately against MAX_UNATTRIBUTED_INTERRUPTIONS:
+    a whole worker stopping takes every task in it down, and the others did
+    nothing wrong.
     """
     source_id = source["id"]
-    if previous is not None and not previous.plausible_cause:
-        logger.warning(
-            f"Source {source_id}: extraction task {task_id} was interrupted while a larger "
-            f"file ({previous.largest_in_flight} bytes, against {previous.size}) was being "
-            f"extracted in the same worker; not counting it, extracting again"
-        )
-        return None
     auto_metadata = source.get("auto_metadata") or {}
-    count = 1
+    count = unattributed = 0
     if auto_metadata.get("extraction_interrupted_task") == task_id:
-        count = int(auto_metadata.get("extraction_interruptions") or 0) + 1
-    record_extraction_interruption(source_id, task_id, count)
-    if count >= MAX_EXTRACTION_INTERRUPTIONS:
-        message = (
-            f"Extraction was interrupted {count} times before finishing: the worker "
-            f"stopped while processing this file, for example because it ran out of "
-            f"memory or was restarted. Not retrying automatically; re-extract to try again."
-        )
-        logger.error(f"Source {source_id}: {message}")
-        update_source_status(source_id, "failed", message, task_id, error_code="permanent")
-        return {"status": "error", "source_id": source_id, "error": message}
-    logger.warning(
-        f"Source {source_id}: extraction task {task_id} was interrupted "
-        f"({count}/{MAX_EXTRACTION_INTERRUPTIONS}); extracting again"
+        count = int(auto_metadata.get("extraction_interruptions") or 0)
+        unattributed = int(auto_metadata.get("extraction_unattributed_interruptions") or 0)
+    if previous is not None and not previous.plausible_cause:
+        unattributed += 1
+        record_extraction_interruption(source_id, task_id, count, unattributed)
+        if unattributed < MAX_UNATTRIBUTED_INTERRUPTIONS:
+            logger.warning(
+                f"Source {source_id}: extraction task {task_id} was interrupted while a "
+                f"larger file ({previous.largest_in_flight} bytes, against {previous.size}) "
+                f"was being extracted in the same worker; not counting it against this "
+                f"file ({unattributed}/{MAX_UNATTRIBUTED_INTERRUPTIONS}), extracting again"
+            )
+            return None
+        interruptions = unattributed
+    else:
+        count += 1
+        record_extraction_interruption(source_id, task_id, count, unattributed)
+        if count < MAX_EXTRACTION_INTERRUPTIONS:
+            logger.warning(
+                f"Source {source_id}: extraction task {task_id} was interrupted "
+                f"({count}/{MAX_EXTRACTION_INTERRUPTIONS}); extracting again"
+            )
+            return None
+        interruptions = count
+    message = (
+        f"Extraction was interrupted {interruptions} times before finishing: the worker "
+        f"stopped while processing this file, for example because it ran out of "
+        f"memory or was restarted. Not retrying automatically; re-extract to try again."
     )
-    return None
+    logger.error(f"Source {source_id}: {message}")
+    update_source_status(source_id, "failed", message, task_id, error_code="permanent")
+    return {"status": "error", "source_id": source_id, "error": message}
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
@@ -513,6 +555,7 @@ def extract_source(
     billing_idempotency_key: str | None = None,
     billing_org_id: str | None = None,
     billing_project_id: str | None = None,
+    source_size: int | None = None,
 ):
     """
     Extract content from a source file.
@@ -535,6 +578,8 @@ def extract_source(
             below). These params are unused, but an in-flight task enqueued
             before the port migration still carries them; keeping them avoids a
             TypeError on a cross-deploy retry.
+        source_size: set only when this task requeued itself to wait for a
+            large-extraction slot: the size it already read from storage.
 
     Returns:
         Dict with extraction results or error info
@@ -559,7 +604,9 @@ def extract_source(
             return {"status": "skipped", "reason": "already_extracted"}
 
         storage = get_storage()
-        size = storage.object_size(source["storage_path"])
+        size = source_size
+        if size is None:
+            size = storage.object_size(source["storage_path"])
 
         # Every exit from a run of this task leaves the source in some other
         # status, so finding it still `extracting` under this task's own id
@@ -582,7 +629,7 @@ def extract_source(
                 f"Source {source_id}: task {task_id} is still extracting in another "
                 f"worker; checking again in {LARGE_EXTRACTION_REQUEUE_SECONDS}s"
             )
-            _requeue(self, LARGE_EXTRACTION_REQUEUE_SECONDS)
+            _requeue(self, LARGE_EXTRACTION_REQUEUE_SECONDS, size)
             return {"status": "deferred", "source_id": source_id, "reason": "still_running"}
 
         if is_large_file(size):
@@ -592,7 +639,7 @@ def extract_source(
                     f"Source {source_id}: all large-file extraction slots are taken "
                     f"({size} bytes); trying again in {LARGE_EXTRACTION_REQUEUE_SECONDS}s"
                 )
-                _requeue(self, LARGE_EXTRACTION_REQUEUE_SECONDS)
+                _requeue(self, LARGE_EXTRACTION_REQUEUE_SECONDS, size)
                 return {"status": "deferred", "source_id": source_id, "reason": "slots_busy"}
 
         if redelivered:
@@ -659,12 +706,25 @@ def extract_source(
                 )
                 logger.warning(f"Source {source_id}: {warning_msg}")
 
-        if update_source_extraction_result(
-            source_id, derivatives, auto_metadata, status, warning_msg
-        ):
-            _delete_replaced_derivatives(
-                storage, bucket_id, source_id, source.get("derivatives") or {}, derivatives
+        if auto_metadata.get("page_images_incomplete"):
+            incomplete_msg = (
+                "Page images are incomplete: rendering failed part-way, so some pages "
+                "have no stored image. Re-extract to try again."
             )
+            status = "attention_required"
+            warning_msg = f"{warning_msg} {incomplete_msg}" if warning_msg else incomplete_msg
+
+        if not update_source_extraction_result(
+            source_id, derivatives, auto_metadata, status, warning_msg, task_id=task_id
+        ):
+            logger.info(
+                f"Source {source_id}: cancelled or re-dispatched to another task during "
+                f"extraction task {task_id}; discarding its results"
+            )
+            return {"status": "superseded", "source_id": source_id}
+        _delete_replaced_derivatives(
+            storage, bucket_id, source_id, source.get("derivatives"), derivatives
+        )
 
         # Bill OCR when OCR was performed. Non-OCR extraction (fitz, pdfplumber,
         # opendataloader, txt-native, ...) is CPU-only and not separately billed
