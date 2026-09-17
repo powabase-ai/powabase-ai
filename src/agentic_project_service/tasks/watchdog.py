@@ -31,7 +31,7 @@ import redis
 from sqlalchemy import text
 
 from ..celery import celery_app
-from ..db import AI_SCHEMA, db
+from ..db import AI_SCHEMA, commit_scoped_write, db
 from ..services.ai_provider_keys_resolver import get_all_user_provider_keys
 from ..services import billing_port as billing
 
@@ -307,6 +307,56 @@ def _find_and_recover_orphans(alive_ids: set[str]) -> int:
                 row.id,
                 exc_info=True,
             )
+            # Through commit_scoped_write, NOT a bare execute+commit. This runs
+            # inside an except handler inside the per-row loop, and the case
+            # that reaches it is a broker outage -- i.e. every row fails, one
+            # after another. A write that raises here would escape the handler,
+            # escape the loop, and strand every orphan after the first, in the
+            # component whose job is to un-strand them.
+            #
+            # Fenced on index_status AND attempts, and the second half is not
+            # decoration. 'pending' does not identify THIS reconciler's row:
+            # ten writers produce it, and the three /reindex routes in
+            # particular set it without clearing celery_task_id. The window is
+            # real and widest exactly when this path runs -- the bulk reset
+            # commits for every row up front, then each .delay() is attempted in
+            # turn, and a sick broker makes those slow. A user who hits Reindex
+            # inside it had their freshly-reset row flipped to 'failed' by a
+            # stale write from this loop, and the index_source they just queued
+            # cannot claim a non-'pending' row, so it exited skipped and their
+            # reindex silently did nothing.
+            #
+            # attempts separates the two: the reset above leaves it untouched,
+            # so this row still carries the value ORPHAN_QUERY read (>= 1,
+            # because the claim increments on the way into 'indexing'), while
+            # every reindex route resets it to 0. A re-requested row therefore
+            # no longer matches, and the rowcount says so.
+            failed_rows = commit_scoped_write(
+                f"""
+                    UPDATE "{AI_SCHEMA}".indexed_sources
+                    SET index_status = 'failed',
+                        error_message = :msg
+                    WHERE id = :id
+                      AND index_status = 'pending'
+                      AND attempts = :attempts
+                """,
+                {
+                    "id": row.id,
+                    "attempts": row.attempts,
+                    # Names only what is known here: the retry could not be
+                    # queued. Why the broker refused is not observable at this
+                    # layer, so it is not guessed at.
+                    "msg": "Indexing could not be re-queued after the worker stopped.",
+                },
+                what="watchdog unqueueable-recovery terminal write",
+            )
+            if not failed_rows:
+                logger.warning(
+                    "Watchdog: could not mark indexed_source_id=%s failed after a "
+                    "dispatch failure; it was moved on by someone else, or the "
+                    "write did not land",
+                    row.id,
+                )
 
     logger.info(
         "Watchdog: recovered %d/%d orphaned indexed_sources rows",
