@@ -266,9 +266,8 @@ def test_a_failed_empty_attach_leaves_a_bare_clone_and_its_retry_never_holds_up_
     try:
         worker.start()
         with engine.connect() as reader:
-            reader.execute(text("SET lock_timeout = '10s'"))
-            reader.commit()
             while worker.is_alive():
+                reader.execute(text("SET LOCAL lock_timeout = '10s'"))
                 started = time.monotonic()
                 reader.execute(text(f"SELECT count(*) FROM {SCHEMA}.knowledge_bases"))
                 waits.append(time.monotonic() - started)
@@ -324,9 +323,8 @@ def test_a_stale_clone_with_foreign_keys_is_dropped_without_queueing_readers_of_
     try:
         worker.start()
         with engine.connect() as reader:
-            reader.execute(text("SET lock_timeout = '10s'"))
-            reader.commit()
             while worker.is_alive():
+                reader.execute(text("SET LOCAL lock_timeout = '10s'"))
                 started = time.monotonic()
                 reader.execute(text(f"SELECT count(*) FROM {SCHEMA}.knowledge_bases"))
                 waits.append(time.monotonic() - started)
