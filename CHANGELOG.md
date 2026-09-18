@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/powabase-ai/powabase-ai/compare/v0.8.0...v0.9.0) (2026-09-17)
+
+
+### Features
+
+* **kb-search:** postgres-native bm25 with a partition and index per knowledge base ([#73](https://github.com/powabase-ai/powabase-ai/issues/73)) ([7f060b9](https://github.com/powabase-ai/powabase-ai/commit/7f060b9c8f664b305d16bbb270a40ced4f908cfc))
+
 ## [0.8.0](https://github.com/powabase-ai/powabase-ai/compare/v0.7.0...v0.8.0) (2026-09-17)
 
 
