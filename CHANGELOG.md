@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/powabase-ai/powabase-ai/compare/v0.9.0...v0.9.1) (2026-09-21)
+
+
+### Bug Fixes
+
+* **deps:** bump powabase-agentic from 0.4.0 to 0.5.0 ([#77](https://github.com/powabase-ai/powabase-ai/issues/77)) ([4770e48](https://github.com/powabase-ai/powabase-ai/commit/4770e48afe1f951e67350418637b65aee30b4715))
+
 ## [0.9.0](https://github.com/powabase-ai/powabase-ai/compare/v0.8.0...v0.9.0) (2026-09-17)
 
 
