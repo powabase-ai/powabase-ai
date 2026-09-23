@@ -452,6 +452,88 @@ def test_deleting_a_source_reconciles_every_knowledge_base_it_was_indexed_in(mon
 
 
 # ---------------------------------------------------------------------------
+# What an operator can see
+# ---------------------------------------------------------------------------
+
+
+def _ensure_log(caplog) -> str:
+    return "\n".join(
+        r.getMessage() for r in caplog.records if "per_kb_vector_index" in r.getMessage()
+    )
+
+
+def test_a_build_attempt_is_logged_as_it_happens(monkeypatch, caplog):
+    """The service's progress hook has to be wired to something.
+
+    Without it the only record of a build is the service's own prose line, and
+    nothing at all records an attempt that the worker did not survive: to answer
+    "does this knowledge base have its index, and if not why", an operator is
+    left deriving the index name by hand and grepping.
+    """
+    import logging
+
+    def fake_ensure(kb_id, engine=None, on_progress=None):
+        on_progress("building", dims=1536, rows=61_000)
+        return {"status": "ready", "built": [f"hnsw_kb_{KB.replace('-', '')}_1536"], "dropped": []}
+
+    monkeypatch.setattr(pvi, "ensure_per_kb_vector_index", fake_ensure)
+    with caplog.at_level(logging.INFO):
+        idx.ensure_per_kb_vector_index.run(KB)
+
+    message = _ensure_log(caplog)
+    assert "event=building" in message, message
+    assert f"kb={KB}" in message, message
+    assert "dims=1536" in message, message
+    assert "rows=61000" in message, message
+
+
+def test_every_run_ends_in_one_structured_line(monkeypatch, caplog):
+    """Outcome, dimensions and duration in one line, whatever the run did."""
+    import logging
+
+    def fake_ensure(kb_id, engine=None, on_progress=None):
+        on_progress("dropping")
+        return {
+            "status": "ready",
+            "built": [],
+            "dropped": [f"hnsw_kb_{KB.replace('-', '')}_768"],
+        }
+
+    monkeypatch.setattr(pvi, "ensure_per_kb_vector_index", fake_ensure)
+    with caplog.at_level(logging.INFO):
+        idx.ensure_per_kb_vector_index.run(KB)
+
+    summary = [line for line in _ensure_log(caplog).splitlines() if "outcome=" in line]
+    assert len(summary) == 1, _ensure_log(caplog)
+    line = summary[0]
+    assert f"kb={KB}" in line
+    assert "outcome=ready" in line
+    assert "dims=768" in line, "the dimensions the run touched, not the index name alone"
+    assert "dropped=hnsw_kb_" in line
+    assert "duration_ms=" in line
+    assert "attempt=1" in line
+
+
+def test_a_failed_build_is_recorded_before_it_is_raised(monkeypatch, caplog):
+    """A permanently failing build is exactly the case an operator has to find."""
+    import logging
+
+    monkeypatch.setattr(
+        pvi,
+        "ensure_per_kb_vector_index",
+        MagicMock(side_effect=ValueError("dimension 3072 exceeds the HNSW limit")),
+    )
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(ValueError):
+            idx.ensure_per_kb_vector_index.run(KB)
+
+    message = _ensure_log(caplog)
+    assert "outcome=failed" in message, message
+    assert "3072" in message, message
+    assert "duration_ms=" in message, message
+
+
+# ---------------------------------------------------------------------------
 # The tasks' own retry decisions
 # ---------------------------------------------------------------------------
 
