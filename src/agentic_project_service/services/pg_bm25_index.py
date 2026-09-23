@@ -3417,14 +3417,32 @@ def ensure_bm25_index(
     created or its rows are moved, ``"building"`` before the bm25 index is
     built (including on a partition whose move committed but whose index never
     got built), and ``"completing"`` before the partition's foreign keys are
-    validated and its plain indexes built; the ensure task persists these.
+    validated and its plain indexes built; the ensure task persists these. A
+    hook that raises is logged and ignored: it reports, so it must not be able
+    to abandon a move it is only describing.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
 
     def progress(status: str) -> None:
-        if on_progress is not None:
+        if on_progress is None:
+            return
+        try:
             on_progress(status)
+        except Exception as exc:
+            # This hook records; it does not decide anything. The ensure task's
+            # recorder writes a row of its own, so it can fail for reasons that
+            # have nothing to do with this build -- and an exception here would
+            # come out of the middle of a move, abandoning that attempt and its
+            # write block for a bookkeeping failure. Losing one record is the
+            # cheaper loss.
+            logger.warning(
+                "The BM25 index progress hook failed for %s on KB %s (%s); the build carries "
+                "on without the record",
+                status,
+                kb_id,
+                first_error_line(exc),
+            )
 
     # Two connections, deliberately: this AUTOCOMMIT one, because CREATE and
     # DROP INDEX CONCURRENTLY refuse to run inside a transaction; and the one
