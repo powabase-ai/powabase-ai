@@ -39,6 +39,7 @@ from ..strategies.graph_defaults import (
 )
 from ..tasks.indexing import (
     build_bm25_for_kb,
+    dispatch_per_kb_vector_index,
     drop_per_kb_vector_index,
     drop_pg_bm25_index,
     ensure_pg_bm25_index,
@@ -1509,6 +1510,25 @@ def remove_source_from_kb(kb_id: str, indexed_source_id: str):
         {"id": indexed_source_id},
     )
     db.session.commit()
+
+    # The CASCADE took this source's embeddings with it, and nothing else will
+    # notice: the indexing path only runs when a source is added. So a knowledge
+    # base can fall below the drop threshold here and keep a partial HNSW index
+    # it no longer qualifies for -- answering nothing useful, maintained on every
+    # write to the embeddings table -- until some pod wins the start-up lock,
+    # which on a stable deployment can be weeks. Dispatched after the commit, so
+    # the row count it reads is the one that is now true, and never fatal: the
+    # dispatch decides with a bounded count and swallows a broker failure.
+    try:
+        dispatch_per_kb_vector_index(kb_id)
+    except Exception:
+        logger.warning(
+            "Failed to dispatch the per-knowledge-base vector index reconcile for KB %s "
+            "after removing a source; it keeps whatever index it has until the next "
+            "indexing run or start-up",
+            kb_id,
+            exc_info=True,
+        )
 
     return jsonify(
         {

@@ -1914,12 +1914,19 @@ def _run_index_body(
         #     only after the commit, so no sparse entry can point at a chunk
         #     that was rolled back.
         # (3) this KB's own partial HNSW index, if the rows it just committed
-        #     took it over the threshold (or a delete took it under). Dispatched
-        #     rather than built here for the same reason as (1) the other way
-        #     round: CREATE INDEX CONCURRENTLY cannot run in a transaction at
-        #     all, and it takes tens of seconds on a large knowledge base.
-        if embedding_dim:
-            dispatch_per_kb_vector_index(knowledge_base_id)
+        #     took it over the threshold (or the ones it removed took it under).
+        #     Dispatched rather than built here for the same reason as (1) the
+        #     other way round: CREATE INDEX CONCURRENTLY cannot run in a
+        #     transaction at all, and it takes tens of seconds on a large
+        #     knowledge base.
+        #
+        #     Deliberately NOT gated on this run having produced embeddings: a
+        #     re-index to a strategy that stores none deletes every embedding
+        #     this knowledge base had, which is precisely when its index has to
+        #     be dropped. The dispatch decides for itself with a row count
+        #     bounded at the threshold, so the cost of asking is the same
+        #     either way.
+        dispatch_per_kb_vector_index(knowledge_base_id)
 
         if _should_build_bm25_now(knowledge_base_id):
             sparse_store = SparseIndexStore(knowledge_base_id=knowledge_base_id)
