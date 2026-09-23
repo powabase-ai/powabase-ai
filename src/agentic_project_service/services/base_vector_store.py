@@ -588,12 +588,20 @@ class BasePgVectorStore:
         | 30 % | two metadata keys | 0/12, 15.0 ms | 12/12, 7.4 ms |
         | 21 % of the table | unfiltered | 0/12, 38.0 ms | 12/12, 4.7 ms |
 
-        The filtered rows are the second thing this repairs. ``_force_custom_plan``
-        gets a one-key filter as far as an estimate, but ``jsonb @>`` has no
-        statistics at all, so the estimate is a fixed guess and two keys put it
-        near zero rows -- which makes the sort look free and loses the index even
-        when the planner does know the filter's value. The estimate is wrong, not
-        the clause, so the fix belongs here rather than in how the filter is
+        The filtered rows are the second thing this repairs, and the reason is
+        not the one it looks like. ``_force_custom_plan`` gets the filter's value
+        to the planner, which prices ``meta @> const`` by matching that constant
+        against ``meta``'s most-common-value list -- so the estimate is real, but
+        it is then multiplied by the knowledge-base predicate as though the two
+        were independent. They are not, when one of the filter's keys *is* the
+        knowledge base. Measured at 384 dimensions on the live fixture:
+        ``{"tier": "gold"}`` estimates 722 rows of 2,400 real and keeps the
+        index, and filtering on the knowledge base alone estimates 1,076 of
+        12,000 and keeps it -- but the two together estimate **217 of the same
+        2,400** and lose it, an ordered index scan at 5,060 against a sort at
+        3,837. So it is an 11x-low correlated estimate rather than a key count:
+        two uncorrelated keys are likely fine. The estimate is wrong, not the
+        clause, so the fix belongs here rather than in how the filter is
         compiled.
 
         **Only with an index of this knowledge base's own.** This is a cost
