@@ -295,3 +295,17 @@ def test_the_clause_is_empty_for_an_empty_filter(empty):
     from agentic_project_service.services.base_vector_store import metadata_filter_clause
 
     assert metadata_filter_clause(empty) == ("", {})
+
+
+@pytest.mark.parametrize("method", _METHODS)
+def test_a_filter_that_will_not_serialise_raises_the_documented_error(method):
+    """``json.dumps`` raises ``TypeError`` for a value it has no encoder for.
+
+    The contract here, and the ``except ValueError`` in the search route that
+    turns it into a 400, is ``ValueError`` -- so an unserialisable value used to be
+    a 500. A ``set`` is the reachable case: it is what a caller assembling a
+    filter in Python most easily ends up with, and it survives every check above
+    because the filter itself is a perfectly good dict.
+    """
+    with pytest.raises(ValueError, match="filter_metadata is not valid JSON"):
+        _search_sql(method, filter_metadata={"tier": {"gold", "silver"}})

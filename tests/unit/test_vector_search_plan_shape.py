@@ -265,9 +265,11 @@ def test_a_search_asks_whether_this_knowledge_base_has_a_valid_partial_index():
     """The catalog probe, by name and in the store's own schema.
 
     Ungated, the penalty drives a knowledge base with no index onto the shared
-    per-dimension index, which post-filters: measured 9.4 ms and recall 1.00
-    became 31.3 ms and recall 0.04 at 5% of the table. So the probe is the fix,
-    not an optimisation on it.
+    per-dimension index, which post-filters and gets *slower* as the knowledge
+    base gets smaller: measured 9.4 ms against an exact scan's 1.00-recall plan at
+    5% of the table, and 39.8 ms at 1%, where the real-embedding run's worst-case
+    recall is also the only one below half. So the probe is the fix, not an
+    optimisation on it.
     """
     statements = _capture()
     probes = [pair for pair in statements if "to_regclass" in pair[0]]
@@ -645,3 +647,51 @@ def test_a_full_answer_is_not_asked_again():
         f"top_k rows came back, so nothing is short and nothing is re-run: {captured}"
     )
     assert not _settings(captured, "plan_cache_mode"), captured
+
+
+# ---------------------------------------------------------------------------
+# The diversity-floor path, which deliberately keeps the planner's own plan
+# ---------------------------------------------------------------------------
+
+
+def test_the_per_source_search_is_left_on_the_planners_own_plan():
+    """Not an inconsistency with ``vector_search``, and measured rather than argued.
+
+    ``vector_search_per_source`` carries the same knowledge base literal and the
+    same iterative-scan mode, so the gate's absence reads like an omission. It is
+    not: the query has no ``LIMIT`` on the distance order -- it scores the whole
+    knowledge base by design -- so there is no ordered-index-scan-against-sort
+    race to win. Measured at 1536 dimensions with the partial index built and
+    valid: no HNSW index in any configuration, six sort nodes no setting can
+    remove, and ``enable_sort = off`` made it 4.8x slower (50.5 -> 244.7 ms).
+
+    A ``LIMIT`` on the distance order would make this ``vector_search``'s shape,
+    and this spec is where that change gets noticed.
+    """
+    session = MagicMock()
+    captured: list[tuple[str, dict]] = []
+
+    def spy_execute(text_obj, params=None):
+        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
+        captured.append((sql, dict(params or {})))
+        if "to_regclass" in sql:
+            return iter([(ENABLE_SORT_WAS, EF_SEARCH_WAS, True)])
+        if "current_setting('plan_cache_mode')" in sql:
+            return _scalar(PLAN_CACHE_MODE_WAS)
+        return iter([])
+
+    session.execute = spy_execute
+    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
+    asyncio.run(
+        store.vector_search_per_source(embedding=[0.0] * 1536, per_source_k=3, source_cap=5)
+    )
+    scored = [sql for sql, _ in captured if "ROW_NUMBER" in sql]
+    assert scored, f"the per-source search did not run: {captured}"
+    assert not _enable_sort(captured), (
+        f"pricing the sort out of a query built on six sorts is a regression: {captured}"
+    )
+    assert not _writes(captured, "hnsw.ef_search"), captured
+    assert not _writes(captured, "plan_cache_mode"), captured
+    assert not [sql for sql, _ in captured if "to_regclass" in sql], (
+        f"no gate here means no catalog round trip to pay for either: {captured}"
+    )
