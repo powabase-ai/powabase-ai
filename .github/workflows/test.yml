@@ -109,6 +109,10 @@ jobs:
       # skips itself when DATABASE_URL is unset or pgvector is missing, and a
       # security regression test that can quietly stop running is worse than one
       # that fails.
+      #
+      # tests/test_run_usage_cache_creation_store.py pins the run usage columns
+      # through their hand-written INSERT/UPDATE/SELECT lists, one of which is
+      # read back by position.
       - name: Run store tests
         run: |
           set -o pipefail
@@ -118,6 +122,7 @@ jobs:
             tests/test_metadata_filter_injection_live.py \
             tests/test_extraction_redelivery_store.py \
             tests/test_index_source_retry.py \
+            tests/test_run_usage_cache_creation_store.py \
             -q -rs | tee pytest-store.log
           if grep -Eq "[0-9]+ skipped" pytest-store.log; then
             echo "::error::the store tier skipped tests; this job must run all of them"

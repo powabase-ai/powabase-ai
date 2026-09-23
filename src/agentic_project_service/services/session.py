@@ -63,7 +63,7 @@ def _unpack_usage(usage: dict | None) -> dict[str, int | None]:
 
     Accepts both flat keys (prompt_tokens, completion_tokens, total_tokens)
     and litellm's nested details dicts (prompt_tokens_details, completion_tokens_details)
-    for reasoning_tokens / cached_tokens.
+    for reasoning_tokens / cached_tokens / cache_creation_tokens.
     """
     if not usage:
         return {
@@ -71,6 +71,7 @@ def _unpack_usage(usage: dict | None) -> dict[str, int | None]:
             "completion_tokens": None,
             "reasoning_tokens": None,
             "cached_tokens": None,
+            "cache_creation_tokens": None,
             "total_tokens": None,
         }
 
@@ -92,11 +93,19 @@ def _unpack_usage(usage: dict | None) -> dict[str, int | None]:
         if isinstance(details, dict):
             cached = _as_int(details.get("cached_tokens"))
 
+    # Prompt-cache writes. Absent stays None, not 0, as for cached_tokens.
+    cache_creation = _as_int(usage.get("cache_creation_tokens"))
+    if cache_creation is None:
+        details = usage.get("prompt_tokens_details") or {}
+        if isinstance(details, dict):
+            cache_creation = _as_int(details.get("cache_creation_tokens"))
+
     return {
         "prompt_tokens": prompt,
         "completion_tokens": completion,
         "reasoning_tokens": reasoning,
         "cached_tokens": cached,
+        "cache_creation_tokens": cache_creation,
         "total_tokens": total,
     }
 
@@ -571,7 +580,8 @@ def persist_agent_run(
              started_at, completed_at, created_at, steps, events,
              reasoning_steps, parent_orchestration_run_id, parent_workflow_execution_id,
              agent_id, model,
-             prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens, total_tokens,
+             prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens,
+             cache_creation_tokens, total_tokens,
              tool_call_count, tool_call_error_count, tool_call_duration_ms_total)
             VALUES (:id, :session_id, :run_id, :context_handler_id, :status,
                     CAST(:input_messages AS jsonb), CAST(:output_messages AS jsonb),
@@ -582,7 +592,7 @@ def persist_agent_run(
                     :parent_orchestration_run_id, :parent_workflow_execution_id,
                     :agent_id, :model,
                     :prompt_tokens, :completion_tokens, :reasoning_tokens,
-                    :cached_tokens, :total_tokens,
+                    :cached_tokens, :cache_creation_tokens, :total_tokens,
                     :tool_call_count, :tool_call_error_count, :tool_call_duration_ms_total)
             """
         ),
@@ -611,6 +621,7 @@ def persist_agent_run(
             "completion_tokens": tokens["completion_tokens"],
             "reasoning_tokens": tokens["reasoning_tokens"],
             "cached_tokens": tokens["cached_tokens"],
+            "cache_creation_tokens": tokens["cache_creation_tokens"],
             "total_tokens": tokens["total_tokens"],
             "tool_call_count": tc["count"],
             "tool_call_error_count": tc["error_count"],
@@ -794,6 +805,7 @@ def update_agent_run(
         updates.append("completion_tokens = :completion_tokens")
         updates.append("reasoning_tokens = :reasoning_tokens")
         updates.append("cached_tokens = :cached_tokens")
+        updates.append("cache_creation_tokens = :cache_creation_tokens")
         updates.append("total_tokens = :total_tokens")
         params.update(tokens)
     if retrieved_context is not None:
@@ -906,7 +918,8 @@ def get_run_by_id(
                    retrieved_context, error, started_at, completed_at, created_at,
                    steps, events, reasoning_steps,
                    agent_id, model,
-                   prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens, total_tokens,
+                   prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens,
+                   cache_creation_tokens, total_tokens,
                    tool_call_count, tool_call_error_count, tool_call_duration_ms_total
             FROM "{AI_SCHEMA}".agent_runs
             WHERE run_id = :run_id
@@ -949,12 +962,12 @@ def _pack_usage(row: Any) -> dict[str, int] | None:
     """Re-assemble a `usage` dict from the typed cols for API back-compat.
 
     Row layout (get_run_by_id): [..., prompt_tokens, completion_tokens,
-    reasoning_tokens, cached_tokens, total_tokens, tool_call_count,
-    tool_call_error_count, tool_call_duration_ms_total]. Returns None when
-    no token info is present.
+    reasoning_tokens, cached_tokens, cache_creation_tokens, total_tokens,
+    tool_call_count, tool_call_error_count, tool_call_duration_ms_total].
+    Returns None when no token info is present.
     """
-    prompt, completion, reasoning, cached, total = row[18], row[19], row[20], row[21], row[22]
-    if all(v is None for v in (prompt, completion, reasoning, cached, total)):
+    prompt, completion, reasoning, cached, cache_creation, total = row[18:24]
+    if all(v is None for v in (prompt, completion, reasoning, cached, cache_creation, total)):
         return None
     usage: dict[str, int] = {}
     if prompt is not None:
@@ -965,6 +978,8 @@ def _pack_usage(row: Any) -> dict[str, int] | None:
         usage["reasoning_tokens"] = reasoning
     if cached is not None:
         usage["cached_tokens"] = cached
+    if cache_creation is not None:
+        usage["cache_creation_tokens"] = cache_creation
     if total is not None:
         usage["total_tokens"] = total
     return usage
@@ -1081,7 +1096,7 @@ def list_runs_for_session(
                    started_at, completed_at, created_at, steps, events,
                    reasoning_steps,
                    prompt_tokens, completion_tokens, reasoning_tokens,
-                   cached_tokens, total_tokens,
+                   cached_tokens, cache_creation_tokens, total_tokens,
                    agent_id, model
             FROM "{AI_SCHEMA}".agent_runs
             WHERE session_id = :session_id
@@ -1102,9 +1117,11 @@ def list_runs_for_session(
         run_uuid = str(row[0])
         citations = citations_by_run.get(run_uuid, [])
 
-        prompt, completion, reasoning, cached, total = row[14], row[15], row[16], row[17], row[18]
+        prompt, completion, reasoning, cached, cache_creation, total = row[14:20]
         usage: dict[str, int] | None = None
-        if any(v is not None for v in (prompt, completion, reasoning, cached, total)):
+        if any(
+            v is not None for v in (prompt, completion, reasoning, cached, cache_creation, total)
+        ):
             usage = {}
             if prompt is not None:
                 usage["prompt_tokens"] = prompt
@@ -1114,6 +1131,8 @@ def list_runs_for_session(
                 usage["reasoning_tokens"] = reasoning
             if cached is not None:
                 usage["cached_tokens"] = cached
+            if cache_creation is not None:
+                usage["cache_creation_tokens"] = cache_creation
             if total is not None:
                 usage["total_tokens"] = total
 
@@ -1134,8 +1153,8 @@ def list_runs_for_session(
             "events": row[12] or [],
             "tool_calls": tool_calls_by_run.get(run_uuid, []),
             "reasoning_steps": row[13] or [],
-            "agent_id": str(row[19]) if row[19] else None,
-            "model": row[20],
+            "agent_id": str(row[20]) if row[20] else None,
+            "model": row[21],
         }
         if citations:
             run_dict["citations"] = citations
