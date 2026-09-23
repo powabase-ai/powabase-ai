@@ -176,6 +176,9 @@ MAX_CONSECUTIVE_BUILD_FAILURES = 3
 # soon as the failed ``CREATE INDEX CONCURRENTLY`` leaves the INVALID index
 # behind, and it goes away with that index, so an operator dropping the index by
 # hand re-arms the build without knowing this marker is here.
+#
+# Nothing in the wording may be ``:word``: ``COMMENT ON`` takes no parameter, so
+# this is interpolated, and ``text()`` would read that as a bind parameter.
 _BUILD_FAILURES_COMMENT = (
     "{n} consecutive failed attempts to build this partial HNSW index. It is "
     "INVALID: it answers no query and is maintained on every write. Drop it "
