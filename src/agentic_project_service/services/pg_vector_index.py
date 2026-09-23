@@ -205,6 +205,12 @@ def _validated_dims(dims: Any) -> int:
 
     PostgreSQL does not accept a type modifier from a parameter, so ``dims``
     reaches SQL as a literal in both the index expression and its predicate.
+
+    ``int()`` coerces rather than rejects, so a float truncates (``1536.9`` ->
+    ``1536``) and ``True`` becomes ``1``. Surprising, and left alone: the value
+    is range-checked either way, so nothing unsafe reaches SQL, and no caller
+    can get here with a non-integer -- ``dims`` comes from an embedding vector's
+    length or from ``pg_class.relname``.
     """
     try:
         value = int(dims)

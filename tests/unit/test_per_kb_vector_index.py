@@ -252,14 +252,22 @@ def test_vector_search_filters_the_embeddings_side_too():
     assert f"e.knowledge_base_id = '{KB}'" in normalized, sql
 
 
-def test_vector_search_keeps_the_item_table_filter():
-    """The embeddings-side predicate is added, not substituted.
+def test_vector_search_keeps_the_item_table_filter_as_well_as_the_embeddings_one():
+    """The embeddings-side predicate is added, not substituted -- both must be there.
 
     The item-table filter is what keeps an embedding whose item has been
-    deleted, or belongs to another knowledge base, out of the answer.
+    deleted, or belongs to another knowledge base, out of the answer; the
+    embeddings-side one is what a partial index can be matched from. Dropping
+    either would pass a test that only looked for the other.
+
+    Both are SQL literals of the same canonical id: a bound one on *either* side
+    loses the partial index once PostgreSQL adopts the statement's generic plan,
+    measured at ~135 ms against 0.98 ms for the life of that connection.
     """
     sql = _search_sql(_statements(lambda s: s.vector_search(embedding=[0.0] * 1536, top_k=10)))
-    assert "c.knowledge_base_id = :kb_id" in " ".join(sql.split())
+    normalized = " ".join(sql.split())
+    assert f"c.knowledge_base_id = '{KB}'" in normalized, sql
+    assert f"e.knowledge_base_id = '{KB}'" in normalized, sql
 
 
 def test_vector_search_passes_the_kb_id_as_a_literal_not_a_bind_parameter():
