@@ -69,6 +69,10 @@ VALID_TS_LANGUAGES = frozenset(
 # route takes it straight from the request body -- so this is where it is
 # checked. Generous: the per-source candidate pool is capped at 200 and hybrid
 # search doubles the caller's value, so nothing legitimate comes near.
+#
+# That doubling also means this is not the ceiling a caller sees on every route:
+# hybrid search validates ``top_k * 2``, so the largest ``top_k`` it accepts is
+# half of this.
 MAX_TOP_K = 10_000
 
 
@@ -134,6 +138,10 @@ def validated_top_k(top_k: Any) -> int:
     prices an ordered index scan out and leaves an exact sort. Zero is allowed
     because that is what a bound ``LIMIT 0`` did -- an empty answer, not an
     error.
+
+    ``int()`` coerces rather than rejects, so ``True`` becomes 1 and ``1.9``
+    becomes 1: surprising to read, safe to emit, and unreachable from the routes,
+    which parse ``top_k`` out of JSON as an int.
     """
     try:
         value = int(top_k)
@@ -153,6 +161,16 @@ def ensure_embedding_index(session: Session, schema: str, dims: int) -> None:
     already holds from INSERTing. Under concurrent workers this routinely
     deadlocks. The pg_indexes read takes only AccessShareLock on system
     catalogs and never contends with user-table DML.
+
+    **This index is load-bearing for every knowledge base without a partial one,
+    and narrowing it is sequenced.** It is the index a KB-scoped vector search
+    falls back to, so it must keep covering every row of its dimension until the
+    embeddings-side ``knowledge_base_id`` predicate (see ``kb_sql_literal``) has
+    deployed everywhere. Replacing it with a residual index that excludes the
+    knowledge bases holding their own partial index is the planned follow-up and
+    the reason that ordering matters: the older query shape matches no HNSW
+    index at all against a residual one and degenerates to a sequential scan.
+    ``pg_vector_index``'s module docstring holds the constraint in full.
     """
     dims = int(dims)
     if not (1 <= dims <= 8192):
@@ -565,6 +583,9 @@ class BasePgVectorStore:
         # to use it, our distance expression must contain that exact cast.
         # dims is interpolated into SQL (not bound) because PostgreSQL does not
         # allow type modifiers to come from a parameter; range-check guards it.
+        # int() truncates rather than rejects, so a float 1536.9 would search as
+        # 1536 -- surprising, safe to emit, and not reachable from a caller that
+        # takes the value off a stored embedding.
         if not (1 <= effective_dims <= 8192):
             raise ValueError(f"dims must be between 1 and 8192, got {effective_dims}")
         effective_top_k = validated_top_k(top_k)
@@ -714,6 +735,14 @@ class BasePgVectorStore:
         # vector_search this query has no outer LIMIT on the distance order -- it
         # scores the whole knowledge base by design, so no HNSW index is used
         # either way, and the remaining parameters stay bound.
+        #
+        # That is also why the item-table id below is still bound, where
+        # vector_search interpolates it on both sides: there is no ordered index
+        # scan here for an unknown row estimate to price out, so the bind costs
+        # nothing -- and it keeps one statement text shared across knowledge
+        # bases instead of one per knowledge base in the driver's
+        # prepared-statement cache. A LIMIT on the distance order would make this
+        # query vector_search's shape and the bind would then matter.
         query = f"""
             WITH scored AS (
                 SELECT
