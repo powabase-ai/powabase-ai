@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.10.0](https://github.com/powabase-ai/powabase-ai/compare/v0.9.2...v0.10.0) (2026-09-23)
+
+
+### Features
+
+* persist prompt-cache writes on agent and orchestration runs ([#84](https://github.com/powabase-ai/powabase-ai/issues/84)) ([86cb206](https://github.com/powabase-ai/powabase-ai/commit/86cb206f589db1d2a0c3621055421399164020d5))
+
+## [0.9.2](https://github.com/powabase-ai/powabase-ai/compare/v0.9.1...v0.9.2) (2026-09-23)
+
+
+### Bug Fixes
+
+* **deps:** bump powabase-agentic from 0.5.0 to 0.5.1 ([#82](https://github.com/powabase-ai/powabase-ai/issues/82)) ([841e034](https://github.com/powabase-ai/powabase-ai/commit/841e0345ad8923f38d161e29a5d5f7c6f9419c74))
+* **test:** pin litellm's cost map to the wheel so the model-choice gate is hermetic ([#80](https://github.com/powabase-ai/powabase-ai/issues/80)) ([63603f5](https://github.com/powabase-ai/powabase-ai/commit/63603f59d327ee31c69f6922e7a8d508cf73ba71))
+
 ## [0.9.1](https://github.com/powabase-ai/powabase-ai/compare/v0.9.0...v0.9.1) (2026-09-21)
 
 
