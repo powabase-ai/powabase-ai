@@ -9,6 +9,8 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from agentic.knowledge.model_config import HYBRID_DEFAULT_VECTOR_WEIGHT
@@ -19,7 +21,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from ..db import AI_SCHEMA
-from . import pg_bm25_index
+from . import pg_bm25_index, pg_vector_index
 from .kb_search_config import HNSW_ITERATIVE_SCAN_MODE
 from .settings_registry import SETTINGS_REGISTRY, get_setting
 
@@ -530,6 +532,169 @@ class BasePgVectorStore:
                 e,
             )
 
+    # One round trip that answers both questions the block below needs: whether
+    # this knowledge base has a partial HNSW index worth steering the planner
+    # towards, and what ``enable_sort`` is set to so it can be put back. Two
+    # independent scalars rather than a nested ``CASE``, so neither depends on
+    # the order the target list is evaluated in.
+    #
+    # ``indisvalid`` and not merely "the name exists": a CONCURRENTLY-built index
+    # is in the catalog from the moment the build starts and cannot answer a
+    # query until it finishes, and a failed build leaves one behind for good.
+    # Steering the planner at an index in either state is exactly the case
+    # requirement 2 of this fix is about.
+    _PARTIAL_INDEX_PROBE = """
+        SELECT
+            current_setting('enable_sort') AS prior,
+            EXISTS (
+                SELECT 1 FROM pg_index
+                WHERE indexrelid = to_regclass(:index) AND indisvalid
+            ) AS usable
+    """
+
+    @contextmanager
+    def _preferring_this_kbs_partial_index(self, dims: int) -> Iterator[bool]:
+        """Price an exact sort out of the search, when there is an index to fall on.
+
+        Yields whether the sort was priced out.
+
+        Everything else in this class makes the partial HNSW index *reachable*.
+        This is what makes the planner *take* it, and it is needed because at
+        1536 dimensions -- the width most embedding models here produce -- the
+        planner's arithmetic comes out the wrong way round.
+
+        A 1536-value vector does not fit in a heap tuple, so it is stored out of
+        line: the heap stays small (656 pages for 40,000 rows) while the HNSW
+        index holds about one tuple per page (12,001 pages for 12,000 tuples).
+        PostgreSQL then prices an exact scan as 656 pages plus a sort of narrow
+        tuples, and prices detoasting -- 12,000 out-of-line reads and 12,000
+        1536-value distance computations -- at nothing at all. So the exact scan
+        is systematically underpriced and the ordered index scan overpriced, and
+        the gap does not close as the knowledge base grows: on a
+        20-knowledge-base, 39,995-row fixture at 1536 dimensions the planner
+        declined the index at every share of the table from 21% to 70%. At 384
+        dimensions the vector is inline, the two paths cost about the same, and
+        the planner takes the index on its own -- which is why this was invisible
+        until the suite was measured at a production width.
+
+        Measured through ``vector_search`` itself, 12 executions on one pooled
+        connection under ``force_generic_plan``, ``top_k`` 20, on that fixture,
+        with the knowledge base's partial index built and valid:
+
+        | knowledge base | search | before | with this |
+        |---|---|---|---|
+        | 30 % of the table | unfiltered | 0/12 on the index, 50.5 ms | 12/12, 5.2 ms |
+        | 30 % | one metadata key | 0/12, 15.2 ms | 12/12, 8.5 ms |
+        | 30 % | two metadata keys | 0/12, 15.0 ms | 12/12, 7.4 ms |
+        | 21 % of the table | unfiltered | 0/12, 38.0 ms | 12/12, 4.7 ms |
+
+        The filtered rows are the second thing this repairs. ``_force_custom_plan``
+        gets a one-key filter as far as an estimate, but ``jsonb @>`` has no
+        statistics at all, so the estimate is a fixed guess and two keys put it
+        near zero rows -- which makes the sort look free and loses the index even
+        when the planner does know the filter's value. The estimate is wrong, not
+        the clause, so the fix belongs here rather than in how the filter is
+        compiled.
+
+        **Only with an index of this knowledge base's own.** This is a cost
+        penalty on every sort in the statement, not an instruction to use a
+        particular index, so with no partial index it drives the query onto the
+        *shared* per-dimension index, which spans every knowledge base and
+        post-filters. Measured on the same fixture with no partial index built,
+        median of six query vectors:
+
+        | knowledge base | planner's own choice | this, ungated |
+        |---|---|---|
+        | 21 %, 8,400 rows | exact scan, 34.4 ms, recall 1.00 | shared index, 6.3 ms, recall 0.08 |
+        | 5 %, 2,000 rows | exact scan, 9.4 ms, recall 1.00 | shared index, 31.3 ms, recall 0.04 |
+        | 1 %, 400 rows | exact scan, 1.8 ms, recall 1.00 | shared index, 39.8 ms, recall 0.36 |
+
+        Slower *and* wrong, which is what the catalog probe buys: a knowledge
+        base below the build threshold, one whose index is INVALID, and one whose
+        index is still being built all keep the plan they have today -- measured,
+        0 of 12 executions on the index and recall 1.00 in each case. The probe
+        costs a round trip, which for a knowledge base that has no index is the
+        whole of what this adds: +0.3 ms, measured over 120 searches each at
+        400, 2,000 and 8,400 rows.
+
+        **What it costs.** An extra predicate that matches nothing turns the
+        ordered scan into a walk of the index for rows that are not there. On the
+        indexed 30% knowledge base, a filter matching no row went from 3.0 ms to
+        38.3 ms, and a ``source_ids`` matching no row from 2.4 ms to 36.7 ms --
+        the same answer (none), later. The cost is bounded rather than
+        proportional: pgvector stops an iterative scan at
+        ``hnsw.max_scan_tuples``, 20,000 by default, so this is a ceiling and not
+        something that grows with the knowledge base.
+
+        Recall is the trade even when the index is there, and on this fixture it
+        measured 0.22 at 30% of the table and 0.28 at 21%, against an exact
+        scan's 1.00. That number is not a production figure and must not be read
+        as one: the fixture's vectors are clustered random noise, so in 1536
+        dimensions almost every pair is about equally distant and there is barely
+        a nearest neighbour to find. It is here because it is what was measured,
+        not because it predicts anything.
+
+        ``set_config(..., true)`` rather than ``SET LOCAL`` so the previous value
+        can be bound; the third argument is what makes it transaction-local.
+        Transaction-local is not enough on its own here, though, and that is the
+        difference from ``_apply_iterative_scan`` and ``_force_custom_plan``:
+        those two settings are harmless to the rest of a transaction, and this
+        one is not. ``hybrid_search`` runs its keyword leg on the same session
+        immediately after the vector leg, and a keyword ranking is a sort. So the
+        previous value goes back on before this returns, the same way
+        ``_fetch_with_timeout`` restores its budget.
+
+        A failure on either side degrades latency, never the answer, so both are
+        logged rather than raised -- and the restore is expected to fail when the
+        search itself did, because the transaction is then aborted and the
+        setting dies with it anyway.
+        """
+        # Not inside the try below: both arguments have already been validated by
+        # the caller, so a failure here is a programming error and should not be
+        # logged as a missing index.
+        index = f'"{self.schema}".{pg_vector_index.per_kb_index_name(self.kb_id, dims)}'
+        prior: str | None = None
+        try:
+            rows = list(self.session.execute(text(self._PARTIAL_INDEX_PROBE), {"index": index}))
+            if rows and rows[0][1]:
+                prior = str(rows[0][0])
+        except Exception as e:  # pragma: no cover - needs a live catalog
+            logger.warning(
+                "Could not check for KB %s's partial HNSW index at %d dimensions: %s; "
+                "this vector search may fall back to an exact scan",
+                self.kb_id,
+                dims,
+                e,
+            )
+        if prior is None:
+            yield False
+            return
+        try:
+            self.session.execute(text("SELECT set_config('enable_sort', 'off', true)"))
+        except Exception as e:  # pragma: no cover - needs a live server
+            logger.warning(
+                "Could not price the exact sort out for KB %s: %s; this vector search "
+                "may miss the knowledge base's partial HNSW index",
+                self.kb_id,
+                e,
+            )
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            try:
+                self.session.execute(
+                    text("SELECT set_config('enable_sort', :prior, true)"), {"prior": prior}
+                )
+            except Exception as e:
+                logger.debug(
+                    "Could not restore enable_sort=%s after a vector search on KB %s: %s",
+                    prior,
+                    self.kb_id,
+                    e,
+                )
+
     def _fetch_with_timeout(
         self, sql: str, params: dict[str, Any], timeout_ms: int, *, query: str
     ) -> list:
@@ -713,19 +878,24 @@ class BasePgVectorStore:
                 # is compiled may change, why a bound filter needs a custom plan
                 # does not.
                 self._force_custom_plan()
-            result = self.session.execute(text(query), params)
-            items = []
-            for row in result:
-                items.append(
-                    RetrievedItem(
-                        item_id=str(row[0]),
-                        text=row[1],
-                        score=float(row[2]) if row[2] is not None else 0.0,
-                        source_id=str(row[3]) if row[3] else None,
-                        knowledge_base_id=self.kb_id,
-                        meta=row[4] or {},
+            # Inside the block, because restoring enable_sort must not happen
+            # until the rows are off the cursor. The plan is fixed when the
+            # statement executes, so this is belt and braces -- but the belt is
+            # free and the alternative depends on how the driver buffers.
+            with self._preferring_this_kbs_partial_index(effective_dims):
+                result = self.session.execute(text(query), params)
+                items = []
+                for row in result:
+                    items.append(
+                        RetrievedItem(
+                            item_id=str(row[0]),
+                            text=row[1],
+                            score=float(row[2]) if row[2] is not None else 0.0,
+                            source_id=str(row[3]) if row[3] else None,
+                            knowledge_base_id=self.kb_id,
+                            meta=row[4] or {},
+                        )
                     )
-                )
             return self._resolve_results(items) if _resolve else items
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
