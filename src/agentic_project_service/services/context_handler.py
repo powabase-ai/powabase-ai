@@ -64,13 +64,31 @@ def _bounded_row_count(kb_id: str, value: Any, field: str, fallback: int | None)
     """
     try:
         count = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is not hypothetical: JSON has no infinity, but Flask's
+        # parser accepts a bare ``Infinity`` and ``int(float('inf'))`` raises
+        # here rather than in the two the obvious guard would list.
         logger.warning(
             "Knowledge base %s has a stored %s of %r, which is not a row count; "
             "using %r instead. Fix the knowledge base's retrieval configuration",
             kb_id,
             field,
             value,
+            fallback,
+        )
+        return fallback
+    if count < 1:
+        # The clamp above bounds the top only, so zero used to pass straight
+        # through: a knowledge base configured to retrieve nothing, answering
+        # nothing, indistinguishable from one with no matching content. A
+        # negative value is already loud (the store refuses it), which is what
+        # made this the quiet half of the same mistake.
+        logger.warning(
+            "Knowledge base %s has a stored %s of %d, which would retrieve nothing at "
+            "all; using %r instead. Fix the knowledge base's retrieval configuration",
+            kb_id,
+            field,
+            count,
             fallback,
         )
         return fallback

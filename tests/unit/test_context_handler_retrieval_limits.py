@@ -271,3 +271,35 @@ def test_the_candidate_pool_is_clamped_on_every_path(monkeypatch, path):
         )
     assert out["errors"] == [], out["errors"]
     assert calls[0]["retrieval_config"]["reranker"]["candidate_count"] == ch.SAFE_RETRIEVAL_TOP_K
+
+
+# ---------------------------------------------------------------------------
+# The two quiet halves of a stored row count
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("stored", [0, "0"])
+def test_a_stored_row_count_of_zero_falls_back_instead_of_silencing_the_kb(caplog, stored):
+    """Zero retrieves nothing, which reads exactly like having nothing to retrieve.
+
+    The clamp bounds the top only, so this used to pass straight through and the
+    knowledge base answered nothing with no line anywhere saying why.
+    """
+    with caplog.at_level(logging.WARNING):
+        got = ch._bounded_row_count("kb-1", stored, "top_k", 7)
+
+    assert got == 7
+    assert any("retrieve nothing at all" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_an_infinite_stored_row_count_is_refused_rather_than_raising(caplog):
+    """``int(float('inf'))`` raises OverflowError, which the obvious guard omits.
+
+    JSON has no infinity, but Flask's parser accepts a bare ``Infinity``, so a
+    stored value can reach here as one.
+    """
+    with caplog.at_level(logging.WARNING):
+        got = ch._bounded_row_count("kb-1", float("inf"), "candidate_count", 5)
+
+    assert got == 5
+    assert any("not a row count" in r.getMessage() for r in caplog.records), caplog.text
