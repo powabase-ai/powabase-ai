@@ -1827,13 +1827,14 @@ def _exact_answers(engine, kb_id, vectors, **kwargs) -> list[list[str]]:
     return answers
 
 
-def _drive_and_collect(engine, kb_id, vectors, *counted, **kwargs):
+def _drive_and_collect(engine, kb_id, vectors, *counted, plan_cache_mode=None, **kwargs):
     """``vector_search`` for real, once per vector, on one connection.
 
     Returns ``(scans, answers)``: the scans each of ``counted`` served over the
     run, and what each search returned. Same connection discipline as
     ``_drive_searches`` -- an engine of its own, closed before the counters are
-    read.
+    read. ``plan_cache_mode`` is left alone by default, so the default run is
+    PostgreSQL deciding for itself when to go generic.
     """
     before = _idx_scans(engine, *counted)
     probe = create_engine(_dsn())
@@ -1841,6 +1842,8 @@ def _drive_and_collect(engine, kb_id, vectors, *counted, **kwargs):
     answers = []
     try:
         with Session(bind=connection) as session:
+            if plan_cache_mode is not None:
+                session.execute(text(f"SET plan_cache_mode = '{plan_cache_mode}'"))
             store = _ChunkStore(db_session=session, knowledge_base_id=kb_id, schema=SCHEMA)
             for vector in vectors:
                 items = asyncio.run(store.vector_search(embedding=list(vector), top_k=20, **kwargs))
@@ -2011,4 +2014,27 @@ def test_a_forced_index_scan_still_returns_every_row_that_matches(
         assert sorted(got) == sorted(wanted), (
             f"an ordered index scan under a LIMIT of 20 dropped rows that matched: "
             f"{len(got)} of {len(wanted)}"
+        )
+
+    # And again with the generic plan pinned, which is what makes the re-run's
+    # request for a custom plan load-bearing rather than decorative. A generic
+    # plan is built once and cached, and PostgreSQL does not rebuild it when a
+    # planner GUC changes -- so the plan built while the sort was priced out is
+    # the plan the re-run would get, and it would return the same short answer.
+    scans, answers = _drive_and_collect(
+        engine,
+        KB_BIG,
+        driven,
+        name,
+        shared,
+        plan_cache_mode="force_generic_plan",
+        item_ids=set(wanted),
+    )
+    assert scans[name] == len(driven), (
+        f"the generic plan must still be the forced index scan here: {scans}"
+    )
+    for got in answers:
+        assert sorted(got) == sorted(wanted), (
+            "with the generic plan pinned, the re-run has to ask for a custom plan or it "
+            f"re-uses the plan that came up short: {len(got)} of {len(wanted)}"
         )
