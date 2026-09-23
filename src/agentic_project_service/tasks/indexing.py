@@ -3241,10 +3241,15 @@ def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
 
     Retries with the same jittered backoff as the BM25 index tasks on a
     transient database failure -- a lost connection, a cancelled statement, a
-    lock conflict -- and while another caller holds this index's build lock.
-    Anything else fails the run at ERROR; nothing is left half-built, because a
-    failed ``CREATE INDEX CONCURRENTLY`` leaves only an INVALID index, which the
-    next run drops and rebuilds.
+    lock conflict. Anything else fails the run at ERROR; nothing is left
+    half-built, because a failed ``CREATE INDEX CONCURRENTLY`` leaves only an
+    INVALID index, which the next run drops and rebuilds.
+
+    It also reschedules itself, without an exception, for the one outcome that
+    nothing else comes back to: an INVALID index left in place because a build of
+    it was still running (``outcome_needs_another_attempt``). Finding this
+    index's build lock held by another caller is **not** that case and does not
+    retry -- that caller is doing this index's work.
 
     Every run leaves two kinds of ``per_kb_vector_index`` line: one per state the
     service enters, as it enters it, and one summary with the outcome and how
@@ -3333,6 +3338,37 @@ def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
         repaired=repaired,
         **({"reason": outcome["reason"]} if outcome.get("reason") else {}),
     )
+
+    # An INVALID index the ensure had to leave alone, because a build of it was
+    # still running, is the one outcome nothing comes back to: the index answers
+    # no query and is maintained on every write, and the running build is a
+    # backend from a worker that may already be dead. So this is the caller that
+    # has to come back -- ordinary lock contention deliberately does not, because
+    # whoever holds the lock is doing the work right now.
+    if pg_vector_index.outcome_needs_another_attempt(outcome):
+        if self.request.retries >= self.max_retries:
+            logger.error(
+                "Giving up on repairing KB %s's INVALID vector index after %d attempts: a "
+                "build of it was still running each time. It answers no query and is "
+                "maintained on every write to the embeddings table until the next indexing "
+                "run or start-up reconciles it: %s",
+                kb_id,
+                attempt,
+                outcome.get("index") or outcome.get("indexes") or "(index unnamed)",
+            )
+            return outcome
+        countdown = _pg_bm25_retry_countdown(self.request.retries)
+        retry = self.retry(countdown=countdown, throw=False)
+        logger.info(
+            "Rescheduling KB %s's vector index reconcile in %d s (attempt %d of %d): %s",
+            kb_id,
+            countdown,
+            attempt + 1,
+            self.max_retries + 1,
+            outcome.get("reason") or "another attempt is needed",
+        )
+        raise retry
+
     return outcome
 
 

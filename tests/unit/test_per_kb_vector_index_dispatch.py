@@ -35,6 +35,24 @@ def _action(monkeypatch, value):
     monkeypatch.setattr(idx, "_per_kb_vector_index_action", lambda kb_id: value)
 
 
+@pytest.fixture(autouse=True)
+def _reschedule_predicate(monkeypatch):
+    """Fill in the service's reschedule predicate where this tree predates it.
+
+    ``outcome_needs_another_attempt`` reads the ``reschedule`` flag the ensure
+    sets, and lands with the service module; the task's call site is here.
+    Reproducing the flag read is enough for these specs, and the branch stops
+    firing -- so the real predicate is used -- as soon as the service carries it.
+    """
+    if not hasattr(pvi, "outcome_needs_another_attempt"):
+        monkeypatch.setattr(
+            pvi,
+            "outcome_needs_another_attempt",
+            lambda outcome: bool(outcome.get("reschedule")),
+            raising=False,
+        )
+
+
 # ---------------------------------------------------------------------------
 # After a source finishes indexing
 # ---------------------------------------------------------------------------
@@ -640,6 +658,78 @@ def test_the_boot_sweeps_count_is_bounded_short_enough_for_a_start_up():
     boot-path bound is 5 s; anything much larger is a start-up that looks hung.
     """
     assert 0 < pvi.SWEEP_TIMEOUT_MS <= 10_000
+
+
+def _invalid_left_behind() -> dict:
+    """The ensure's outcome when it could not repair an INVALID index."""
+    return {
+        "status": "building",
+        "reason": "invalid_index_build_in_progress",
+        "reschedule": True,
+        "index": "hnsw_kb_abc_1536",
+        "built": [],
+        "dropped": [],
+    }
+
+
+def test_an_invalid_index_that_could_not_be_repaired_is_rescheduled(monkeypatch, retry_spy):
+    """Nothing else comes back to it, so the task that saw it has to.
+
+    The ensure returns rather than raising here, so a task that only reacts to
+    exceptions leaves the index INVALID -- answering no query, maintained on
+    every write -- until the next indexed source or pod restart.
+    """
+    from celery.exceptions import Retry
+
+    monkeypatch.setattr(
+        pvi, "ensure_per_kb_vector_index", MagicMock(return_value=_invalid_left_behind())
+    )
+    with pytest.raises(Retry):
+        idx.ensure_per_kb_vector_index.run(KB)
+    spy = retry_spy[idx.ensure_per_kb_vector_index.name]
+    spy.assert_called_once()
+    assert spy.call_args.kwargs["countdown"] > 0
+
+
+def test_an_index_whose_lock_is_merely_held_is_not_rescheduled(monkeypatch, retry_spy):
+    """Whoever holds the lock is building this very index; requeueing adds nothing."""
+    outcome = {
+        "status": "building",
+        "reason": "build_lock_held",
+        "index": "hnsw_kb_abc_1536",
+        "built": [],
+        "dropped": [],
+    }
+    monkeypatch.setattr(pvi, "ensure_per_kb_vector_index", MagicMock(return_value=outcome))
+    assert idx.ensure_per_kb_vector_index.run(KB) == outcome
+    retry_spy[idx.ensure_per_kb_vector_index.name].assert_not_called()
+
+
+def test_a_reschedule_gives_up_at_the_retry_bound_and_says_what_is_left(monkeypatch, caplog):
+    """An unbounded reschedule would requeue this knowledge base forever."""
+    import logging
+
+    from celery.exceptions import Retry
+
+    monkeypatch.setattr(
+        pvi, "ensure_per_kb_vector_index", MagicMock(return_value=_invalid_left_behind())
+    )
+    task = idx.ensure_per_kb_vector_index
+    spy = MagicMock(side_effect=Retry("retry"))
+    monkeypatch.setattr(task, "retry", spy)
+
+    task.push_request(retries=task.max_retries)
+    try:
+        with caplog.at_level(logging.ERROR):
+            outcome = task.run(KB)
+    finally:
+        task.pop_request()
+
+    spy.assert_not_called()
+    assert outcome["reschedule"] is True
+    message = "\n".join(r.getMessage() for r in caplog.records)
+    assert "hnsw_kb_abc_1536" in message, message
+    assert "INVALID" in message, message
 
 
 def test_the_ensure_task_returns_the_services_outcome(monkeypatch, retry_spy):

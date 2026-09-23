@@ -20,6 +20,19 @@ SMALLEST_MEASURED_REGRESSION = 12_600
 LARGEST_MEASURED_REGRESSION = 18_000
 
 
+def test_the_defaults_are_the_pair_the_measurement_chose():
+    """The literal numbers, pinned once, here.
+
+    Everything else about these two settings is asserted as a relation -- the
+    hysteresis, the range -- which is right for properties that hold whatever the
+    numbers are. But the numbers themselves are the fix: 50,000 and 25,000 left
+    every measured regression below the threshold with no index and no way to
+    earn one. A change back needs a new measurement and a deliberate edit here.
+    """
+    assert SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"].default == 10_000
+    assert SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_DROP_ROWS"].default == 5_000
+
+
 def test_the_build_default_is_at_or_below_the_measured_regression_window():
     build = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"]
     assert build.default <= SMALLEST_MEASURED_REGRESSION, (
@@ -42,8 +55,15 @@ def test_the_drop_default_keeps_the_hysteresis_below_the_new_build_default():
     )
 
 
-def test_the_drop_threshold_cannot_be_set_to_an_unreachable_zero():
-    """``rows < 0`` is never true, so 0 means "never drop, and re-dispatch forever"."""
+def test_the_drop_threshold_cannot_be_set_to_zero():
+    """At 0 an index is held open until the knowledge base's last embedding is gone.
+
+    Which is not a threshold at all: the write cost of the index is paid on every
+    write to the embeddings table, for an index of a handful of rows, and it was
+    worse before the drop test included equality -- ``rows < 0`` could never be
+    satisfied by any knowledge base, empty or not, while the start-up sweep went
+    on re-dispatching it every boot.
+    """
     drop = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_DROP_ROWS"]
     assert drop.min == 1
 

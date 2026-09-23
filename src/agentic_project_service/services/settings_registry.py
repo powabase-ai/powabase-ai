@@ -1187,11 +1187,11 @@ def _build_registry() -> dict[str, SettingDef]:
                 "threshold: with one threshold, a knowledge base sitting on it would "
                 "have its index built and thrown away over and over, and each build "
                 "is a full index build. A value at or above the build threshold is "
-                "ignored in favour of half of it. It cannot be 0: the test is "
-                "*fewer* than this many rows, so at 0 nothing can ever satisfy it — "
-                "not even a knowledge base whose embeddings are all gone, which would "
-                "then keep an index of nothing while the start-up sweep re-dispatched "
-                "it on every boot."
+                "ignored in favour of half of it. It cannot be 0: a knowledge base "
+                "goes back to the project-wide index once it is at or below this many "
+                "embeddings, so 0 would hold its own index open until the very last "
+                "embedding was gone — an index of nothing in particular, still "
+                "evaluated on every write to the embeddings table."
             ),
         ),
         SettingDef(
