@@ -103,6 +103,10 @@ jobs:
       # requeues a source (the single attempts bound, and the countdown a lock
       # conflict or partition-move race requeues with) against real rows, and
       # needs only this job's database -- no pg_search.
+      #
+      # tests/test_run_usage_cache_creation_store.py pins the run usage columns
+      # through their hand-written INSERT/UPDATE/SELECT lists, one of which is
+      # read back by position.
       - name: Run store tests
         run: >-
           uv run --no-sync pytest
@@ -110,6 +114,7 @@ jobs:
           tests/test_full_text_search_timeout_live.py
           tests/test_extraction_redelivery_store.py
           tests/test_index_source_retry.py
+          tests/test_run_usage_cache_creation_store.py
           -q
 
   # tests/pg_search exercises the Postgres-native BM25 path for real: the

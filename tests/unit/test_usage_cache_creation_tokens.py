@@ -6,9 +6,10 @@ so a run's net cache saving needs both. These tests pin the unpack (usage dict
 -> typed columns), the pack (typed columns -> usage dict) and migration 0033
 that adds the column.
 
-A missing key must stay NULL, not become 0: agentic drops None-valued keys, so
-"the provider reported no writes" and "the provider does not report writes"
-are different facts.
+A missing key stays NULL rather than becoming 0, matching `cached_tokens`.
+agentic's run totals start every key at 0, so runs recorded through agentic
+store 0 even when the provider reports no writes; NULL marks rows written
+before the column existed, or usage that did not come from agentic's totals.
 """
 
 import importlib.util
@@ -122,8 +123,24 @@ def test_migration_0033_upgrade_adds_nullable_column_to_both_run_tables(migratio
     sql = _captured_sql(migration_0033.upgrade)
     for table in ("ai.agent_runs", "ai.orchestration_runs"):
         assert f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS cache_creation_tokens INT" in sql
-    assert "NOT NULL" not in sql
-    assert "DEFAULT" not in sql
+    alters = [s for s in sql.splitlines() if s.startswith("ALTER TABLE")]
+    assert len(alters) == 2
+    for alter in alters:
+        assert "NOT NULL" not in alter
+        assert "DEFAULT" not in alter
+
+
+@pytest.mark.parametrize("step", ["upgrade", "downgrade"])
+def test_migration_0033_bounds_its_lock_wait(migration_0033, step):
+    """Each ALTER needs ACCESS EXCLUSIVE, and migrations run at start-up: behind
+    a long reader, an unbounded wait would hang the boot and queue every run
+    insert behind it. The bound is set before the ALTERs and put back after.
+    """
+    sql = _captured_sql(getattr(migration_0033, step)).splitlines()
+    alters = [i for i, s in enumerate(sql) if s.startswith("ALTER TABLE")]
+    assert sql[0] == "SET LOCAL lock_timeout = '10s'"
+    assert sql[-1] == "SET LOCAL lock_timeout TO DEFAULT"
+    assert 0 < min(alters) and max(alters) < len(sql) - 1
 
 
 def test_migration_0033_downgrade_drops_column_from_both_run_tables(migration_0033):

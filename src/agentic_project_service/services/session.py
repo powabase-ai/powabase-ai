@@ -93,8 +93,7 @@ def _unpack_usage(usage: dict | None) -> dict[str, int | None]:
         if isinstance(details, dict):
             cached = _as_int(details.get("cached_tokens"))
 
-    # Prompt-cache writes. Absent stays None, not 0: a provider that does not
-    # report writes is not a provider that wrote none.
+    # Prompt-cache writes. Absent stays None, not 0, as for cached_tokens.
     cache_creation = _as_int(usage.get("cache_creation_tokens"))
     if cache_creation is None:
         details = usage.get("prompt_tokens_details") or {}

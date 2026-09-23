@@ -5,8 +5,7 @@ next to ``cached_tokens`` (cache reads). Anthropic bills writes at 1.25x input
 and reads at 0.1x, so a run's net cache saving needs both.
 
 Nullable with no default and no backfill: runs written before this revision
-never stored the value, and NULL keeps "not reported" distinct from a reported
-zero.
+never stored the value, so they stay NULL.
 
 Revision ID: 0033
 Revises: 0032
@@ -22,12 +21,25 @@ depends_on = None
 
 _TABLES = ("ai.agent_runs", "ai.orchestration_runs")
 
+# Each ALTER takes ACCESS EXCLUSIVE, and migrations run at start-up. Behind a
+# long reader (a nightly pg_dump holds ACCESS SHARE for its whole run) an
+# unbounded wait would hang the boot and queue every run insert behind the
+# waiting ALTER. On timeout the migration fails, start-up exits, and the next
+# start runs this revision again. Both settings are transaction-local, so the
+# session's own lock_timeout returns at commit.
+_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '10s'"
+_LOCK_TIMEOUT_DEFAULT = "SET LOCAL lock_timeout TO DEFAULT"
+
 
 def upgrade():
+    op.execute(_LOCK_TIMEOUT)
     for table in _TABLES:
         op.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS cache_creation_tokens INT")
+    op.execute(_LOCK_TIMEOUT_DEFAULT)
 
 
 def downgrade():
+    op.execute(_LOCK_TIMEOUT)
     for table in _TABLES:
         op.execute(f"ALTER TABLE {table} DROP COLUMN IF EXISTS cache_creation_tokens")
+    op.execute(_LOCK_TIMEOUT_DEFAULT)
