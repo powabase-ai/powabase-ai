@@ -325,7 +325,7 @@ class TestCacheCreationTokensRoundTrip:
             {"rid": run_id},
         ).scalar_one()
 
-    def _persist(self, usage, db_session_uuid=None) -> str:
+    def _persist(self, usage, db_session_uuid=None, model=None) -> str:
         from agentic_project_service.services.session import persist_agent_run
 
         run_id = f"run_{uuid.uuid4().hex[:12]}"
@@ -337,6 +337,7 @@ class TestCacheCreationTokensRoundTrip:
             output_messages=[{"role": "assistant", "content": "hello"}],
             usage=usage,
             db_session_uuid=db_session_uuid,
+            model=model,
         )
         db.session.commit()
         return run_id
@@ -392,10 +393,13 @@ class TestCacheCreationTokensRoundTrip:
                 {"id": session_uuid, "sid": session_id},
             )
             db.session.commit()
-            self._persist(self.USAGE, db_session_uuid=session_uuid)
+            self._persist(self.USAGE, db_session_uuid=session_uuid, model="test-model")
 
             [run] = session_service.list_runs_for_session(db.session, session_id)
             assert run["usage"] == self.USAGE
+            # The columns after the usage block are read by position too.
+            assert run["model"] == "test-model"
+            assert run["agent_id"] is None
 
     def test_update_orchestration_run_sets_column_and_orm_usage(self, app):
         from agentic_project_service.models.tenant import OrchestrationRunModel

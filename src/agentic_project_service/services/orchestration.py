@@ -221,6 +221,7 @@ def update_orchestration_run(
         updates.append("completion_tokens = :completion_tokens")
         updates.append("reasoning_tokens = :reasoning_tokens")
         updates.append("cached_tokens = :cached_tokens")
+        updates.append("cache_creation_tokens = :cache_creation_tokens")
         updates.append("total_tokens = :total_tokens")
         params.update(tokens)
     if error is not None:

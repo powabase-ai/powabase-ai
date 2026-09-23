@@ -764,6 +764,7 @@ class AgentRun(db.Model):
     completion_tokens: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
     reasoning_tokens: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
     cached_tokens: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
+    cache_creation_tokens: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
     total_tokens: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
     tool_call_count: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
     tool_call_error_count: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
@@ -780,6 +781,7 @@ class AgentRun(db.Model):
             self.completion_tokens,
             self.reasoning_tokens,
             self.cached_tokens,
+            self.cache_creation_tokens,
             self.total_tokens,
         )
 
@@ -829,10 +831,11 @@ def _pack_usage_from_attrs(
     completion: int | None,
     reasoning: int | None,
     cached: int | None,
+    cache_creation: int | None,
     total: int | None,
 ) -> dict[str, int] | None:
     """Assemble a `usage` dict from typed-col values, or None if all empty."""
-    if all(v is None for v in (prompt, completion, reasoning, cached, total)):
+    if all(v is None for v in (prompt, completion, reasoning, cached, cache_creation, total)):
         return None
     out: dict[str, int] = {}
     if prompt is not None:
@@ -843,6 +846,8 @@ def _pack_usage_from_attrs(
         out["reasoning_tokens"] = reasoning
     if cached is not None:
         out["cached_tokens"] = cached
+    if cache_creation is not None:
+        out["cache_creation_tokens"] = cache_creation
     if total is not None:
         out["total_tokens"] = total
     return out
@@ -1283,6 +1288,7 @@ class OrchestrationRunModel(db.Model):
     completion_tokens: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
     reasoning_tokens: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
     cached_tokens: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
+    cache_creation_tokens: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
     total_tokens: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
     tool_call_count: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
     tool_call_error_count: Mapped[int | None] = mapped_column(db.Integer, nullable=True)
@@ -1299,6 +1305,7 @@ class OrchestrationRunModel(db.Model):
             self.completion_tokens,
             self.reasoning_tokens,
             self.cached_tokens,
+            self.cache_creation_tokens,
             self.total_tokens,
         )
 
