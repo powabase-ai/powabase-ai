@@ -15,17 +15,55 @@ this surface too. Failure modes caught at CI time (not at boot):
    ``openrouter/mistralai/mistral-small-3.1-24b-instruct``, which resolves
    and has cost but reports function-calling = False).
 
-These run as ordinary unit tests (no network, no DB) — litellm reads its
-model_cost JSON locally.
+These run as ordinary unit tests (no network, no DB), but only because
+``tests/conftest.py`` sets ``LITELLM_LOCAL_MODEL_COST_MAP=True`` before
+anything imports litellm: the registry these assertions read is then the
+``model_prices_and_context_window_backup.json`` inside the pinned litellm
+wheel, not a file fetched from GitHub at import time. Without that, the
+assertions track whatever upstream publishes, and an upstream edit fails this
+file on an unchanged main — which is what happened when three ids were dropped
+from the live map. ``test_registry_is_the_pinned_local_cost_map`` below guards
+the arrangement.
+
+What that costs: these tests can no longer notice that a provider retired a
+model, because the pinned snapshot still describes it. They catch our own
+typos and slug drift against the litellm the service actually deploys, which
+is what a gate on every PR should do; noticing a retirement is a job for
+whoever bumps the litellm pin (the boot-time guard in main.py reads the
+deployment's own map at startup and logs any picker entry it cannot price).
 """
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import litellm
+from litellm.litellm_core_utils.get_model_cost_map import get_model_cost_map_source_info
 
 from agentic_project_service.services.settings_registry import _LLM_MODEL_CHOICES
+
+
+def test_registry_is_the_pinned_local_cost_map() -> None:
+    """Every assertion below is only reproducible if litellm loaded its cost
+    map from the pinned wheel. Assert both halves: the variable is set, and
+    litellm actually honored it (it reads the variable once, at import time, so
+    setting it after the first ``import litellm`` in the process is a silent
+    no-op that would put this file back on the network)."""
+    assert os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP", "").lower() == "true", (
+        "LITELLM_LOCAL_MODEL_COST_MAP is not set — tests/conftest.py sets it so "
+        "this file asserts against the pinned litellm's own cost map instead of "
+        "a JSON fetched from GitHub at import time."
+    )
+    source = get_model_cost_map_source_info()
+    assert source["is_env_forced"] and source["source"] == "local", (
+        "litellm loaded its cost map from "
+        f"{source['source']} (env_forced={source['is_env_forced']}, "
+        f"url={source['url']}) — something imported litellm before "
+        "tests/conftest.py set LITELLM_LOCAL_MODEL_COST_MAP, so these "
+        "assertions are running against the live upstream map."
+    )
 
 
 @pytest.mark.parametrize("model_id", _LLM_MODEL_CHOICES)
