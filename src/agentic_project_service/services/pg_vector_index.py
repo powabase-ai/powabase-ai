@@ -859,11 +859,30 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
 # (an INVALID index, an index whose knowledge base has emptied) are found
 # without this count at all.
 #
-# 5 s matches this codebase's other boot-path bound (the migrations' own
-# ``lock_timeout``) rather than being generous for its own sake. Measured 14 ms
-# over 66,000 embeddings, so about 1.1 s extrapolated to 5.3 million -- the
-# ceiling is for a pathological case, not the expected one.
+# 5 s is not borrowed from another bound -- the migrations' own boot-path
+# ``lock_timeout`` is 10 s. It comes from the measurement: 14 ms over 66,000
+# embeddings, so about 1.1 s extrapolated to 5.3 million rows. That leaves
+# several times the slowest count worth waiting for, while staying short enough
+# that a start-up cannot look hung on it.
 SWEEP_TIMEOUT_MS = 5_000
+
+# Upper bound on how many reconciles one start-up sets off. ``MAX_PER_KB_INDEXES``
+# caps how many of these indexes a project may hold, not how many builds may be
+# in flight, and every dispatched build runs with ``statement_timeout = 0`` and
+# asks for ``maintenance_work_mem`` of its own. The first boot after this
+# deploys, on a project with 30 knowledge bases over the threshold -- exactly the
+# population the feature is for -- would otherwise queue 30 of them at once,
+# against a database that may have 512 MiB in total. 10 bounds that at about
+# 1.3 GB of build memory at the default setting even if the queue runs them all
+# in parallel, and is more than a project crosses the threshold with between two
+# boots in practice.
+#
+# Nothing is dropped by the cap: the next source to finish indexing in each
+# knowledge base dispatches the same reconcile, and so does the next start-up.
+# The ``INVALID`` indexes are first in the list because they answer no query
+# while Postgres maintains them on every write, so they are the ones that must
+# not be deferred.
+MAX_SWEEP_DISPATCH = 10
 
 _THRESHOLD_KEYS = ("VECTOR_PER_KB_INDEX_MIN_ROWS", "VECTOR_PER_KB_INDEX_DROP_ROWS")
 
@@ -872,11 +891,19 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
     """Knowledge bases whose partial HNSW indexes are out of step, for the start-up sweep.
 
     Three cases, in one pass: a knowledge base at or above the build threshold
-    with no index, one below the drop threshold that has one, and one whose
-    index is ``INVALID``. The last two are read from the catalog, which is
-    cheap; the first needs the grouped count, which is not, so it runs under
-    ``SWEEP_TIMEOUT_MS`` and an abandoned count leaves the catalog cases to be
-    dispatched on their own.
+    with no index, one at or below the drop threshold that has one, and one whose
+    index is ``INVALID``. The last of those is read from the catalog, which is
+    cheap; the first two need the grouped count, which is not, so it runs under
+    ``SWEEP_TIMEOUT_MS``.
+
+    An abandoned count is not evidence about any knowledge base, so when it
+    fails nothing is concluded from it -- only the ``INVALID`` indexes are
+    returned. In particular the "a knowledge base whose rows are all gone still
+    has its index" case cannot be told apart from a count that never ran, so it
+    is only considered when the count finished.
+
+    At most ``MAX_SWEEP_DISPATCH`` ids come back, because each one can start an
+    unbounded index build.
 
     Never raises, and never touches ``db.session``: this runs inside the boot's
     migration transaction, where a failing statement would abort the boot's own
@@ -917,6 +944,7 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
         )
         return []
 
+    counted_ok = True
     try:
         with engine.connect() as conn:
             conn.execute(
@@ -931,20 +959,37 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
             ).all()
             conn.rollback()
     except Exception as exc:
+        counted_ok = False
         logger.warning(
-            "Could not count embeddings per knowledge base at start-up (%s); the knowledge "
-            "bases that need an index are picked up as their sources finish indexing",
+            "Could not count embeddings per knowledge base at start-up (%s); only the "
+            "knowledge bases whose index is INVALID are reconciled now, and the rest are "
+            "picked up as their sources finish indexing or at the next start-up",
             first_error_line(exc),
         )
         counted = []
 
-    for kb_id, dims, count in counted:
-        has_index = int(dims) in indexed.get(kb_id, ())
-        if (not has_index and count >= build_at) or (has_index and count < drop_below):
-            needing[kb_id] = None
-    # A knowledge base whose rows are all gone still has its index, and the
-    # grouped count above cannot see it (no rows, no group).
-    for kb_id in indexed:
-        if not any(r[0] == kb_id for r in counted):
-            needing[kb_id] = None
-    return list(needing)
+    if counted_ok:
+        for kb_id, dims, count in counted:
+            has_index = int(dims) in indexed.get(kb_id, ())
+            if (not has_index and count >= build_at) or (has_index and count <= drop_below):
+                needing[kb_id] = None
+        # A knowledge base whose rows are all gone still has its index, and the
+        # grouped count above cannot see it (no rows, no group). Only sound
+        # because the count finished: an abandoned one is empty for a reason
+        # that says nothing about any knowledge base.
+        for kb_id in indexed:
+            if not any(r[0] == kb_id for r in counted):
+                needing[kb_id] = None
+
+    pending = list(needing)
+    if len(pending) > MAX_SWEEP_DISPATCH:
+        logger.warning(
+            "%d knowledge bases need their partial HNSW index reconciled; dispatching the "
+            "first %d and leaving %d for their next indexed source or the next start-up, "
+            "because each dispatch can start an index build with no statement timeout",
+            len(pending),
+            MAX_SWEEP_DISPATCH,
+            len(pending) - MAX_SWEEP_DISPATCH,
+        )
+        pending = pending[:MAX_SWEEP_DISPATCH]
+    return pending

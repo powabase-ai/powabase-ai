@@ -10,6 +10,7 @@ their hysteresis whatever is stored for them.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from unittest.mock import MagicMock
 
@@ -526,3 +527,76 @@ def test_a_build_does_not_hold_the_settings_session_idle_in_a_transaction(monkey
     monkeypatch.setattr(db_module.db, "session", session)
     _ensure(monkeypatch, _FakeConn())
     session.rollback.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# The start-up sweep
+# ---------------------------------------------------------------------------
+
+# Distinct knowledge base ids, for the fan-out specs.
+_KBS = [str(uuid.UUID(int=n)) for n in range(1, 40)]
+
+_COUNT_QUERY = "GROUP BY 1, 2"
+_CATALOG_QUERY = "i.indisvalid"
+
+
+def _sweep(conn):
+    return pvi.kbs_needing_a_per_kb_index(engine=_FakeEngine(conn))
+
+
+def test_an_abandoned_boot_count_does_not_dispatch_every_indexed_knowledge_base(caplog):
+    """A count that times out says nothing about any knowledge base.
+
+    On a database too slow to finish one ``GROUP BY`` in ``SWEEP_TIMEOUT_MS``,
+    treating "no rows counted" as "no rows exist" dispatched a reconcile for
+    every indexed knowledge base -- up to ``MAX_PER_KB_INDEXES`` unbounded
+    builds against the database that was already struggling.
+    """
+    healthy = [_index_row(kb, 1536) for kb in _KBS[:5]]
+    conn = _FakeConn(answers=[(_CATALOG_QUERY, healthy)], fail_on=_COUNT_QUERY)
+    with caplog.at_level(logging.WARNING):
+        assert _sweep(conn) == []
+    assert "Could not count embeddings" in caplog.text
+
+
+def test_an_invalid_index_is_still_dispatched_when_the_boot_count_is_abandoned():
+    """The catalog cases need no count, which is what the count's warning promises."""
+    rows = [_index_row(_KBS[0], 1536, False), _index_row(_KBS[1], 1536, True)]
+    conn = _FakeConn(answers=[(_CATALOG_QUERY, rows)], fail_on=_COUNT_QUERY)
+    assert _sweep(conn) == [_KBS[0]]
+
+
+def test_a_knowledge_base_whose_rows_are_all_gone_is_dispatched_when_the_count_ran():
+    """The other side of the guard: an emptied knowledge base has no group at all."""
+    conn = _FakeConn(
+        answers=[
+            (_CATALOG_QUERY, [_index_row(_KBS[0], 1536)]),
+            (_COUNT_QUERY, [(_KBS[1], 1536, 100)]),
+        ]
+    )
+    assert _sweep(conn) == [_KBS[0]]
+
+
+def test_the_boot_sweep_caps_how_many_reconciles_one_start_up_sets_off(caplog):
+    """Every dispatch can start an unbounded build; the index cap does not bound those."""
+    rows = [_index_row(kb, 1536, False) for kb in _KBS[: pvi.MAX_SWEEP_DISPATCH + 4]]
+    conn = _FakeConn(answers=[(_CATALOG_QUERY, rows)])
+    with caplog.at_level(logging.WARNING):
+        pending = _sweep(conn)
+    assert len(pending) == pvi.MAX_SWEEP_DISPATCH
+    assert pending == _KBS[: pvi.MAX_SWEEP_DISPATCH]
+    assert "4" in caplog.text, "the knowledge bases left for later must be counted in the log"
+
+
+def test_the_capped_dispatch_keeps_the_invalid_indexes_ahead_of_the_rest():
+    """An INVALID index answers no query and is maintained on every write."""
+    over_threshold = _KBS[1 : pvi.MAX_SWEEP_DISPATCH + 5]
+    conn = _FakeConn(
+        answers=[
+            (_CATALOG_QUERY, [_index_row(_KBS[0], 1536, False)]),
+            (_COUNT_QUERY, [(kb, 1536, 60_000) for kb in over_threshold]),
+        ]
+    )
+    pending = _sweep(conn)
+    assert len(pending) == pvi.MAX_SWEEP_DISPATCH
+    assert pending[0] == _KBS[0], "the INVALID index must not be the one left behind"
