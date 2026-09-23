@@ -401,7 +401,7 @@ class _FakeConn:
             raise self._exc
         for fragment, rows in self.answers:
             if fragment in sql:
-                return _Result(rows)
+                return _Result(rows(params) if callable(rows) else rows)
         return _Result([])
 
     def execution_options(self, **_kwargs):
@@ -600,3 +600,193 @@ def test_the_capped_dispatch_keeps_the_invalid_indexes_ahead_of_the_rest():
     pending = _sweep(conn)
     assert len(pending) == pvi.MAX_SWEEP_DISPATCH
     assert pending[0] == _KBS[0], "the INVALID index must not be the one left behind"
+
+
+# ---------------------------------------------------------------------------
+# Reconciling one knowledge base
+# ---------------------------------------------------------------------------
+
+_LOCK_QUERY = "pg_try_advisory_lock"
+_ROW_COUNT_QUERY = "LIMIT :cap) s"
+_INDEX_COUNT_QUERY = "count(*) FROM pg_class"
+_BUILD_RUNNING_QUERY = "pg_stat_progress_create_index"
+
+
+def _ensure_conn(existing=(), dims_present=(1536,), rows_by_dims=None, index_count=1, **kwargs):
+    """A connection that answers every read ``ensure_per_kb_vector_index`` makes."""
+    rows = dict(rows_by_dims or {})
+    return _FakeConn(
+        answers=[
+            (_CATALOG_QUERY, list(existing)),
+            ("GROUP BY dims", [(d,) for d in dims_present]),
+            (_INDEX_COUNT_QUERY, [(index_count,)]),
+            (_ROW_COUNT_QUERY, lambda params: [(rows.get(int(params["dims"]), 0),)]),
+            (_LOCK_QUERY, [(True,)]),
+        ],
+        **kwargs,
+    )
+
+
+# -- the disk-size log, which is the only free-space signal there can be ------
+
+
+def test_the_build_log_gives_the_row_count_and_the_index_size_as_floors(monkeypatch, caplog):
+    """The count stops just past the threshold, and the size is derived from it.
+
+    There can be no free-space precheck, so this line is the operator's disk
+    signal -- and for a knowledge base far over the threshold, which is what
+    this feature is for, an unqualified figure understates the index by up to
+    20x.
+    """
+    conn = _ensure_conn(rows_by_dims={1536: 10_001})
+    with caplog.at_level(logging.INFO):
+        outcome = _ensure(monkeypatch, conn, build_at=10_000)
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)]
+    assert "at least 10001 rows" in caplog.text, caplog.text
+    assert f"at least {pvi.estimated_index_mb(10_001, 1536)} MB" in caplog.text, caplog.text
+    assert "floor" in caplog.text, "the qualifier has to be unmistakable, not implied"
+
+
+def test_the_build_log_does_not_hedge_a_count_that_is_exact(monkeypatch, caplog):
+    """The negative control: an unbounded count must be reported as the number it is."""
+    conn = _ensure_conn(rows_by_dims={1536: 10_000})
+    with caplog.at_level(logging.INFO):
+        _ensure(monkeypatch, conn, build_at=10_000)
+    assert "10000 rows" in caplog.text
+    assert "at least" not in caplog.text, caplog.text
+
+
+# -- pgvector's HNSW dimension limit -----------------------------------------
+
+
+def test_a_dimension_above_pgvectors_hnsw_limit_is_never_built(monkeypatch, caplog):
+    """A structurally doomed build must not be attempted, let alone repeatedly.
+
+    pgvector refuses an HNSW index above 2,000 dimensions while ``MAX_DIMS``
+    lets a 3,072-dimension model through, and dispatch runs after every source
+    that finishes indexing -- so the build looped forever, each attempt holding
+    a worker slot with ``statement_timeout = 0``.
+    """
+    conn = _ensure_conn(dims_present=(3072,), rows_by_dims={3072: 20_000})
+    with caplog.at_level(logging.WARNING):
+        outcome = _ensure(monkeypatch, conn)
+    assert outcome["built"] == []
+    assert outcome["status"] == "skipped", outcome
+    assert outcome["reason"] == "dims_above_hnsw_limit", outcome
+    assert conn.issued("CREATE INDEX") == [], conn.statements
+    assert "3072" in caplog.text and str(pvi.MAX_HNSW_DIMS) in caplog.text, caplog.text
+
+
+def test_a_dimension_above_the_hnsw_limit_is_not_dispatched_again(monkeypatch):
+    """The other half of "do not retry": nothing may ask for that build."""
+    _stub_settings(
+        monkeypatch,
+        {"VECTOR_PER_KB_INDEX_MIN_ROWS": 10_000, "VECTOR_PER_KB_INDEX_DROP_ROWS": 5_000},
+    )
+    conn = _ensure_conn(dims_present=(3072,), rows_by_dims={3072: 20_000})
+    assert pvi.index_action(conn, KB) is None
+
+
+def test_the_dimensions_below_the_limit_still_get_their_index(monkeypatch):
+    conn = _ensure_conn(
+        dims_present=(1536, 3072), rows_by_dims={1536: 20_000, 3072: 20_000}
+    )
+    outcome = _ensure(monkeypatch, conn)
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+
+
+def test_an_invalid_index_above_the_hnsw_limit_is_dropped_and_not_rebuilt(monkeypatch):
+    """A failed build leaves an INVALID index; it costs every write and can never work."""
+    name = pvi.per_kb_index_name(KB, 3072)
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 3072, False)],
+        dims_present=(3072,),
+        rows_by_dims={3072: 20_000},
+    )
+    outcome = _ensure(monkeypatch, conn)
+    assert outcome["repaired_invalid_indexes"] == [name], outcome
+    assert outcome["built"] == [], outcome
+
+
+# -- the drop threshold is reachable -----------------------------------------
+
+
+def test_a_knowledge_base_at_exactly_the_drop_threshold_loses_its_index(monkeypatch):
+    """``rows < drop_below`` made a drop threshold of 0 unreachable forever.
+
+    The sweep then re-dispatched that knowledge base on every boot, nothing
+    logged why, and the index stayed.
+    """
+    name = pvi.per_kb_index_name(KB, 1536)
+    conn = _ensure_conn(existing=[_index_row(KB, 1536)], rows_by_dims={1536: 5_000})
+    outcome = _ensure(monkeypatch, conn, drop_below=5_000)
+    assert outcome["dropped"] == [name], outcome
+
+
+def test_the_reconcile_check_agrees_with_the_drop_at_the_threshold(monkeypatch):
+    _stub_settings(
+        monkeypatch,
+        {"VECTOR_PER_KB_INDEX_MIN_ROWS": 10_000, "VECTOR_PER_KB_INDEX_DROP_ROWS": 5_000},
+    )
+    conn = _ensure_conn(existing=[_index_row(KB, 1536)], rows_by_dims={1536: 5_000})
+    assert pvi.index_action(conn, KB) == "drop"
+
+
+# -- a declined INVALID repair is work left over, not a success --------------
+
+
+def test_a_declined_invalid_repair_asks_to_be_run_again(monkeypatch, caplog):
+    """Holding the lock while a build runs means an orphan backend from a dead worker.
+
+    The index stays INVALID -- answering no query, maintained on every insert --
+    until something comes back to it, and until now nothing did.
+    """
+    name = pvi.per_kb_index_name(KB, 1536)
+    conn = _ensure_conn(existing=[_index_row(KB, 1536, False)], rows_by_dims={1536: 20_000})
+    conn.answers.insert(0, (_BUILD_RUNNING_QUERY, [(1,)]))
+    with caplog.at_level(logging.WARNING):
+        outcome = _ensure(monkeypatch, conn)
+    assert outcome["status"] == "building", outcome
+    assert outcome["reschedule"] is True, outcome
+    assert pvi.outcome_needs_another_attempt(outcome) is True
+    assert outcome["index"] == name
+    assert outcome["built"] == [] and outcome["dropped"] == [], outcome
+    assert "repaired_invalid_indexes" not in outcome, outcome
+    assert conn.issued("DROP INDEX") == [], "the running build's index must stay"
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING], caplog.text
+
+
+def test_ordinary_lock_contention_is_not_work_left_over(monkeypatch):
+    """Whoever holds the lock is doing this index's work and will finish it."""
+    conn = _ensure_conn(rows_by_dims={1536: 20_000})
+    conn.answers.insert(0, (_LOCK_QUERY, [(False,)]))
+    outcome = _ensure(monkeypatch, conn)
+    assert outcome["status"] == "building", outcome
+    assert pvi.outcome_needs_another_attempt(outcome) is False, outcome
+    assert outcome["built"] == [], outcome
+
+
+# -- one dimension's outcome does not decide the others ----------------------
+
+
+def test_a_dimension_whose_lock_is_held_does_not_abandon_the_others(monkeypatch):
+    conn = _ensure_conn(
+        dims_present=(768, 1536), rows_by_dims={768: 20_000, 1536: 20_000}
+    )
+    conn.answers.insert(0, (_LOCK_QUERY, lambda p: [("_1536" not in p["relation"],)]))
+    outcome = _ensure(monkeypatch, conn)
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 768)], outcome
+    assert outcome["status"] == "building", outcome
+
+
+def test_the_index_cap_does_not_abandon_another_dimensions_drop(monkeypatch):
+    """The cap is reached at 768; 1536's index still has to go."""
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536)],
+        dims_present=(768, 1536),
+        rows_by_dims={768: 20_000, 1536: 0},
+        index_count=pvi.MAX_PER_KB_INDEXES,
+    )
+    outcome = _ensure(monkeypatch, conn)
+    assert outcome["dropped"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert outcome["status"] == "skipped" and outcome["reason"] == "index_cap_reached", outcome

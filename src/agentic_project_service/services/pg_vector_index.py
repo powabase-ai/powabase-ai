@@ -102,10 +102,24 @@ logger = logging.getLogger(__name__)
 # UUID's canonical form would need quoting for.
 INDEX_NAME_PREFIX = "hnsw_kb_"
 
-# pgvector's own bound on a vector's dimensions for an HNSW index; the same
-# range ``ensure_embedding_index`` enforces.
+# pgvector's own bound on a vector's dimensions; the same range
+# ``ensure_embedding_index`` enforces, and the range an index *name* is derived
+# for -- an existing index has to be found and dropped whatever its dimension.
 MIN_DIMS = 1
 MAX_DIMS = 8192
+
+# pgvector refuses an HNSW index on a vector wider than this, so a partial HNSW
+# index above it cannot be built at all: the attempt fails, and under
+# CONCURRENTLY it fails *after* the catalog entry exists, leaving an INVALID
+# index behind that answers no query and is maintained on every write. Embedding
+# models of 3,072 dimensions are in ordinary use and ``MAX_DIMS`` lets them
+# through, which is why this is a second, lower limit rather than a tightening of
+# that one. A knowledge base above it is declined once, at WARNING, and
+# ``index_action`` stops asking -- otherwise every source that finished indexing
+# dispatched the same doomed build, each attempt holding a worker slot with no
+# statement timeout. Its searches stay exact: the shared per-dimension index is
+# HNSW too, so there is no index of any kind to fall back to at this width.
+MAX_HNSW_DIMS = 2_000
 
 # Ceiling on how many of these a single project may hold. The planner opens and
 # locks *every* index of a relation while planning any query on it, so partial
@@ -114,9 +128,14 @@ MAX_DIMS = 8192
 # 513 locks per backend (comfortable), while 5,000 cost 25 ms of planning and
 # made the seventh concurrent search fail with "out of shared memory". 200 is
 # far below the point where either matters, and at the default threshold it
-# already means 10 million indexed rows in one project. A project that reaches
+# already means two million indexed rows in one project. A project that reaches
 # it keeps the shared index for the rest of its knowledge bases and says so at
 # WARNING, rather than quietly degrading every query on the table.
+#
+# The cap is soft under concurrency: two workers reconciling different knowledge
+# bases hold different locks and count the same catalog, so the overshoot is
+# bounded by one index per worker running at that moment, which is far inside the
+# margin above.
 MAX_PER_KB_INDEXES = 200
 
 # Bounded counts never read more than this many rows past the threshold, so the
@@ -449,9 +468,11 @@ def index_action(conn, knowledge_base_id: Any) -> str | None:
     for dims in sorted(set(candidate_dims(conn, knowledge_base_id, cap)) | set(existing)):
         rows = bounded_row_count(conn, knowledge_base_id, dims, cap)
         if dims in existing:
-            if rows < drop_below:
+            if rows <= drop_below:
                 return "drop"
-        elif rows >= build_at:
+        elif rows >= build_at and dims <= MAX_HNSW_DIMS:
+            # Above ``MAX_HNSW_DIMS`` the build cannot succeed, so asking for it
+            # once per indexed source would be a doomed task per source.
             return "build"
     return None
 
@@ -469,6 +490,12 @@ def estimated_index_mb(rows: int, dims: int) -> int:
     filesystem has left, and the index goes into the database's own tablespace.
     So the size the build is reaching for is logged instead, which is what an
     operator needs when a build fails on a full disk.
+
+    ``rows`` is normally a *bounded* count that stops just past the build
+    threshold, which makes this a floor and not an estimate: a knowledge base
+    ten times the threshold builds an index ten times this size. The caller
+    says so in the log line rather than printing a number that reads like the
+    whole answer.
     """
     return max(1, rows * dims * _INDEX_BYTES_PER_DIMENSION // (1024 * 1024))
 
@@ -664,22 +691,53 @@ def _repair_invalid(conn, kb_id: str, dims: int) -> bool:
     return True
 
 
+def outcome_needs_another_attempt(outcome: dict) -> bool:
+    """Did this ensure leave work only a later run can finish?
+
+    True for exactly one case: an ``INVALID`` index that had to be left in place
+    because a build of it is still running. Nothing else comes back to that
+    knowledge base on its own -- the index answers no query and is maintained on
+    every write until a reconcile runs again -- whereas a plain lock conflict
+    means another caller is doing this index's work right now and will finish it.
+
+    Meant for the caller that can actually reschedule (the task), so the
+    condition lives here with the code that produces it rather than being
+    re-derived from the dict.
+    """
+    return bool(outcome.get("reschedule"))
+
+
 def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=None) -> dict:
     """Give this knowledge base a partial HNSW index per dimension it is big enough for.
 
     Idempotent, and a no-op whenever a partial index is not the right answer:
-    too few rows, one already there and valid, or the project already at
-    ``MAX_PER_KB_INDEXES``. Below ``VECTOR_PER_KB_INDEX_DROP_ROWS`` an index
-    that exists is dropped, so a knowledge base that shrinks -- sources deleted,
-    a reindex to a different embedding model -- does not keep paying for one.
-    An ``INVALID`` index is dropped and rebuilt.
+    too few rows, one already there and valid, more dimensions than pgvector
+    will build an HNSW index for, or the project already at
+    ``MAX_PER_KB_INDEXES``. At or below ``VECTOR_PER_KB_INDEX_DROP_ROWS`` an
+    index that exists is dropped, so a knowledge base that shrinks -- sources
+    deleted, a reindex to a different embedding model -- does not keep paying
+    for one. An ``INVALID`` index is dropped and rebuilt.
 
     ``on_progress(status)`` is called with ``"building"`` before each build and
     ``"dropping"`` before each drop.
 
-    Returns a dict with ``status`` in ``ready`` (nothing left to do),
-    ``building`` (another caller holds this index's lock), or ``skipped`` with
-    a ``reason``, plus the names built and dropped.
+    Every dimension in play is attempted: one dimension being locked, declined
+    or over the cap no longer abandons the rest, because a knowledge base that
+    has just changed embedding model has an index to drop at the old dimension
+    and one to build at the new one.
+
+    Returns a dict with ``status``:
+
+    * ``ready`` -- nothing left to do, and ``built``/``dropped`` say what was
+      done. ``repaired_invalid_indexes`` lists the INVALID indexes dropped.
+    * ``building`` -- at least one dimension belongs to another caller right
+      now. ``reason`` distinguishes ``build_lock_held`` (that caller is doing
+      the work) from ``invalid_index_build_in_progress``, which also sets
+      ``reschedule`` -- see ``outcome_needs_another_attempt``.
+    * ``skipped`` with a ``reason`` of ``index_cap_reached`` or
+      ``dims_above_hnsw_limit`` -- a build this project or this embedding width
+      cannot have. ``building`` outranks both, because it is the one that is
+      still moving.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
@@ -697,6 +755,10 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     built: list[str] = []
     dropped: list[str] = []
     repaired: list[str] = []
+    blocked: list[str] = []
+    reschedule: str | None = None
+    cap_reached: int | None = None
+    above_limit: list[int] = []
 
     with _autocommit_connection(engine) as conn:
         existing = existing_per_kb_indexes(conn, kb_id)
@@ -708,8 +770,10 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
             name = per_kb_index_name(kb_id, dims)
             lock = index_lock_relation(kb_id, dims)
             if not _try_lock(conn, lock):
-                # Whoever holds it is building or dropping this very index.
-                return {"status": "building", "index": name, "built": built, "dropped": dropped}
+                # Whoever holds it is building or dropping this very index, and
+                # will finish it. The other dimensions are still ours.
+                blocked.append(name)
+                continue
             try:
                 # Re-read under the lock: another caller may have finished
                 # between the survey above and this point.
@@ -721,43 +785,68 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         # `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, which
                         # no-ops against the name the invalid index holds -- and
                         # this would report the index as built while it answers
-                        # no query and is maintained on every write. Report what
-                        # is true and let the running build finish; the next
-                        # ensure repairs it if that build fails too. (The BM25
+                        # no query and is maintained on every write. (The BM25
                         # path does the same, for the same reason.)
-                        logger.info(
-                            "Leaving partial HNSW index %s.%s INVALID for now: another "
-                            "backend is building it",
+                        #
+                        # We hold this index's build lock, so that build belongs
+                        # to no live caller of this module: it is an orphan
+                        # backend, most often from a worker that did not survive
+                        # its own build. Nothing else comes back to this
+                        # knowledge base, so the outcome asks to be run again.
+                        logger.warning(
+                            "Partial HNSW index %s.%s is INVALID and a build of it is still "
+                            "running, so it has to be left in place: dropping it would pull "
+                            "the ground out from under that build, and a rebuild would "
+                            "no-op against the name it holds and report an index that "
+                            "answers no query as built. Its backend outlived whatever "
+                            "started it (this caller holds the build lock). Until a later "
+                            "reconcile succeeds, every insert into %s.embeddings maintains "
+                            "an index no search can use",
                             AI_SCHEMA,
                             name,
+                            AI_SCHEMA,
                         )
-                        return {
-                            "status": "building",
-                            "index": name,
-                            "built": built,
-                            "dropped": dropped,
-                        }
+                        blocked.append(name)
+                        reschedule = reschedule or name
+                        continue
                     repaired.append(name)
                     valid = None
 
                 rows = bounded_row_count(conn, kb_id, dims, cap)
                 if valid is True:
-                    if rows < drop_below:
+                    if rows <= drop_below:
                         progress("dropping")
                         logger.info(
                             "Dropping partial HNSW index %s.%s: knowledge base %s now has "
-                            "fewer than %d rows at %d dimensions",
+                            "%d rows at %d dimensions, at or below the drop threshold of %d",
                             AI_SCHEMA,
                             name,
                             kb_id,
-                            drop_below,
+                            rows,
                             dims,
+                            drop_below,
                         )
                         conn.execute(text(per_kb_index_drop_ddl(kb_id, dims)))
                         dropped.append(name)
                     continue
 
                 if rows < build_at:
+                    continue
+                if dims > MAX_HNSW_DIMS:
+                    logger.warning(
+                        "Not building partial HNSW index %s.%s: %d dimensions is above "
+                        "pgvector's HNSW limit of %d, so this build would fail every time it "
+                        "was attempted, and is not attempted or dispatched again. Searches of "
+                        "knowledge base %s stay exact -- at this width no HNSW index is "
+                        "possible at all, the shared per-dimension one included -- until it "
+                        "is reindexed with a narrower embedding model",
+                        AI_SCHEMA,
+                        name,
+                        dims,
+                        MAX_HNSW_DIMS,
+                        kb_id,
+                    )
+                    above_limit.append(dims)
                     continue
                 total = per_kb_index_count(conn)
                 if total >= MAX_PER_KB_INDEXES:
@@ -772,26 +861,31 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         total,
                         MAX_PER_KB_INDEXES,
                     )
-                    return {
-                        "status": "skipped",
-                        "reason": "index_cap_reached",
-                        "index_count": total,
-                        "built": built,
-                        "dropped": dropped,
-                    }
+                    cap_reached = total
+                    continue
                 progress("building")
+                bounded = rows >= cap
+                floor = "at least " if bounded else ""
                 logger.info(
                     "Building partial HNSW index %s.%s for knowledge base %s (%s%d rows at %d "
-                    "dimensions, threshold %d); expect roughly %d MB of index, and no write "
-                    "block",
+                    "dimensions, threshold %d); it needs %s%d MB of disk%s, and blocks no "
+                    "writes",
                     AI_SCHEMA,
                     name,
                     kb_id,
-                    "at least " if rows >= cap else "",
+                    floor,
                     rows,
                     dims,
                     build_at,
+                    floor,
                     estimated_index_mb(rows, dims),
+                    (
+                        f" -- both figures are floors, because the row count stops at {cap}, "
+                        f"so a knowledge base ten times that builds an index ten times this "
+                        f"size"
+                        if bounded
+                        else ""
+                    ),
                 )
                 _create_index(conn, kb_id, dims, mem_mb)
                 built.append(name)
@@ -801,6 +895,23 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     outcome: dict = {"status": "ready", "built": built, "dropped": dropped}
     if repaired:
         outcome["repaired_invalid_indexes"] = repaired
+    if above_limit:
+        outcome["dims_above_hnsw_limit"] = above_limit
+        outcome.update({"status": "skipped", "reason": "dims_above_hnsw_limit"})
+    if cap_reached is not None:
+        outcome.update(
+            {"status": "skipped", "reason": "index_cap_reached", "index_count": cap_reached}
+        )
+    if blocked:
+        # Still moving somewhere, which outranks a skip: reported last so its
+        # reason is the one that survives.
+        outcome["status"] = "building"
+        outcome["index"] = reschedule or blocked[0]
+        outcome["reason"] = (
+            "invalid_index_build_in_progress" if reschedule else "build_lock_held"
+        )
+        if reschedule:
+            outcome["reschedule"] = True
     return outcome
 
 
