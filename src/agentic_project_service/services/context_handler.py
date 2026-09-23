@@ -30,11 +30,115 @@ from .knowledge_search import (
     search_knowledge_base_async,
     format_items_as_context,
 )
+from .base_vector_store import MAX_TOP_K
 from .knowledge_store import RetrievedItem
 from .storage import get_storage
 from ..strategies import get_default_retrieval_method
 
 logger = logging.getLogger(__name__)
+
+
+# The largest row limit these paths will pass to a search. The vector store
+# refuses anything above MAX_TOP_K, because it interpolates the limit into the
+# SQL, and hybrid search asks each leg for twice the caller's limit before that
+# check -- so half of the store's ceiling is the largest value that is safe
+# whatever retrieval method a knowledge base is configured for.
+SAFE_RETRIEVAL_TOP_K = MAX_TOP_K // 2
+
+
+def _bounded_row_count(kb_id: str, value: Any, field: str, fallback: int | None) -> int | None:
+    """A stored row count these paths can actually use, or ``fallback``.
+
+    ``top_k`` and the reranker's ``candidate_count`` come from a knowledge
+    base's stored configuration, are range-checked nowhere on the way in, and are
+    invisible to whoever makes the request that reads them. The store refuses a
+    limit above its own ceiling, and every caller here turns that into an empty
+    result list plus one warning naming a parameter the requester never sent --
+    so a knowledge base could be configured into answering nothing at all, with
+    no way to tell that from "no matching chunks".
+
+    Clamped rather than rejected, and always logged: a slightly smaller candidate
+    pool is a far better answer than none, and the log is the only place the
+    misconfiguration can surface. (The REST search route keeps raising its 400;
+    there the value really did come from the caller.)
+    """
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Knowledge base %s has a stored %s of %r, which is not a row count; "
+            "using %r instead. Fix the knowledge base's retrieval configuration",
+            kb_id,
+            field,
+            value,
+            fallback,
+        )
+        return fallback
+    if count <= SAFE_RETRIEVAL_TOP_K:
+        return count
+    logger.warning(
+        "Knowledge base %s has a stored %s of %d, above the %d rows a search can ask "
+        "for; retrieving %d instead. Left as stored, this knowledge base would return "
+        "no results at all. Fix the knowledge base's retrieval configuration",
+        kb_id,
+        field,
+        count,
+        SAFE_RETRIEVAL_TOP_K,
+        SAFE_RETRIEVAL_TOP_K,
+    )
+    return SAFE_RETRIEVAL_TOP_K
+
+
+def _resolve_top_k(kb_id: str, kb_config: dict[str, Any], kb_retrieval_configs: dict) -> int | None:
+    """The row limit to search this knowledge base with: request, stored, default."""
+    default = get_setting("KB_DEFAULT_TOP_K")
+    top_k = kb_config.get("top_k") or kb_retrieval_configs.get(kb_id, {}).get("top_k", default)
+    return _bounded_row_count(kb_id, top_k, "top_k", default)
+
+
+def _bounded_retrieval_config(kb_id: str, kb_retrieval_configs: dict) -> dict | None:
+    """This knowledge base's stored retrieval config, if its candidate pool needs bounding.
+
+    ``None`` means "nothing to correct": the search then reads the row itself,
+    exactly as before. The reranker's ``candidate_count`` is what the store is
+    handed instead of ``top_k`` whenever a reranker is configured, so it is the
+    one stored number that can silence a knowledge base on its own. An unusable
+    value has its key dropped rather than replaced, so the search applies its own
+    documented default.
+    """
+    stored = kb_retrieval_configs.get(kb_id)
+    if not isinstance(stored, dict):
+        return None
+    reranker = stored.get("reranker")
+    if not isinstance(reranker, dict) or reranker.get("candidate_count") is None:
+        return None
+    bounded = _bounded_row_count(kb_id, reranker["candidate_count"], "candidate_count", None)
+    if bounded == reranker["candidate_count"]:
+        return None
+    corrected = {k: v for k, v in reranker.items() if k != "candidate_count"}
+    if bounded is not None:
+        corrected["candidate_count"] = bounded
+    return {**stored, "reranker": corrected}
+
+
+def _log_retrieval_error(kb_id: str, exc: Exception) -> None:
+    """One line per knowledge base that answered nothing, at the right level.
+
+    A ``ValueError`` out of a search is a contract failure, not a bad day: the
+    parameters came from this knowledge base's stored configuration, and it will
+    answer nothing until that is changed. Everything else keeps the warning it
+    had.
+    """
+    if isinstance(exc, ValueError):
+        logger.error(
+            "KB retrieval returned nothing for %s because a search parameter was refused: "
+            "%s. The parameters come from this knowledge base's stored configuration, not "
+            "from the request -- check its retrieval configuration",
+            kb_id,
+            exc,
+        )
+    else:
+        logger.warning(f"KB retrieval error for {kb_id}: {exc}")
 
 
 def make_lightweight_retrieved_context(
@@ -422,11 +526,11 @@ def _search_single_kb(
             db_session=thread_session,
             knowledge_base_id=kb_id,
             query=query,
-            top_k=kb_config.get("top_k")
-            or kb_retrieval_configs.get(kb_id, {}).get("top_k", get_setting("KB_DEFAULT_TOP_K")),
+            top_k=_resolve_top_k(kb_id, kb_config, kb_retrieval_configs),
             retrieval_method=retrieval_method,
             similarity_threshold=kb_config.get("similarity_threshold", 0.0),
             filter_metadata=kb_config.get("filter_metadata"),
+            retrieval_config=_bounded_retrieval_config(kb_id, kb_retrieval_configs),
             session_history=session_history,
             pre_enriched_query=pre_enriched_query,
             pre_keyword_query=pre_keyword_query,
@@ -445,7 +549,7 @@ def _search_single_kb(
             "error": None,
         }
     except Exception as e:
-        logger.warning(f"KB retrieval error for {kb_id}: {e}")
+        _log_retrieval_error(kb_id, e)
         return {
             "kb_id": kb_id,
             "results": [],
@@ -631,13 +735,11 @@ def execute_retrieval(
                 db_session=db_session,
                 knowledge_base_id=kb_id,
                 query=query,
-                top_k=kb_config.get("top_k")
-                or kb_retrieval_configs.get(kb_id, {}).get(
-                    "top_k", get_setting("KB_DEFAULT_TOP_K")
-                ),
+                top_k=_resolve_top_k(kb_id, kb_config, kb_retrieval_configs),
                 retrieval_method=retrieval_method,
                 similarity_threshold=kb_config.get("similarity_threshold", 0.0),
                 filter_metadata=kb_config.get("filter_metadata"),
+                retrieval_config=_bounded_retrieval_config(kb_id, kb_retrieval_configs),
                 session_history=session_history,
                 pre_enriched_query=pre_enriched_query,
                 pre_keyword_query=pre_keyword_query,
@@ -659,7 +761,7 @@ def execute_retrieval(
                 }
             )
         except Exception as e:
-            logger.warning(f"KB retrieval error for {kb_id}: {e}")
+            _log_retrieval_error(kb_id, e)
             _collect_outcome(
                 {
                     "kb_id": kb_id,
@@ -1009,13 +1111,11 @@ async def execute_retrieval_async(
                 db_session=db_session,
                 knowledge_base_id=kb_id,
                 query=query,
-                top_k=kb_config.get("top_k")
-                or kb_retrieval_configs.get(kb_id, {}).get(
-                    "top_k", get_setting("KB_DEFAULT_TOP_K")
-                ),
+                top_k=_resolve_top_k(kb_id, kb_config, kb_retrieval_configs),
                 retrieval_method=retrieval_method,
                 similarity_threshold=kb_config.get("similarity_threshold", 0.0),
                 filter_metadata=kb_config.get("filter_metadata"),
+                retrieval_config=_bounded_retrieval_config(kb_id, kb_retrieval_configs),
                 source_ids=kb_config.get("source_ids"),
             )
             db_method = kb_retrieval_configs.get(kb_id, {}).get("method", "vector_search")
@@ -1029,7 +1129,7 @@ async def execute_retrieval_async(
             per_kb_methods[kb_id] = method
             all_items.extend(results)
         except Exception as e:
-            logger.warning(f"KB retrieval error for {kb_id}: {e}")
+            _log_retrieval_error(kb_id, e)
             errors.append(
                 {
                     "type": "kb_retrieval_error",

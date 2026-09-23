@@ -1138,7 +1138,7 @@ def _build_registry() -> dict[str, SettingDef]:
             category=cat,
             label="Per-KB Vector Index Threshold (rows)",
             type="int",
-            default=50000,
+            default=10000,
             min=1000,
             max=10000000,
             advanced=True,
@@ -1148,17 +1148,27 @@ def _build_registry() -> dict[str, SettingDef]:
                 "instead of sharing the project-wide one. Its searches then rank "
                 "over only its own vectors: measured on a 73,290-embedding knowledge "
                 "base, 182 ms to 1.4 ms warm and 824 ms to 225 ms cold, and a top-k "
-                "drawn from the right population rather than from the whole "
-                "project. It costs disk (roughly 573 MB for "
-                "73,290 vectors at 1536 dimensions) and makes writes to that "
-                "knowledge base slower until the project-wide index is retired. The "
-                "crossover where this starts paying was bracketed, not measured "
-                "exactly — a 2,000-row knowledge base is better off without one, a "
-                "73,290-row one is two orders of magnitude better off with one — so "
-                "the default sits deliberately at the conservative end. Lowering it "
-                "below where a knowledge base actually benefits costs disk and write "
-                "throughput for nothing; raising it leaves a large knowledge base on "
-                "the project-wide index."
+                "drawn from the right population rather than from the whole project. "
+                "A knowledge base BELOW this threshold keeps the project-wide index "
+                "and is slower than it was before this feature existed: measured "
+                "3.6 ms to 80 ms where its own rows are 21% of the embeddings table, "
+                "and 129 ms at 30%. What it buys there is a correct answer instead of "
+                "a fast wrong one — searching the project-wide index and discarding "
+                "other knowledge bases' hits returned, measured against an exact "
+                "scan, only 0.65 to 0.70 of the right top-k, and the scoped search "
+                "returns all of it. So the default sits at the low end of that "
+                "regression window rather than above it: a knowledge base that is "
+                "slow because it is a small fraction of a large table is exactly the "
+                "one an index of its own fixes. (That index is itself approximate — "
+                "measured recall 0.90 — because it is an HNSW index, just one over "
+                "the right population.) The cost is disk and write throughput: "
+                "roughly 9.5 MB of index per 1,000 embeddings at 1536 dimensions "
+                "(573 MB measured at 60,000), multiplied by up to the 200 "
+                "per-knowledge-base indexes a project may hold, and writes to an "
+                "indexed knowledge base pay for one more index until the "
+                "project-wide one is retired. Raising this leaves a mid-sized "
+                "knowledge base in the regression window; lowering it spends disk on "
+                "knowledge bases too small to be slow in the first place."
             ),
         ),
         SettingDef(
@@ -1166,8 +1176,8 @@ def _build_registry() -> dict[str, SettingDef]:
             category=cat,
             label="Per-KB Vector Index Drop Threshold (rows)",
             type="int",
-            default=25000,
-            min=0,
+            default=5000,
+            min=1,
             max=10000000,
             advanced=True,
             description=(
@@ -1177,7 +1187,11 @@ def _build_registry() -> dict[str, SettingDef]:
                 "threshold: with one threshold, a knowledge base sitting on it would "
                 "have its index built and thrown away over and over, and each build "
                 "is a full index build. A value at or above the build threshold is "
-                "ignored in favour of half of it."
+                "ignored in favour of half of it. It cannot be 0: a knowledge base "
+                "goes back to the project-wide index once it is at or below this many "
+                "embeddings, so 0 would hold its own index open until the very last "
+                "embedding was gone — an index of nothing in particular, still "
+                "evaluated on every write to the embeddings table."
             ),
         ),
         SettingDef(

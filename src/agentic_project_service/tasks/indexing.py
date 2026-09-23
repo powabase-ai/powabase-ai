@@ -1914,12 +1914,19 @@ def _run_index_body(
         #     only after the commit, so no sparse entry can point at a chunk
         #     that was rolled back.
         # (3) this KB's own partial HNSW index, if the rows it just committed
-        #     took it over the threshold (or a delete took it under). Dispatched
-        #     rather than built here for the same reason as (1) the other way
-        #     round: CREATE INDEX CONCURRENTLY cannot run in a transaction at
-        #     all, and it takes tens of seconds on a large knowledge base.
-        if embedding_dim:
-            dispatch_per_kb_vector_index(knowledge_base_id)
+        #     took it over the threshold (or the ones it removed took it under).
+        #     Dispatched rather than built here for the same reason as (1) the
+        #     other way round: CREATE INDEX CONCURRENTLY cannot run in a
+        #     transaction at all, and it takes tens of seconds on a large
+        #     knowledge base.
+        #
+        #     Deliberately NOT gated on this run having produced embeddings: a
+        #     re-index to a strategy that stores none deletes every embedding
+        #     this knowledge base had, which is precisely when its index has to
+        #     be dropped. The dispatch decides for itself with a row count
+        #     bounded at the threshold, so the cost of asking is the same
+        #     either way.
+        dispatch_per_kb_vector_index(knowledge_base_id)
 
         if _should_build_bm25_now(knowledge_base_id):
             sparse_store = SparseIndexStore(knowledge_base_id=knowledge_base_id)
@@ -3190,6 +3197,38 @@ def dispatch_per_kb_vector_indexes_at_start(engine) -> list[str]:
     return dispatched
 
 
+def _vector_index_log_fields(fields: dict) -> str:
+    """Render ``key=value`` pairs for one of the log lines below.
+
+    Sorted so the fields are in the same order on every line, lists joined, and
+    a value containing a space quoted -- otherwise a failure reason would run
+    into the next field and nothing downstream could split the line.
+    """
+    rendered = []
+    for key in sorted(fields):
+        value = fields[key]
+        if isinstance(value, (list, tuple, set)):
+            value = ",".join(str(v) for v in sorted(value)) or "none"
+        value = str(value)
+        rendered.append(f' {key}="{value}"' if " " in value else f" {key}={value}")
+    return "".join(rendered)
+
+
+def _vector_index_dims(*name_lists) -> str:
+    """The dimensions an ensure touched, read out of the index names it reports.
+
+    The names are ``hnsw_kb_<hex>_<dims>``, so this is the one place the run's
+    dimensions can be recovered without the service handing them over.
+    """
+    dims = set()
+    for names in name_lists:
+        for name in names or ():
+            tail = str(name).rpartition("_")[2]
+            if tail.isdigit():
+                dims.add(int(tail))
+    return ",".join(str(d) for d in sorted(dims)) or "none"
+
+
 @celery_app.task(bind=True, max_retries=PG_BM25_TASK_MAX_RETRIES)
 @billing.no_billing_context
 def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
@@ -3202,14 +3241,66 @@ def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
 
     Retries with the same jittered backoff as the BM25 index tasks on a
     transient database failure -- a lost connection, a cancelled statement, a
-    lock conflict -- and while another caller holds this index's build lock.
-    Anything else fails the run at ERROR; nothing is left half-built, because a
-    failed ``CREATE INDEX CONCURRENTLY`` leaves only an INVALID index, which the
-    next run drops and rebuilds.
+    lock conflict. Anything else fails the run at ERROR; nothing is left
+    half-built, because a failed ``CREATE INDEX CONCURRENTLY`` leaves only an
+    INVALID index, which the next run drops and rebuilds.
+
+    It also reschedules itself, without an exception, for the one outcome that
+    nothing else comes back to: an INVALID index left in place because a build of
+    it was still running (``outcome_needs_another_attempt``). Finding this
+    index's build lock held by another caller is **not** that case and does not
+    retry -- that caller is doing this index's work.
+
+    Every run leaves two kinds of ``per_kb_vector_index`` line: one per state the
+    service enters, as it enters it, and one summary with the outcome and how
+    long it took. The first is why the service's ``on_progress`` hook is passed
+    at all -- a build that the worker does not survive is otherwise invisible,
+    and answering "does this knowledge base have an index, and if not why"
+    otherwise means deriving the index name by hand and reading the catalog.
+    There is deliberately no builds table and no status field on the knowledge
+    base yet; these lines are the whole of it.
     """
+    import time
+
+    started = time.monotonic()
+    attempt = self.request.retries + 1
+    events: list[str] = []
+    progress_fields: dict = {}
+
+    def record(status: str, **fields) -> None:
+        """The service's ``on_progress`` hook.
+
+        Logged as it happens rather than accumulated, so a build killed
+        mid-flight still leaves the evidence that it was attempted. Takes
+        keyword details so the service can hand over what only it knows (the
+        dimensions and row count of the build it is starting) without this
+        having to change again.
+        """
+        events.append(status)
+        progress_fields.update(fields)
+        logger.info(
+            "per_kb_vector_index kb=%s attempt=%d event=%s%s",
+            kb_id,
+            attempt,
+            status,
+            _vector_index_log_fields(fields),
+        )
+
+    def summarise(outcome: str, **fields) -> None:
+        logger.info(
+            "per_kb_vector_index kb=%s attempt=%d outcome=%s duration_ms=%d events=%s%s",
+            kb_id,
+            attempt,
+            outcome,
+            (time.monotonic() - started) * 1000,
+            ",".join(events) or "none",
+            _vector_index_log_fields({**progress_fields, **fields}),
+        )
+
     try:
-        return pg_vector_index.ensure_per_kb_vector_index(kb_id)
+        outcome = pg_vector_index.ensure_per_kb_vector_index(kb_id, on_progress=record)
     except Exception as exc:
+        summarise("failed", reason=pg_vector_index.first_error_line(exc))
         if not pg_vector_index.is_transient_db_error(exc):
             logger.error(
                 "The per-knowledge-base vector index build for KB %s failed", kb_id, exc_info=exc
@@ -3235,6 +3326,50 @@ def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
             reason,
         )
         raise retry from exc
+
+    built = outcome.get("built") or []
+    dropped = outcome.get("dropped") or []
+    repaired = outcome.get("repaired_invalid_indexes") or []
+    summarise(
+        outcome.get("status", "unknown"),
+        dims=_vector_index_dims(built, dropped, repaired),
+        built=built,
+        dropped=dropped,
+        repaired=repaired,
+        **({"reason": outcome["reason"]} if outcome.get("reason") else {}),
+    )
+
+    # An INVALID index the ensure had to leave alone, because a build of it was
+    # still running, is the one outcome nothing comes back to: the index answers
+    # no query and is maintained on every write, and the running build is a
+    # backend from a worker that may already be dead. So this is the caller that
+    # has to come back -- ordinary lock contention deliberately does not, because
+    # whoever holds the lock is doing the work right now.
+    if pg_vector_index.outcome_needs_another_attempt(outcome):
+        if self.request.retries >= self.max_retries:
+            logger.error(
+                "Giving up on repairing KB %s's INVALID vector index after %d attempts: a "
+                "build of it was still running each time. It answers no query and is "
+                "maintained on every write to the embeddings table until the next indexing "
+                "run or start-up reconciles it: %s",
+                kb_id,
+                attempt,
+                outcome.get("index") or outcome.get("indexes") or "(index unnamed)",
+            )
+            return outcome
+        countdown = _pg_bm25_retry_countdown(self.request.retries)
+        retry = self.retry(countdown=countdown, throw=False)
+        logger.info(
+            "Rescheduling KB %s's vector index reconcile in %d s (attempt %d of %d): %s",
+            kb_id,
+            countdown,
+            attempt + 1,
+            self.max_retries + 1,
+            outcome.get("reason") or "another attempt is needed",
+        )
+        raise retry
+
+    return outcome
 
 
 def _orphaned_vector_index_names(kb_id: str) -> list[str]:
