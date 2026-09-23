@@ -121,37 +121,48 @@ def test_lock_relation_is_per_index_not_per_table():
 # ---------------------------------------------------------------------------
 
 
-def test_the_three_settings_are_registered_with_conservative_defaults():
+def test_the_three_settings_are_registered_with_the_hysteresis_and_a_memory_bound():
+    """The relations, not the numbers.
+
+    The two row thresholds are tuned against measurements that move (the
+    regression the embeddings-side predicate costs was re-measured at 80 ms at
+    21% selectivity and 129 ms at 30%, both in knowledge bases of 12.6k-18k
+    rows), so pinning their exact values here would only duplicate the registry.
+    What must hold whatever they are is the hysteresis and a bounded build
+    memory.
+    """
     build = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"]
     drop = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_DROP_ROWS"]
     mem = SETTINGS_REGISTRY["VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB"]
-    assert (build.type, build.default) == ("int", 50000)
-    assert (drop.type, drop.default) == ("int", 25000)
-    assert (mem.type, mem.default) == ("int", 128)
+    assert (build.type, drop.type, mem.type) == ("int", "int", "int")
     assert drop.default < build.default, "the defaults must carry the hysteresis"
-    assert mem.max == 4096, "unbounded build memory would OOM the smallest project pods"
+    assert build.default >= (build.min or 0)
+    assert (mem.default, mem.max) == (128, 4096), (
+        "unbounded build memory would OOM the smallest project databases"
+    )
     for d in (build, drop, mem):
         assert d.category == "knowledge-retrieval"
         assert d.advanced is True
         assert d.description
 
 
-@pytest.mark.parametrize(
-    "key,value,ok",
-    [
-        ("VECTOR_PER_KB_INDEX_MIN_ROWS", 999, False),
-        ("VECTOR_PER_KB_INDEX_MIN_ROWS", 1000, True),
-        ("VECTOR_PER_KB_INDEX_MIN_ROWS", 10_000_001, False),
-        ("VECTOR_PER_KB_INDEX_DROP_ROWS", 0, True),
-        ("VECTOR_PER_KB_INDEX_DROP_ROWS", -1, False),
-        ("VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB", 63, False),
-        ("VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB", 64, True),
-        ("VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB", 4097, False),
-    ],
-)
-def test_validate_setting_enforces_the_ranges(key, value, ok):
-    accepted, message = validate_setting(key, value)
-    assert accepted is ok, message
+_ROW_SETTINGS = ("VECTOR_PER_KB_INDEX_MIN_ROWS", "VECTOR_PER_KB_INDEX_DROP_ROWS")
+_ALL_SETTINGS = _ROW_SETTINGS + ("VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB",)
+
+
+@pytest.mark.parametrize("key", _ALL_SETTINGS)
+def test_validate_setting_enforces_each_settings_own_range(key):
+    """Read off the registry, so tightening a bound cannot leave this test behind."""
+    defn = SETTINGS_REGISTRY[key]
+    for value, ok in (
+        (defn.min, True),
+        (defn.min - 1, False),
+        (defn.max, True),
+        (defn.max + 1, False),
+        ("many", False),
+    ):
+        accepted, message = validate_setting(key, value)
+        assert accepted is ok, f"{key}={value!r}: {message}"
 
 
 def _stub_settings(monkeypatch, values: dict[str, int]):
@@ -161,29 +172,30 @@ def _stub_settings(monkeypatch, values: dict[str, int]):
 
 
 def test_thresholds_default_to_the_registry_values(monkeypatch):
+    build = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"].default
+    drop = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_DROP_ROWS"].default
     _stub_settings(
         monkeypatch,
-        {
-            "VECTOR_PER_KB_INDEX_MIN_ROWS": 50000,
-            "VECTOR_PER_KB_INDEX_DROP_ROWS": 25000,
-        },
+        {"VECTOR_PER_KB_INDEX_MIN_ROWS": build, "VECTOR_PER_KB_INDEX_DROP_ROWS": drop},
     )
-    assert pvi.thresholds() == (50000, 25000)
+    assert pvi.thresholds() == (build, drop)
 
 
 def test_thresholds_clamp_a_stored_value_outside_the_registrys_bounds(monkeypatch):
     # get_setting coerces but does not range-check, so a row written before a
     # bound was tightened would otherwise be used as-is.
+    build_min = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"].min
+    drop_min = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_DROP_ROWS"].min
     _stub_settings(
         monkeypatch,
         {
-            "VECTOR_PER_KB_INDEX_MIN_ROWS": 5,
-            "VECTOR_PER_KB_INDEX_DROP_ROWS": 0,
+            "VECTOR_PER_KB_INDEX_MIN_ROWS": build_min - 5,
+            "VECTOR_PER_KB_INDEX_DROP_ROWS": max(0, drop_min - 5),
         },
     )
     build_at, drop_below = pvi.thresholds()
-    assert build_at == 1000, "below the registry minimum must be pulled up to it"
-    assert drop_below == 0
+    assert build_at == build_min, "below the registry minimum must be pulled up to it"
+    assert drop_below == drop_min
 
 
 @pytest.mark.parametrize("stored_drop", [50000, 60000])
@@ -688,9 +700,7 @@ def test_a_dimension_above_the_hnsw_limit_is_not_dispatched_again(monkeypatch):
 
 
 def test_the_dimensions_below_the_limit_still_get_their_index(monkeypatch):
-    conn = _ensure_conn(
-        dims_present=(1536, 3072), rows_by_dims={1536: 20_000, 3072: 20_000}
-    )
+    conn = _ensure_conn(dims_present=(1536, 3072), rows_by_dims={1536: 20_000, 3072: 20_000})
     outcome = _ensure(monkeypatch, conn)
     assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
 
@@ -770,9 +780,7 @@ def test_ordinary_lock_contention_is_not_work_left_over(monkeypatch):
 
 
 def test_a_dimension_whose_lock_is_held_does_not_abandon_the_others(monkeypatch):
-    conn = _ensure_conn(
-        dims_present=(768, 1536), rows_by_dims={768: 20_000, 1536: 20_000}
-    )
+    conn = _ensure_conn(dims_present=(768, 1536), rows_by_dims={768: 20_000, 1536: 20_000})
     conn.answers.insert(0, (_LOCK_QUERY, lambda p: [("_1536" not in p["relation"],)]))
     outcome = _ensure(monkeypatch, conn)
     assert outcome["built"] == [pvi.per_kb_index_name(KB, 768)], outcome
@@ -859,3 +867,22 @@ def test_a_transient_drop_failure_is_re_raised_untouched_for_the_retry(caplog):
         with pytest.raises(_LostConnection):
             pvi.drop_per_kb_vector_indexes(KB, engine=_FakeEngine(conn))
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
+
+
+def test_the_catalog_lookups_match_the_index_name_and_not_a_like_wildcard():
+    """``_`` is a LIKE wildcard and every one of these names carries two of them.
+
+    Without ``ESCAPE`` the patterns match names these functions' docstrings
+    promise they cannot -- another prefix with any character where an underscore
+    belongs. Asserted on the emitted pattern and clause rather than on rows,
+    because the filtering happens in the server; the escaping itself is verified
+    against a real PostgreSQL catalog in the pg_search tier.
+    """
+    conn = _FakeConn()
+    pvi.existing_per_kb_indexes(conn, KB)
+    pvi.per_kb_index_count(conn)
+    _sweep(_FakeConn())
+    assert conn.params[0]["prefix"] == f"hnsw\\_kb\\_{KB_HEX}\\_%"
+    assert conn.params[1]["prefix"] == "hnsw\\_kb\\_%"
+    for sql in conn.statements:
+        assert "LIKE :prefix ESCAPE '\\'" in sql, sql

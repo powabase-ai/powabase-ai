@@ -57,18 +57,33 @@ Three properties shape this module:
   path uses -- not in ``base_vector_store.ensure_embedding_index``, which runs
   inside the indexing transaction on purpose.
 
-**The index building is a no-op for a project whose knowledge bases are all
-below the threshold; the query change is not.** The embeddings-side predicate
-applies to every KB-scoped vector search from the moment it deploys, with or
-without a partial index, and for a knowledge base big enough that the planner
-had been reaching the shared index it can flip the plan to an exact bitmap scan
-and sort: measured 0.356 ms approximate to 3.540 ms exact at 9% selectivity,
-and 3.57 ms to 26.83 ms at 21%. Slower but correct, and only in the window
-between "big enough for the shared index to have been used" and the build
-threshold -- which is the window the threshold exists to close. A knowledge base
-whose searches already run an exact scan sees no flip at all, and neither do the
-small ones, which measured *faster* with the predicate (9.96 ms to 4.76 ms at
-1.4% selectivity, 19.50 ms to 13.00 ms at 4.3%).
+**No index gets built for a project whose knowledge bases are all below the
+threshold; the query change still applies to all of them.** The embeddings-side
+predicate applies to every KB-scoped vector search from the moment it deploys,
+with or without a partial index, and for a knowledge base big enough that the
+planner had been reaching the shared index it can flip the plan to an exact
+bitmap scan and sort: measured 0.356 ms approximate to 3.540 ms exact at 9%
+selectivity, 3.59 ms to 80 ms at 21%, and 129 ms at 30%. A knowledge base whose
+searches already run an exact scan sees no flip at all, and neither do the small
+ones, which measured *faster* with the predicate (9.96 ms to 4.76 ms at 1.4%
+selectivity, 19.50 ms to 13.00 ms at 4.3%).
+
+That window is a real cost and it is paid for something real: the plan it
+replaces was fast and quietly wrong. Measured against an exact scan over the
+same knowledge base, the old shape returned recall 0.65-0.70 -- it stopped as
+soon as the join had produced ``top_k`` rows of the wanted knowledge base --
+where the new one returns 1.0. So the trade in that window is lossy-fast for
+exact-slow, and the build threshold has to sit *below* the knowledge bases that
+land in it, which is what the 10,000-row default is for: the two knowledge bases
+where this was measured held 12.6k and 18k rows, and a 50,000-row threshold left
+both of them regressed with no index ever built.
+
+(The partial index is itself approximate, at recall 0.90 on that fixture. The
+exactness above is a property of the transitional plan, not of the destination.)
+
+The start-up sweep is not free for a small project either: it runs one grouped
+count over ``ai.embeddings`` on every boot, bounded by ``SWEEP_TIMEOUT_MS``,
+even when it then dispatches nothing.
 
 Nothing here touches the shared per-dimension index. Replacing it with a
 residual one (``WHERE dims = N AND knowledge_base_id NOT IN (...)``) is what
@@ -236,6 +251,18 @@ def per_kb_index_drop_ddl(knowledge_base_id: Any, dims: Any) -> str:
     return f'DROP INDEX CONCURRENTLY IF EXISTS "{AI_SCHEMA}".{name}'
 
 
+# ``_`` matches any single character in a LIKE pattern and ``%`` any run of
+# them, and every one of these index names carries two underscores. Escaped, the
+# catalog lookups below match the literal names they are derived from and
+# nothing else, which is what their docstrings claim.
+_LIKE_WILDCARDS = str.maketrans({"\\": "\\\\", "_": "\\_", "%": "\\%"})
+
+
+def _like_prefix(prefix: str) -> str:
+    """``prefix`` as a LIKE pattern matching it literally, for ``ESCAPE '\\'``."""
+    return prefix.translate(_LIKE_WILDCARDS) + "%"
+
+
 def index_lock_relation(knowledge_base_id: Any, dims: Any) -> str:
     """Advisory-lock subject for building or dropping one of these indexes."""
     return f"{AI_SCHEMA}.{per_kb_index_name(knowledge_base_id, dims)}"
@@ -325,8 +352,12 @@ def thresholds(overrides: dict[str, int] | None = None) -> tuple[int, int]:
     bracketed, not bisected: at 2,000 rows the planner does not use a partial
     index at all (an exact bitmap scan and sort is genuinely cheaper, and
     exact), and at 73,290 rows the partial index is two orders of magnitude
-    faster. The defaults sit deliberately at the conservative end of that
-    bracket, and a project that measures its own crossover can move them.
+    faster. Inside that bracket the defaults are set by where the *regression*
+    is rather than by where the win is largest: the embeddings-side predicate
+    costs 80 ms at 21% selectivity and 129 ms at 30%, measured in knowledge
+    bases of 12.6k and 18k rows, and a build threshold above those leaves them
+    slower with no index to compensate. A project that measures its own
+    crossover can move both.
 
     ``overrides`` is for a caller that cannot read settings through
     ``db.session``; see ``read_overrides``.
@@ -377,8 +408,9 @@ def existing_per_kb_indexes(conn, knowledge_base_id: Any) -> dict[int, bool]:
     """``{dims: is_valid}`` for this knowledge base's partial HNSW indexes.
 
     Read by name rather than by parsing predicates: the name is derived from
-    the KB's UUID and the dimension, so the catalog lookup is an equality match
-    on ``pg_class.relname`` and cannot mistake another KB's index for this
+    the KB's UUID and the dimension, so the catalog lookup is a literal prefix
+    match on ``pg_class.relname`` -- wildcards escaped, so the underscores in
+    the name are underscores -- and cannot mistake another KB's index for this
     one's.
     """
     kb_hex = uuid.UUID(_validated_kb_id(knowledge_base_id)).hex
@@ -388,9 +420,10 @@ def existing_per_kb_indexes(conn, knowledge_base_id: Any) -> dict[int, bool]:
             "SELECT c.relname, i.indisvalid FROM pg_class c "
             "JOIN pg_index i ON i.indexrelid = c.oid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE n.nspname = :schema AND c.relkind = 'i' AND c.relname LIKE :prefix"
+            r"WHERE n.nspname = :schema AND c.relkind = 'i' "
+            r"AND c.relname LIKE :prefix ESCAPE '\'"
         ),
-        {"schema": AI_SCHEMA, "prefix": prefix + "%"},
+        {"schema": AI_SCHEMA, "prefix": _like_prefix(prefix)},
     ).all()
     found: dict[int, bool] = {}
     for relname, valid in rows:
@@ -407,9 +440,10 @@ def per_kb_index_count(conn) -> int:
             text(
                 "SELECT count(*) FROM pg_class c "
                 "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE n.nspname = :schema AND c.relkind = 'i' AND c.relname LIKE :prefix"
+                r"WHERE n.nspname = :schema AND c.relkind = 'i' "
+                r"AND c.relname LIKE :prefix ESCAPE '\'"
             ),
-            {"schema": AI_SCHEMA, "prefix": INDEX_NAME_PREFIX + "%"},
+            {"schema": AI_SCHEMA, "prefix": _like_prefix(INDEX_NAME_PREFIX)},
         ).scalar()
         or 0
     )
@@ -471,7 +505,10 @@ def index_action(conn, knowledge_base_id: Any) -> str | None:
 
     Cheap enough for the indexing path to call once per source: one catalog
     lookup plus one bounded count per dimension in play. Never raises for a
-    knowledge base that has no embeddings at all.
+    knowledge base that has no embeddings at all, and never asks for a build
+    ``MAX_HNSW_DIMS`` makes impossible -- this runs once per source that
+    finishes indexing, so anything it asks for that cannot succeed is asked for
+    again and again.
     """
     build_at, drop_below = thresholds()
     existing = existing_per_kb_indexes(conn, knowledge_base_id)
@@ -922,9 +959,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
         # reason is the one that survives.
         outcome["status"] = "building"
         outcome["index"] = reschedule or blocked[0]
-        outcome["reason"] = (
-            "invalid_index_build_in_progress" if reschedule else "build_lock_held"
-        )
+        outcome["reason"] = "invalid_index_build_in_progress" if reschedule else "build_lock_held"
         if reschedule:
             outcome["reschedule"] = True
     return outcome
@@ -1067,9 +1102,10 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
                     "SELECT c.relname, i.indisvalid FROM pg_class c "
                     "JOIN pg_index i ON i.indexrelid = c.oid "
                     "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                    "WHERE n.nspname = :schema AND c.relkind = 'i' AND c.relname LIKE :prefix"
+                    r"WHERE n.nspname = :schema AND c.relkind = 'i' "
+                    r"AND c.relname LIKE :prefix ESCAPE '\'"
                 ),
-                {"schema": AI_SCHEMA, "prefix": INDEX_NAME_PREFIX + "%"},
+                {"schema": AI_SCHEMA, "prefix": _like_prefix(INDEX_NAME_PREFIX)},
             ).all()
             indexed: dict[str, list[int]] = {}
             for relname, valid in rows:
