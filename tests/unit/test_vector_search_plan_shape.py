@@ -28,7 +28,7 @@ _KB_ID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
 # the setting usually is would pass against a fixture whose prior value *was* that.
 ENABLE_SORT_WAS = "off"
 EF_SEARCH_WAS = "55"
-PLAN_CACHE_MODE_WAS = "force_generic_plan"
+ENABLE_INDEXSCAN_WAS = "off"
 
 
 class _FakeStore(BasePgVectorStore):
@@ -69,8 +69,8 @@ def _capture(
         captured.append((sql, dict(params or {})))
         if "to_regclass" in sql:
             return iter([(ENABLE_SORT_WAS, EF_SEARCH_WAS, partial_index)])
-        if "current_setting('plan_cache_mode')" in sql:
-            return _scalar(PLAN_CACHE_MODE_WAS)
+        if "current_setting('enable_indexscan')" in sql:
+            return _scalar(ENABLE_INDEXSCAN_WAS)
         return iter([])
 
     session.execute = spy_execute
@@ -157,90 +157,6 @@ def test_a_bad_knowledge_base_id_is_rejected_on_both_sides():
         assert "knowledge_base_id" in str(exc), exc
     else:
         raise AssertionError("a non-UUID knowledge base id must raise")
-
-
-# ---------------------------------------------------------------------------
-# The metadata filter, which cannot be a literal
-# ---------------------------------------------------------------------------
-
-
-def test_a_filtered_search_asks_for_a_custom_plan():
-    """The fourth bound value, and the only one that has to stay bound.
-
-    A generic plan has no selectivity estimate for ``meta @> $n``, so it prices
-    the ordered index scan out and falls back to a bitmap scan plus an exact
-    sort. Measured: 5.6 ms with the index, 628.8 ms without. The filter value
-    cannot be interpolated -- it is caller data -- so the fix is to make this one
-    execution plan against the value it actually has.
-    """
-    statements = _capture(filter_metadata={"tag": "a"})
-    forced = _writes(statements, "plan_cache_mode")
-    assert forced, (
-        "a filtered search must ask for a custom plan, or it loses the partial "
-        f"index once the statement is prepared; statements: {statements}"
-    )
-    normalized = "".join(statements[forced[0]][0].split()).lower()
-    assert "set_config('plan_cache_mode','force_custom_plan',true)" in normalized, statements[
-        forced[0]
-    ][0]
-
-
-def test_the_custom_plan_request_precedes_the_search():
-    """``SET LOCAL`` only reaches a statement that runs after it, same transaction."""
-    statements = _capture(filter_metadata={"tag": "a"})
-    first_set = _writes(statements, "plan_cache_mode")[0]
-    search_at = next(i for i, (sql, _) in enumerate(statements) if "ORDER BY" in sql)
-    assert first_set < search_at, f"plan_cache_mode set after the search: {statements}"
-
-
-def test_an_unfiltered_search_leaves_the_plan_cache_alone():
-    """The unfiltered shape is fully provable from literals, so it keeps its
-    cached generic plan -- which is the point of the literals, and worth one
-    fewer round trip and one fewer replan per search."""
-    statements = _capture()
-    assert not _settings(statements, "plan_cache_mode"), (
-        f"nothing should touch plan_cache_mode without a filter: {statements}"
-    )
-
-
-def test_an_empty_filter_is_not_a_filter():
-    """``filter_metadata={}`` adds no predicate, so it must not cost a replan."""
-    statements = _capture(filter_metadata={})
-    assert not _settings(statements, "plan_cache_mode"), statements
-
-
-def test_the_custom_plan_request_is_transaction_scoped():
-    """Session-level would follow the connection back into the pool and make
-    every later search on it replan."""
-    statements = _capture(filter_metadata={"tag": "a"})
-    sql = statements[_writes(statements, "plan_cache_mode")[0]][0]
-    assert "true" in "".join(sql.split()).lower(), (
-        f"the setting must not outlive the transaction:\n{sql}"
-    )
-
-
-def test_the_custom_plan_request_follows_the_argument_not_the_sql_text():
-    """Pinned against how the filter is *compiled*.
-
-    The clause the filter becomes is being rewritten to bind the whole filter as
-    one jsonb instead of one parameter per key. That changes the SQL and changes
-    nothing about why this setting is needed, so the decision keys off the
-    argument: any non-empty filter, whatever it compiles to.
-    """
-    for filter_metadata in ({"tag": "a"}, {"a": 1, "b": 2}, {"nested": {"x": [1, 2]}}):
-        statements = _capture(filter_metadata=filter_metadata)
-        assert _writes(statements, "plan_cache_mode"), (
-            f"no custom plan requested for {filter_metadata}: {statements}"
-        )
-
-
-def test_a_filter_combined_with_other_predicates_still_asks_for_a_custom_plan():
-    statements = _capture(
-        filter_metadata={"tag": "a"},
-        item_ids={"3f2504e0-4f89-11d3-9a0c-0305e82c3302"},
-        source_ids=["3f2504e0-4f89-11d3-9a0c-0305e82c3303"],
-    )
-    assert _writes(statements, "plan_cache_mode"), statements
 
 
 # ---------------------------------------------------------------------------
@@ -348,26 +264,6 @@ def test_the_restore_puts_back_the_value_the_probe_read():
     )
 
 
-def test_a_filtered_search_keeps_the_sort_and_still_asks_for_a_custom_plan():
-    """A metadata filter gets the custom plan and *not* the sort penalty.
-
-    The two settings answer different questions and this is where they part. The
-    custom plan is what gets the filter's value to the planner, and it helps every
-    filtered search. Pricing the sort out helps only the unfiltered one: measured
-    at 1536 dimensions through ``vector_search``, a one-source ``source_ids``
-    search went 22.7 -> 28.5 ms at recall 1.00 -> 0.49, a 200-item ``item_ids``
-    search 11.0 -> 37.8 ms at 1.00 -> 0.80, and a filter matching no row
-    3.0 -> 38.3 ms. Slower and less accurate, on a search whose restriction the
-    caller wrote down and expects to be honoured.
-    """
-    statements = _capture(partial_index=True, filter_metadata={"tier": "gold", "kb": "a"})
-    assert _writes(statements, "plan_cache_mode"), statements
-    assert not _enable_sort(statements), (
-        "a filtered search must keep the plan the planner chooses for it; pricing "
-        f"the sort out makes it slower and less complete: {statements}"
-    )
-
-
 @pytest.mark.parametrize(
     "restriction",
     [
@@ -379,20 +275,87 @@ def test_a_filtered_search_keeps_the_sort_and_still_asks_for_a_custom_plan():
     ],
     ids=["item_ids", "empty-item_ids", "source_ids", "empty-source_ids", "filter_metadata"],
 )
-def test_a_restricted_search_does_not_enter_the_gate_at_all(restriction):
+def test_a_restricted_search_has_the_index_priced_out_not_merely_unforced(restriction):
     """Every restriction the search accepts, including the empty ones.
 
-    The gate's probe answers "does this knowledge base have a valid partial
-    index", which is not "is this search better off on it". An empty id set is the
-    most starved restriction there is -- it matches nothing -- so keying on
-    ``is not None`` rather than truthiness is load-bearing, and pinned here.
+    Two propositions in one spec, because either alone passes a broken
+    implementation: the sort penalty must not be applied, *and* the index must be
+    priced out. Not forcing is not enough -- at 384 dimensions the planner takes
+    the index for a restricted search unaided and returns a full page of ``top_k``
+    rows of which 12 to 17 of 20 are not the nearest matching ones, and a full page
+    has no signal in it.
+
+    An empty id set is the most starved restriction there is -- it matches nothing
+    -- so keying on ``is not None`` rather than truthiness is load-bearing, and
+    pinned here.
     """
     statements = _capture(partial_index=True, **restriction)
+    priced_out = _writes(statements, "enable_indexscan")
+    assert priced_out, (
+        "a restricted search must have the approximate index priced out, not just "
+        f"left to the planner: {statements}"
+    )
+    normalized = "".join(statements[priced_out[0]][0].split()).lower()
+    assert "set_config('enable_indexscan','off',true)" in normalized, statements[priced_out[0]]
     assert not _enable_sort(statements), statements
     assert not _writes(statements, "hnsw.ef_search"), statements
     assert len([s for s, _ in statements if "ORDER BY" in s]) == 1, (
-        f"a restricted search must run once, on the planner's own plan: {statements}"
+        f"a restricted search runs once; there is no re-run to repair it: {statements}"
     )
+
+
+@pytest.mark.parametrize(
+    "restriction",
+    [
+        {"item_ids": {"3f2504e0-4f89-11d3-9a0c-0305e82c3302"}},
+        {"source_ids": ["3f2504e0-4f89-11d3-9a0c-0305e82c3303"]},
+        {"filter_metadata": {"tier": "gold"}},
+    ],
+    ids=["item_ids", "source_ids", "filter_metadata"],
+)
+def test_the_exact_search_puts_enable_indexscan_back(restriction):
+    """``hybrid_search`` runs its keyword leg on this same session afterwards, and
+    a keyword ranking wants its index scans. Not a hardcoded ``on`` either:
+    whatever the transaction had."""
+    statements = _capture(partial_index=True, **restriction)
+    touched = _writes(statements, "enable_indexscan")
+    assert len(touched) == 2, f"expected one set and one restore: {statements}"
+    assert statements[touched[1]][1].get("prior") == ENABLE_INDEXSCAN_WAS, statements[touched[1]]
+    search_at = next(i for i, (sql, _) in enumerate(statements) if "ORDER BY" in sql)
+    assert touched[0] < search_at < touched[1], statements
+
+
+def test_a_restricted_search_does_not_pay_for_the_catalog_probe():
+    """It does not matter whether the knowledge base has an index: the answer has
+    to be exact either way. So there is nothing to ask the catalog."""
+    statements = _capture(partial_index=True, source_ids=["3f2504e0-4f89-11d3-9a0c-0305e82c3303"])
+    assert not [sql for sql, _ in statements if "to_regclass" in sql], statements
+
+
+def test_an_unrestricted_search_is_not_made_exact():
+    """The other half of the symmetry, and it must not be vacuous.
+
+    Pricing the index out of *every* search would satisfy every spec above while
+    throwing away the feature.
+    """
+    statements = _capture(partial_index=True)
+    assert not _writes(statements, "enable_indexscan"), (
+        f"an unrestricted search is the one that should use the index: {statements}"
+    )
+    assert _enable_sort(statements), statements
+
+
+@pytest.mark.parametrize("empty", [None, {}], ids=["None", "empty-object"])
+def test_an_empty_metadata_filter_is_not_a_restriction(empty):
+    """``filter_metadata={}`` adds no clause, so it cannot starve anything.
+
+    It must therefore be treated as the unrestricted search it is, and keep the
+    index -- the decision keys on what narrows the search, not on which arguments
+    were passed.
+    """
+    statements = _capture(partial_index=True, filter_metadata=empty)
+    assert not _writes(statements, "enable_indexscan"), statements
+    assert _enable_sort(statements), statements
 
 
 def test_the_gate_is_only_for_the_item_table_it_was_measured_on():
@@ -425,73 +388,6 @@ def test_the_chunks_store_is_the_one_that_does_enter_it():
 # ---------------------------------------------------------------------------
 # The re-run, which is what makes the setting safe on a restricted search
 # ---------------------------------------------------------------------------
-
-
-def test_a_short_answer_is_asked_again_with_the_sort_available():
-    """An ordered index scan can starve the ``LIMIT``; an exact scan cannot.
-
-    Measured at 384 dimensions: a ``top_k`` of 20 against 12 matching rows of a
-    12,000-row knowledge base came back with 11 of them from the forced index
-    scan, and all 12 from the exact scan the planner picks on its own. So a short
-    answer is re-run -- and the re-run asks for a custom plan, or it would be
-    handed the plan that came up short.
-
-    The fake session returns no rows, which is a short answer for any ``top_k``.
-    """
-    statements = _capture(partial_index=True)
-    searches = [i for i, (sql, _) in enumerate(statements) if "ORDER BY" in sql]
-    assert len(searches) == 2, (
-        f"a short answer from the forced index scan must be asked again: {statements}"
-    )
-    restored = _enable_sort(statements)[1]
-    assert restored < searches[1], (
-        f"the re-run has to happen with the sort available again: {statements}"
-    )
-    replanned = [i for i in _writes(statements, "plan_cache_mode") if i < searches[1]]
-    assert replanned and replanned[-1] > searches[0], (
-        f"the re-run must ask for a custom plan, between the two searches: {statements}"
-    )
-
-
-def test_the_re_runs_custom_plan_is_put_back_too():
-    """The re-run's replan must not outlive the search either.
-
-    The same argument as the filtered case below it: in the single-knowledge-base
-    fast path this session is the request's, so a ``plan_cache_mode`` left on
-    makes the hybrid keyword leg, the metadata reads and the billing writes all
-    replan for the rest of the transaction.
-    """
-    statements = _capture(partial_index=True)
-    touched = _writes(statements, "plan_cache_mode")
-    assert len(touched) == 2, f"expected one set and one restore: {statements}"
-    assert statements[touched[1]][1].get("prior") == PLAN_CACHE_MODE_WAS, (
-        f"the restore must bind the value that was read, not a guess: {statements[touched[1]]}"
-    )
-
-
-def test_a_shorter_re_run_does_not_replace_a_longer_first_answer():
-    """Both plans read the same rows under the same LIMIT, so normally the re-run
-    is at least as complete. A second plan that comes back *shorter* is evidence
-    of nothing, and letting it win would turn this net into a way to lose rows."""
-    session = MagicMock()
-    row = ("11111111-1111-4111-8111-111111111111", "text", 0.5, None, {})
-    answers = [[row, row], []]
-
-    def spy_execute(text_obj, params=None):
-        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
-        if "to_regclass" in sql:
-            return iter([(ENABLE_SORT_WAS, EF_SEARCH_WAS, True)])
-        if "current_setting('plan_cache_mode')" in sql:
-            return _scalar(PLAN_CACHE_MODE_WAS)
-        if "ORDER BY" in sql:
-            return iter(answers.pop(0))
-        return iter([])
-
-    session.execute = spy_execute
-    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
-    items = asyncio.run(store.vector_search(embedding=[0.0] * 1536, top_k=10))
-    assert not answers, "both searches must have run for this spec to mean anything"
-    assert len(items) == 2, f"the longer of the two answers must be kept, got {items}"
 
 
 # ---------------------------------------------------------------------------
@@ -573,8 +469,8 @@ def test_a_database_without_pgvector_sets_no_ef_search():
         captured.append((sql, dict(params or {})))
         if "to_regclass" in sql:
             return iter([(ENABLE_SORT_WAS, None, True)])
-        if "current_setting('plan_cache_mode')" in sql:
-            return _scalar(PLAN_CACHE_MODE_WAS)
+        if "current_setting('enable_indexscan')" in sql:
+            return _scalar(ENABLE_INDEXSCAN_WAS)
         return iter([])
 
     session.execute = spy_execute
@@ -624,31 +520,6 @@ def test_the_probe_runs_in_a_savepoint():
     )
 
 
-def test_a_full_answer_is_not_asked_again():
-    """The re-run is for the short case only; an ordinary search pays nothing."""
-    session = MagicMock()
-    captured: list[tuple[str, dict]] = []
-    row = ("11111111-1111-4111-8111-111111111111", "text", 0.5, None, {})
-
-    def spy_execute(text_obj, params=None):
-        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
-        captured.append((sql, dict(params or {})))
-        if "to_regclass" in sql:
-            return iter([(ENABLE_SORT_WAS, True)])
-        if "ORDER BY" in sql:
-            return iter([row] * 3)
-        return iter([])
-
-    session.execute = spy_execute
-    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
-    asyncio.run(store.vector_search(embedding=[0.0] * 1536, top_k=3))
-    searches = [pair for pair in captured if "ORDER BY" in pair[0]]
-    assert len(searches) == 1, (
-        f"top_k rows came back, so nothing is short and nothing is re-run: {captured}"
-    )
-    assert not _settings(captured, "plan_cache_mode"), captured
-
-
 # ---------------------------------------------------------------------------
 # The diversity-floor path, which deliberately keeps the planner's own plan
 # ---------------------------------------------------------------------------
@@ -676,8 +547,8 @@ def test_the_per_source_search_is_left_on_the_planners_own_plan():
         captured.append((sql, dict(params or {})))
         if "to_regclass" in sql:
             return iter([(ENABLE_SORT_WAS, EF_SEARCH_WAS, True)])
-        if "current_setting('plan_cache_mode')" in sql:
-            return _scalar(PLAN_CACHE_MODE_WAS)
+        if "current_setting('enable_indexscan')" in sql:
+            return _scalar(ENABLE_INDEXSCAN_WAS)
         return iter([])
 
     session.execute = spy_execute

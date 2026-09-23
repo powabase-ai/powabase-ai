@@ -10,7 +10,7 @@ import logging
 import time
 import uuid
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from typing import Any
 
 from agentic.knowledge.model_config import HYBRID_DEFAULT_VECTOR_WEIGHT
@@ -166,9 +166,16 @@ def kb_sql_literal(knowledge_base_id: Any) -> str:
     index scan. A ``filter_metadata`` search has a fourth value the planner does
     not know, and it cannot be made a literal -- it is caller data, bound as
     jsonb. A generic plan has no selectivity estimate for ``meta @>`` at all, so
-    it prices the ordered index scan out and the partial index is lost. That
-    shape is protected differently, by asking for a custom plan for that one
-    execution: see ``BasePgVectorStore._forcing_a_custom_plan``.
+    it prices the ordered index scan out and the partial index is lost.
+
+    **That is accepted rather than worked around, and the earlier claim that a
+    filtered search reaches the index is withdrawn.** A restriction the caller
+    wrote down -- a metadata filter, ``item_ids`` or ``source_ids`` -- has to be
+    answered exactly, and an approximate scan cannot promise that however well it
+    is planned. Such a search is therefore steered *away* from the index rather
+    than towards it: see ``BasePgVectorStore._insisting_on_an_exact_search``. The
+    guarantee above is for the unfiltered search, which is the one this whole
+    mechanism exists for.
     """
     try:
         return f"'{uuid.UUID(str(knowledge_base_id))}'"
@@ -554,85 +561,107 @@ class BasePgVectorStore:
             )
 
     @contextmanager
-    def _forcing_a_custom_plan(self) -> Iterator[None]:
-        """Plan the statements in this block against their real parameters.
+    def _insisting_on_an_exact_search(self) -> Iterator[None]:
+        """Price the approximate index out, for a search the caller restricted.
 
-        Two callers: a search carrying a metadata filter, and the exact re-run in
-        ``_search_again_exactly``. Everything the partial HNSW index's predicate
-        needs is a literal (see ``kb_sql_literal``), so an unfiltered search that
-        is not being re-run keeps whatever plan the cache holds. A metadata
-        filter cannot be a literal -- it is caller data -- and a plan built
-        without its value has no selectivity estimate for ``meta @> $n`` at all,
-        so the planner stops believing the ordered index scan will stop early
-        and prices an exact sort below it instead. That is the whole partial
-        index lost, for the life of a pooled connection, on a documented and
-        shipped search parameter.
+        The mirror of ``_preferring_this_kbs_partial_index``, and the reason the
+        pair is symmetric: an unrestricted search wants the index and cannot be
+        starved by anything, a restricted one must be exact and an ordered ANN
+        scan cannot promise that.
 
-        Forcing a custom plan is the direct fix: the planner sees the filter's
-        actual value, estimates it, and keeps the index. The cost is one replan
-        per filtered search, which is cheap against what it buys.
+        **Why not simply leave the planner alone.** Because the planner's own
+        choice is a cost race, and the race comes out differently at different
+        widths. At 384 dimensions a vector is inline, the ANN scan prices below
+        the sort, and the planner takes the partial index for a restricted search
+        unaided -- returning a *full* page of ``top_k`` rows in which 12 to 17 of
+        20 are not the nearest matching ones. A full page is the failure mode with
+        no signal in it: nothing is short, so nothing can notice. At 1536
+        dimensions, the width production runs, the same planner declines the index
+        and the search is already exact. Pinning that is the whole of this block.
 
-        Measured on a 20,000-embedding knowledge base with its partial index, on
-        a connection whose plan cache had gone generic, 20 filtered searches
-        through the real driver in one transaction:
+        **So this is not a regression, it is the behaviour production already
+        has.** Measured at 1536 dimensions on a 12,000-row knowledge base with its
+        partial index built and valid, median of six query vectors, against a
+        seq-scan-and-sort ground truth:
 
-        | filtered search | plans on the partial index | latency |
+        | restricted search | planner unaided | this block |
         |---|---|---|
-        | without this | 0 of 20 -- bitmap scan and an exact sort | 8.7-10.8 ms |
-        | with this | 20 of 20 | 2.5-6.0 ms |
+        | ``source_ids`` covering ~80 % of the KB | exact, 44.8 ms, recall 1.00 | exact, **42.7 ms**, recall 1.00 |
+        | ``source_ids`` covering ~1 % of the KB | exact, 3.6 ms, recall 1.00 | exact, **1.6 ms**, recall 1.00 |
+        | ``item_ids``, 200 named (10x ``top_k``) | exact, 3.0 ms, recall 1.00 | exact, **2.1 ms**, recall 1.00 |
+        | ``filter_metadata``, one row in five | exact, 14.1 ms, recall 1.00 | exact, **13.8 ms**, recall 1.00 |
 
-        The unfiltered shape needs none of it -- 20 of 20 on the index on the
-        same pinned-generic connection -- which is what the literals are for.
-        The gap grows with the knowledge base, because what replaces the index
-        is an exact scan of it.
+        The large restricted search is the one worth checking rather than assuming,
+        because it is the case with the most rows to sort, and it matches: 42.7
+        against 44.8 ms. For comparison, the same four shapes with the index forced
+        *in* cost 1.6/22.0/18.0/4.2 ms at recall 0.07/0.58/0.63/0.13 -- which is
+        what the symmetry exists to make impossible.
 
-        **That table was measured with the sort priced out, and a filtered search
-        no longer gets that** -- see ``_preferring_this_kbs_partial_index`` for
-        why. Re-measured in the shape that now ships, 12 filtered searches on one
-        pinned-generic connection at 1536 dimensions against a 12,000-row
-        knowledge base with its partial index valid, the custom plan reaches no
-        HNSW index and costs about a millisecond of replan: ``{"tier": "gold"}``
-        15.9 -> 17.6 ms, two keys 16.3 -> 17.0, a filter matching no row
-        3.4 -> 4.3, all with 0 of 12 executions on either index in both arms. It
-        is kept because the estimate it buys is real for the plans a filtered
-        search does get -- the choice between a bitmap index scan on ``meta`` and
-        a scan of the knowledge base is priced from that estimate, and this
-        fixture's ``meta`` is two values wide, which is the shape least able to
-        show the difference. But on this evidence it is a candidate for removal
-        rather than a proven win, and the next person to touch it should have the
-        numbers rather than only the table above.
+        **``enable_indexscan`` is broader than "no ANN scan", and the fallback was
+        checked rather than assumed.** PostgreSQL has no GUC that prices one index
+        out, so this prices out every ordered index scan in the statement. What
+        replaces them is a *bitmap* index scan on the same indexes -- not a
+        sequential scan -- so the work still tracks the number of matching rows
+        rather than the size of the knowledge base. Read off ``EXPLAIN ANALYZE``
+        for all three restricted shapes: the item-table predicate went from
+        ``Index Scan using chunks_knowledge_base_id_idx`` to a ``BitmapAnd`` of
+        the same index, the embeddings side from ``Index Scan using
+        embeddings_knowledge_base_id_idx`` to a ``Bitmap Index Scan`` on it, and no
+        plan contained a ``Seq Scan`` on either table. The thin ``source_ids`` case
+        is faster because the bitmap path picks ``chunks_source_id_idx`` and drives
+        a nested loop where the unaided plan hashed the whole knowledge base's
+        embeddings.
 
-        **Restored on the way out, which is why this is a block and not the bare
-        setter it used to be** (``_force_custom_plan``, in case an older comment
-        still names it). Transaction-local was never the whole of it: in the
-        single-knowledge-base fast path the session is the request's own, so
-        everything the request does after the vector leg -- the hybrid keyword
-        leg, the metadata fetches, the reranker's reads, the billing writes --
-        would keep replanning for the rest of the transaction. The setting has
-        to come off when the statement it was asked for is done, the same way
-        ``_fetch_with_timeout`` puts its budget back and
-        ``_preferring_this_kbs_partial_index`` puts ``enable_sort`` back.
+        ``set_config(..., true)`` so the previous value can be bound and dies with
+        the transaction; restored before returning, because ``hybrid_search`` runs
+        its keyword leg on this same session and a keyword ranking wants its index
+        scans back. A failure on either side degrades latency or exactness rather
+        than erroring, so both are logged, not raised.
 
-        ``set_config(..., true)`` rather than ``SET LOCAL`` so the previous value
-        can be bound. Same caveat as ``_apply_iterative_scan``: it needs the
-        session to be in a transaction, which is how this store is used, and a
-        failure here degrades latency rather than the answer, so it is logged
-        and not raised -- and the restore is expected to fail when the search
-        itself did, because the transaction is then aborted and the setting dies
-        with it anyway.
+        **What it costs, split honestly.** Three statements -- read the prior, set
+        it, put it back -- and the plan they produce. Measured separately, 18
+        executions on one pooled connection so the statement is prepared:
+
+        | restricted search | the plan | the three round trips |
+        |---|---|---|
+        | ``source_ids`` ~80 % of the KB | 49.1 -> **42.0 ms** | +1.5 ms |
+        | ``source_ids`` ~1 % of the KB | 3.2 -> **2.0 ms** | +1.3 ms |
+        | ``item_ids``, 200 named | 2.5 -> **2.3 ms** | +1.1 ms |
+        | ``filter_metadata`` | 14.8 -> 15.3 ms | +1.4 ms |
+
+        So the plan is a saving on three of the four shapes and the round trips are
+        the real cost -- flat, about 1.3 ms, and the largest share of it on the
+        cheapest search. It could be two statements rather than three by reading
+        the prior and setting it in one, which needs a ``MATERIALIZED`` CTE to make
+        the evaluation order safe; that was left undone deliberately, because this
+        block reads the same way as the one beside it and a construct that depends
+        on evaluation order is the kind of thing this file already warns about.
+
+        **The plan cache is not a hole here, which was checked rather than
+        assumed.** A planner GUC does not rebuild a cached generic plan, so a
+        setting that arrives after one is built does nothing -- the defect this
+        file has met before. It does not apply because the setting is made *before*
+        the statement on every execution, so whichever execution PostgreSQL chooses
+        to build the generic plan on, it builds it with the index priced out.
+        Verified through the real store, 14 executions of each restricted shape on
+        one pooled connection, counters read from ``pg_stat_all_indexes``: 0 of 14
+        on the partial index and 0 on the shared one, under ``plan_cache_mode``
+        ``auto`` *and* under ``force_generic_plan``. The unrestricted search on the
+        same connection was 14 of 14 on the partial index, which is what makes that
+        a result rather than an absence.
         """
         prior: str | None = None
         try:
             prior = str(
-                self.session.execute(text("SELECT current_setting('plan_cache_mode')")).scalar()
+                self.session.execute(text("SELECT current_setting('enable_indexscan')")).scalar()
             )
-            self.session.execute(
-                text("SELECT set_config('plan_cache_mode', 'force_custom_plan', true)")
-            )
-        except Exception as e:  # pragma: no cover - depends on server version
+            self.session.execute(text("SELECT set_config('enable_indexscan', 'off', true)"))
+        except Exception as e:  # pragma: no cover - needs a live server
             logger.warning(
-                "Could not set plan_cache_mode=force_custom_plan: %s; a filtered vector "
-                "search may miss this knowledge base's partial HNSW index",
+                "Could not price the approximate index out for KB %s: %s; a restricted "
+                "vector search may answer from an approximate scan and miss rows the "
+                "caller named",
+                self.kb_id,
                 e,
             )
             yield
@@ -642,33 +671,16 @@ class BasePgVectorStore:
         finally:
             try:
                 self.session.execute(
-                    text("SELECT set_config('plan_cache_mode', :prior, true)"), {"prior": prior}
+                    text("SELECT set_config('enable_indexscan', :prior, true)"), {"prior": prior}
                 )
             except Exception as e:
                 logger.debug(
-                    "Could not restore plan_cache_mode=%s after a vector search on KB %s: %s",
+                    "Could not restore enable_indexscan=%s after a vector search on KB %s: %s",
                     prior,
                     self.kb_id,
                     e,
                 )
 
-    # One round trip that answers every question the block below needs: whether
-    # this knowledge base has a partial HNSW index worth steering the planner
-    # towards, and what ``enable_sort`` and ``hnsw.ef_search`` are set to so they
-    # can be put back. Independent scalars rather than a nested ``CASE``, so none
-    # of them depends on the order the target list is evaluated in.
-    #
-    # ``indisvalid`` and not merely "the name exists": a CONCURRENTLY-built index
-    # is in the catalog from the moment the build starts and cannot answer a
-    # query until it finishes, and a failed build leaves one behind for good.
-    # Steering the planner at an index in either state is exactly the case
-    # requirement 2 of this fix is about.
-    #
-    # ``hnsw.ef_search`` is read with ``missing_ok`` because it is pgvector's GUC,
-    # not PostgreSQL's: on a database without the extension loaded the name does
-    # not exist and a plain ``current_setting`` would raise, failing the whole
-    # probe. NULL there means "no pgvector", which also means no HNSW index of
-    # any kind, so the block simply leaves that setting alone.
     _PARTIAL_INDEX_PROBE = """
         SELECT
             current_setting('enable_sort') AS prior_sort,
@@ -680,10 +692,8 @@ class BasePgVectorStore:
     """
 
     @contextmanager
-    def _preferring_this_kbs_partial_index(self, dims: int) -> Iterator[bool]:
+    def _preferring_this_kbs_partial_index(self, dims: int) -> Iterator[None]:
         """Price an exact sort out of the search, when there is an index to fall on.
-
-        Yields whether the sort was priced out.
 
         Everything else in this class makes the partial HNSW index *reachable*.
         This is what makes the planner *take* it, and it is needed because at
@@ -715,13 +725,11 @@ class BasePgVectorStore:
         | 30 % | two metadata keys | 0/12, 15.0 ms | 12/12, 7.4 ms |
         | 21 % of the table | unfiltered | 0/12, 38.0 ms | 12/12, 4.7 ms |
 
-        The filtered rows are the second thing this repairs, and the reason is
-        not the one it looks like. ``_forcing_a_custom_plan`` gets the filter's value
-        to the planner, which prices ``meta @> const`` by matching that constant
-        against ``meta``'s most-common-value list -- so the estimate is real, but
-        it is then multiplied by the knowledge-base predicate as though the two
-        were independent. They are not, when one of the filter's keys *is* the
-        knowledge base. Measured at 384 dimensions on the live fixture:
+        The filtered rows in that table are history: a filtered search no longer
+        comes here at all (see below). They are worth keeping only for what they
+        showed about the *estimate*, which is that a filter whose key is the
+        knowledge base is multiplied by the knowledge-base predicate as though the
+        two were independent. Measured at 384 dimensions on the live fixture:
         ``{"tier": "gold"}`` estimates 722 rows of 2,400 real and keeps the
         index, and filtering on the knowledge base alone estimates 1,076 of
         12,000 and keeps it -- but the two together estimate **217 of the same
@@ -779,16 +787,18 @@ class BasePgVectorStore:
         | ``source_ids`` matching no row | 2.4 ms | 36.7 ms |
 
         Row one is the whole of what this mechanism is for. So a search carrying
-        ``item_ids``, ``source_ids`` or a metadata filter does not enter this
-        block at all, and keeps the plan the planner chooses for it.
+        ``item_ids``, ``source_ids`` or a metadata filter does not enter this block
+        at all -- it gets ``_insisting_on_an_exact_search`` instead, which prices
+        the index out rather than merely declining to force it in.
 
-        ``_search_again_exactly`` is not a substitute for that, which is the
-        mistake worth not repeating: it fires on ``len(items) < top_k``, so it
-        catches a restriction that starves the ``LIMIT`` *below* the limit and
-        misses one that starves it *at* the limit -- a restriction with more than
-        ``top_k`` matching rows fills the LIMIT with the wrong rows and looks like
-        a complete answer. It fired 0 times in all four restricted rows above.
-        A row count cannot be the completeness signal for a restricted search.
+        **Not forcing is not enough, and that is worth stating because it was the
+        first fix tried.** The planner's own choice is a cost race that comes out
+        differently at 384 dimensions, where it takes the index for a restricted
+        search unaided and answers with a full page of ``top_k`` rows of which 12
+        to 17 of 20 are not the nearest matching ones. There is no signal in a full
+        page. Nor can a re-run repair it: where the planner already prefers the
+        index, the re-run replays the same approximate scan. So the restricted case
+        is made exact by construction, on both sides of the race.
 
         The cost of a restricted search that did get here anyway is bounded
         rather than proportional: pgvector stops an iterative scan at
@@ -821,7 +831,7 @@ class BasePgVectorStore:
         immediately after the vector leg, and a keyword ranking is a sort. So the
         previous values go back on before this returns, the same way
         ``_fetch_with_timeout`` restores its budget and
-        ``_forcing_a_custom_plan`` restores ``plan_cache_mode``.
+        ``_insisting_on_an_exact_search`` restores ``enable_indexscan``.
 
         A failure on any side degrades latency, never the answer, so all of them
         are logged rather than raised -- and the restore is expected to fail when
@@ -855,7 +865,7 @@ class BasePgVectorStore:
                 e,
             )
         if prior is None:
-            yield False
+            yield
             return
         try:
             self.session.execute(text("SELECT set_config('enable_sort', 'off', true)"))
@@ -866,7 +876,7 @@ class BasePgVectorStore:
                 self.kb_id,
                 e,
             )
-            yield False
+            yield
             return
         if prior_ef_search is not None:
             try:
@@ -887,7 +897,7 @@ class BasePgVectorStore:
                 )
                 prior_ef_search = None
         try:
-            yield True
+            yield
         finally:
             # One statement per setting, each naming its own GUC, so the restore
             # is as readable in a captured statement list as the set was.
@@ -915,63 +925,6 @@ class BasePgVectorStore:
                     self.kb_id,
                     e,
                 )
-
-    def _search_again_exactly(
-        self, run_the_search, first_answer: list[RetrievedItem]
-    ) -> list[RetrievedItem]:
-        """Re-run a short answer with the sort available again, and keep the better one.
-
-        A short answer from an ordered HNSW scan means either that few rows really
-        match, or that the scan starved: pgvector's iterative scan keeps going,
-        but under ``strict_order`` it does not reach every tuple in the index.
-        Measured at 384 dimensions, a ``top_k`` of 20 against 12 matching rows of
-        a 12,000-row knowledge base: the forced index scan reached 11,170 of
-        12,006 index tuples and returned 11 of the 12 for two of six query
-        vectors, where the exact scan the planner chooses on its own returns all
-        12 every time.
-
-        The plan the planner prefers with the sort available answers both cases
-        exactly, and answers them cheaply, because what makes an exact scan
-        expensive is having many rows to sort. So ask again. A full answer, which
-        is the ordinary case, never pays it.
-
-        **This is a net for starvation, not a completeness guarantee, and it is
-        not what makes a restricted search safe.** It fires on ``len(items) <
-        top_k``, which catches a restriction that starves the ``LIMIT`` below the
-        limit and misses one that starves it *at* the limit -- more matching rows
-        than ``top_k``, the wrong ones returned, nothing short to notice. That is
-        why ``item_ids``, ``source_ids`` and ``filter_metadata`` searches no longer
-        enter ``_preferring_this_kbs_partial_index`` in the first place; see its
-        docstring for the measurements. What reaches here is an unrestricted
-        search that came up short.
-
-        **The longer answer wins, rather than the second one.** Both plans read
-        the same rows under the same ``LIMIT``, so the re-run is normally at least
-        as complete -- but it is a different plan, and a second plan that comes
-        back shorter is not evidence of anything except that it came back
-        shorter. Replacing a longer first answer with it would turn this net into
-        a way to lose rows.
-
-        The custom plan is what makes the re-run a different plan. PostgreSQL
-        builds a statement's generic plan once and does not rebuild it when a
-        planner GUC changes, so the plan built while the sort was priced out is
-        the plan a second execution would get, and it would come up equally
-        short. Asking for a custom plan re-plans against the settings now in
-        force. With ``plan_cache_mode`` left at ``auto`` it happens not to be
-        needed -- the generic plan carries the disabled sort's cost, so PostgreSQL
-        keeps preferring a custom plan anyway -- which is exactly the kind of
-        thing not to depend on: removing it makes the live spec's generic-plan leg
-        fail.
-        """
-        logger.debug(
-            "Vector search on KB %s returned %d rows from the partial HNSW index, fewer "
-            "than top_k; re-running it exactly",
-            self.kb_id,
-            len(first_answer),
-        )
-        with self._forcing_a_custom_plan():
-            again = run_the_search()
-        return again if len(again) >= len(first_answer) else first_answer
 
     def _fetch_with_timeout(
         self, sql: str, params: dict[str, Any], timeout_ms: int, *, query: str
@@ -1151,7 +1104,8 @@ class BasePgVectorStore:
         # What cannot be a literal is the metadata filter below: it is caller
         # data, so it is bound as jsonb, and a generic plan has no selectivity
         # estimate for `@>` at all. That is why a filtered search asks for a
-        # custom plan instead -- see _forcing_a_custom_plan.
+        # bound as jsonb -- and a search carrying one is made exact instead of
+        # approximate, see _insisting_on_an_exact_search.
         kb_literal = kb_sql_literal(self.kb_id)
         query = f"""
             SELECT
@@ -1202,32 +1156,47 @@ class BasePgVectorStore:
                 for row in result
             ]
 
-        # Keyed on the arguments, not on the clauses built above: how a
-        # restriction is compiled may change, the reason a restricted search must
-        # keep the planner's own plan does not. ``is not None`` rather than
-        # truthiness for the two id sets, so it matches exactly the condition
-        # under which a clause was added -- an empty set still narrows the search
-        # to nothing, which is the most starved restriction there is.
+        # Which of the two blocks below this search gets, and it is deliberately
+        # symmetric: a search the caller restricted must be exact, and one it did
+        # not restrict should use the index if there is one.
+        #
+        # Keyed on the arguments, not on the clauses built above: how a restriction
+        # is compiled may change, the reason a restricted search must be exact does
+        # not. ``is not None`` rather than truthiness for the two id sets, so it
+        # matches exactly the condition under which a clause was added -- an empty
+        # set narrows the search to nothing, which is the most starved restriction
+        # there is.
+        #
+        # There is no safety net after the fact any more, and that is the point.
+        # The old one re-ran a short answer with the sort available, which cannot
+        # repair the case that matters: a restriction with more matching rows than
+        # ``top_k`` comes back with a *full* page of the wrong rows, so there is
+        # nothing short to trigger on -- and where the planner's own preferred plan
+        # is also the index, the re-run replays the same approximate scan and
+        # returns the same answer. Exactness is structural here instead.
         restricted = item_ids is not None or source_ids is not None or bool(filter_metadata)
 
         try:
             self._apply_iterative_scan()
-            with ExitStack() as scope:
-                if filter_metadata:
-                    scope.enter_context(self._forcing_a_custom_plan())
-                priced_out = False
-                if not restricted and self.TABLE == PER_KB_INDEX_ITEM_TABLE:
-                    # Inside the block, because restoring enable_sort must not
-                    # happen until the rows are off the cursor. The plan is fixed
-                    # when the statement executes, so this is belt and braces --
-                    # but the belt is free and the alternative depends on how the
-                    # driver buffers.
-                    priced_out = scope.enter_context(
-                        self._preferring_this_kbs_partial_index(effective_dims)
-                    )
+            # Both blocks wrap the execution rather than preceding it, because a
+            # setting must not be put back until the rows are off the cursor. The
+            # plan is fixed when the statement executes, so this is belt and
+            # braces -- but the belt is free and the alternative depends on how
+            # the driver buffers.
+            if restricted:
+                with self._insisting_on_an_exact_search():
+                    items = run_the_search()
+            elif self.TABLE == PER_KB_INDEX_ITEM_TABLE:
+                with self._preferring_this_kbs_partial_index(effective_dims):
+                    items = run_the_search()
+            else:
+                # An unrestricted search from one of the other item tables. The
+                # partial index's predicate names only the knowledge base and the
+                # dimension, so it spans every item table and this store's rows
+                # are a subset of it -- steering at it would walk rows that cannot
+                # join. Measured at 1536 dimensions on a 40-row document-level
+                # store: 2.2 -> 25.9 ms, recall 1.00 -> 0.33.
                 items = run_the_search()
-            if priced_out and len(items) < effective_top_k:
-                items = self._search_again_exactly(run_the_search, items)
             return self._resolve_results(items) if _resolve else items
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
