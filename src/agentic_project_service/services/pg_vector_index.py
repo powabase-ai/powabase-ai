@@ -409,7 +409,11 @@ def thresholds(overrides: dict[str, int] | None = None) -> tuple[int, int]:
     full index build and each drop throws it away. A stored pair that inverts
     the hysteresis (drop at or above build) would do exactly that, so the drop
     threshold is pulled down to half the build threshold and the override is
-    reported.
+    reported. Never below 1: the registry gives the drop setting a minimum of 1
+    because at 0 the drop test can only be satisfied by a knowledge base with no
+    embeddings at all -- an index held open for a handful of rows, and paid for
+    on every write -- and a substituted value is no more allowed to be 0 than a
+    stored one is.
 
     The crossover where a partial index starts beating an exact scan was
     bracketed, not bisected: at 2,000 rows the planner does not use a partial
@@ -428,7 +432,7 @@ def thresholds(overrides: dict[str, int] | None = None) -> tuple[int, int]:
     build_at = _clamped_setting("VECTOR_PER_KB_INDEX_MIN_ROWS", overrides)
     drop_below = _clamped_setting("VECTOR_PER_KB_INDEX_DROP_ROWS", overrides)
     if drop_below >= build_at:
-        corrected = max(0, build_at // 2)
+        corrected = max(1, build_at // 2)
         logger.warning(
             "VECTOR_PER_KB_INDEX_DROP_ROWS=%d is not below VECTOR_PER_KB_INDEX_MIN_ROWS=%d, "
             "which would build and drop the same index repeatedly; using %d instead",
@@ -1022,6 +1026,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                 status,
                 fields.get("dims", 0),
                 first_error_line(exc),
+                exc_info=True,
             )
 
     build_at, drop_below = thresholds()
@@ -1236,8 +1241,15 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
     reporting a drop that did not happen, and a *permanent* one raises
     ``PerKbVectorIndexDropFailed`` for the same reason turned up to ERROR: it is
     the case where the index really is orphaned, and no retry, dispatch or
-    start-up sweep will ever reach it again. Every dimension is attempted first,
-    so one index that cannot be dropped does not strand the others.
+    start-up sweep will ever reach it again. A dimension that cannot be dropped
+    for a permanent reason does not strand the others: the loop carries on and
+    the failures are reported together at the end.
+
+    A *lock conflict* is the one thing that does stop the loop, by raising
+    ``PerKbVectorIndexBuildInProgress`` where it happens. That is deliberate and
+    the opposite case: another caller is working on this index right now, so the
+    whole drop is worth retrying rather than partly completing, and the retry
+    reaches the dimensions this attempt did not.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)

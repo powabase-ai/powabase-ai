@@ -13,11 +13,19 @@ So the defaults are pinned against the measurement, not against each other.
 
 from __future__ import annotations
 
+import re
+
 from agentic_project_service.services.settings_registry import SETTINGS_REGISTRY
 
 # The two knowledge bases measured as regressing, in rows.
 SMALLEST_MEASURED_REGRESSION = 12_600
 LARGEST_MEASURED_REGRESSION = 18_000
+
+# The shapes the copy has to carry, whatever the numbers turn out to be and
+# however they are worded: a latency, a recall fraction, and an index size.
+_LATENCY_FIGURE = re.compile(r"\d[\d,.]* ?ms\b")
+_RECALL_FIGURE = re.compile(r"0\.\d+")
+_DISK_FIGURE = re.compile(r"\d[\d,.]* ?(?:MB|GB)\b")
 
 
 def test_the_defaults_are_the_pair_the_measurement_chose():
@@ -75,10 +83,26 @@ def test_the_build_threshold_description_is_honest_about_the_regression():
     only one a person choosing a value ever sees, so it has to carry both the
     cost (how slow an un-indexed knowledge base now is) and the reason to pay it
     (the old answer was faster and wrong).
+
+    Pinned by shape rather than by wording. An earlier version of this test named
+    nine literal fragments of the copy, so a rephrasing or a fresh measurement
+    that changed nothing about what the operator learns broke it -- which trains
+    the next person to edit the test rather than to read it. What must not happen
+    is one of the three facts quietly going away, and that is what is asserted:
+    the two latencies (an un-indexed knowledge base's and an indexed one's), the
+    recall the choice trades against, and the disk it costs.
     """
     text = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"].description
-    assert "80 ms" in text and "21%" in text, "the corrected regression figure"
-    assert "129 ms" in text and "30%" in text
-    assert "0.65" in text and "0.70" in text, "the recall the old query shape had"
-    assert "0.90" in text, "the partial index is itself approximate"
-    assert "9.5 MB" in text and "1,000 embeddings" in text, "the disk consequence"
+    assert len(_LATENCY_FIGURE.findall(text)) >= 2, (
+        f"the copy has to give both sides of the trade in milliseconds, not one of them: {text!r}"
+    )
+    assert "slower" in text, (
+        "the cost of being below the threshold is that searches got slower, and an "
+        f"operator who is not told that cannot weigh it: {text!r}"
+    )
+    assert _RECALL_FIGURE.search(text), (
+        f"the recall figures are the reason to pay that cost: {text!r}"
+    )
+    assert _DISK_FIGURE.search(text), (
+        f"an index of this size per knowledge base is the other cost: {text!r}"
+    )

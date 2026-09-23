@@ -214,6 +214,28 @@ def test_thresholds_restore_the_hysteresis_when_drop_is_not_below_build(monkeypa
     assert drop_below < build_at
 
 
+def test_the_substituted_drop_threshold_is_never_zero(monkeypatch):
+    """The correction is the one line that could re-admit the zero the registry forbids.
+
+    ``VECTOR_PER_KB_INDEX_DROP_ROWS`` has a minimum of 1 because at 0 only a
+    knowledge base with no embeddings at all can satisfy the drop test, so an
+    index is held open for a handful of rows and paid for on every write. A
+    *substituted* value has to obey the same floor. Out of reach through the
+    build setting's current minimum of 1,000, so the bound is relaxed here: the
+    guard has to hold for whatever the registry allows next, which is the only
+    way this line is ever reached.
+    """
+    build = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"]
+    monkeypatch.setattr(build, "min", 1)
+    _stub_settings(
+        monkeypatch,
+        {"VECTOR_PER_KB_INDEX_MIN_ROWS": 1, "VECTOR_PER_KB_INDEX_DROP_ROWS": 1},
+    )
+    _, drop_below = pvi.thresholds()
+    assert drop_below == 1, f"the hysteresis correction produced {drop_below}"
+    assert drop_below >= SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_DROP_ROWS"].min
+
+
 def test_build_memory_is_clamped_to_the_registry_bound(monkeypatch):
     monkeypatch.setattr(pvi, "get_setting", lambda key: 99999)
     assert pvi.maintenance_work_mem_mb() == 4096
@@ -1303,3 +1325,7 @@ def test_a_failing_progress_hook_cannot_fail_the_build(monkeypatch, caplog):
         outcome = _ensure(monkeypatch, conn, on_progress=_raiser(RuntimeError("log sink down")))
     assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
     assert "log sink down" in caplog.text
+    # Nothing else reports this failure, so the traceback is the only way to find
+    # out where in the recorder it happened -- as the lock release beside it does.
+    failed = [r for r in caplog.records if "progress hook failed" in r.getMessage()]
+    assert failed and all(r.exc_info for r in failed), caplog.text
