@@ -1,15 +1,15 @@
-"""The shape ``vector_search`` must emit for a prepared statement to keep the index.
+"""The shape ``vector_search`` must emit for the planner to keep the index.
 
 ``tests/unit/test_base_vector_store_hnsw_cast.py`` pins the distance expression.
-These specs pin the other half: which values reach the server as literals, and
-what the store does about the one value it cannot turn into a literal -- the
-metadata filter.
+These specs pin the rest of what the measurements in ``tests/pg_search`` found to
+be the difference between using the per-knowledge-base partial HNSW index and
+not: which values reach the server as literals, what the store does about the
+one value it cannot turn into a literal (the metadata filter), and the session
+settings it asks for around the search.
 
-Both properties are invisible to a single execution. They only matter once
-psycopg has prepared the statement and PostgreSQL has adopted its generic plan,
-which is a live-Postgres measurement (``tests/pg_search``). What a unit spec can
-do is pin the text and the session settings that measurement showed to be the
-difference, so a later edit that quietly reverts either one fails here first.
+None of it is visible in a single execution's answer. Which is why it is pinned
+here as text: a later edit that quietly reverts one of them fails here first,
+before the live suite has to catch it with a scan counter.
 """
 
 import asyncio
@@ -19,6 +19,10 @@ from agentic_project_service.services.base_vector_store import BasePgVectorStore
 
 _KB_ID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
 
+# Deliberately not "on": a restore that hardcodes the default would pass
+# against a fixture whose prior value *was* the default.
+ENABLE_SORT_WAS = "off"
+
 
 class _FakeStore(BasePgVectorStore):
     TABLE = "chunks"
@@ -26,14 +30,23 @@ class _FakeStore(BasePgVectorStore):
     SEARCH_TEXT_COL = "text"
 
 
-def _capture(**kwargs) -> list[tuple[str, dict]]:
-    """Every statement ``vector_search`` executes, with the parameters it binds."""
+def _capture(*, partial_index: bool = False, **kwargs) -> list[tuple[str, dict]]:
+    """Every statement ``vector_search`` executes, with the parameters it binds.
+
+    ``partial_index`` is the answer the store's catalog probe gets back: whether
+    this knowledge base has a valid partial HNSW index. It decides a branch, so
+    the fake has to be able to answer both ways. ``ENABLE_SORT_WAS`` is the value
+    the probe reports ``enable_sort`` currently has, so a spec can tell a restore
+    from a hardcoded ``on``.
+    """
     session = MagicMock()
     captured: list[tuple[str, dict]] = []
 
     def spy_execute(text_obj, params=None):
         sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
         captured.append((sql, dict(params or {})))
+        if "to_regclass" in sql:
+            return iter([(ENABLE_SORT_WAS, partial_index)])
         return iter([])
 
     session.execute = spy_execute
@@ -182,4 +195,124 @@ def test_a_filter_combined_with_other_predicates_still_asks_for_a_custom_plan():
         item_ids={"3f2504e0-4f89-11d3-9a0c-0305e82c3302"},
         source_ids=["3f2504e0-4f89-11d3-9a0c-0305e82c3303"],
     )
+    assert _settings(statements, "plan_cache_mode"), statements
+
+
+# ---------------------------------------------------------------------------
+# The sort, which the planner prefers to the index at production widths
+#
+# At 1536 dimensions a vector is stored out of line, and PostgreSQL prices
+# detoasting at nothing -- so an exact scan plus a sort costs less on paper than
+# the ordered index scan, and the partial index is never chosen. Measured through
+# the real store: 0 of 12 executions on the index at 50.5 ms, against 12 of 12 at
+# 5.2 ms once the sort is priced out. These specs pin the three things that
+# measurement depends on: that the penalty is applied, that it is applied only
+# when there is an index to fall on, and that it is taken back off.
+# ---------------------------------------------------------------------------
+
+
+def _enable_sort(statements: list[tuple[str, dict]]) -> list[int]:
+    """Indices of the statements that *change* ``enable_sort``.
+
+    Not every statement mentioning it: the probe reads the current value, and a
+    reader is not a writer.
+    """
+    return _settings(statements, "set_config('enable_sort'")
+
+
+def test_a_search_asks_whether_this_knowledge_base_has_a_valid_partial_index():
+    """The catalog probe, by name and in the store's own schema.
+
+    Ungated, the penalty drives a knowledge base with no index onto the shared
+    per-dimension index, which post-filters: measured 9.4 ms and recall 1.00
+    became 31.3 ms and recall 0.04 at 5% of the table. So the probe is the fix,
+    not an optimisation on it.
+    """
+    statements = _capture()
+    probes = [pair for pair in statements if "to_regclass" in pair[0]]
+    assert probes, f"nothing asked whether the partial index exists: {statements}"
+    sql, params = probes[0]
+    assert "indisvalid" in sql, (
+        "an index that is INVALID, or still being built, is in the catalog and "
+        f"cannot answer a query; the probe must exclude it:\n{sql}"
+    )
+    index = params["index"]
+    schema = _FakeStore(db_session=MagicMock(), knowledge_base_id=_KB_ID).schema
+    assert index.startswith(f'"{schema}".'), (
+        f"the probe must look in the schema the search reads: {index}"
+    )
+    assert index.endswith("_1536"), (
+        f"one index per dimension, so the probe has to name this search's: {index}"
+    )
+    assert "hnsw_kb_" in index and "3f2504e04f8911d39a0c0305e82c3301" in index, (
+        f"the probe must name this knowledge base's own index: {index}"
+    )
+
+
+def test_the_sort_is_priced_out_when_the_knowledge_base_has_an_index():
+    statements = _capture(partial_index=True)
+    forced = _enable_sort(statements)
+    assert forced, (
+        "with a valid partial index the exact sort must be priced out, or the "
+        f"planner keeps choosing it: {statements}"
+    )
+    sql = statements[forced[0]][0]
+    normalized = "".join(sql.split()).lower()
+    assert "set_config('enable_sort','off',true)" in normalized, sql
+
+
+def test_the_sort_is_left_alone_when_there_is_no_index_to_fall_on():
+    """A knowledge base below the build threshold, or one whose index is INVALID.
+
+    Both answer the probe the same way, and both must come out with the plan they
+    have today -- an exact scan, which at those sizes is also the exact answer.
+    """
+    statements = _capture(partial_index=False)
+    assert not _enable_sort(statements), (
+        f"nothing may touch enable_sort without an index to use: {statements}"
+    )
+
+
+def test_pricing_the_sort_out_is_transaction_scoped():
+    """The third argument to ``set_config`` is what keeps it out of the pool."""
+    statements = _capture(partial_index=True)
+    sql = statements[_enable_sort(statements)[0]][0]
+    assert "true" in "".join(sql.split()).lower(), (
+        f"a session-level setting would follow the connection into the pool:\n{sql}"
+    )
+
+
+def test_the_sort_is_priced_out_before_the_search_and_restored_after():
+    """``hybrid_search`` runs its keyword leg on this same transaction, and a
+    keyword ranking is a sort. So the penalty has to be off again by the time
+    ``vector_search`` returns."""
+    statements = _capture(partial_index=True)
+    touched = _enable_sort(statements)
+    search_at = next(i for i, (sql, _) in enumerate(statements) if "ORDER BY" in sql)
+    assert len(touched) == 2, f"expected one set and one restore: {statements}"
+    assert touched[0] < search_at < touched[1], (
+        f"enable_sort must be set before the search and put back after it: {statements}"
+    )
+
+
+def test_the_restore_puts_back_the_value_the_probe_read():
+    """Not a hardcoded ``on``: whatever the transaction had before."""
+    statements = _capture(partial_index=True)
+    restore_at = _enable_sort(statements)[1]
+    sql, params = statements[restore_at]
+    assert params.get("prior") == ENABLE_SORT_WAS, (
+        f"the restore must bind the value the probe read, not a guess: {sql} {params}"
+    )
+
+
+def test_a_two_key_filtered_search_prices_the_sort_out_as_well():
+    """The defect that made this fix necessary rather than deferrable.
+
+    ``jsonb @>`` has no statistics, so two keys estimate near zero rows and the
+    sort looks free even to a custom plan that knows the filter's value. Measured:
+    0 of 12 executions on the partial index, repaired to 12 of 12. Asking for a
+    custom plan is not enough on its own, so both settings have to be here.
+    """
+    statements = _capture(partial_index=True, filter_metadata={"tier": "gold", "kb": "a"})
+    assert _enable_sort(statements), statements
     assert _settings(statements, "plan_cache_mode"), statements
