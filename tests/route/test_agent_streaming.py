@@ -421,8 +421,7 @@ class TestReActClientDisconnect:
         with app.app_context():
             row = db.session.execute(
                 text(
-                    'SELECT status, error FROM "ai".agent_runs '
-                    "WHERE input_messages::text LIKE :q"
+                    'SELECT status, error FROM "ai".agent_runs WHERE input_messages::text LIKE :q'
                 ),
                 {"q": '%"disconnect-mid-run"%'},
             ).fetchone()

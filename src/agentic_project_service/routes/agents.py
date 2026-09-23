@@ -1977,6 +1977,10 @@ def run_agent_stream(agent_id: str):
         _stream_run_id_token = set_run_id(run_id)
         context_handler_id: str | None = None
         llm_gen = None
+        # The ReAct branch runs its loop on a worker thread and never assigns
+        # ``llm_gen``; this marks that the loop has started, so a disconnect
+        # after it is not labelled pre-stream.
+        react_started = False
         run_persisted = False
         content_chunks: list[str] = []
         query_enrichment: dict[str, Any] | None = None
@@ -2258,6 +2262,7 @@ def run_agent_stream(agent_id: str):
                 _captured_ctx = contextvars.copy_context()
                 worker = threading.Thread(target=lambda: _captured_ctx.run(run_agent), daemon=True)
                 worker.start()
+                react_started = True
 
                 # Drain events from the queue and yield them live.
                 # Buffer-aware drain (β): content_delta accumulates into
@@ -2891,7 +2896,11 @@ def run_agent_stream(agent_id: str):
                         db_session=db.session,
                         run_id=run_id,
                         status=AgentRunStatus.FAILED,
-                        error="Client disconnected before LLM streaming started",
+                        error=(
+                            "Client disconnected during the run"
+                            if react_started
+                            else "Client disconnected before LLM streaming started"
+                        ),
                         completed_at=datetime.now(UTC),
                     )
                     db.session.commit()
