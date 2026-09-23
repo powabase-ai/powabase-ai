@@ -586,6 +586,22 @@ class BasePgVectorStore:
         The gap grows with the knowledge base, because what replaces the index
         is an exact scan of it.
 
+        **That table was measured with the sort priced out, and a filtered search
+        no longer gets that** -- see ``_preferring_this_kbs_partial_index`` for
+        why. Re-measured in the shape that now ships, 12 filtered searches on one
+        pinned-generic connection at 1536 dimensions against a 12,000-row
+        knowledge base with its partial index valid, the custom plan reaches no
+        HNSW index and costs about a millisecond of replan: ``{"tier": "gold"}``
+        15.9 -> 17.6 ms, two keys 16.3 -> 17.0, a filter matching no row
+        3.4 -> 4.3, all with 0 of 12 executions on either index in both arms. It
+        is kept because the estimate it buys is real for the plans a filtered
+        search does get -- the choice between a bitmap index scan on ``meta`` and
+        a scan of the knowledge base is priced from that estimate, and this
+        fixture's ``meta`` is two values wide, which is the shape least able to
+        show the difference. But on this evidence it is a candidate for removal
+        rather than a proven win, and the next person to touch it should have the
+        numbers rather than only the table above.
+
         **Restored on the way out, which is why this is a block and not the bare
         setter it used to be** (``_force_custom_plan``, in case an older comment
         still names it). Transaction-local was never the whole of it: in the
