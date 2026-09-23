@@ -776,8 +776,13 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     deleted, a reindex to a different embedding model -- does not keep paying
     for one. An ``INVALID`` index is dropped and rebuilt.
 
-    ``on_progress(status)`` is called with ``"building"`` before each build and
-    ``"dropping"`` before each drop.
+    ``on_progress(status, **fields)`` is called with ``"building"`` before each
+    build and ``"dropping"`` before each drop, and is given the ``dims`` and the
+    ``rows`` that decided it. ``rows`` is a bounded count, so
+    ``rows_are_a_floor`` says whether it stopped at the bound rather than at the
+    knowledge base's real size -- reported as a plain number it would understate
+    a large knowledge base by as much as the disk figure once did. A hook that
+    raises is logged and does not fail the reconcile.
 
     Every dimension in play is attempted: one dimension being locked, declined
     or over the cap no longer abandons the rest, because a knowledge base that
@@ -800,9 +805,22 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
 
-    def progress(status: str) -> None:
-        if on_progress is not None:
-            on_progress(status)
+    def progress(status: str, **fields: Any) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(status, **fields)
+        except Exception as exc:
+            # This is a reporting hook. Losing one event is acceptable; losing
+            # the index because the recorder raised is not -- and the caller is
+            # mid-loop, holding this index's build lock.
+            logger.warning(
+                "The vector index progress hook failed for %s at %d dimensions (%s); the "
+                "reconcile carries on without the record",
+                status,
+                fields.get("dims", 0),
+                first_error_line(exc),
+            )
 
     build_at, drop_below = thresholds()
     mem_mb = maintenance_work_mem_mb()
@@ -871,9 +889,12 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                     valid = None
 
                 rows = bounded_row_count(conn, kb_id, dims, cap)
+                # The count stops at ``cap``, so at the bound it is a floor and
+                # not the knowledge base's size. Everything that reports it says so.
+                floored = rows >= cap
                 if valid is True:
                     if rows <= drop_below:
-                        progress("dropping")
+                        progress("dropping", dims=dims, rows=rows, rows_are_a_floor=floored)
                         logger.info(
                             "Dropping partial HNSW index %s.%s: knowledge base %s now has "
                             "%d rows at %d dimensions, at or below the drop threshold of %d",
@@ -921,9 +942,8 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                     )
                     cap_reached = total
                     continue
-                progress("building")
-                bounded = rows >= cap
-                floor = "at least " if bounded else ""
+                progress("building", dims=dims, rows=rows, rows_are_a_floor=floored)
+                floor = "at least " if floored else ""
                 logger.info(
                     "Building partial HNSW index %s.%s for knowledge base %s (%s%d rows at %d "
                     "dimensions, threshold %d); it needs %s%d MB of disk, and blocks no "
@@ -941,7 +961,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         f" Both figures are floors: the row count stops at {cap}, so a "
                         f"knowledge base ten times that size builds an index ten times this "
                         f"one."
-                        if bounded
+                        if floored
                         else ""
                     ),
                 )

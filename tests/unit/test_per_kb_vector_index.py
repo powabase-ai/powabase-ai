@@ -894,3 +894,61 @@ def test_the_catalog_lookups_match_the_index_name_and_not_a_like_wildcard():
     assert conn.params[1]["prefix"] == "hnsw\\_kb\\_%"
     for sql in conn.statements:
         assert "LIKE :prefix ESCAPE '\\'" in sql, sql
+
+
+# ---------------------------------------------------------------------------
+# What the progress hook reports
+# ---------------------------------------------------------------------------
+
+
+def _events(monkeypatch, conn, **kwargs):
+    """Every progress callback the ensure makes, as ``(status, fields)``."""
+    seen: list[tuple[str, dict]] = []
+    _ensure(
+        monkeypatch,
+        conn,
+        on_progress=lambda status, **fields: seen.append((status, fields)),
+        **kwargs,
+    )
+    return seen
+
+
+def test_the_progress_hook_carries_the_dimension_and_the_row_count_of_a_build(monkeypatch):
+    """The row count is the field the caller's log cannot source any other way.
+
+    A status on its own says a build happened; what an operator asks next is how
+    big the knowledge base was when it crossed the threshold. The dimension is
+    recoverable from the index name, the count is not.
+    """
+    conn = _ensure_conn(rows_by_dims={1536: 10_000})
+    assert _events(monkeypatch, conn, build_at=10_000) == [
+        ("building", {"dims": 1536, "rows": 10_000, "rows_are_a_floor": False})
+    ]
+
+
+def test_the_progress_hook_carries_them_for_a_drop_too(monkeypatch):
+    conn = _ensure_conn(existing=[_index_row(KB, 1536)], rows_by_dims={1536: 5_000})
+    assert _events(monkeypatch, conn, drop_below=5_000) == [
+        ("dropping", {"dims": 1536, "rows": 5_000, "rows_are_a_floor": False})
+    ]
+
+
+def test_the_progress_hook_says_when_the_row_count_is_only_a_floor(monkeypatch):
+    """The same bounded count that made the disk log understate by 20x.
+
+    Reported as a number with no qualifier it would put that understatement
+    straight back, in a structured field this time.
+    """
+    conn = _ensure_conn(rows_by_dims={1536: 10_001})
+    assert _events(monkeypatch, conn, build_at=10_000) == [
+        ("building", {"dims": 1536, "rows": 10_001, "rows_are_a_floor": True})
+    ]
+
+
+def test_a_failing_progress_hook_cannot_fail_the_build(monkeypatch, caplog):
+    """It is a logging hook. Losing an event is acceptable; losing the index is not."""
+    conn = _ensure_conn(rows_by_dims={1536: 20_000})
+    with caplog.at_level(logging.WARNING):
+        outcome = _ensure(monkeypatch, conn, on_progress=_raiser(RuntimeError("log sink down")))
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert "log sink down" in caplog.text
