@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/powabase-ai/powabase-ai/compare/v0.9.2...v0.10.0) (2026-09-23)
+
+
+### Features
+
+* persist prompt-cache writes on agent and orchestration runs ([#84](https://github.com/powabase-ai/powabase-ai/issues/84)) ([86cb206](https://github.com/powabase-ai/powabase-ai/commit/86cb206f589db1d2a0c3621055421399164020d5))
+
 ## [0.9.2](https://github.com/powabase-ai/powabase-ai/compare/v0.9.1...v0.9.2) (2026-09-23)
 
 
