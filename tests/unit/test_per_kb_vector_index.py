@@ -790,3 +790,72 @@ def test_the_index_cap_does_not_abandon_another_dimensions_drop(monkeypatch):
     outcome = _ensure(monkeypatch, conn)
     assert outcome["dropped"] == [pvi.per_kb_index_name(KB, 1536)], outcome
     assert outcome["status"] == "skipped" and outcome["reason"] == "index_cap_reached", outcome
+
+
+# ---------------------------------------------------------------------------
+# Dropping a deleted knowledge base's indexes
+# ---------------------------------------------------------------------------
+
+
+class _LostConnection(Exception):
+    """What SQLAlchemy raises for a connection that went away, as this module reads it."""
+
+    connection_invalidated = True
+
+
+def _drop_conn(dims=(1536,), **kwargs):
+    return _FakeConn(
+        answers=[
+            (_CATALOG_QUERY, [_index_row(KB, d) for d in dims]),
+            (_LOCK_QUERY, [(True,)]),
+        ],
+        **kwargs,
+    )
+
+
+def test_a_drop_reports_every_index_it_dropped():
+    conn = _drop_conn(dims=(768, 1536))
+    outcome = pvi.drop_per_kb_vector_indexes(KB, engine=_FakeEngine(conn))
+    assert outcome == {
+        "status": "dropped",
+        "indexes": [pvi.per_kb_index_name(KB, 768), pvi.per_kb_index_name(KB, 1536)],
+    }
+
+
+def test_a_permanent_drop_failure_is_not_reported_as_a_success(caplog):
+    """The knowledge base row is already gone, so nothing ever comes back to this.
+
+    A non-transient failure used to return ``status: "partial"`` -- the task
+    marked SUCCESS, one WARNING, and an index left behind that is named after a
+    knowledge base that no longer exists and is maintained on every write. The
+    give-up log the drop task advertises fires on retry exhaustion only, which a
+    permanent failure never reaches.
+    """
+    name = pvi.per_kb_index_name(KB, 1536)
+    conn = _drop_conn(fail_on="DROP INDEX")
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(pvi.PerKbVectorIndexDropFailed) as raised:
+            pvi.drop_per_kb_vector_indexes(KB, engine=_FakeEngine(conn))
+    assert raised.value.failed_indexes == [name]
+    assert name in str(raised.value)
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
+    assert name in caplog.text
+
+
+def test_a_drop_that_fails_at_one_dimension_still_drops_the_others():
+    failing = pvi.per_kb_index_name(KB, 768)
+    surviving = pvi.per_kb_index_name(KB, 1536)
+    conn = _drop_conn(dims=(768, 1536), fail_on=failing)
+    with pytest.raises(pvi.PerKbVectorIndexDropFailed) as raised:
+        pvi.drop_per_kb_vector_indexes(KB, engine=_FakeEngine(conn))
+    assert raised.value.failed_indexes == [failing]
+    assert raised.value.dropped_indexes == [surviving]
+
+
+def test_a_transient_drop_failure_is_re_raised_untouched_for_the_retry(caplog):
+    """A retry can get past this one, so it must not be turned into a permanent failure."""
+    conn = _drop_conn(fail_on="DROP INDEX", exc=_LostConnection("server closed the connection"))
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(_LostConnection):
+            pvi.drop_per_kb_vector_indexes(KB, engine=_FakeEngine(conn))
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text

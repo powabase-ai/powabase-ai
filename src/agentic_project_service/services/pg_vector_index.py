@@ -154,6 +154,21 @@ class PerKbVectorIndexBuildInProgress(RuntimeError):
     """Another caller holds the build lock for this index."""
 
 
+class PerKbVectorIndexDropFailed(RuntimeError):
+    """An index could not be dropped for a reason a retry cannot get past.
+
+    Raised rather than reported because the only caller is the deleted knowledge
+    base's drop, where nothing comes back: the row these indexes are named after
+    is gone, so neither the indexing dispatch nor the start-up sweep will ever
+    look at them again.
+    """
+
+    def __init__(self, message: str, dropped_indexes=(), failed_indexes=()):
+        super().__init__(message)
+        self.dropped_indexes = list(dropped_indexes)
+        self.failed_indexes = list(failed_indexes)
+
+
 # ---------------------------------------------------------------------------
 # Naming and DDL
 # ---------------------------------------------------------------------------
@@ -925,7 +940,11 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
     since.
 
     A transient database error is re-raised so the task retries rather than
-    reporting a drop that did not happen.
+    reporting a drop that did not happen, and a *permanent* one raises
+    ``PerKbVectorIndexDropFailed`` for the same reason turned up to ERROR: it is
+    the case where the index really is orphaned, and no retry, dispatch or
+    start-up sweep will ever reach it again. Every dimension is attempted first,
+    so one index that cannot be dropped does not strand the others.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
@@ -954,7 +973,24 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
                 _release_lock(conn, lock)
 
     if failed:
-        return {"status": "partial", "indexes": dropped, "failed_indexes": failed}
+        names = ", ".join(f"{AI_SCHEMA}.{name}" for name in failed)
+        logger.error(
+            "Could not drop %d of deleted knowledge base %s's partial HNSW index(es), for a "
+            "reason a retry cannot get past: %s. They are orphaned -- named after a knowledge "
+            "base that no longer exists, answering no query, and maintained by Postgres on "
+            "every write to %s.embeddings -- and have to be dropped by hand. Dropped "
+            "successfully: %s",
+            len(failed),
+            kb_id,
+            names,
+            AI_SCHEMA,
+            ", ".join(dropped) or "(none)",
+        )
+        raise PerKbVectorIndexDropFailed(
+            f"could not drop {names} of deleted knowledge base {kb_id}",
+            dropped_indexes=dropped,
+            failed_indexes=failed,
+        )
     return {"status": "dropped", "indexes": dropped}
 
 
