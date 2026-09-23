@@ -35,18 +35,48 @@ be asserting a preference the planner does not have. Measured on this fixture,
 the partial index is chosen at 30% and 21% selectivity and declined at 5% and
 1% (where an exact scan really is cheaper, and exact).
 
-Why 384 dimensions
-------------------
+Why 384 dimensions, and what that leaves unpinned
+-------------------------------------------------
 ``dims`` is 384 -- a real embedding width, and the one that keeps the fixture at
-~15 s. It is *not* the width this platform's default model uses, and the
-difference turned out to matter more than a fixture usually does: a vector wide
-enough to be stored out of line (1536 and up) leaves a small heap and a
-one-tuple-per-page HNSW index, and on the same 20-knowledge-base fixture at
-1536 dimensions the planner declined the partial index at every selectivity
-tried up to 70% -- it preferred an exact scan. That is a finding about the
-feature, not about this suite, and it is reported separately; what this module
-pins is the behaviour at a width where the partial index is reachable. A spec
-here that passes says nothing about 1536-dimension embeddings.
+~15 s. It is *not* the width most embedding models here produce, and the
+difference matters more than a fixture's usually does.
+
+At 384 the vector is stored in line, the exact scan and the ordered index scan
+cost about the same, and the planner takes the index on its own. That is what
+makes this width the right one for most of the module: the specs below about
+*matchability* -- that the embeddings-side predicate is what lets the index be
+used at all, that a prepared statement's generic plan can prove the index's
+predicate only when all of the KB id, ``dims`` and the LIMIT are literals -- can
+only be asserted where the planner has a preference to express.
+
+At 1536 and up the vector is stored out of line, which leaves a small heap and a
+one-tuple-per-page HNSW index, and PostgreSQL prices detoasting at nothing. The
+two plans then cost within a small factor of each other, and which one wins is
+settled by a join row estimate that is wrong by orders of magnitude -- so it
+flips with the size of the table rather than tracking anything real. Measured
+across all-1536 fixtures of one shape: the index was declined at 6,000 and
+12,000 rows, chosen at 20,000, and declined again at 40,000. On the 40,000-row
+one it stayed declined as the knowledge base's share was raised from 21% to 70%.
+
+So at production widths the feature cannot be left to the planner, and
+``BasePgVectorStore._preferring_this_kbs_partial_index`` prices the exact sort
+out of the search when the knowledge base has a valid partial index to fall on.
+Its docstring carries the 1536 measurements. **This module cannot reproduce them
+cheaply.** A 1536-dimension knowledge base added to this fixture does not
+reproduce them at all, and that is worth knowing: the 384 rows inflate the
+embeddings heap, which is one of the two things that make the exact scan look
+cheap, so the planner chooses the index there and the spec would assert a
+preference the defect does not have. A faithful reproduction needs an
+``embeddings`` table that is *mostly* 1536, and pinning it needs a second
+module-scoped fixture and a row count on the lucky side of a coin flip. What is
+pinned instead, deterministically, is that the store asks for the setting:
+``tests/unit/test_vector_search_plan_shape.py``.
+
+What this module does show about the fix is the part that is stable at any
+width: that the setting is asked for only when there is an index to use, that
+the answer for a knowledge base without one does not change, and that a filtered
+search reaches the index -- which at 384 it does not do without the fix, because
+a jsonb estimate is wrong the same way at every dimension.
 
 Every test works in a scratch schema of its own, shaped like ``ai.chunks`` and
 ``ai.embeddings``, and the module fixture costs about 15 s, once.
@@ -1332,10 +1362,27 @@ def test_the_real_code_path_keeps_the_index_under_a_forced_generic_plan(
 # ``filter_metadata`` is a documented, shipped parameter on the knowledge-base
 # search route, passed through unchanged by the search service and by the
 # runtime and attached-knowledge-base configuration paths. It adds a fourth
-# bound value to the statement -- ``c.meta @> $n`` -- and a generic plan cannot
-# estimate a containment operator against an unknown value, so it prices the
-# ordered index scan out and falls back to a bitmap scan and an exact sort.
-# Nothing else in this suite passes a filter.
+# bound value to the statement -- ``c.meta @> $n`` -- and it is the one value the
+# planner cannot be given as a literal, because it is caller data.
+#
+# Two different estimates go wrong, so two settings are needed. A *generic* plan
+# has no value to estimate at all and falls back to a fixed guess, which is what
+# ``_force_custom_plan`` is for. A *custom* plan does better, but not well: it
+# estimates ``meta @> const`` by testing the constant against the column's MCV
+# list, so the more keys the filter carries the fewer MCV entries it matches, and
+# it then multiplies that by ``c.knowledge_base_id = ...`` as if the two were
+# independent -- which they are not, when one of the filter's own keys is the
+# knowledge base. Measured on this fixture, ``top_k`` 20:
+#
+#   filter                          estimate   rows that really match
+#   {"tier": "gold"}                     722                    2,400
+#   {"kb": KB_BIG}                     1,076                   12,000
+#   {"tier": "gold", "kb": KB_BIG}       217                    2,400
+#
+# The first two keep the ordered index scan; the third, 11 times low, makes a
+# sort of 217 rows cost 3,837 against the index scan's 5,060 and loses it. Which
+# is why the other setting, ``_preferring_this_kbs_partial_index``, is about the
+# sort rather than about the filter. Nothing else in this suite passes a filter.
 # ---------------------------------------------------------------------------
 
 # 20% of the rows in any knowledge base, and 100% of them: the same shape with
@@ -1343,25 +1390,27 @@ def test_the_real_code_path_keeps_the_index_under_a_forced_generic_plan(
 # between the two cannot be read as "the filter was too selective".
 FILTER_ONE_IN_FIVE = {"tier": "gold"}
 FILTER_EVERYTHING = {"kb": KB_BIG}
-# Two keys, which is two bound `@>` operators and two interpolated key names --
-# the shape the metadata-filter hardening changes. Whichever of the two changes
-# lands second, the merged vector_search is a shape neither suite had executed:
-# this one never passed a filter, and the other has no partial index.
+# Two keys, in one bound `@>` over the whole object since the metadata-filter
+# hardening landed. Collapsing two operators into one did not bring the index
+# back, and that is the point: the estimate is not made per operator, it is made
+# by matching the whole constant against `meta`'s MCV list, so one `@>` over two
+# keys estimates as low as two `@>` did.
 FILTER_TWO_KEYS = {"tier": "gold", "kb": KB_BIG}
 
 
 def test_a_filtered_search_reaches_the_partial_index_under_a_custom_plan(
     engine, schema, settings, query_vectors
 ):
-    """The control the next two specs need: the filter alone loses nothing.
+    """The control the next two specs need: one filter key loses nothing.
 
-    A custom plan knows the filter's value, estimates it, and still chooses the
-    partial index. So what the generic-plan spec below finds for these two
-    filters is about plan caching, not about filtering. Measured: 12 of 12 on
-    the partial index at 1.4-1.9 ms with either.
+    A custom plan knows a single key's value, estimates it, and still chooses the
+    partial index -- so what the generic-plan spec below finds for these two
+    filters is about plan caching, not about filtering. Measured: 12 of 12 on the
+    partial index at 1.4-1.9 ms with either.
 
-    One key, both of them, deliberately: with two the custom plan loses the
-    index as well, which is a different defect and has its own spec.
+    Both single-key filters, deliberately, and at both ends of the selectivity
+    range: 20% of the rows and 100% of them. Two keys is the case a custom plan
+    does *not* get right on its own, and it has its own spec below.
     """
     name = _build_big_index(engine, settings)
     for filter_metadata in (FILTER_ONE_IN_FIVE, FILTER_EVERYTHING):
@@ -1382,20 +1431,24 @@ def test_a_filtered_search_reaches_the_partial_index_under_a_custom_plan(
 def test_a_two_key_filter_reaches_the_partial_index_under_a_custom_plan(
     engine, schema, settings, query_vectors
 ):
-    """Two metadata keys lose the index even when the planner knows their values.
+    """Two metadata keys, which a custom plan alone does not save.
 
-    ``jsonb @>`` has no statistics, so each key contributes a fixed guess and the
-    planner multiplies them: two keys put the estimate near zero, an ordered
-    index scan then looks like it would have to walk the whole index to fill a
-    LIMIT of 20, and it is priced out. Measured on this fixture: 0 of 12
-    executions on the partial index under ``force_custom_plan``, where a
-    single-key filter gets 12 of 12.
+    Each key the filter carries cuts the entries of ``meta``'s MCV list the bound
+    constant is contained in, and the planner then multiplies that by the
+    knowledge-base predicate as if the two were independent. With ``kb`` among
+    the keys they are not, so the estimate falls to 217 rows where 2,400 really
+    match -- and a sort of 217 rows looks cheaper than the ordered index scan, so
+    the index is priced out *even though the planner knows the filter's value*.
+    Measured before the fix: 0 of 12 executions on the partial index under
+    ``force_custom_plan``, where either single-key filter gets 12 of 12.
 
-    That matters for the shape of the fix. Forcing a custom plan for filtered
-    searches repairs the single-key case -- verified by simulating it here -- and
-    does not repair this one, because this one is not about plan caching at all.
-    Two keys is an ordinary request: the search route takes a whole
-    ``filter_metadata`` object.
+    So this is the spec that decided the shape of the fix. Asking for a custom
+    plan cannot repair it, because it is not about plan caching; what repairs it
+    is pricing the exact sort out, which is also what the 1536-dimension case
+    needs. One mechanism, two defects. Measured after: 12 of 12.
+
+    Two keys is an ordinary request -- the search route takes a whole
+    ``filter_metadata`` object -- which is why this could not be deferred.
     """
     name = _build_big_index(engine, settings)
     scans, prepared = _drive_searches(
@@ -1544,10 +1597,21 @@ def test_a_partial_index_is_not_used_at_all_for_a_small_share_knowledge_base(
 ):
     """Why the build threshold exists, asserted rather than assumed.
 
-    An index the planner will not choose still costs every insert into
-    ``ai.embeddings`` and still takes one of the ``MAX_PER_KB_INDEXES`` slots.
-    At 5 % of the table, building one changes no plan -- so a threshold low
-    enough to reach this knowledge base would be pure cost.
+    At 5 % of the table an exact scan of 2,000 rows is cheaper than an
+    approximate one, and the planner says so: it declines this index when it is
+    left to decide.
+
+    It is no longer left to decide, so read this spec for what it says and not for
+    what it used to imply. "An index the planner will not choose costs every
+    insert and buys no plan" was the argument for the threshold, and
+    ``_preferring_this_kbs_partial_index`` retired it -- an index the service has
+    built is now used whether the planner prefers it or not. The argument that
+    replaces it is about the *answer*: a knowledge base with no index is searched
+    exactly, and one with an index is searched approximately. Measured at 1536
+    dimensions on a 2,000-row knowledge base, 8.9 ms and recall 1.00 became
+    1.3 ms and recall 0.68. So the threshold is what keeps small knowledge bases
+    exact, and section 11 pins the half of that this spec does not: that the
+    store does not steer at an index that is not there.
     """
     assert MID_ROWS < settings["VECTOR_PER_KB_INDEX_MIN_ROWS"]
     with engine.connect() as conn:
@@ -1721,3 +1785,230 @@ def test_hybrid_search_has_a_vector_leg_that_reaches_the_partial_index(
         f"vector leg reaching it (before {before}, after {after})"
     )
     assert all(item.knowledge_base_id == KB_BIG for item in items), items
+
+
+# ---------------------------------------------------------------------------
+# 11. The setting that makes the planner take the index, and its gate
+#
+# ``_preferring_this_kbs_partial_index`` prices the exact sort out of the search.
+# That is a penalty on every sort in the statement, not an instruction naming an
+# index, so left ungated it would drive a knowledge base with no index of its own
+# onto the shared per-dimension index -- which spans every knowledge base and
+# post-filters. Measured at 1536 dimensions with no partial index built, median
+# of six query vectors:
+#
+#   share   rows    the planner's own choice     the same, ungated
+#    21 %   8,400   exact scan, 34.4 ms, r=1.00  shared index, 6.3 ms, r=0.04
+#     5 %   2,000   exact scan,  9.4 ms, r=1.00  shared index, 31.3 ms, r=0.04
+#     1 %     400   exact scan,  1.8 ms, r=1.00  shared index, 39.8 ms, r=0.36
+#
+# Slower and wrong, so the gate is the fix rather than a refinement on it. These
+# specs pin it from the outside: same answers, same index counters, for a
+# knowledge base the build threshold left alone and for one whose index is on
+# disk but INVALID.
+#
+# They run at 5 % (KB_MID) because that is where this fixture's planner answers
+# exactly without an index, so "the answer did not change" is a claim with
+# something in it. At 21 % and above the shared index is already what an
+# unindexed search gets, and there is no exact answer to preserve.
+# ---------------------------------------------------------------------------
+
+
+def _exact_answers(engine, kb_id, vectors, **kwargs) -> list[list[str]]:
+    """The exact top-20 for each query vector: the same SQL with no index at all."""
+    sql, params = _capture_search_sql(engine, kb_id, vectors[0], **kwargs)
+    answers = []
+    with Session(engine) as session:
+        for vector in vectors:
+            session.execute(text("SET LOCAL enable_indexscan = off"))
+            rows = session.execute(text(sql), {**params, "embedding": _literal(vector)}).all()
+            session.rollback()
+            answers.append([str(row[0]) for row in rows])
+    return answers
+
+
+def _drive_and_collect(engine, kb_id, vectors, *counted, **kwargs):
+    """``vector_search`` for real, once per vector, on one connection.
+
+    Returns ``(scans, answers)``: the scans each of ``counted`` served over the
+    run, and what each search returned. Same connection discipline as
+    ``_drive_searches`` -- an engine of its own, closed before the counters are
+    read.
+    """
+    before = _idx_scans(engine, *counted)
+    probe = create_engine(_dsn())
+    connection = probe.connect()
+    answers = []
+    try:
+        with Session(bind=connection) as session:
+            store = _ChunkStore(db_session=session, knowledge_base_id=kb_id, schema=SCHEMA)
+            for vector in vectors:
+                items = asyncio.run(store.vector_search(embedding=list(vector), top_k=20, **kwargs))
+                answers.append([item.item_id for item in items])
+            session.commit()
+    finally:
+        connection.close()
+        probe.dispose()
+    after = _idx_scans(engine, *counted)
+    return {name: after[name] - before[name] for name in counted}, answers
+
+
+def test_a_knowledge_base_with_no_index_of_its_own_keeps_the_answer_it_has_today(
+    engine, schema, settings, query_vectors
+):
+    """The gate, from the outside: no index, so nothing changes.
+
+    KB_MID is 5 % of the table and below the build threshold, so the service
+    never gives it an index and its search is an exact scan. Ungated, the sort
+    penalty would move it onto the shared index and throw most of the answer
+    away.
+    """
+    exact = _exact_answers(engine, KB_MID, query_vectors)
+    shared = f"idx_ai_embeddings_hnsw_{DIMS}"
+    scans, answers = _drive_and_collect(engine, KB_MID, query_vectors, shared)
+    assert scans[shared] == 0, (
+        f"a knowledge base with no partial index must not be pushed onto the shared "
+        f"one, which post-filters away most of what it returns: {scans}"
+    )
+    assert answers == exact, (
+        "the answer for an unindexed knowledge base must be the exact one, "
+        f"unchanged by this fix:\n{answers}\n{exact}"
+    )
+
+
+def test_an_index_that_is_invalid_is_not_steered_at_either(engine, schema, settings, query_vectors):
+    """An INVALID index is in the catalog and cannot answer a query.
+
+    A build that was interrupted or ran out of disk leaves one behind, and
+    ``ensure_per_kb_vector_index`` repairs it on its next pass -- until then the
+    search has to behave as though there were no index, which is what the
+    probe's ``indisvalid`` is for. Without it the sort would be priced out for a
+    knowledge base with nothing to fall on, and the shared index would take the
+    search.
+    """
+    name = _build_index_ignoring_thresholds(engine, KB_MID)
+    _invalidate(engine, name)
+    with engine.connect() as conn:
+        assert pvi.existing_per_kb_indexes(conn, KB_MID) == {DIMS: False}, "not invalidated"
+
+    exact = _exact_answers(engine, KB_MID, query_vectors)
+    shared = f"idx_ai_embeddings_hnsw_{DIMS}"
+    scans, answers = _drive_and_collect(engine, KB_MID, query_vectors, name, shared)
+    assert scans[name] == 0, f"an INVALID index cannot serve a scan: {scans}"
+    assert scans[shared] == 0, (
+        f"an INVALID index is not an index to fall on, so the sort must not be "
+        f"priced out and the shared index must not take the search: {scans}"
+    )
+    assert answers == exact, (answers, exact)
+
+
+@pytest.mark.parametrize("was", ["on", "off"])
+def test_a_vector_search_leaves_enable_sort_as_it_found_it(
+    engine, schema, settings, query_vectors, was
+):
+    """The restore, which is not optional.
+
+    ``hybrid_search`` runs its keyword leg on this same session immediately after
+    the vector leg, and a keyword ranking is a sort. A penalty left on would
+    follow the vector search into it -- and, with a session-level setting, into
+    every other statement on that pooled connection.
+
+    Both starting values, because a restore that put back a hardcoded ``on``
+    would pass against the default and quietly clear a setting the caller had
+    made.
+    """
+    _build_big_index(engine, settings)
+    probe = create_engine(_dsn())
+    connection = probe.connect()
+    try:
+        with Session(bind=connection) as session:
+            session.execute(text(f"SET LOCAL enable_sort = {was}"))
+            store = _ChunkStore(db_session=session, knowledge_base_id=KB_BIG, schema=SCHEMA)
+            items = asyncio.run(store.vector_search(embedding=list(query_vectors[0]), top_k=20))
+            assert items, "the search under test returned nothing"
+            after = session.execute(text("SELECT current_setting('enable_sort')")).scalar()
+            session.commit()
+    finally:
+        connection.close()
+        probe.dispose()
+    assert after == was, (
+        f"vector_search left enable_sort at {after!r} in a transaction that had it "
+        f"at {was!r}; the next statement in the caller's transaction pays for that"
+    )
+
+
+def test_a_filter_matching_no_row_still_answers_nothing(engine, schema, settings, query_vectors):
+    """What the forced index scan costs, and that it does not cost correctness.
+
+    With the sort priced out, an extra predicate that matches nothing turns the
+    search into a walk of the index looking for rows that are not there. Measured
+    at 1536 dimensions on the indexed 30 % knowledge base: a filter matching no
+    row went from 3.0 ms to 38.3 ms, and a ``source_ids`` matching no row from
+    2.4 ms to 36.7 ms. The answer is the same in both -- none -- and the cost is
+    bounded rather than proportional, because pgvector stops an iterative scan at
+    ``hnsw.max_scan_tuples`` (20,000 by default).
+
+    That is the trade this fix makes in the direction nobody wants, so it is
+    pinned as behaviour: an empty answer, not a wrong one and not an error.
+    """
+    name = _build_big_index(engine, settings)
+    shared = f"idx_ai_embeddings_hnsw_{DIMS}"
+    for kwargs in (
+        {"filter_metadata": {"tier": "platinum"}},
+        {"filter_metadata": {"tier": "gold", "kb": "no such knowledge base"}},
+        {"source_ids": ["9f8b1c2e-0000-4000-8000-0000000000bb"]},
+        {"item_ids": {"9f8b1c2e-0000-4000-8000-0000000000cc"}},
+    ):
+        _, answers = _drive_and_collect(engine, KB_BIG, query_vectors[:2], name, shared, **kwargs)
+        assert answers == [[], []], f"{kwargs} matches no row, so the answer is none: {answers}"
+
+
+def test_a_forced_index_scan_still_returns_every_row_that_matches(
+    engine, schema, settings, query_vectors
+):
+    """Fewer rows match than ``top_k``, and all of them come back.
+
+    This is the property that made pricing the sort out acceptable at all. An
+    ordered HNSW scan under a ``LIMIT`` produces candidates and the join and the
+    extra predicates throw some away, so a search whose predicates are selective
+    can be starved: pgvector emits about ``ef_search`` candidates and stops, and
+    what survives the filter is whatever happened to be among them.
+    ``_apply_iterative_scan`` is what stops that -- it makes pgvector keep going
+    until the ``LIMIT`` is filled -- and before this fix an unfiltered search at
+    1536 dimensions was not on an index scan at all, so nothing here depended on
+    it.
+
+    Now it does. Twelve rows of a 12,000-row knowledge base, asked for as a
+    ``top_k`` of 20, on a forced ordered index scan: all twelve, best first.
+    """
+    name = _build_big_index(engine, settings)
+    with engine.connect() as conn:
+        wanted = [
+            str(row[0])
+            for row in conn.execute(
+                text(
+                    f"SELECT id FROM {SCHEMA}.chunks WHERE knowledge_base_id = :kb "
+                    "ORDER BY id LIMIT 12"
+                ),
+                {"kb": KB_BIG},
+            ).all()
+        ]
+        conn.rollback()
+    assert len(wanted) == 12, wanted
+
+    # Twice through the vectors, so the short ones come round again after psycopg
+    # has prepared the statement. A cached generic plan built while the sort was
+    # priced out is re-used whatever enable_sort says afterwards, so without a
+    # custom plan the re-run returns the same short answer -- and a spec that only
+    # ever ran unprepared executions would not notice.
+    driven = list(query_vectors) * 2
+    shared = f"idx_ai_embeddings_hnsw_{DIMS}"
+    scans, answers = _drive_and_collect(engine, KB_BIG, driven, name, shared, item_ids=set(wanted))
+    assert scans[name] == len(driven), (
+        f"this spec is only worth anything on the forced index scan: {scans}"
+    )
+    for got in answers:
+        assert sorted(got) == sorted(wanted), (
+            f"an ordered index scan under a LIMIT of 20 dropped rows that matched: "
+            f"{len(got)} of {len(wanted)}"
+        )

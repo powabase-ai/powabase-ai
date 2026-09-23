@@ -695,6 +695,47 @@ class BasePgVectorStore:
                     e,
                 )
 
+    def _search_again_exactly(self, run_the_search, rows_found: int) -> list[RetrievedItem]:
+        """Re-run a short answer with the sort available again.
+
+        This is what makes ``_preferring_this_kbs_partial_index`` safe to apply to
+        a search that has an ``item_ids``, ``source_ids`` or ``filter_metadata``
+        restriction, and it is here because the alternative measured wrong.
+
+        An ordered HNSW scan feeds rows to the join and those restrictions throw
+        some away, so a selective one can starve the ``LIMIT``: pgvector's
+        iterative scan keeps going, but under ``strict_order`` it does not reach
+        every tuple in the index. Measured at 384 dimensions, a ``top_k`` of 20
+        restricted to 12 named items of a 12,000-row knowledge base: the forced
+        index scan reached 11,170 of 12,006 index tuples and returned 11 of the
+        12 for two of six query vectors, where the exact scan the planner chooses
+        on its own returns all 12 every time. A row the caller named and did not
+        get is not a recall trade, it is a wrong answer.
+
+        A short answer is the signal, and a reliable one: fewer rows than ``top_k``
+        means either that few really match, or that the scan starved. The plan the
+        planner prefers with the sort available answers both exactly, and answers
+        both cheaply, because what makes an exact scan expensive is having many
+        rows to sort. So ask again. Measured: a filter matching no row went from
+        38.3 ms forced to 41 ms forced-then-exact, against 3.0 ms before this fix.
+        A full answer, which is the ordinary case, never pays it.
+
+        The custom plan is not optional. PostgreSQL does not invalidate a cached
+        plan when a planner GUC changes, so once psycopg has prepared this
+        statement the generic plan built while the sort was priced out is re-used
+        here and the second execution returns the same short answer. Asking for a
+        custom plan re-plans against the settings now in force -- verified by
+        removing it and watching the live spec fail from the sixth execution on.
+        """
+        logger.debug(
+            "Vector search on KB %s returned %d rows from the partial HNSW index, fewer "
+            "than top_k; re-running it exactly",
+            self.kb_id,
+            rows_found,
+        )
+        self._force_custom_plan()
+        return run_the_search()
+
     def _fetch_with_timeout(
         self, sql: str, params: dict[str, Any], timeout_ms: int, *, query: str
     ) -> list:
@@ -871,6 +912,20 @@ class BasePgVectorStore:
             LIMIT {effective_top_k}
         """
 
+        def run_the_search() -> list[RetrievedItem]:
+            result = self.session.execute(text(query), params)
+            return [
+                RetrievedItem(
+                    item_id=str(row[0]),
+                    text=row[1],
+                    score=float(row[2]) if row[2] is not None else 0.0,
+                    source_id=str(row[3]) if row[3] else None,
+                    knowledge_base_id=self.kb_id,
+                    meta=row[4] or {},
+                )
+                for row in result
+            ]
+
         try:
             self._apply_iterative_scan()
             if filter_metadata:
@@ -882,20 +937,10 @@ class BasePgVectorStore:
             # until the rows are off the cursor. The plan is fixed when the
             # statement executes, so this is belt and braces -- but the belt is
             # free and the alternative depends on how the driver buffers.
-            with self._preferring_this_kbs_partial_index(effective_dims):
-                result = self.session.execute(text(query), params)
-                items = []
-                for row in result:
-                    items.append(
-                        RetrievedItem(
-                            item_id=str(row[0]),
-                            text=row[1],
-                            score=float(row[2]) if row[2] is not None else 0.0,
-                            source_id=str(row[3]) if row[3] else None,
-                            knowledge_base_id=self.kb_id,
-                            meta=row[4] or {},
-                        )
-                    )
+            with self._preferring_this_kbs_partial_index(effective_dims) as priced_out:
+                items = run_the_search()
+            if priced_out and len(items) < effective_top_k:
+                items = self._search_again_exactly(run_the_search, len(items))
             return self._resolve_results(items) if _resolve else items
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
