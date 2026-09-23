@@ -10,20 +10,53 @@ keeps the index after psycopg has prepared the statement.
 
 It lives beside the pg_search suite because that suite's image is the one with
 both extensions and the conftest that scopes timeouts and leaves the ``ai``
-schema alone; nothing here needs ``pg_search`` itself. Every test works in a
-scratch schema of its own, shaped like ``ai.chunks`` and ``ai.embeddings``.
+schema alone; nothing here needs ``pg_search`` itself.
 
-The fixture is 12,000 embeddings of 1536 dimensions, 9,000 of them in one
-knowledge base. That size is not arbitrary: below roughly a few thousand rows
-per knowledge base the planner correctly prefers an exact bitmap scan and sort
-over any HNSW index, so a smaller fixture could not show a plan choice at all.
-It costs about 15 s to build, once per module.
+The regime the fixture represents
+--------------------------------
+20 knowledge bases in one ``embeddings`` table of ~40,000 rows, with the
+indexed one at 30% of it and the others from 21% down to 1%. That is the shape
+this feature exists for -- one knowledge base is a *fraction* of a shared table
+-- and it is deliberately not the shape an earlier version of this module used
+(2 knowledge bases, the target at 75%). The difference is not cosmetic. Three
+things are true here and false at 75%:
+
+- the planner's estimate for a *bound* ``knowledge_base_id`` is 1/n_distinct,
+  so 5% here against 50% there -- the regime a prepared statement's generic
+  plan actually meets in production;
+- a knowledge base below the build threshold is small in absolute terms as well
+  as relative, which is the population the threshold decides for;
+- the shared per-dimension index post-filters away 70-99% of what it returns,
+  so recall through it is genuinely poor rather than a wash.
+
+Sizes are chosen against the planner, not for roundness: the partial index has
+to be the cheapest plan for the indexed knowledge base, or the plan tests would
+be asserting a preference the planner does not have. Measured on this fixture,
+the partial index is chosen at 30% and 21% selectivity and declined at 5% and
+1% (where an exact scan really is cheaper, and exact).
+
+Why 384 dimensions
+------------------
+``dims`` is 384 -- a real embedding width, and the one that keeps the fixture at
+~15 s. It is *not* the width this platform's default model uses, and the
+difference turned out to matter more than a fixture usually does: a vector wide
+enough to be stored out of line (1536 and up) leaves a small heap and a
+one-tuple-per-page HNSW index, and on the same 20-knowledge-base fixture at
+1536 dimensions the planner declined the partial index at every selectivity
+tried up to 70% -- it preferred an exact scan. That is a finding about the
+feature, not about this suite, and it is reported separately; what this module
+pins is the behaviour at a width where the partial index is reachable. A spec
+here that passes says nothing about 1536-dimension embeddings.
+
+Every test works in a scratch schema of its own, shaped like ``ai.chunks`` and
+``ai.embeddings``, and the module fixture costs about 15 s, once.
 """
 
 from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import threading
 import time
@@ -39,14 +72,42 @@ from agentic_project_service.services import base_vector_store as bvs
 from agentic_project_service.services import pg_vector_index as pvi
 
 SCHEMA = "vector_perkb_live_test"
-DIMS = 1536
+DIMS = 384
 
+# Five knowledge bases the tests name, and fifteen more that exist only to put
+# n_distinct(knowledge_base_id) at 20. The row counts are the selectivities the
+# feature has to work at, as a share of the whole table (see the module
+# docstring): 30, 21, 5, 2 and 1 per cent.
 KB_BIG = "9f8b1c2e-0000-4000-8000-000000000001"
 KB_SMALL = "9f8b1c2e-0000-4000-8000-000000000002"
+KB_MED = "9f8b1c2e-0000-4000-8000-000000000003"
+KB_MID = "9f8b1c2e-0000-4000-8000-000000000004"
+KB_THIN = "9f8b1c2e-0000-4000-8000-000000000005"
+FILLER_KBS = [f"9f8b1c2e-0000-4000-8000-0000000000{10 + i:02d}" for i in range(15)]
 SOURCE = "9f8b1c2e-0000-4000-8000-0000000000aa"
 
-BIG_ROWS = 9_000
-SMALL_ROWS = 3_000
+BIG_ROWS = 12_000
+SMALL_ROWS = 800
+MED_ROWS = 8_400
+MID_ROWS = 2_000
+THIN_ROWS = 400
+FILLER_ROWS = 1_093
+
+ROW_COUNTS: list[tuple[str, int]] = [
+    (KB_BIG, BIG_ROWS),
+    (KB_MED, MED_ROWS),
+    (KB_MID, MID_ROWS),
+    (KB_SMALL, SMALL_ROWS),
+    (KB_THIN, THIN_ROWS),
+    *((kb, FILLER_ROWS) for kb in FILLER_KBS),
+]
+TOTAL_ROWS = sum(rows for _, rows in ROW_COUNTS)
+
+# Metadata the filter specs filter on. Every fifth chunk is "gold" (a 20%-
+# selective filter inside a knowledge base) and every chunk carries its own
+# knowledge base's tag (a 100%-selective one), so a filtered search can be
+# measured without the filter's selectivity being the variable under test.
+GOLD_EVERY = 5
 
 # Any valid vector will do for a plan probe -- EXPLAIN prices the scan, it does
 # not care where in the space the query sits.
@@ -118,7 +179,7 @@ def query_vectors(engine):
 
 @pytest.fixture(scope="module")
 def fixture_schema(engine):
-    """The two tables the vector path joins, with a knowledge base worth indexing."""
+    """The two tables the vector path joins, in the regime the docstring describes."""
     raw_dsn = engine.url.set(drivername="postgresql").render_as_string(hide_password=False)
     with psycopg.connect(raw_dsn, autocommit=True) as conn:
         conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
@@ -148,15 +209,25 @@ def fixture_schema(engine):
         conn.execute(f"CREATE INDEX ON {SCHEMA}.chunks (knowledge_base_id)")
         conn.execute(f"CREATE INDEX ON {SCHEMA}.embeddings (item_id)")
         conn.execute(f"CREATE INDEX ON {SCHEMA}.embeddings (knowledge_base_id)")
+        # Every index build in this module is serial. A 384-dimension vector is
+        # stored in line, so the heap is big enough for PostgreSQL to want
+        # parallel workers for an index build, and a parallel HNSW build asks
+        # for a shared memory segment the size of maintenance_work_mem -- more
+        # than the 64 MiB of /dev/shm a stock container has. The reloption is
+        # the narrowest place to say "not on this table".
+        conn.execute(f"ALTER TABLE {SCHEMA}.embeddings SET (parallel_workers = 0)")
 
         rng = np.random.default_rng(4242)
-        for kb_id, rows in ((KB_BIG, BIG_ROWS), (KB_SMALL, SMALL_ROWS)):
+        for kb_id, rows in ROW_COUNTS:
             vectors = _vectors(rng, rows)
             chunks = io.StringIO()
             embeddings = io.StringIO()
             for i in range(rows):
                 item_id = str(uuid.uuid4())
-                chunks.write(f"{item_id}\t{kb_id}\t{SOURCE}\tpassage {i}\t{{}}\n")
+                meta = json.dumps(
+                    {"tier": "gold" if i % GOLD_EVERY == 0 else "silver", "kb": kb_id}
+                )
+                chunks.write(f"{item_id}\t{kb_id}\t{SOURCE}\tpassage {i}\t{meta}\n")
                 embeddings.write(
                     f"{item_id}\tchunks\t{kb_id}\t{SOURCE}\ttest-embed\t{DIMS}\t"
                     f"{_literal(vectors[i])}\n"
@@ -178,7 +249,9 @@ def fixture_schema(engine):
         # The shared per-dimension index every project has today. It is what the
         # query falls back to, and what the old query shape picks even when a
         # partial index is available.
-        conn.execute(f"SET maintenance_work_mem = '{_MEM_MB}MB'")
+        # The one build in the module that is worth giving more memory than the
+        # service's own setting: it covers every row in the table.
+        conn.execute("SET maintenance_work_mem = '512MB'")
         conn.execute(
             f"CREATE INDEX idx_ai_embeddings_hnsw_{DIMS} ON {SCHEMA}.embeddings "
             f"USING hnsw ((embedding::vector({DIMS})) vector_cosine_ops) WHERE dims = {DIMS}"
@@ -202,9 +275,14 @@ def schema(engine, fixture_schema, monkeypatch):
 @pytest.fixture
 def settings(monkeypatch):
     """Injectable thresholds, read through the real clamping and hysteresis code."""
+    # 10,000 / 5,000 are the registry's intended defaults, so these tests run
+    # the thresholds production runs. On this fixture only KB_BIG (12,000 rows)
+    # is at or above the build threshold; KB_MED, at 8,400, is the knowledge
+    # base those defaults leave without an index, which is what the regression
+    # specs measure.
     values = {
-        "VECTOR_PER_KB_INDEX_MIN_ROWS": 5_000,
-        "VECTOR_PER_KB_INDEX_DROP_ROWS": 2_500,
+        "VECTOR_PER_KB_INDEX_MIN_ROWS": 10_000,
+        "VECTOR_PER_KB_INDEX_DROP_ROWS": 5_000,
         "VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB": _MEM_MB,
     }
     monkeypatch.setattr(pvi, "get_setting", lambda key: values[key])
@@ -256,12 +334,12 @@ class _RecordingSession:
         return getattr(self._session, name)
 
 
-def _capture_search_sql(engine, kb_id, embedding):
+def _capture_search_sql(engine, kb_id, embedding, **kwargs):
     """The SQL the real store issues, and the parameters it binds."""
     with Session(engine) as session:
         recorder = _RecordingSession(session)
         store = _ChunkStore(db_session=recorder, knowledge_base_id=kb_id, schema=SCHEMA)
-        asyncio.run(store.vector_search(embedding=list(embedding), top_k=20))
+        asyncio.run(store.vector_search(embedding=list(embedding), top_k=20, **kwargs))
         session.rollback()
     searches = [pair for pair in recorder.statements if "ORDER BY" in pair[0]]
     assert searches, f"the store issued no search query: {recorder.statements}"
@@ -329,6 +407,35 @@ def _idx_scans(engine, *names: str) -> dict[str, int]:
     missing = [name for name in names if name not in found]
     assert not missing, f"no such index in {SCHEMA}: {missing}"
     return {name: found[name] for name in names}
+
+
+def _execute_args(session, statement_name: str, vector) -> str:
+    """Literal ``EXECUTE`` arguments matching a prepared statement's parameters.
+
+    ``vector_search`` interpolates some values and binds others, and which is
+    which is the subject of this whole module -- so the argument list is built
+    from ``pg_prepared_statements.parameter_types`` rather than written out.
+    Every parameter the statement has is either the embedding (text, cast in
+    the statement itself) or the knowledge base id, and both are known here.
+
+    The arguments are literals with casts, not bound parameters: an ``EXECUTE``
+    whose own arguments arrive through the extended protocol cannot have their
+    types inferred (``could not determine data type of parameter $1``).
+    """
+    # No rollback here, deliberately: psycopg throws away its whole
+    # prepared-statement state when it sees one, which would take the statement
+    # this is building arguments for with it.
+    types = session.execute(
+        text("SELECT parameter_types::text[] FROM pg_prepared_statements WHERE name = :n"),
+        {"n": statement_name},
+    ).scalar()
+    args = []
+    for pg_type in types or []:
+        if pg_type == "uuid":
+            args.append(f"'{KB_BIG}'::uuid")
+        else:
+            args.append(f"'{_literal(vector)}'::{pg_type}")
+    return ", ".join(args)
 
 
 def _build_big_index(engine, settings) -> str:
@@ -403,15 +510,22 @@ def test_the_partial_index_answers_only_from_its_own_knowledge_base_in_order(
 ):
     """Every row comes from this knowledge base, ranked by similarity.
 
-    What the fixture cannot show is the benchmark's recall result. At this scale
-    the indexed knowledge base is 75% of the table, so the shared index's
-    post-filter throws almost nothing away and both indexes are equally
-    approximate at ``hnsw.ef_search = 40`` (measured: 0.28 against 0.29
-    recall@20, i.e. a wash). The quality gap the benchmark found belongs to the
-    regime where one knowledge base is a small fraction of a large table, which
-    would take a fixture two orders of magnitude bigger to reproduce. So what is
-    pinned here is what does hold at every scale, and the completeness of the
-    index itself is pinned by the next test.
+    An earlier version of this docstring explained that the fixture could not
+    show the benchmark's recall gap because the indexed knowledge base was 75%
+    of the table, so the shared index's post-filter threw almost nothing away.
+    The fixture is now in the regime where that post-filter does discard most of
+    what it returns, and recall was measured rather than reasoned about: at 30%
+    of the table the two indexes come out the same (0.41 recall at 20 either
+    way), and at 21% the partial index is better (0.39 against 0.18). Neither
+    number is asserted anywhere, on purpose -- absolute recall on a synthetic
+    fixture is an artifact of how the vectors were generated, and a spec built
+    on one would be pinning the generator. What is asserted is the part that
+    does not depend on it: exactness, in
+    ``test_the_new_shape_answers_exactly_where_the_old_one_was_approximate``.
+
+    What stays here is the invariant that holds at every scale -- own knowledge
+    base only, in similarity order -- with the index's completeness pinned by
+    the next test.
     """
     name = _build_big_index(engine, settings)
     sql, params = _capture_search_sql(engine, KB_BIG, query_vectors[0])
@@ -521,15 +635,17 @@ def test_the_real_code_path_keeps_the_index_past_the_prepare_threshold(
             )
             # What the plan cache would use for the next execution -- generic or
             # custom, whichever it settled on over the 14.
+            # The arguments are read off the prepared statement rather than
+            # written out here: how many parameters production's statement
+            # still has is exactly the thing this feature keeps changing, and a
+            # hard-coded list turns that into an "Expected N parameters" error
+            # instead of a result.
             cached_plan = "\n".join(
                 str(r[0])
                 for r in session.execute(
-                    # $1 is the embedding and $2 the item-table knowledge base
-                    # id -- the only two parameters the statement still has, in
-                    # the order they first appear in it.
                     text(
                         f"EXPLAIN EXECUTE {searches[0][0]} "
-                        f"('{_literal(query_vectors[0])}', '{KB_BIG}'::uuid)"
+                        f"({_execute_args(session, searches[0][0], query_vectors[0])})"
                     )
                 ).all()
             )
@@ -1000,8 +1116,15 @@ def test_the_start_up_sweep_survives_a_database_with_no_settings_table(engine, s
         assert pvi.read_overrides(conn, *pvi._THRESHOLD_KEYS) == {}
         assert conn.execute(text("SELECT 1")).scalar() == 1
         conn.rollback()
-    # 9,000 rows, and the registry default build threshold is 50,000.
-    assert pvi.kbs_needing_a_per_kb_index(engine) == []
+    # What the sweep then finds follows from the registry's own default, which
+    # this PR's successors are expected to move: the assertion is derived from
+    # it rather than from a number copied out of the registry, so lowering the
+    # default changes this test's expectation instead of breaking it.
+    build_at, _ = pvi.thresholds()
+    expected = [KB_BIG] if BIG_ROWS >= build_at else []
+    assert pvi.kbs_needing_a_per_kb_index(engine) == expected, (
+        f"build threshold {build_at}, KB_BIG has {BIG_ROWS} rows"
+    )
 
 
 def test_a_build_held_by_another_caller_is_reported_not_duplicated(engine, schema, settings):
@@ -1104,3 +1227,497 @@ def test_a_concurrent_build_does_not_block_writes(engine, schema, settings):
             ),
             {"kb": KB_BIG},
         )
+
+
+# ---------------------------------------------------------------------------
+# 7. The generic plan, through the real driver
+#
+# Everything in section 3 above reaches the generic plan through a hand-written
+# ``PREPARE``. That is the right tool for asking which of three values the
+# planner needs, because it can take them out one at a time -- but it is not
+# production's path, and there is one thing it cannot see: ``EXPLAIN`` on an
+# un-prepared statement still has the parameter values in hand, so it reports
+# the plan the planner *would* build knowing them, even under
+# ``force_generic_plan``. Measured on this fixture, a filtered search EXPLAINs
+# as using the partial index under ``force_generic_plan`` and then does not use
+# it when psycopg actually prepares it. So these specs drive ``vector_search``
+# itself, on one pooled connection, past psycopg's prepare threshold, and read
+# the answer out of the index's own scan counters.
+# ---------------------------------------------------------------------------
+
+# Above psycopg's ``prepare_threshold`` (5) with room to spare, so the driver
+# has prepared the statement and PostgreSQL has had several executions to settle
+# on a plan for it.
+_DRIVEN_EXECUTIONS = 12
+
+
+def _drive_searches(engine, kb_id, vectors, *, plan_cache_mode, index_name, **kwargs):
+    """Run ``vector_search`` for real, N times, on one connection.
+
+    Returns ``(scans, prepared)``: how many scans each index served over the
+    run, and the names of the prepared statements the driver ended up with.
+
+    An engine of its own, disposed before the counters are read: a backend
+    flushes its statistics at most once a second, or unconditionally when it
+    exits, so the searches must not be left sitting in an idle pooled
+    connection. The searches share one transaction because psycopg discards its
+    prepared-statement state when it sees a ROLLBACK.
+    """
+    shared = f"idx_ai_embeddings_hnsw_{DIMS}"
+    before = _idx_scans(engine, index_name, shared)
+    probe = create_engine(_dsn())
+    connection = probe.connect()
+    prepared: list[str] = []
+    try:
+        with Session(bind=connection) as session:
+            session.execute(text(f"SET plan_cache_mode = '{plan_cache_mode}'"))
+            store = _ChunkStore(db_session=session, knowledge_base_id=kb_id, schema=SCHEMA)
+            for i in range(_DRIVEN_EXECUTIONS):
+                items = asyncio.run(
+                    store.vector_search(
+                        embedding=list(vectors[i % len(vectors)]), top_k=20, **kwargs
+                    )
+                )
+                assert items, f"execution {i} returned nothing"
+            prepared = [
+                row[0]
+                for row in session.execute(
+                    text("SELECT name, statement FROM pg_prepared_statements")
+                ).all()
+                if "e.knowledge_base_id" in row[1]
+            ]
+            session.commit()
+    finally:
+        connection.close()
+        probe.dispose()
+    after = _idx_scans(engine, index_name, shared)
+    return {name: after[name] - before[name] for name in after}, prepared
+
+
+def test_the_real_code_path_keeps_the_index_under_a_forced_generic_plan(
+    engine, schema, settings, query_vectors
+):
+    """Production's exact statement, prepared, planned without its parameters.
+
+    ``force_generic_plan`` is the decision PostgreSQL makes on its own once a
+    statement has been prepared and its generic plan costs no more than the
+    custom ones; forcing it removes the dependence on that cost comparison,
+    which is fixture-specific, and leaves the structural question. The negative
+    control is the ``prepared`` assertion: without it a run in which psycopg
+    never prepared anything would pass while proving nothing.
+
+    Measured on this fixture, unfiltered: 12 of 12 executions on the partial
+    index at 1.4-1.6 ms, generic and custom alike.
+    """
+    name = _build_big_index(engine, settings)
+    scans, prepared = _drive_searches(
+        engine, KB_BIG, query_vectors, plan_cache_mode="force_generic_plan", index_name=name
+    )
+    assert prepared, (
+        "the driver never prepared the search statement, so this test could not "
+        "have seen a generic plan at all"
+    )
+    assert scans[name] == _DRIVEN_EXECUTIONS, (
+        f"only {scans[name]} of {_DRIVEN_EXECUTIONS} executions used the partial index "
+        f"under a generic plan; another plan took the rest ({scans})"
+    )
+    assert scans[f"idx_ai_embeddings_hnsw_{DIMS}"] == 0, (
+        f"no execution may fall back to the shared index ({scans})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8. A filtered search
+#
+# ``filter_metadata`` is a documented, shipped parameter on the knowledge-base
+# search route, passed through unchanged by the search service and by the
+# runtime and attached-knowledge-base configuration paths. It adds a fourth
+# bound value to the statement -- ``c.meta @> $n`` -- and a generic plan cannot
+# estimate a containment operator against an unknown value, so it prices the
+# ordered index scan out and falls back to a bitmap scan and an exact sort.
+# Nothing else in this suite passes a filter.
+# ---------------------------------------------------------------------------
+
+# 20% of the rows in any knowledge base, and 100% of them: the same shape with
+# the filter's own selectivity moved from one end to the other, so a difference
+# between the two cannot be read as "the filter was too selective".
+FILTER_ONE_IN_FIVE = {"tier": "gold"}
+FILTER_EVERYTHING = {"kb": KB_BIG}
+# Two keys, which is two bound `@>` operators and two interpolated key names --
+# the shape the metadata-filter hardening changes. Whichever of the two changes
+# lands second, the merged vector_search is a shape neither suite had executed:
+# this one never passed a filter, and the other has no partial index.
+FILTER_TWO_KEYS = {"tier": "gold", "kb": KB_BIG}
+
+
+def test_a_filtered_search_reaches_the_partial_index_under_a_custom_plan(
+    engine, schema, settings, query_vectors
+):
+    """The control the next two specs need: the filter alone loses nothing.
+
+    A custom plan knows the filter's value, estimates it, and still chooses the
+    partial index. So what the generic-plan spec below finds for these two
+    filters is about plan caching, not about filtering. Measured: 12 of 12 on
+    the partial index at 1.4-1.9 ms with either.
+
+    One key, both of them, deliberately: with two the custom plan loses the
+    index as well, which is a different defect and has its own spec.
+    """
+    name = _build_big_index(engine, settings)
+    for filter_metadata in (FILTER_ONE_IN_FIVE, FILTER_EVERYTHING):
+        scans, prepared = _drive_searches(
+            engine,
+            KB_BIG,
+            query_vectors,
+            plan_cache_mode="force_custom_plan",
+            index_name=name,
+            filter_metadata=filter_metadata,
+        )
+        assert prepared, "the driver never prepared the filtered search statement"
+        assert scans[name] == _DRIVEN_EXECUTIONS, (
+            f"a custom plan must reach the partial index with {filter_metadata}: {scans}"
+        )
+
+
+def test_a_two_key_filter_reaches_the_partial_index_under_a_custom_plan(
+    engine, schema, settings, query_vectors
+):
+    """Two metadata keys lose the index even when the planner knows their values.
+
+    ``jsonb @>`` has no statistics, so each key contributes a fixed guess and the
+    planner multiplies them: two keys put the estimate near zero, an ordered
+    index scan then looks like it would have to walk the whole index to fill a
+    LIMIT of 20, and it is priced out. Measured on this fixture: 0 of 12
+    executions on the partial index under ``force_custom_plan``, where a
+    single-key filter gets 12 of 12.
+
+    That matters for the shape of the fix. Forcing a custom plan for filtered
+    searches repairs the single-key case -- verified by simulating it here -- and
+    does not repair this one, because this one is not about plan caching at all.
+    Two keys is an ordinary request: the search route takes a whole
+    ``filter_metadata`` object.
+    """
+    name = _build_big_index(engine, settings)
+    scans, prepared = _drive_searches(
+        engine,
+        KB_BIG,
+        query_vectors,
+        plan_cache_mode="force_custom_plan",
+        index_name=name,
+        filter_metadata=FILTER_TWO_KEYS,
+    )
+    assert prepared, "the driver never prepared the filtered search statement"
+    assert scans[name] == _DRIVEN_EXECUTIONS, (
+        f"a two-key filtered search used the partial index for only {scans[name]} of "
+        f"{_DRIVEN_EXECUTIONS} executions under a custom plan ({scans})"
+    )
+
+
+@pytest.mark.parametrize(
+    "filter_metadata,selectivity",
+    [
+        (FILTER_ONE_IN_FIVE, "one row in five"),
+        (FILTER_EVERYTHING, "every row"),
+        (FILTER_TWO_KEYS, "one row in five, through two keys"),
+    ],
+)
+def test_a_filtered_search_keeps_the_index_under_a_forced_generic_plan(
+    engine, schema, settings, query_vectors, filter_metadata, selectivity
+):
+    """A filtered search must not lose the partial index once the plan is cached.
+
+    This is the shape the suite never executed. Measured on this fixture before
+    the fix, driving the real store on one pooled connection: 0 of 12 executions
+    on the partial index, 5.0 ms for the 20%-selective filter and 15.9 ms for
+    the 100%-selective one, against 1.9 ms and 1.4 ms under a custom plan. The
+    filter that selects everything is the slower of the two, which is what rules
+    out the reading that the filter was simply too selective for an ordered
+    scan.
+
+    A connection keeps its plan for the life of the pool entry, so this is not a
+    one-search cost: it is every filtered search on that connection from the
+    prepare threshold on.
+    """
+    name = _build_big_index(engine, settings)
+    scans, prepared = _drive_searches(
+        engine,
+        KB_BIG,
+        query_vectors,
+        plan_cache_mode="force_generic_plan",
+        index_name=name,
+        filter_metadata=filter_metadata,
+    )
+    assert prepared, (
+        "the driver never prepared the filtered search statement, so this test "
+        "could not have seen a generic plan at all"
+    )
+    assert scans[name] == _DRIVEN_EXECUTIONS, (
+        f"a filtered search selecting {selectivity} used the partial index for only "
+        f"{scans[name]} of {_DRIVEN_EXECUTIONS} executions under a generic plan ({scans}); "
+        "a search with a metadata filter must reach the index the same way an "
+        "unfiltered one does"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. What the thresholds decide
+#
+# The build threshold decides which knowledge bases never get an index, so the
+# question it answers is what a search costs without one. On this fixture, with
+# ``dims = 384`` and a median over six query vectors:
+#
+#   share   rows    old shape        new shape, no index   new shape, indexed
+#   30 %   12,000   1.5 ms r=0.41    1.8 ms r=0.41         1.2 ms r=0.41
+#   21 %    8,400   4.2 ms r=0.18    4.5 ms r=0.18         1.3 ms r=0.39
+#    5 %    2,000   9.9 ms r=0.36    2.2 ms r=1.00         2.2 ms r=1.00
+#    1 %      400   1.5 ms r=1.00    1.0 ms r=1.00         0.8 ms r=1.00
+#
+# ``r`` is recall at 20 against an exact scan of the same knowledge base. Two
+# things in that table are worth a spec rather than a comment: below about 5 %
+# of the table the new shape stops using any HNSW index and starts answering
+# exactly -- slower in principle, correct in fact, and the honest argument for
+# this change -- and a partial index built for such a knowledge base is not used
+# at all, so building one buys nothing and costs every insert.
+# ---------------------------------------------------------------------------
+
+
+def _build_index_ignoring_thresholds(engine, kb_id: str) -> str:
+    """The partial index a knowledge base would get, built past the threshold gate.
+
+    The service will not build one below the build threshold, and rightly; these
+    specs need one anyway, to measure what it would be worth.
+    """
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(f"SET maintenance_work_mem = '{_MEM_MB}MB'"))
+        conn.execute(text(pvi.per_kb_index_ddl(kb_id, DIMS)))
+        conn.execute(text(f"ANALYZE {SCHEMA}.embeddings"))
+    return pvi.per_kb_index_name(kb_id, DIMS)
+
+
+def _recall_against_an_exact_scan(session, sql: str, params: dict, vectors) -> float:
+    """Mean fraction of an exact scan's top-20 that ``sql`` returns, over ``vectors``."""
+    hits = []
+    for vector in vectors:
+        call = {**params, "embedding": _literal(vector)}
+        session.execute(text("SET LOCAL enable_indexscan = off"))
+        exact = {str(r[0]) for r in session.execute(text(sql), call).all()}
+        session.rollback()
+        got = {str(r[0]) for r in _search(session, sql, call)}
+        hits.append(len(got & exact) / max(1, len(exact)))
+    return sum(hits) / len(hits)
+
+
+def test_the_new_shape_answers_exactly_where_the_old_one_was_approximate(
+    engine, schema, settings, query_vectors
+):
+    """The trade this PR actually makes, for a knowledge base that is a small share.
+
+    At 5 % of the table the new predicate lets the planner restrict
+    ``ai.embeddings`` by its own ``knowledge_base_id``, and an exact scan of 2,000
+    rows is then cheaper than any approximate one -- so the plan stops using an
+    HNSW index and starts returning the exact answer. The old shape had to go
+    through the shared index and post-filter, which at this share threw most of
+    its candidates away: measured 0.36 recall at 20 against 1.00.
+
+    "Slower and correct, where it was fast and quietly wrong" is a real argument
+    for this change. It is not the argument the PR body makes, and nothing else
+    here pins it.
+    """
+    sql, params = _capture_search_sql(engine, KB_MID, query_vectors[0])
+    old_sql = _without_the_embeddings_predicate(sql)
+    with Session(engine) as session:
+        new_recall = _recall_against_an_exact_scan(session, sql, params, query_vectors)
+        old_recall = _recall_against_an_exact_scan(session, old_sql, params, query_vectors)
+        plan = _explain(session, sql, params)
+    assert new_recall == 1.0, f"the new shape must return the exact answer here: {new_recall}"
+    assert old_recall < 1.0, (
+        f"the old shape is supposed to be the approximate one ({old_recall}); if it is now "
+        "exact too, this fixture no longer shows the trade and the docstring above is wrong"
+    )
+    assert "hnsw" not in plan, (
+        f"the exact answer above should come from an exact scan, not an index:\n{plan}"
+    )
+
+
+def test_a_partial_index_is_not_used_at_all_for_a_small_share_knowledge_base(
+    engine, schema, settings, query_vectors
+):
+    """Why the build threshold exists, asserted rather than assumed.
+
+    An index the planner will not choose still costs every insert into
+    ``ai.embeddings`` and still takes one of the ``MAX_PER_KB_INDEXES`` slots.
+    At 5 % of the table, building one changes no plan -- so a threshold low
+    enough to reach this knowledge base would be pure cost.
+    """
+    assert MID_ROWS < settings["VECTOR_PER_KB_INDEX_MIN_ROWS"]
+    with engine.connect() as conn:
+        assert pvi.index_action(conn, KB_MID) is None, "the gate should decline this one"
+
+    name = _build_index_ignoring_thresholds(engine, KB_MID)
+    sql, params = _capture_search_sql(engine, KB_MID, query_vectors[0])
+    with Session(engine) as session:
+        plan = _explain(session, sql, params)
+    assert name not in plan, f"the planner is not expected to choose this index:\n{plan}"
+
+
+def test_the_knowledge_base_the_default_threshold_leaves_out_is_the_measured_one(
+    engine, schema, settings
+):
+    """Pins which side of the threshold each fixture knowledge base falls on.
+
+    The row counts, the thresholds and the measurements in the comment above are
+    one argument, and it stops being an argument if a later edit moves a row
+    count without moving the table. KB_MED at 8,400 rows is the knowledge base
+    the 10,000-row default declines -- the population the threshold decision is
+    about -- and KB_BIG at 12,000 is the one it serves.
+    """
+    build_at = settings["VECTOR_PER_KB_INDEX_MIN_ROWS"]
+    assert MED_ROWS < build_at <= BIG_ROWS, (MED_ROWS, build_at, BIG_ROWS)
+    with engine.connect() as conn:
+        assert pvi.index_action(conn, KB_BIG) == "build"
+        assert pvi.index_action(conn, KB_MED) is None
+        assert pvi.index_action(conn, KB_MID) is None
+        assert pvi.index_action(conn, KB_THIN) is None
+    # And the shares the module docstring's regime claim rests on.
+    assert 0.28 < BIG_ROWS / TOTAL_ROWS < 0.32, BIG_ROWS / TOTAL_ROWS
+    assert 0.19 < MED_ROWS / TOTAL_ROWS < 0.23, MED_ROWS / TOTAL_ROWS
+    assert len({kb for kb, _ in ROW_COUNTS}) == 20
+
+
+# ---------------------------------------------------------------------------
+# 10. Three claims that had no test that could fail
+#
+# Each of the three below was found by mutation: the guard was removed and the
+# whole suite stayed green. A constant asserted to have a value is not the same
+# claim as a bound actually applied, a function that returns "dropped" is not
+# the same claim as a drop, and a test that reads ``vector_search``'s SQL is not
+# the same claim as ``hybrid_search`` calling it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(60)
+def test_the_start_up_sweeps_count_runs_under_the_bound_it_sets(
+    engine, schema, settings, monkeypatch
+):
+    """``SWEEP_TIMEOUT_MS`` is asserted as applied, not as a number.
+
+    The sweep's grouped count reads all of ``ai.embeddings``, and it runs on the
+    boot path, so it is bounded: a count that cannot finish must be abandoned and
+    the boot must go on. Deleting the ``set_config('statement_timeout', ...)``
+    statement so the count runs unbounded left the whole live suite green, because
+    every other spec here runs the sweep against a database where the count
+    finishes in milliseconds.
+
+    So this one makes the count unable to finish -- a second connection holds an
+    ACCESS EXCLUSIVE lock on the table, which the count has to wait for -- and
+    asserts that the sweep comes back anyway, within the bound, having abandoned
+    it. Without the bound applied the count waits for the lock forever and this
+    test fails on its own timeout rather than hanging the run.
+
+    The bound is lowered from its real value for the test's sake; what is being
+    pinned is that the value in ``SWEEP_TIMEOUT_MS`` reaches the server as a
+    statement bound, whatever it is.
+    """
+    monkeypatch.setattr(pvi, "SWEEP_TIMEOUT_MS", 400)
+
+    # The control, first: with nothing in the way the count is what finds KB_BIG,
+    # since it has no index for the catalog half of the sweep to notice.
+    assert pvi.kbs_needing_a_per_kb_index(engine) == [KB_BIG]
+
+    blocker = engine.connect()
+    try:
+        blocker.execute(text(f"LOCK TABLE {SCHEMA}.embeddings IN ACCESS EXCLUSIVE MODE"))
+        started = time.monotonic()
+        found = pvi.kbs_needing_a_per_kb_index(engine)
+        elapsed = time.monotonic() - started
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert elapsed < 20, (
+        f"the sweep took {elapsed:.1f} s against a blocked count; its "
+        f"{pvi.SWEEP_TIMEOUT_MS} ms bound is not reaching the server"
+    )
+    assert found == [], (
+        "with the count abandoned the sweep has only its catalog half, and there are "
+        f"no per-knowledge-base indexes in this schema, so it should find nothing: {found}"
+    )
+
+
+def test_a_drop_cannot_report_success_while_another_caller_holds_the_lock(engine, schema, settings):
+    """A drop that did not happen must not come back as ``dropped``.
+
+    ``drop_per_kb_vector_indexes`` runs on the knowledge-base-delete path, where
+    nothing inspects what it returns, so a silent failure there is permanent: the
+    knowledge base row is gone and nothing will ever reconcile the index again.
+    Turning its ``raise PerKbVectorIndexBuildInProgress`` into ``continue`` left
+    both tiers green, and the function then returned
+    ``{"status": "dropped", "indexes": []}`` -- success, for an index still on
+    disk. The test that looks like it covers this replaces the service with a
+    ``MagicMock`` and exercises the task's ``except`` clause instead.
+
+    Asserted on disk as well as on the return value: the index is still there.
+    """
+    _build_big_index(engine, settings)
+    lock = pvi.index_lock_relation(KB_BIG, DIMS)
+    holder = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+    try:
+        assert (
+            holder.execute(text(pvi.partition_build_lock_sql()), {"relation": lock}).scalar()
+            is True
+        )
+        with pytest.raises(pvi.PerKbVectorIndexBuildInProgress):
+            pvi.drop_per_kb_vector_indexes(KB_BIG, engine=engine)
+        with engine.connect() as conn:
+            assert pvi.existing_per_kb_indexes(conn, KB_BIG) == {DIMS: True}, (
+                "the index must still be on disk after a drop that could not take the lock"
+            )
+    finally:
+        holder.execute(text(pvi.partition_build_unlock_sql()), {"relation": lock})
+        holder.close()
+
+
+def test_hybrid_search_has_a_vector_leg_that_reaches_the_partial_index(
+    engine, schema, settings, query_vectors
+):
+    """``hybrid_search`` really runs a vector search, and it lands on the index.
+
+    The unit spec named after this claim never calls ``hybrid_search``: it reads
+    ``vector_search``'s SQL and asserts the predicate is in it. Replacing the
+    whole ``await self.vector_search(...)`` inside ``hybrid_search`` with
+    ``vector_results = []`` left that spec green.
+
+    The honest place to pin it is here rather than in the unit tier, because what
+    makes the claim worth anything is not that the call exists in the source but
+    that the query it issues reaches this knowledge base's index -- which only a
+    real index and a real planner can say. So: call ``hybrid_search``, then read
+    the partial index's own scan counter.
+
+    The keyword leg is deliberately not asserted on. It is allowed to come back
+    empty (that is its documented degradation), and hybrid search is still
+    supposed to answer from its vector leg when it does.
+    """
+    name = _build_big_index(engine, settings)
+    shared = f"idx_ai_embeddings_hnsw_{DIMS}"
+    before = _idx_scans(engine, name, shared)
+
+    probe = create_engine(_dsn())
+    connection = probe.connect()
+    try:
+        with Session(bind=connection) as session:
+            store = _ChunkStore(db_session=session, knowledge_base_id=KB_BIG, schema=SCHEMA)
+            items = asyncio.run(
+                store.hybrid_search(query="passage", embedding=list(query_vectors[0]), top_k=10)
+            )
+            session.commit()
+    finally:
+        connection.close()
+        probe.dispose()
+
+    after = _idx_scans(engine, name, shared)
+    assert items, "hybrid search returned nothing at all"
+    assert after[name] > before[name], (
+        "hybrid search never scanned this knowledge base's partial index, so it has no "
+        f"vector leg reaching it (before {before}, after {after})"
+    )
+    assert all(item.knowledge_base_id == KB_BIG for item in items), items
