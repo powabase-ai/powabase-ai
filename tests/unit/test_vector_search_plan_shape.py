@@ -316,3 +316,59 @@ def test_a_two_key_filtered_search_prices_the_sort_out_as_well():
     statements = _capture(partial_index=True, filter_metadata={"tier": "gold", "kb": "a"})
     assert _enable_sort(statements), statements
     assert _settings(statements, "plan_cache_mode"), statements
+
+
+# ---------------------------------------------------------------------------
+# The re-run, which is what makes the setting safe on a restricted search
+# ---------------------------------------------------------------------------
+
+
+def test_a_short_answer_is_asked_again_with_the_sort_available():
+    """An ordered index scan can starve a selective restriction; an exact scan cannot.
+
+    Measured at 384 dimensions: a ``top_k`` of 20 restricted to 12 named items of
+    a 12,000-row knowledge base came back with 11 of them from the forced index
+    scan, and all 12 from the exact scan the planner picks on its own. So a short
+    answer is re-run -- and the re-run asks for a custom plan, or it would be
+    handed the plan that came up short.
+
+    The fake session returns no rows, which is a short answer for any ``top_k``.
+    """
+    statements = _capture(partial_index=True)
+    searches = [i for i, (sql, _) in enumerate(statements) if "ORDER BY" in sql]
+    assert len(searches) == 2, (
+        f"a short answer from the forced index scan must be asked again: {statements}"
+    )
+    restored = _enable_sort(statements)[1]
+    assert restored < searches[1], (
+        f"the re-run has to happen with the sort available again: {statements}"
+    )
+    replanned = [i for i in _settings(statements, "plan_cache_mode") if i < searches[1]]
+    assert replanned and replanned[-1] > searches[0], (
+        f"the re-run must ask for a custom plan, between the two searches: {statements}"
+    )
+
+
+def test_a_full_answer_is_not_asked_again():
+    """The re-run is for the short case only; an ordinary search pays nothing."""
+    session = MagicMock()
+    captured: list[tuple[str, dict]] = []
+    row = ("11111111-1111-4111-8111-111111111111", "text", 0.5, None, {})
+
+    def spy_execute(text_obj, params=None):
+        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
+        captured.append((sql, dict(params or {})))
+        if "to_regclass" in sql:
+            return iter([(ENABLE_SORT_WAS, True)])
+        if "ORDER BY" in sql:
+            return iter([row] * 3)
+        return iter([])
+
+    session.execute = spy_execute
+    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
+    asyncio.run(store.vector_search(embedding=[0.0] * 1536, top_k=3))
+    searches = [pair for pair in captured if "ORDER BY" in pair[0]]
+    assert len(searches) == 1, (
+        f"top_k rows came back, so nothing is short and nothing is re-run: {captured}"
+    )
+    assert not _settings(captured, "plan_cache_mode"), captured

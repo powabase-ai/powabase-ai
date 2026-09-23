@@ -720,12 +720,16 @@ class BasePgVectorStore:
         38.3 ms forced to 41 ms forced-then-exact, against 3.0 ms before this fix.
         A full answer, which is the ordinary case, never pays it.
 
-        The custom plan is not optional. PostgreSQL does not invalidate a cached
-        plan when a planner GUC changes, so once psycopg has prepared this
-        statement the generic plan built while the sort was priced out is re-used
-        here and the second execution returns the same short answer. Asking for a
-        custom plan re-plans against the settings now in force -- verified by
-        removing it and watching the live spec fail from the sixth execution on.
+        The custom plan is what makes the re-run a different plan. PostgreSQL
+        builds a statement's generic plan once and does not rebuild it when a
+        planner GUC changes, so the plan built while the sort was priced out is
+        the plan a second execution would get, and it would come up equally
+        short. Asking for a custom plan re-plans against the settings now in
+        force. With ``plan_cache_mode`` left at ``auto`` it happens not to be
+        needed -- the generic plan carries the disabled sort's cost, so PostgreSQL
+        keeps preferring a custom plan anyway -- which is exactly the kind of
+        thing not to depend on: removing this line makes the live spec's
+        generic-plan leg fail.
         """
         logger.debug(
             "Vector search on KB %s returned %d rows from the partial HNSW index, fewer "
