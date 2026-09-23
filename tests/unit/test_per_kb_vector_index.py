@@ -458,6 +458,15 @@ def _raiser(exc):
     return boom
 
 
+def _failure_comment(failures: int) -> str:
+    """The comment the service writes, built by the service's own template.
+
+    So a test says "two failures are already on record" rather than restating the
+    wording, and a reworded comment the parser still reads keeps these passing.
+    """
+    return pvi._BUILD_FAILURES_COMMENT.format(n=failures)
+
+
 # The catalog row shape both the ensure survey and the boot sweep read.
 def _index_row(kb_id: str, dims: int, valid: bool = True):
     return (pvi.per_kb_index_name(kb_id, dims), valid)
@@ -735,18 +744,31 @@ def test_the_capped_dispatch_keeps_the_invalid_indexes_ahead_of_the_rest():
 # ---------------------------------------------------------------------------
 
 _LOCK_QUERY = "pg_try_advisory_lock"
+_FAILURE_RECORD_QUERY = "obj_description"
+_FAILURE_COMMENT_DDL = "COMMENT ON INDEX"
 _ROW_COUNT_QUERY = "LIMIT :cap) s"
 _INDEX_COUNT_QUERY = "count(*) FROM pg_class"
 _BUILD_RUNNING_QUERY = "pg_stat_progress_create_index"
 
 
 def _ensure_conn(
-    existing=(), dims_present=(1536,), rows_by_dims=None, index_count=1, cls=None, **kwargs
+    existing=(),
+    dims_present=(1536,),
+    rows_by_dims=None,
+    index_count=1,
+    cls=None,
+    failures=0,
+    **kwargs,
 ):
-    """A connection that answers every read ``ensure_per_kb_vector_index`` makes."""
+    """A connection that answers every read ``ensure_per_kb_vector_index`` makes.
+
+    ``failures`` is what the index's own catalog comment already records, which is
+    where a doomed build's history lives.
+    """
     rows = dict(rows_by_dims or {})
     return (cls or _FakeConn)(
         answers=[
+            (_FAILURE_RECORD_QUERY, [(_failure_comment(failures),)] if failures else []),
             (_CATALOG_QUERY, list(existing)),
             ("GROUP BY dims", [(d,) for d in dims_present]),
             (_INDEX_COUNT_QUERY, [(index_count,)]),
@@ -834,6 +856,145 @@ def test_an_invalid_index_above_the_hnsw_limit_is_dropped_and_not_rebuilt(monkey
     outcome = _ensure(monkeypatch, conn)
     assert outcome["repaired_invalid_indexes"] == [name], outcome
     assert outcome["built"] == [], outcome
+
+
+# -- a build that can never succeed is given up on, durably ------------------
+
+
+def test_a_failed_build_counts_itself_on_the_index_it_leaves_behind(monkeypatch):
+    """The only durable record there is, and the only one that needs no migration.
+
+    A failed ``CREATE INDEX CONCURRENTLY`` leaves the index in the catalog, so
+    the attempt is recorded on the index itself. An in-process counter would
+    forget on every worker restart and know nothing of the other workers, which
+    is the population this reconcile runs across.
+    """
+    conn = _ensure_conn(rows_by_dims={1536: 20_000}, fail_on="CREATE INDEX")
+    with pytest.raises(RuntimeError):
+        _ensure(monkeypatch, conn)
+    written = conn.issued(_FAILURE_COMMENT_DDL)
+    assert len(written) == 1, conn.statements
+    assert pvi.per_kb_index_name(KB, 1536) in written[0]
+    assert _failure_comment(1) in written[0]
+
+
+def test_each_failure_counts_on_from_the_last_one(monkeypatch):
+    """The repair drop takes the record with it, so the count is carried over.
+
+    Read before the drop and written back after the next failure -- otherwise
+    every attempt records "1" and the bound is never reached.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)],
+        rows_by_dims={1536: 20_000},
+        failures=1,
+        fail_on="CREATE INDEX",
+    )
+    with pytest.raises(RuntimeError):
+        _ensure(monkeypatch, conn)
+    assert _failure_comment(2) in conn.issued(_FAILURE_COMMENT_DDL)[0], conn.statements
+
+
+def test_a_build_that_succeeds_forgets_the_failures_before_it(monkeypatch):
+    """Consecutive failures are what says a build is doomed, not lifetime ones.
+
+    A build lost to a server restart or a killed worker is a failure a retry
+    really does get past.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)], rows_by_dims={1536: 20_000}, failures=2
+    )
+    outcome = _ensure(monkeypatch, conn)
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    cleared = conn.issued(_FAILURE_COMMENT_DDL)
+    assert len(cleared) == 1 and cleared[0].endswith("IS NULL"), conn.statements
+
+
+def test_a_build_that_has_failed_the_limit_is_not_attempted_again(monkeypatch, caplog):
+    """Where the drop-rebuild-fail loop stops.
+
+    Measured against a real server on a build that could never succeed: three
+    reconciles each dropped the INVALID index, rebuilt it and failed, and the
+    fourth did it again, once per source that finished indexing. Now the third
+    failure is the last, and the INVALID index stays as the record of it -- an
+    operator dropping it by hand is what lets a later reconcile try again.
+    """
+    name = pvi.per_kb_index_name(KB, 1536)
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)],
+        rows_by_dims={1536: 20_000},
+        failures=pvi.MAX_CONSECUTIVE_BUILD_FAILURES,
+    )
+    with caplog.at_level(logging.ERROR):
+        outcome = _ensure(monkeypatch, conn)
+    assert outcome["status"] == "skipped" and outcome["reason"] == "build_repeatedly_failed"
+    assert outcome["build_repeatedly_failed"] == [1536], outcome
+    assert outcome["built"] == [] and outcome["dropped"] == [], outcome
+    assert conn.issued("DROP INDEX") == [], "nothing to gain by dropping and rebuilding again"
+    assert conn.issued("CREATE INDEX") == []
+    assert pvi.outcome_needs_another_attempt(outcome) is False, "a retry cannot get past this"
+    assert name in caplog.text and "by hand" in caplog.text
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
+
+
+def test_a_build_that_has_failed_the_limit_is_not_dispatched_either(monkeypatch):
+    """Every source that finishes indexing would otherwise dispatch it again."""
+    _stub_settings(
+        monkeypatch,
+        {"VECTOR_PER_KB_INDEX_MIN_ROWS": 10_000, "VECTOR_PER_KB_INDEX_DROP_ROWS": 5_000},
+    )
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)],
+        rows_by_dims={1536: 20_000},
+        failures=pvi.MAX_CONSECUTIVE_BUILD_FAILURES,
+    )
+    assert pvi.index_action(conn, KB) is None
+    conn_below_limit = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)],
+        rows_by_dims={1536: 20_000},
+        failures=pvi.MAX_CONSECUTIVE_BUILD_FAILURES - 1,
+    )
+    assert pvi.index_action(conn_below_limit, KB) == "build", "one attempt still to go"
+
+
+def test_an_invalid_index_on_a_shrunken_knowledge_base_asks_for_a_drop(monkeypatch):
+    """An INVALID index used to mean "build" whatever the row count said.
+
+    A knowledge base that fell below the drop threshold while its build was
+    failing does not want that index rebuilt at a size it no longer is. The
+    reconcile drops it either way, so asking for a build was asking for something
+    it would decline.
+    """
+    _stub_settings(
+        monkeypatch,
+        {"VECTOR_PER_KB_INDEX_MIN_ROWS": 10_000, "VECTOR_PER_KB_INDEX_DROP_ROWS": 5_000},
+    )
+    conn = _ensure_conn(existing=[_index_row(KB, 1536, False)], rows_by_dims={1536: 100})
+    assert pvi.index_action(conn, KB) == "drop"
+
+
+def test_an_invalid_index_above_the_hnsw_limit_asks_for_a_drop_not_a_build(monkeypatch):
+    """pgvector cannot build this one at any row count; the reconcile only drops it."""
+    _stub_settings(
+        monkeypatch,
+        {"VECTOR_PER_KB_INDEX_MIN_ROWS": 10_000, "VECTOR_PER_KB_INDEX_DROP_ROWS": 5_000},
+    )
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 3072, False)], dims_present=(3072,), rows_by_dims={3072: 20_000}
+    )
+    assert pvi.index_action(conn, KB) == "drop"
+
+
+def test_a_project_at_the_index_cap_dispatches_no_further_builds(monkeypatch):
+    """The task at the cap can only report ``skipped``, once per indexed source."""
+    _stub_settings(
+        monkeypatch,
+        {"VECTOR_PER_KB_INDEX_MIN_ROWS": 10_000, "VECTOR_PER_KB_INDEX_DROP_ROWS": 5_000},
+    )
+    at_cap = _ensure_conn(rows_by_dims={1536: 20_000}, index_count=pvi.MAX_PER_KB_INDEXES)
+    assert pvi.index_action(at_cap, KB) is None
+    below_cap = _ensure_conn(rows_by_dims={1536: 20_000}, index_count=pvi.MAX_PER_KB_INDEXES - 1)
+    assert pvi.index_action(below_cap, KB) == "build"
 
 
 # -- the drop threshold is reachable -----------------------------------------
