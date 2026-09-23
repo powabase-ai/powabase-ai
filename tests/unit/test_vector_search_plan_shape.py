@@ -102,3 +102,84 @@ def test_a_bad_knowledge_base_id_is_rejected_on_both_sides():
         assert "knowledge_base_id" in str(exc), exc
     else:
         raise AssertionError("a non-UUID knowledge base id must raise")
+
+
+# ---------------------------------------------------------------------------
+# The metadata filter, which cannot be a literal
+# ---------------------------------------------------------------------------
+
+
+def test_a_filtered_search_asks_for_a_custom_plan():
+    """The fourth bound value, and the only one that has to stay bound.
+
+    A generic plan has no selectivity estimate for ``meta @> $n``, so it prices
+    the ordered index scan out and falls back to a bitmap scan plus an exact
+    sort. Measured: 5.6 ms with the index, 628.8 ms without. The filter value
+    cannot be interpolated -- it is caller data -- so the fix is to make this one
+    execution plan against the value it actually has.
+    """
+    statements = _capture(filter_metadata={"tag": "a"})
+    forced = _settings(statements, "plan_cache_mode")
+    assert forced, (
+        "a filtered search must ask for a custom plan, or it loses the partial "
+        f"index once the statement is prepared; statements: {statements}"
+    )
+    normalized = "".join(statements[forced[0]][0].split()).lower()
+    assert "setlocalplan_cache_mode" in normalized, statements[forced[0]][0]
+    assert "force_custom_plan" in normalized, statements[forced[0]][0]
+
+
+def test_the_custom_plan_request_precedes_the_search():
+    """``SET LOCAL`` only reaches a statement that runs after it, same transaction."""
+    statements = _capture(filter_metadata={"tag": "a"})
+    first_set = _settings(statements, "plan_cache_mode")[0]
+    search_at = next(i for i, (sql, _) in enumerate(statements) if "ORDER BY" in sql)
+    assert first_set < search_at, f"plan_cache_mode set after the search: {statements}"
+
+
+def test_an_unfiltered_search_leaves_the_plan_cache_alone():
+    """The unfiltered shape is fully provable from literals, so it keeps its
+    cached generic plan -- which is the point of the literals, and worth one
+    fewer round trip and one fewer replan per search."""
+    statements = _capture()
+    assert not _settings(statements, "plan_cache_mode"), (
+        f"nothing should touch plan_cache_mode without a filter: {statements}"
+    )
+
+
+def test_an_empty_filter_is_not_a_filter():
+    """``filter_metadata={}`` adds no predicate, so it must not cost a replan."""
+    statements = _capture(filter_metadata={})
+    assert not _settings(statements, "plan_cache_mode"), statements
+
+
+def test_the_custom_plan_request_is_transaction_scoped():
+    """Session-level would follow the connection back into the pool and make
+    every later search on it replan."""
+    statements = _capture(filter_metadata={"tag": "a"})
+    sql = statements[_settings(statements, "plan_cache_mode")[0]][0]
+    assert "SET LOCAL" in sql, f"the setting must not outlive the transaction:\n{sql}"
+
+
+def test_the_custom_plan_request_follows_the_argument_not_the_sql_text():
+    """Pinned against how the filter is *compiled*.
+
+    The clause the filter becomes is being rewritten to bind the whole filter as
+    one jsonb instead of one parameter per key. That changes the SQL and changes
+    nothing about why this setting is needed, so the decision keys off the
+    argument: any non-empty filter, whatever it compiles to.
+    """
+    for filter_metadata in ({"tag": "a"}, {"a": 1, "b": 2}, {"nested": {"x": [1, 2]}}):
+        statements = _capture(filter_metadata=filter_metadata)
+        assert _settings(statements, "plan_cache_mode"), (
+            f"no custom plan requested for {filter_metadata}: {statements}"
+        )
+
+
+def test_a_filter_combined_with_other_predicates_still_asks_for_a_custom_plan():
+    statements = _capture(
+        filter_metadata={"tag": "a"},
+        item_ids={"3f2504e0-4f89-11d3-9a0c-0305e82c3302"},
+        source_ids=["3f2504e0-4f89-11d3-9a0c-0305e82c3303"],
+    )
+    assert _settings(statements, "plan_cache_mode"), statements

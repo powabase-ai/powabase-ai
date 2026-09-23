@@ -104,9 +104,20 @@ def kb_sql_literal(knowledge_base_id: Any) -> str:
     | **kb, ``dims`` and ``LIMIT`` all literal** | **the partial index**, cost 369 |
     | kb bound, ``dims`` and ``LIMIT`` literal | the *shared* index, cost 533 |
 
-    So ``vector_search`` interpolates all three. ``dims`` is range-checked and
-    already interpolated into the distance cast, and ``top_k`` is checked
-    against ``MAX_TOP_K``; the last row is why the KB id has to be one of them.
+    So ``vector_search`` interpolates all three, on both sides of the join for
+    the KB id. ``dims`` is range-checked and already interpolated into the
+    distance cast, and ``top_k`` is checked against ``MAX_TOP_K``; the last row
+    is why the KB id has to be one of them.
+
+    **What this guarantees, and what it does not.** The guarantee is for the
+    *unfiltered* search: every value in the index's predicate, and the LIMIT, is
+    a literal, so a generic plan can prove the predicate and keep the ordered
+    index scan. A ``filter_metadata`` search has a fourth value the planner does
+    not know, and it cannot be made a literal -- it is caller data, bound as
+    jsonb. A generic plan has no selectivity estimate for ``meta @>`` at all, so
+    it prices the ordered index scan out and the partial index is lost. That
+    shape is protected differently, by asking for a custom plan for that one
+    execution: see ``BasePgVectorStore._force_custom_plan``.
     """
     try:
         return f"'{uuid.UUID(str(knowledge_base_id))}'"
@@ -408,6 +419,53 @@ class BasePgVectorStore:
                 e,
             )
 
+    def _force_custom_plan(self) -> None:
+        """Plan the next statement in this transaction against its real parameters.
+
+        For the filtered vector search, and only that. Everything the partial
+        HNSW index's predicate needs is a literal (see ``kb_sql_literal``), so
+        the unfiltered search keeps whatever plan the cache holds. A metadata
+        filter cannot be a literal -- it is caller data -- and a plan built
+        without its value has no selectivity estimate for ``meta @> $n`` at all,
+        so the planner stops believing the ordered index scan will stop early
+        and prices an exact sort below it instead. That is the whole partial
+        index lost, for the life of a pooled connection, on a documented and
+        shipped search parameter.
+
+        Forcing a custom plan is the direct fix: the planner sees the filter's
+        actual value, estimates it, and keeps the index. The cost is one replan
+        per filtered search, which is cheap against what it buys.
+
+        Measured on a 20,000-embedding knowledge base with its partial index, on
+        a connection whose plan cache had gone generic, 20 filtered searches
+        through the real driver in one transaction:
+
+        | filtered search | plans on the partial index | latency |
+        |---|---|---|
+        | without this | 0 of 20 -- bitmap scan and an exact sort | 8.7-10.8 ms |
+        | with this | 20 of 20 | 2.5-6.0 ms |
+
+        The unfiltered shape needs none of it -- 20 of 20 on the index on the
+        same pinned-generic connection -- which is what the literals are for.
+        The gap grows with the knowledge base, because what replaces the index
+        is an exact scan of it.
+
+        ``SET LOCAL`` so it dies with the transaction rather than following the
+        connection back into the pool and making every later search on it
+        replan. Same precedent, and the same caveat, as
+        ``_apply_iterative_scan``: it needs the session to be in a transaction,
+        which is how this store is used, and a failure here degrades latency
+        rather than the answer, so it is logged and not raised.
+        """
+        try:
+            self.session.execute(text("SET LOCAL plan_cache_mode = 'force_custom_plan'"))
+        except Exception as e:  # pragma: no cover - depends on server version
+            logger.warning(
+                "Could not set plan_cache_mode=force_custom_plan: %s; a filtered vector "
+                "search may miss this knowledge base's partial HNSW index",
+                e,
+            )
+
     def _fetch_with_timeout(
         self, sql: str, params: dict[str, Any], timeout_ms: int, *, query: str
     ) -> list:
@@ -584,6 +642,11 @@ class BasePgVectorStore:
 
         try:
             self._apply_iterative_scan()
+            if filter_metadata:
+                # Keyed on the argument, not on the clause above: how the filter
+                # is compiled may change, why a bound filter needs a custom plan
+                # does not.
+                self._force_custom_plan()
             result = self.session.execute(text(query), params)
             items = []
             for row in result:
