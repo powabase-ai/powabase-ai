@@ -67,15 +67,19 @@ def test_preserves_thinking_blocks_when_provider_matches():
     assert ctx.events == []
 
 
-def test_preserves_openai_psf_when_target_is_openai():
-    """OpenAI encrypted_content_items survive same-provider replay."""
+def test_openai_reasoning_items_are_not_replayed_across_turns():
+    """OpenAI reasoning items are replayed within a run only: the Responses API
+    discards reasoning from turns before the latest user message, and encrypted
+    content is bound to the organization that produced it."""
     history = [
         Message(role="user", content="Q"),
         Message(
             role="assistant",
             content="A",
             reasoning=OpenAIReasoning(
-                encrypted_content_items=[{"type": "reasoning", "encrypted_content": "e"}],
+                reasoning_items=[
+                    {"id": "rs_1", "type": "reasoning", "encrypted_content": "e", "summary": []}
+                ],
                 response_id="r1",
             ),
         ),
@@ -91,20 +95,21 @@ def test_preserves_openai_psf_when_target_is_openai():
             context=ctx,
             user_input="Q2",
         )
-    assistant = out[1]
-    assert assistant["provider_specific_fields"] == {
-        "encrypted_content_items": [{"type": "reasoning", "encrypted_content": "e"}]
-    }
+    assert out[1] == {"role": "assistant", "content": "A"}
     assert ctx.events == []
 
 
 def test_drops_thinking_blocks_when_provider_changes():
+    # Signed, so the block would be replayed if the provider matched: an
+    # unsigned block is never replayed, which would pass this test vacuously.
     history = [
         Message(role="user", content="Q"),
         Message(
             role="assistant",
             content="A",
-            reasoning=AnthropicReasoning(thinking_blocks=[{"type": "thinking", "thinking": "x"}]),
+            reasoning=AnthropicReasoning(
+                thinking_blocks=[{"type": "thinking", "thinking": "x", "signature": "s"}]
+            ),
         ),
     ]
     ctx = _FakeContext()
@@ -136,7 +141,9 @@ def test_drops_openai_psf_when_target_is_anthropic():
             role="assistant",
             content="A",
             reasoning=OpenAIReasoning(
-                encrypted_content_items=[{"type": "reasoning", "encrypted_content": "e"}],
+                reasoning_items=[
+                    {"id": "rs_1", "type": "reasoning", "encrypted_content": "e", "summary": []}
+                ],
             ),
         ),
     ]
@@ -152,18 +159,22 @@ def test_drops_openai_psf_when_target_is_anthropic():
             user_input="Q2",
         )
     assistant = out[1]
+    assert "reasoning_items" not in assistant
     assert "provider_specific_fields" not in assistant
     assert len(ctx.events) == 1
 
 
 def test_unknown_provider_does_not_drop():
     """If get_llm_provider raises (custom endpoint), preserve artifacts."""
+    # Signed: only signed thinking blocks are ever replayed.
     history = [
         Message(role="user", content="Q"),
         Message(
             role="assistant",
             content="A",
-            reasoning=AnthropicReasoning(thinking_blocks=[{"type": "thinking", "thinking": "x"}]),
+            reasoning=AnthropicReasoning(
+                thinking_blocks=[{"type": "thinking", "thinking": "x", "signature": "s"}]
+            ),
         ),
     ]
     ctx = _FakeContext()
