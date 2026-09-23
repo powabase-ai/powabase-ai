@@ -1,9 +1,40 @@
 """Test configuration and fixtures for the project service."""
 
 import os
-from pathlib import Path
 
-from dotenv import load_dotenv
+# Pin litellm's model cost map to the copy shipped inside the pinned wheel,
+# BEFORE anything can `import litellm`.
+#
+# litellm reads this variable once, at import time (litellm/__init__.py ->
+# get_model_cost_map()). Without it, importing litellm fetches
+# model_prices_and_context_window.json from GitHub over the network, so every
+# test that asks litellm what a model costs or whether it exists is really
+# asserting against whatever upstream published this morning. That is how
+# tests/unit/test_llm_model_choices.py came to fail on an unchanged main: the
+# moment upstream dropped three model ids from the live map, 9 of its tests
+# went red on every open PR. test_copilot_picker_models.py and
+# test_boot_picker_cost_guard.py read the same registry and had the same
+# exposure; they were green only because their entries survived that edit.
+#
+# Set here, in the top-level conftest, rather than in a per-directory conftest,
+# in the test modules, in the CI job env or in a pytest-env ini block: pytest
+# loads this file before collecting any test module underneath tests/, whatever
+# the invocation (`pytest`, `pytest tests/unit`, a single file, `-k ...`, any
+# cwd, with or without uv), and it is the earliest point in that sequence that
+# runs repo-owned code. A CI-only env entry would leave local runs on the
+# network; a module-level os.environ line only wins if that module happens to
+# be the first thing to import litellm.
+#
+# Assigned, not setdefault()-ed, so the suite cannot be pushed back onto the
+# network by an exported LITELLM_LOCAL_MODEL_COST_MAP=False. The pinned wheel's
+# copy is the map the tests mean to assert against; checking the live map for
+# drift is a separate, deliberate job, not something a stray shell export
+# should turn every unit run into.
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+
+from pathlib import Path  # noqa: E402
+
+from dotenv import load_dotenv  # noqa: E402
 
 # Load .env from the repo root so POSTGRES_PASSWORD is available
 # without having to pass it on every pytest invocation.
