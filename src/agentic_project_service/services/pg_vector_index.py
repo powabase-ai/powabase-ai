@@ -344,7 +344,11 @@ def read_overrides(conn, *keys: str) -> dict[str, int]:
     the registry defaults, and the sweep carries on: a start-up that is a little
     wrong about a threshold is worth far more than one that does not happen.
     ``set_config(..., true)`` scopes it to this transaction, so nothing the
-    caller does afterwards inherits it.
+    caller does afterwards inherits it -- which does mean the connection has to
+    be a transactional one, as the sweep's is. On a connection in AUTOCOMMIT the
+    scope would end with the ``set_config`` statement itself and the read would
+    be unbounded again, and a session-level ``SET`` is not the answer either: it
+    would ride a pooled connection out into unrelated work.
     """
     try:
         conn.execute(
