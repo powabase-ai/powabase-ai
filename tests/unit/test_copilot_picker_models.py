@@ -10,8 +10,13 @@ registry. Failure modes this catches at CI time (not at boot):
    ``supports_function_calling`` — the copilot uses tools, so a non-tool
    model would fail every run on the first tool call.
 
-These run as ordinary unit tests (no network, no DB) — litellm reads its
-model_cost JSON locally — and add ~50ms to the suite.
+These run as ordinary unit tests (no network, no DB) — and add ~50ms to the
+suite — because ``tests/conftest.py`` sets ``LITELLM_LOCAL_MODEL_COST_MAP=True``
+before anything imports litellm, so the registry read here is the copy inside
+the pinned wheel rather than one fetched from GitHub at import time. See
+``test_llm_model_choices.py`` for the full reasoning and the guard on that
+arrangement; the same tradeoff applies to this file (it pins the picker to the
+deployed litellm, and cannot see a retirement upstream already knows about).
 """
 
 from __future__ import annotations
