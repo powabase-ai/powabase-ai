@@ -751,6 +751,39 @@ def _create_index(conn, kb_id: str, dims: int, mem_mb: int | None = None) -> Non
         _reset_session_setting(conn, "statement_timeout")
 
 
+def _drop_index(conn, kb_id: str, dims: int) -> None:
+    """Drop one index online, with no bound on how long the wait takes.
+
+    ``statement_timeout = 0`` for the same reason the build gets it, and it is
+    the same wait: ``DROP INDEX CONCURRENTLY`` also waits for every transaction
+    holding a snapshot that could still be using the index. A role- or
+    database-level ``statement_timeout`` therefore cancels a drop that is doing
+    nothing wrong, and a cancelled ``DROP INDEX CONCURRENTLY`` leaves the index
+    in place with ``indisvalid = false``: charged to every insert into
+    ``ai.embeddings``, answering no query. Measured against a real server with a
+    2 s role timeout and one open write transaction -- cancelled after 2.02 s,
+    leaving exactly that state.
+
+    An ensure finds that state on its next run and repairs it. The deleted
+    knowledge base's drop cannot: the row these indexes are named after is gone,
+    so neither ``index_action`` nor the start-up sweep will ever look at them
+    again, and a cancelled drop there is permanent. The cost of the bound being
+    gone is that one client idle in a transaction can hold a drop, and with it
+    one worker slot, for as long as it likes; it blocks no writes while it waits
+    (``ShareUpdateExclusiveLock`` only).
+
+    Session-level rather than ``SET LOCAL``, and reset in a ``finally``, for the
+    reasons ``_create_index`` gives: the connection is in AUTOCOMMIT, so
+    ``SET LOCAL`` would affect nothing, and a pooled connection left with no
+    statement timeout would carry that into unrelated work.
+    """
+    try:
+        conn.execute(text("SET statement_timeout = 0"))
+        conn.execute(text(per_kb_index_drop_ddl(kb_id, dims)))
+    finally:
+        _reset_session_setting(conn, "statement_timeout")
+
+
 def _repair_invalid(conn, kb_id: str, dims: int) -> bool:
     """Drop an INVALID index left behind by a failed concurrent build.
 
@@ -772,7 +805,7 @@ def _repair_invalid(conn, kb_id: str, dims: int) -> bool:
         per_kb_index_name(kb_id, dims),
         AI_SCHEMA,
     )
-    conn.execute(text(per_kb_index_drop_ddl(kb_id, dims)))
+    _drop_index(conn, kb_id, dims)
     return True
 
 
@@ -932,7 +965,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                             dims,
                             drop_below,
                         )
-                        conn.execute(text(per_kb_index_drop_ddl(kb_id, dims)))
+                        _drop_index(conn, kb_id, dims)
                         dropped.append(name)
                     continue
 
@@ -1048,7 +1081,7 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
                     f"{AI_SCHEMA}.{name} is being built or dropped by another caller"
                 )
             try:
-                conn.execute(text(per_kb_index_drop_ddl(kb_id, dims)))
+                _drop_index(conn, kb_id, dims)
                 dropped.append(name)
             except Exception as exc:
                 if is_transient_db_error(exc):

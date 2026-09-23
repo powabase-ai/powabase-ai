@@ -740,10 +740,12 @@ _INDEX_COUNT_QUERY = "count(*) FROM pg_class"
 _BUILD_RUNNING_QUERY = "pg_stat_progress_create_index"
 
 
-def _ensure_conn(existing=(), dims_present=(1536,), rows_by_dims=None, index_count=1, **kwargs):
+def _ensure_conn(
+    existing=(), dims_present=(1536,), rows_by_dims=None, index_count=1, cls=None, **kwargs
+):
     """A connection that answers every read ``ensure_per_kb_vector_index`` makes."""
     rows = dict(rows_by_dims or {})
-    return _FakeConn(
+    return (cls or _FakeConn)(
         answers=[
             (_CATALOG_QUERY, list(existing)),
             ("GROUP BY dims", [(d,) for d in dims_present]),
@@ -927,8 +929,8 @@ class _LostConnection(Exception):
     connection_invalidated = True
 
 
-def _drop_conn(dims=(1536,), **kwargs):
-    return _FakeConn(
+def _drop_conn(dims=(1536,), cls=None, **kwargs):
+    return (cls or _FakeConn)(
         answers=[
             (_CATALOG_QUERY, [_index_row(KB, d) for d in dims]),
             (_LOCK_QUERY, [(True,)]),
@@ -983,6 +985,86 @@ def test_a_transient_drop_failure_is_re_raised_untouched_for_the_retry(caplog):
         with pytest.raises(_LostConnection):
             pvi.drop_per_kb_vector_indexes(KB, engine=_FakeEngine(conn))
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR], caplog.text
+
+
+# ---------------------------------------------------------------------------
+# A drop waits as long as a build does
+# ---------------------------------------------------------------------------
+
+
+class _TimeoutCancellingConn(_FakeConn):
+    """A server with a statement timeout of its own, as a role or database has.
+
+    ``DROP INDEX CONCURRENTLY`` waits for every transaction whose snapshot could
+    still be using the index, exactly as the build does, so a timeout the drop
+    did not ask for cancels it mid-wait. Here that is modelled where it happens:
+    the DROP raises unless the timeout was lifted on this connection first, and
+    the ``RESET`` puts it back, so a second drop is unprotected again if the
+    lifting is not per-drop.
+
+    Against a real server the cancelled drop leaves the index ``indisvalid =
+    false`` -- maintained on every insert, answering no query -- which the
+    deleted knowledge base's path can never come back to.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.timeout_lifted = False
+        self.cancelled: list[str] = []
+
+    def execute(self, clause, params=None):
+        sql = clause.text if hasattr(clause, "text") else str(clause)
+        if "SET statement_timeout = 0" in sql:
+            self.timeout_lifted = True
+        elif "RESET statement_timeout" in sql:
+            self.timeout_lifted = False
+        elif "DROP INDEX CONCURRENTLY" in sql and not self.timeout_lifted:
+            self.statements.append(" ".join(sql.split()))
+            self.cancelled.append(sql)
+            raise RuntimeError("canceling statement due to statement timeout")
+        return super().execute(clause, params)
+
+
+def test_a_deleted_knowledge_bases_drops_are_not_cancelled_by_a_statement_timeout():
+    """This is the path a cancelled drop strands for good.
+
+    Both dimensions, because the timeout is lifted per drop: the ``RESET`` after
+    the first one leaves the second exposed unless it lifts it again.
+    """
+    conn = _drop_conn(dims=(768, 1536), cls=_TimeoutCancellingConn)
+    outcome = pvi.drop_per_kb_vector_indexes(KB, engine=_FakeEngine(conn))
+    assert conn.cancelled == [], conn.statements
+    assert outcome == {
+        "status": "dropped",
+        "indexes": [pvi.per_kb_index_name(KB, 768), pvi.per_kb_index_name(KB, 1536)],
+    }
+    assert not conn.timeout_lifted, (
+        "the timeout has to be back before this connection can return to the pool"
+    )
+
+
+def test_a_drop_below_the_threshold_is_not_cancelled_by_a_statement_timeout(monkeypatch):
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536)], rows_by_dims={1536: 0}, cls=_TimeoutCancellingConn
+    )
+    outcome = _ensure(monkeypatch, conn)
+    assert conn.cancelled == [], conn.statements
+    assert outcome["dropped"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert not conn.timeout_lifted
+
+
+def test_the_repair_of_an_invalid_index_is_not_cancelled_by_a_statement_timeout(monkeypatch):
+    """A cancelled repair drop is the one that loops: it leaves what it came to clear."""
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)],
+        rows_by_dims={1536: 20_000},
+        cls=_TimeoutCancellingConn,
+    )
+    outcome = _ensure(monkeypatch, conn)
+    assert conn.cancelled == [], conn.statements
+    assert outcome["repaired_invalid_indexes"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert not conn.timeout_lifted
 
 
 def test_the_catalog_lookups_match_the_index_name_and_not_a_like_wildcard():
