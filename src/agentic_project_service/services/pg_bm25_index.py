@@ -3442,6 +3442,7 @@ def ensure_bm25_index(
                 status,
                 kb_id,
                 first_error_line(exc),
+                exc_info=True,
             )
 
     # Two connections, deliberately: this AUTOCOMMIT one, because CREATE and
