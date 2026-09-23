@@ -520,12 +520,32 @@ class BasePgVectorStore:
         # partial index present. The item-table filter stays: it is what keeps a
         # row whose embedding outlived its item out of the answer.
         #
-        # Three values are interpolated rather than bound -- the KB id, `dims`
-        # and the LIMIT -- because a prepared statement's generic plan can only
-        # match the index's predicate when it can prove all of it, and the
-        # planner's estimate for an unknown LIMIT prices the ordered index scan
-        # out. kb_sql_literal has the measured table; all three are validated
-        # above. Anything else here stays bound.
+        # The KB id is interpolated on BOTH sides, and the second one was
+        # measured rather than reasoned about. The embeddings-side literal is
+        # what makes the index *matchable*; it is not what makes the planner
+        # choose it. With `c.knowledge_base_id` still bound, a generic plan has
+        # no row estimate for the item side of the join, so it prices a hash
+        # join plus an exact sort below the ordered index scan the index would
+        # drive -- the index is matchable and not chosen. Measured through the
+        # real driver on one pooled connection, on a table where the KB is a
+        # small fraction of the rows (the regime this feature exists for):
+        # ~0.98 ms while the custom plan held, ~135 ms from the execution the
+        # generic plan was adopted on, and for the life of that connection.
+        # Both literals come from the same validated gate, so the second costs
+        # no new injection surface.
+        #
+        # So four values decide whether a prepared statement keeps the index:
+        # the KB id on each side, `dims`, and the LIMIT. All four are
+        # interpolated -- a generic plan can only match the index's predicate
+        # when it can prove all of it, and the planner's estimate for an unknown
+        # LIMIT prices the ordered index scan out. kb_sql_literal has the
+        # measured table; all of them are validated above.
+        #
+        # What cannot be a literal is the metadata filter below: it is caller
+        # data, so it is bound as jsonb, and a generic plan has no selectivity
+        # estimate for `@>` at all. That is why a filtered search asks for a
+        # custom plan instead -- see _force_custom_plan.
+        kb_literal = kb_sql_literal(self.kb_id)
         query = f"""
             SELECT
                 c.id,
@@ -535,14 +555,13 @@ class BasePgVectorStore:
                 c.meta
             FROM "{self.schema}".{self.TABLE} c
             JOIN "{self.schema}".embeddings e ON e.item_id = c.id
-            WHERE c.knowledge_base_id = :kb_id
-              AND e.knowledge_base_id = {kb_sql_literal(self.kb_id)}
+            WHERE c.knowledge_base_id = {kb_literal}
+              AND e.knowledge_base_id = {kb_literal}
               AND e.dims = {effective_dims}
         """
 
         params: dict[str, Any] = {
             "embedding": embedding_str,
-            "kb_id": self.kb_id,
         }
 
         if item_ids is not None:
