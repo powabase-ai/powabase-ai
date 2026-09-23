@@ -75,10 +75,15 @@ pinned instead, deterministically, is that the store asks for the setting:
 ``tests/unit/test_vector_search_plan_shape.py``.
 
 What this module does show about the fix is the part that is stable at any
-width: that the setting is asked for only when there is an index to use, that
-the answer for a knowledge base without one does not change, and that a filtered
-search reaches the index -- which at 384 it does not do without the fix, because
-a jsonb estimate is wrong the same way at every dimension.
+width: that the sort is priced out only for an *unrestricted* search on a
+knowledge base with an index to fall on, that the answer for a knowledge base
+without one does not change, and that a search the caller restricted -- named
+rows, a source, a metadata filter -- is given the exact plan instead and returns
+exactly what an exact scan returns. That last one is the half of the design that
+does not depend on the width at all: at 1536 dimensions the planner declines an
+HNSW index for a restricted search anyway, so insisting on it changes nothing
+there and costs 42.7 ms against 44.8 ms; at 384 the planner would take the index
+and answer a full page of the wrong rows.
 
 Every test works in a scratch schema of its own, shaped like ``ai.chunks`` and
 ``ai.embeddings``, and the module fixture costs about 15 s, once.
@@ -1434,33 +1439,39 @@ def test_the_real_code_path_keeps_the_index_under_a_forced_generic_plan(
 #
 # ``filter_metadata`` is a documented, shipped parameter on the knowledge-base
 # search route, passed through unchanged by the search service and by the
-# runtime and attached-knowledge-base configuration paths. It adds a fourth
-# bound value to the statement -- ``c.meta @> $n`` -- and it is the one value the
-# planner cannot be given as a literal, because it is caller data.
+# runtime and attached-knowledge-base configuration paths. It adds a bound value
+# to the statement -- ``c.meta @> $n`` -- and it is the one value the planner
+# cannot be given as a literal, because it is caller data.
 #
-# A *generic* plan has no value to estimate at all and falls back to a fixed
-# guess, which is what the custom plan the store asks for is there to avoid. A
-# custom plan does better, but not always well: it
-# estimates ``meta @> const`` by testing the constant against the column's MCV
-# list, so the more keys the filter carries the fewer MCV entries it matches, and
-# it then multiplies that by ``c.knowledge_base_id = ...`` as if the two were
-# independent -- which they are not, when one of the filter's own keys is the
-# knowledge base. Measured on this fixture, ``top_k`` 20:
+# The planner's estimates for it are wrong in two different ways, and the service
+# no longer tries to win the cost race they decide. A *generic* plan has no value
+# to estimate at all and falls back to a fixed guess. A *custom* plan does better,
+# but not always well: it estimates ``meta @> const`` by testing the constant
+# against the column's MCV list, so the more keys the filter carries the fewer MCV
+# entries it matches, and it then multiplies that by ``c.knowledge_base_id = ...``
+# as if the two were independent -- which they are not, when one of the filter's
+# own keys is the knowledge base. Measured on this fixture, ``top_k`` 20:
 #
 #   filter                          estimate   rows that really match
 #   {"tier": "gold"}                     722                    2,400
 #   {"kb": KB_BIG}                     1,076                   12,000
 #   {"tier": "gold", "kb": KB_BIG}       217                    2,400
 #
-# The first two keep the ordered index scan; the third, 11 times low, makes a
-# sort of 217 rows cost 3,837 against the index scan's 5,060 and loses it.
+# Which way that race comes out decided what a filtered search returned, and it
+# came out differently at different vector widths -- so the answer a caller got
+# depended on the width of their embeddings. The service now settles it in the
+# same direction at every width: a search the caller restricted gets the exact
+# plan insisted on (``_insisting_on_an_exact_search``), because an ordered ANN
+# scan cannot promise the rows the caller asked for and a full page of ``top_k``
+# rows has no signal in it to notice that with. So these specs assert the
+# opposite of what they used to: a filtered search reaches neither index and
+# answers exactly, at both ends of the selectivity range and with the correlated
+# two-key estimate as well.
 #
-# The service used to answer that by pricing the sort out for a filtered search
-# too. It does not any more -- steering a restricted or filtered search made three
-# other shapes slower and less accurate than they were before it -- so the two
-# single-key filters below keep the index because the planner keeps it, and the
-# two-key one loses it and answers exactly, which is the trade the owner took.
-# Section 12 has what a restricted search is still held to.
+# Each carries the positive control beside it -- the *unrestricted* search on the
+# same knowledge base still being steered onto the partial index -- because
+# without it this whole set would also pass against a build with the feature
+# removed, which is the failure mode this module has been caught by twice.
 # ---------------------------------------------------------------------------
 
 # 20% of the rows in any knowledge base, and 100% of them: the same shape with
@@ -1476,65 +1487,42 @@ FILTER_EVERYTHING = {"kb": KB_BIG}
 FILTER_TWO_KEYS = {"tier": "gold", "kb": KB_BIG}
 
 
-def test_a_filtered_search_reaches_the_partial_index_under_a_custom_plan(
-    engine, schema, settings, query_vectors
+@pytest.mark.parametrize(
+    "filter_metadata,selectivity",
+    [
+        (FILTER_ONE_IN_FIVE, "one row in five"),
+        (FILTER_EVERYTHING, "every row"),
+        (FILTER_TWO_KEYS, "one row in five, through two correlated keys"),
+    ],
+)
+def test_a_filtered_search_keeps_the_exact_plan_and_answers_exactly(
+    engine, schema, settings, query_vectors, filter_metadata, selectivity
 ):
-    """The control the next two specs need: one filter key loses nothing.
+    """A metadata filter takes neither index, and returns the exact answer.
 
-    A custom plan knows a single key's value, estimates it, and still chooses the
-    partial index -- so what the generic-plan spec below finds for these two
-    filters is about plan caching, not about filtering. Measured: 12 of 12 on the
-    partial index at 1.4-1.9 ms with either.
+    Three filters, and what used to be three different stories about them is one:
+    the 20%-selective one and the 100%-selective one kept the partial index when
+    the planner was asked for a custom plan, the correlated two-key one did not,
+    and none of them kept it once the plan went generic. Every one of those
+    outcomes was a cost race between an estimate that is wrong (see the section
+    header) and a sort, decided differently at different vector widths -- so what
+    a caller got back depended on how wide their embeddings were.
 
-    Both single-key filters, deliberately, and at both ends of the selectivity
-    range: 20% of the rows and 100% of them. Two keys is the case a custom plan
-    does *not* get right on its own, and it has its own spec below.
-    """
-    name = _build_big_index(engine, settings)
-    for filter_metadata in (FILTER_ONE_IN_FIVE, FILTER_EVERYTHING):
-        scans, prepared = _drive_searches(
-            engine,
-            KB_BIG,
-            query_vectors,
-            plan_cache_mode="force_custom_plan",
-            index_name=name,
-            filter_metadata=filter_metadata,
-        )
-        assert prepared, "the driver never prepared the filtered search statement"
-        assert scans[name] == _DRIVEN_EXECUTIONS, (
-            f"a custom plan must reach the partial index with {filter_metadata}: {scans}"
-        )
+    Now all three are the same and the width does not enter: the search is given
+    the exact plan, it scans neither the knowledge base's partial index nor the
+    shared per-dimension one, and it answers exactly what an exact scan answers.
+    Measured at 1536 dimensions, the width production stores, the largest
+    restricted shape costs 42.7 ms this way against 44.8 ms unaided -- the plan
+    the planner would have chosen there anyway -- and what replaces the ordered
+    scans is a bitmap scan of the same indexes, not a sequential scan.
 
-
-def test_a_two_key_filter_keeps_the_planners_own_plan_and_answers_exactly(
-    engine, schema, settings, query_vectors
-):
-    """Two metadata keys, and the claim this spec used to make is withdrawn.
-
-    The estimate is still wrong the way the section header describes: each key the
-    filter carries cuts the entries of ``meta``'s MCV list the bound constant is
-    contained in, and the planner multiplies that by the knowledge-base predicate
-    as though the two were independent -- 217 rows estimated where 2,400 really
-    match -- so a sort of 217 rows looks cheaper than the ordered index scan and
-    the partial index is priced out even though the planner knows the filter's
-    value. What changed is what the service does about it: nothing. A restricted
-    or filtered search keeps the plan the planner picks, because pricing the sort
-    out of one made three other search shapes slower and less accurate than they
-    were before.
-
-    So this pins the withdrawal rather than the old claim, on both sides of the
-    plan cache: no scan of this knowledge base's partial index, and -- the half
-    that matters to a caller -- exactly the answer an exact scan gives, once per
-    query vector. Losing the index here costs latency and buys correctness, and
-    that trade is the whole of the change; a spec that only counted scans would
-    not say which way it went.
-
-    Driven twice through the query vectors so the second pass runs on a prepared
-    statement, with ``prepared`` as the negative control.
+    Both sides of the plan cache, twelve executions each so the second pass runs
+    on a prepared statement, with ``prepared`` as the negative control and the
+    unrestricted search as the positive one.
     """
     name = _build_big_index(engine, settings)
     shared = f"idx_ai_embeddings_hnsw_{DIMS}"
-    kwargs = {"filter_metadata": FILTER_TWO_KEYS}
+    kwargs = {"filter_metadata": filter_metadata}
     exact = _exact_answers(engine, KB_BIG, query_vectors, **kwargs)
     assert all(len(answer) == TOP_K for answer in exact), [len(a) for a in exact]
 
@@ -1555,66 +1543,18 @@ def test_a_two_key_filter_keeps_the_planners_own_plan_and_answers_exactly(
             "the driver never prepared the filtered search statement, so this leg "
             f"could not have seen a {plan_cache_mode} plan at all"
         )
-        assert scans[name] == 0, (
-            f"a two-key filtered search must keep the planner's own plan, and the "
-            f"planner does not choose the partial index for it: {scans[name]} of "
-            f"{len(driven)} executions scanned it under {plan_cache_mode} ({scans})"
+        assert scans[name] == 0 and scans[shared] == 0, (
+            f"a filtered search selecting {selectivity} must keep the exact plan, and "
+            f"an approximate index cannot answer it: {scans[name]} executions of "
+            f"{len(driven)} scanned the partial index and {scans[shared]} the shared one "
+            f"under {plan_cache_mode} ({scans})"
         )
         assert answers == exact * 2, (
-            "the plan the planner picks for this filter is an exact one, so the answer "
-            f"is the exact answer ({plan_cache_mode}, scans {scans})"
+            f"a filtered search selecting {selectivity} did not return the exact answer "
+            f"under {plan_cache_mode} (scans {scans})"
         )
 
-
-@pytest.mark.parametrize(
-    "filter_metadata,selectivity",
-    [
-        (FILTER_ONE_IN_FIVE, "one row in five"),
-        (FILTER_EVERYTHING, "every row"),
-    ],
-)
-def test_a_filtered_search_keeps_the_index_under_a_forced_generic_plan(
-    engine, schema, settings, query_vectors, filter_metadata, selectivity
-):
-    """A single-key filtered search must not lose the partial index once cached.
-
-    This is the shape the suite never executed. Measured on this fixture before
-    the fix, driving the real store on one pooled connection: 0 of 12 executions
-    on the partial index, 5.0 ms for the 20%-selective filter and 15.9 ms for
-    the 100%-selective one, against 1.9 ms and 1.4 ms under a custom plan. The
-    filter that selects everything is the slower of the two, which is what rules
-    out the reading that the filter was simply too selective for an ordered
-    scan.
-
-    Single-key only. The two-key filter used to be a third case here and is now
-    its own spec, asserting the opposite: the planner declines the partial index
-    for it, the service no longer overrides that, and the answer is exact. What
-    keeps these two cases on the index is the custom plan the filter asks for,
-    which survived the change.
-
-    A connection keeps its plan for the life of the pool entry, so this is not a
-    one-search cost: it is every filtered search on that connection from the
-    prepare threshold on.
-    """
-    name = _build_big_index(engine, settings)
-    scans, prepared = _drive_searches(
-        engine,
-        KB_BIG,
-        query_vectors,
-        plan_cache_mode="force_generic_plan",
-        index_name=name,
-        filter_metadata=filter_metadata,
-    )
-    assert prepared, (
-        "the driver never prepared the filtered search statement, so this test "
-        "could not have seen a generic plan at all"
-    )
-    assert scans[name] == _DRIVEN_EXECUTIONS, (
-        f"a filtered search selecting {selectivity} used the partial index for only "
-        f"{scans[name]} of {_DRIVEN_EXECUTIONS} executions under a generic plan ({scans}); "
-        "a search with a metadata filter must reach the index the same way an "
-        "unfiltered one does"
-    )
+    _assert_the_unrestricted_search_still_reaches_the_index(engine, query_vectors, name, shared)
 
 
 # ---------------------------------------------------------------------------
@@ -1924,6 +1864,10 @@ def test_hybrid_search_has_a_vector_leg_that_reaches_the_partial_index(
 # exactly without an index, so "the answer did not change" is a claim with
 # something in it. At 21 % and above the shared index is already what an
 # unindexed search gets, and there is no exact answer to preserve.
+#
+# This block is half of a symmetric pair and only applies to an *unrestricted*
+# search. Its mirror prices the approximate index out for a search the caller
+# restricted; sections 8 and 12 are that side.
 # ---------------------------------------------------------------------------
 
 
@@ -1982,6 +1926,37 @@ def _drive_and_collect(
         probe.dispose()
     after = _idx_scans(engine, *counted)
     return {name: after[name] - before[name] for name in counted}, answers
+
+
+def _assert_the_unrestricted_search_still_reaches_the_index(engine, vectors, name, shared):
+    """The positive control every "stays off the index" spec needs beside it.
+
+    A restricted search taking zero scans of the partial index is also what a
+    build with this feature removed would do, and a suite that only asserted the
+    negative would pass against one. Twice through ``vector_search`` unrestricted,
+    on the knowledge base whose index is built: both executions on the partial
+    index, neither on the shared one, and a full page each time.
+
+    Two executions rather than twelve because the steering is decided per search;
+    what needs many executions is a claim about a *cached* plan, and that is the
+    spec's own business, not this control's.
+
+    What it proves and what it does not, measured rather than assumed. Taking the
+    embeddings-side knowledge base id out of the statement, or not building the
+    index, fails the specs that call this -- the first through
+    ``_capture_search_sql``, the second through ``_build_big_index``. Removing only
+    the ``enable_sort`` steering does *not*: at 384 dimensions the planner chooses
+    the partial index for an unrestricted search unaided, which is the premise the
+    module docstring opens with, so there is nothing here to observe. That half is
+    pinned deterministically in the unit tier, in
+    ``tests/unit/test_vector_search_plan_shape.py``.
+    """
+    scans, answers = _drive_and_collect(engine, KB_BIG, list(vectors)[:2], name, shared)
+    assert scans[name] == 2 and scans[shared] == 0, (
+        "the unrestricted search is the one this feature exists for, and it must still "
+        f"be steered onto the knowledge base's own partial index: {scans}"
+    )
+    assert all(len(answer) == TOP_K for answer in answers), [len(a) for a in answers]
 
 
 def test_a_knowledge_base_with_no_index_of_its_own_keeps_the_answer_it_has_today(
@@ -2069,18 +2044,17 @@ def test_a_vector_search_leaves_enable_sort_as_it_found_it(
 
 
 def test_a_filter_matching_no_row_still_answers_nothing(engine, schema, settings, query_vectors):
-    """What the forced index scan costs, and that it does not cost correctness.
+    """A restriction that matches nothing: an empty answer, not a wrong one.
 
-    With the sort priced out, an extra predicate that matches nothing turns the
-    search into a walk of the index looking for rows that are not there. Measured
-    at 1536 dimensions on the indexed 30 % knowledge base: a filter matching no
-    row went from 3.0 ms to 38.3 ms, and a ``source_ids`` matching no row from
-    2.4 ms to 36.7 ms. The answer is the same in both -- none -- and the cost is
-    bounded rather than proportional, because pgvector stops an iterative scan at
-    ``hnsw.max_scan_tuples`` (20,000 by default).
-
-    That is the trade this fix makes in the direction nobody wants, so it is
-    pinned as behaviour: an empty answer, not a wrong one and not an error.
+    This was written when a restricted search was driven onto the index, where a
+    predicate matching no row turned the search into a walk of the index looking
+    for rows that are not there -- measured at 1536 dimensions on the indexed 30 %
+    knowledge base, a filter matching no row went from 3.0 ms to 38.3 ms and a
+    ``source_ids`` matching no row from 2.4 ms to 36.7 ms. A restricted search is
+    given the exact plan now, so that cost is gone with it; the behaviour it was
+    written to pin is not width- or plan-dependent and is worth keeping either
+    way. All four restriction shapes, because an empty answer is the one case
+    where a wrong one is easiest to produce and hardest to notice.
     """
     name = _build_big_index(engine, settings)
     shared = f"idx_ai_embeddings_hnsw_{DIMS}"
@@ -2100,19 +2074,18 @@ def test_a_restriction_below_top_k_returns_every_row_that_matches(
     """Fewer rows match than ``top_k``, and all of them come back.
 
     This spec used to pin the forced ordered index scan returning all twelve, and
-    the exact re-run that made it do so. Both halves of that premise are gone: a
-    restricted search is no longer steered, so it runs on the plan the planner
-    picks and the re-run's short-answer signal never fires for it. What is left is
-    the claim that was always the point -- a row the caller named and did not get
-    is a wrong answer, not a recall trade -- and the two things that now deliver
-    it: the planner's own plan, and ``_apply_iterative_scan`` for the executions
-    where the planner does choose an index.
+    the after-the-fact re-run that made it do so. Both are gone: a restricted
+    search is given the exact plan instead, so there is no approximate scan to
+    starve and nothing to repair afterwards. The claim that was always the point
+    survives it -- a row the caller named and did not get is a wrong answer, not a
+    recall trade -- and it is now structural rather than rescued.
 
     So the assertions are inverted rather than deleted: zero scans of this
-    knowledge base's partial index, because a restricted search must not be
-    driven onto it, and all twelve rows regardless. Both plan cache modes,
-    because a cached plan is what a pooled connection settles on, and twice
-    through the query vectors so the second pass is a prepared one.
+    knowledge base's partial index and zero of the shared one, because neither can
+    promise the rows the caller named, and all twelve rows regardless. Both plan
+    cache modes, because a cached plan is what a pooled connection settles on, and
+    twice through the query vectors so the second pass is a prepared one. The
+    unrestricted search beside it is the positive control.
 
     Its twin above the limit is
     ``test_a_restriction_the_caller_named_still_answers_exactly``, which names 200
@@ -2154,10 +2127,11 @@ def test_a_restriction_below_top_k_returns_every_row_that_matches(
             "the driver never prepared the restricted search statement, so the second "
             "pass proves nothing about a cached plan"
         )
-        assert scans[name] == 0, (
-            f"a search restricted to named rows must keep the planner's own plan: "
+        assert scans[name] == 0 and scans[shared] == 0, (
+            f"a search restricted to named rows must keep the exact plan: "
             f"{scans[name]} of {len(driven)} executions were steered onto the partial "
-            f"index under plan_cache_mode {plan_cache_mode or 'auto'} ({scans})"
+            f"index and {scans[shared]} onto the shared one under plan_cache_mode "
+            f"{plan_cache_mode or 'auto'} ({scans})"
         )
         for got in answers:
             assert sorted(got) == sorted(wanted), (
@@ -2166,50 +2140,43 @@ def test_a_restriction_below_top_k_returns_every_row_that_matches(
                 f"(plan_cache_mode {plan_cache_mode or 'auto'}, scans {scans})"
             )
 
+    _assert_the_unrestricted_search_still_reaches_the_index(engine, query_vectors, name, shared)
+
 
 # ---------------------------------------------------------------------------
 # 12. A restriction with more matching rows than ``top_k``
 #
-# ``_search_again_exactly`` is what keeps a restricted search honest once the
-# exact sort is priced out, and its signal is ``len(items) < effective_top_k``.
-# That catches starvation *below* the limit. It cannot catch starvation *at* it:
-# a restriction that still matches more rows than ``top_k`` fills the LIMIT with
-# whatever the ordered scan happened to reach, and a full page of the wrong rows
-# is indistinguishable from a complete answer by row count alone. The suite's
-# other restricted-search spec,
-# ``test_a_forced_index_scan_still_returns_every_row_that_matches``, names 12
-# rows against a ``top_k`` of 20 -- deliberately the corner a row count does
-# catch, and until now the only corner anything here covered.
+# The safety net this section was written against is gone, and what replaced it is
+# why. It re-ran a search whose answer came back short, on the signal
+# ``len(items) < top_k``: that catches starvation *below* the limit and cannot
+# catch starvation *at* it. A restriction that still matches more rows than
+# ``top_k`` fills the LIMIT with whatever the ordered scan happened to reach, and
+# a full page of the wrong rows is indistinguishable from a complete answer by row
+# count alone -- so there is nothing to trigger on, and where the plan the planner
+# prefers is also the approximate index the re-run replays the same scan and
+# returns the same answer. A restricted search is now given the exact plan
+# instead, and exactness is structural rather than rescued.
 #
 # So these specs sit on the other side of the limit, and they assert what the
-# caller gets rather than how the store got it. None of them looks at which
-# branch of the store ran or at whether a setting was applied; the index counters
-# they do read are read to assert that a restricted search was *not* steered,
-# which is the behaviour that ships, not the mechanism that delivers it.
+# caller gets rather than how the store got it. Neither looks at which branch of
+# the store ran or at whether a particular setting was applied; the index counters
+# they read are read to assert that a restricted search was not steered onto an
+# approximate index, which is behaviour and not mechanism, and each carries the
+# unrestricted search beside it as the positive control -- a suite that only
+# asserted the negative would pass against a build with the feature removed.
 #
-# What each restriction is held to differs, and the difference is the caller's,
-# not the planner's:
+# Both restrictions are held to the same bar, because the caller's claim is the
+# same in both: a row you named, or a source you narrowed to, is not a recall
+# trade. ``item_ids`` is the one the old re-run's docstring argued for and only
+# covered below the limit; ``source_ids`` is the shape a caller reaches for most
+# often, one document of a knowledge base, and it is a *set* restriction, so the
+# two together cover both ways a caller can narrow a search that still leaves many
+# more rows than the limit. The metadata filter is the third way and it is pinned
+# in section 8, at both ends of its selectivity range.
 #
-# - rows the caller *named* must all come back, and the nearest of them first.
-#   The store's own reasoning makes that commitment -- a row the caller named and
-#   did not get is not a recall trade, it is a wrong answer -- and it holds
-#   because the planner's own plan for a named-rows restriction is an exact one.
-# - a restriction that *narrows a set* -- one source, a metadata filter -- cannot
-#   be held to an exact answer at this module's 384 dimensions, because there the
-#   planner sometimes chooses the knowledge base's own approximate index for it
-#   unaided. That is a known limitation of a restricted search at small vector
-#   widths and not something this PR introduced: before it, the same search could
-#   reach the shared per-dimension index and be approximate the same way. At
-#   1536 dimensions, production's width, the planner declines an HNSW index at
-#   every selectivity measured, so a restricted search there is an exact scan.
-#   What is asserted instead is what holds at both widths and is wrongness rather
-#   than recall when it fails: narrowing must not lose a row the wider search
-#   already returned, every row must really match the restriction, and the page
-#   must be full when many times ``top_k`` rows match.
-#
-# The specs that can be are driven twice through the query vectors, because the
-# failure this is about survives plan caching: a plan a pooled connection settled
-# on is re-used for the life of the pool entry.
+# Both are driven twice through the query vectors, because the failure this is
+# about survives plan caching: a plan a pooled connection settled on is re-used
+# for the life of the pool entry.
 #
 # What exact means is measured on the same statement with no index at all, once
 # per query vector, so the expectation is PostgreSQL's own and not a number
@@ -2251,19 +2218,15 @@ def named_items(engine, fixture_schema):
     return ids
 
 
-def _restricted_ids(engine, *, ids: list[str] | None = None, **kwargs) -> list[str]:
-    """The ids of KB_BIG the restriction really matches, from the database.
+def _matching_rows(engine, **kwargs) -> int:
+    """How many rows of KB_BIG the restriction really matches, from the database.
 
     The restriction is spelled out here in SQL rather than taken from the store,
-    so what the specs below compare against is the question the caller asked and
-    not the store's own answer to it. ``ids`` narrows the search to a candidate
-    list, for asking which of an answer's rows match.
+    so the margin the specs below assert -- many times ``top_k`` rows matching -- is
+    the question the caller asked and not the store's own answer to it.
     """
     where = [f"knowledge_base_id = '{KB_BIG}'"]
     params: dict = {}
-    if ids is not None:
-        where.append("id = ANY(CAST(:candidates AS uuid[]))")
-        params["candidates"] = "{" + ",".join(ids) + "}"
     if "item_ids" in kwargs:
         where.append("id = ANY(CAST(:named AS uuid[]))")
         params["named"] = "{" + ",".join(kwargs["item_ids"]) + "}"
@@ -2274,44 +2237,44 @@ def _restricted_ids(engine, *, ids: list[str] | None = None, **kwargs) -> list[s
         where.append("meta @> CAST(:meta AS jsonb)")
         params["meta"] = json.dumps(kwargs["filter_metadata"])
     with engine.connect() as conn:
-        rows = conn.execute(
-            text(f"SELECT id FROM {SCHEMA}.chunks WHERE " + " AND ".join(where)), params
-        ).all()
+        count = conn.execute(
+            text(f"SELECT count(*) FROM {SCHEMA}.chunks WHERE " + " AND ".join(where)), params
+        ).scalar()
         conn.rollback()
-    return [str(row[0]) for row in rows]
+    return int(count)
 
 
-def _matching_rows(engine, **kwargs) -> int:
-    """How many rows of KB_BIG the restriction really matches."""
-    return len(_restricted_ids(engine, **kwargs))
-
-
-def _matching_ids(engine, ids: list[str], **kwargs) -> list[str]:
-    """Which of ``ids`` the restriction matches, in the order given."""
-    keep = set(_restricted_ids(engine, ids=ids, **kwargs))
-    return [item_id for item_id in ids if item_id in keep]
-
-
-def test_a_restriction_the_caller_named_still_answers_exactly(
-    engine, schema, settings, query_vectors, named_items
+@pytest.mark.parametrize("restriction", ["item_ids", "source_ids"])
+def test_a_restriction_above_top_k_answers_exactly(
+    engine, schema, settings, query_vectors, named_items, restriction
 ):
-    """``NAMED_ITEMS`` named rows, a ``top_k`` of 20, and the nearest 20 of them.
+    """The nearest ``top_k`` rows that match, from many more than ``top_k`` matches.
 
-    Ten times ``top_k`` matches, so the answer is a full page and nothing about it
-    looks wrong from the outside -- which is the whole case: the store's only
-    completeness signal is that the page came back short, and this page does not.
-    The exact answer is a full page too, which is asserted for the same reason: if
-    it were not, a wrong answer could pass as a short one.
+    200 named rows and a source of 300, against a ``top_k`` of 20: ten and fifteen
+    times the limit, so the answer is a full page and nothing about it looks wrong
+    from the outside. That is the whole case. The exact answer is a full page too,
+    which is asserted for the same reason -- if it were not, a wrong answer could
+    pass as a short one.
 
-    The suite's other named-rows spec asks for 12 rows against a ``top_k`` of 20,
-    which the row count catches. This one is the half above the limit.
+    One spec per restriction rather than one for both, because the two are
+    estimated differently -- named ids against the primary key, a source against
+    an ordinary equality -- and a change that repairs one can leave the other
+    exactly as it was.
+
+    Measured before the store insisted on an exact plan for a restricted search:
+    a full page of 20 with 15 of them not among the nearest 20 named rows, and 15
+    of 20 for the source, on 12 of 12 executions of the partial index.
     """
-    kwargs = {"item_ids": set(named_items)}
+    restrictions = {
+        "item_ids": {"item_ids": set(named_items)},
+        "source_ids": {"source_ids": [SOURCE_B]},
+    }
+    kwargs = restrictions[restriction]
     matching = _matching_rows(engine, **kwargs)
     assert matching >= 10 * TOP_K, (
-        f"{matching} rows match; this spec is only about the case where more than "
-        f"top_k ({TOP_K}) do -- the one a row count cannot detect -- and it keeps a "
-        "margin of ten times rather than one row"
+        f"{restriction} matches {matching} rows; this spec is only about the case "
+        f"where more than top_k ({TOP_K}) do -- the one a row count cannot detect -- "
+        "and it keeps a margin of ten times rather than one row"
     )
 
     name = _build_big_index(engine, settings)
@@ -2324,104 +2287,17 @@ def test_a_restriction_the_caller_named_still_answers_exactly(
         scans, answers = _drive_and_collect(
             engine, KB_BIG, driven, name, shared, plan_cache_mode=plan_cache_mode, **kwargs
         )
+        assert scans[name] == 0 and scans[shared] == 0, (
+            f"a search restricted by {restriction} must keep the exact plan; neither "
+            f"index can promise the rows the caller asked for: {scans}"
+        )
         for i, (got, wanted) in enumerate(zip(answers, exact * 2)):
             assert got == wanted, (
-                f"a search restricted to {matching} named rows with top_k {TOP_K} "
+                f"a search restricted to {matching} matching rows with top_k {TOP_K} "
                 f"returned a full page of {len(got)} that is not the {TOP_K} nearest "
                 f"of them: {len(set(got) - set(wanted))} of them do not belong "
                 f"(query vector {i % len(query_vectors)}, plan_cache_mode "
                 f"{plan_cache_mode or 'auto'}, scans {scans})"
             )
 
-
-def test_narrowing_by_source_never_loses_a_row_the_wider_search_found(
-    engine, schema, settings, query_vectors
-):
-    """The weaker claim, for a restriction that narrows a set rather than naming rows.
-
-    Exactness cannot be asked of these: a search restricted to a source or carrying
-    a metadata filter runs on whatever plan the planner picks, and at this module's
-    384 dimensions the planner does sometimes pick the knowledge base's own HNSW
-    index -- an approximate index, so an approximate answer. That is a known
-    limitation of a restricted search at small vector widths rather than something
-    this PR introduced: before it, the same search could reach the *shared*
-    per-dimension index and be approximate in exactly the same way. At 1536
-    dimensions, which is what production stores, the planner declines an HNSW
-    index at every selectivity measured, so a restricted search there is an exact
-    scan and is exact.
-
-    What is asserted instead is the part that holds at both widths and is still a
-    wrong answer when it fails: a caller who narrows a search they have already
-    run gets at least the rows they already saw. The source matches 15 times
-    ``top_k``, so this is the same above-the-limit case as the spec above -- the
-    narrowed answer is a full page, and a full page missing a row the caller
-    watched come back looks exactly like a complete answer.
-
-    Source only. The single-key metadata filter is the case where the planner does
-    reach the partial index unaided on this fixture, and it loses rows this way --
-    measured on the shipped store, 3 of the 4 rows the unrestricted search had
-    returned, on one of six query vectors. That is the known limitation above, and
-    it has its own spec asserting what does survive it.
-    """
-    kwargs = {"source_ids": [SOURCE_B]}
-    matching = _matching_rows(engine, **kwargs)
-    assert matching >= 10 * TOP_K, (matching, TOP_K)
-
-    name = _build_big_index(engine, settings)
-    shared = f"idx_ai_embeddings_hnsw_{DIMS}"
-    driven = list(query_vectors) * 2
-    _, wider = _drive_and_collect(engine, KB_BIG, driven, name, shared)
-    scans, narrowed = _drive_and_collect(engine, KB_BIG, driven, name, shared, **kwargs)
-    for i, (wide, narrow) in enumerate(zip(wider, narrowed)):
-        already_seen = _matching_ids(engine, wide, **kwargs)
-        assert len(narrow) == TOP_K, (
-            f"the narrowed search returned {len(narrow)} rows of {matching} that match, "
-            "so this is not the above-the-limit case any more"
-        )
-        missing = [item_id for item_id in already_seen if item_id not in narrow]
-        assert not missing, (
-            f"narrowing by source lost {len(missing)} of the {len(already_seen)} rows "
-            f"the unrestricted search had already returned, and still filled the page "
-            f"with {len(narrow)} rows (query vector {i % len(query_vectors)}, "
-            f"{matching} rows match the restriction, scans {scans})"
-        )
-
-
-def test_a_filtered_search_answers_from_its_own_knowledge_base_and_fills_the_page(
-    engine, schema, settings, query_vectors
-):
-    """What survives the known limitation, for a metadata filter above the limit.
-
-    The one restricted shape on this fixture where the planner reaches the
-    approximate index unaided, so neither exactness nor "no row the wider search
-    found is lost" can be asked of it at 384 dimensions (see the spec above for
-    why, and for why production's width does not have the problem). Two things can,
-    and both are wrongness rather than recall if they fail: every row the caller
-    gets back really matches the filter and really belongs to this knowledge base,
-    and the page is full when 120 times ``top_k`` rows match it.
-
-    A filter is applied in SQL and a page is filled by the ``LIMIT``, so neither
-    depends on which plan ran -- which is what makes them the right pair to keep
-    here while the plan is the planner's business.
-    """
-    kwargs = {"filter_metadata": FILTER_ONE_IN_FIVE}
-    matching = _matching_rows(engine, **kwargs)
-    assert matching >= 10 * TOP_K, (matching, TOP_K)
-
-    name = _build_big_index(engine, settings)
-    shared = f"idx_ai_embeddings_hnsw_{DIMS}"
-    scans, answers = _drive_and_collect(engine, KB_BIG, query_vectors, name, shared, **kwargs)
-    for i, got in enumerate(answers):
-        assert len(got) == TOP_K, (
-            f"{matching} rows match the filter and the page came back with {len(got)} "
-            f"(query vector {i}, scans {scans})"
-        )
-        foreign = [
-            item_id
-            for item_id in got
-            if item_id not in set(_restricted_ids(engine, ids=got, **kwargs))
-        ]
-        assert not foreign, (
-            f"{len(foreign)} of {len(got)} rows do not match the filter the caller sent, "
-            f"or are not in this knowledge base (query vector {i}, scans {scans})"
-        )
+    _assert_the_unrestricted_search_still_reaches_the_index(engine, query_vectors, name, shared)
