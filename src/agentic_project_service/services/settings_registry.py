@@ -1133,6 +1133,70 @@ def _build_registry() -> dict[str, SettingDef]:
                 "like this setting it is trusted, not verified."
             ),
         ),
+        SettingDef(
+            key="VECTOR_PER_KB_INDEX_MIN_ROWS",
+            category=cat,
+            label="Per-KB Vector Index Threshold (rows)",
+            type="int",
+            default=50000,
+            min=1000,
+            max=10000000,
+            advanced=True,
+            description=(
+                "A knowledge base with at least this many embeddings gets a vector "
+                "index of its own, built in the background without blocking writes, "
+                "instead of sharing the project-wide one. Its searches then rank "
+                "over only its own vectors: measured on a 73,290-embedding knowledge "
+                "base, 182 ms to 1.4 ms warm and 824 ms to 225 ms cold, and a top-k "
+                "drawn from the right population rather than from the whole "
+                "project. It costs disk (roughly 573 MB for "
+                "73,290 vectors at 1536 dimensions) and makes writes to that "
+                "knowledge base slower until the project-wide index is retired. The "
+                "crossover where this starts paying was bracketed, not measured "
+                "exactly — a 2,000-row knowledge base is better off without one, a "
+                "73,290-row one is two orders of magnitude better off with one — so "
+                "the default sits deliberately at the conservative end."
+            ),
+        ),
+        SettingDef(
+            key="VECTOR_PER_KB_INDEX_DROP_ROWS",
+            category=cat,
+            label="Per-KB Vector Index Drop Threshold (rows)",
+            type="int",
+            default=25000,
+            min=0,
+            max=10000000,
+            advanced=True,
+            description=(
+                "A knowledge base that falls below this many embeddings — sources "
+                "deleted, or reindexed with a different embedding model — has its own "
+                "vector index dropped again. Deliberately well below the build "
+                "threshold: with one threshold, a knowledge base sitting on it would "
+                "have its index built and thrown away over and over, and each build "
+                "is a full index build. A value at or above the build threshold is "
+                "ignored in favour of half of it."
+            ),
+        ),
+        SettingDef(
+            key="VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB",
+            category=cat,
+            label="Vector Index Build Memory (MB)",
+            type="int",
+            default=128,
+            min=64,
+            max=4096,
+            advanced=True,
+            description=(
+                "maintenance_work_mem for a per-knowledge-base vector index build, "
+                "set in the builder's own session only. A build that does not fit "
+                "spills and gets much slower: measured 3.3x slower at 64 MB than at "
+                "1 GB for a 73,290-vector, 1536-dimension index (50.6 s against "
+                "15.3 s), which needs roughly 500 MB to stay in memory. Raise it "
+                "only as far as the database has memory to spare — the smallest "
+                "project databases have 512 MiB in total, and this is memory the "
+                "build takes on top of shared_buffers."
+            ),
+        ),
     ]
 
     # =========================================================================

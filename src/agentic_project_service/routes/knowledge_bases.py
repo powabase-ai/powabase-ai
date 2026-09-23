@@ -39,6 +39,7 @@ from ..strategies.graph_defaults import (
 )
 from ..tasks.indexing import (
     build_bm25_for_kb,
+    drop_per_kb_vector_index,
     drop_pg_bm25_index,
     ensure_pg_bm25_index,
     index_source,
@@ -1251,6 +1252,19 @@ def delete_knowledge_base(kb_id: str):
     except Exception:
         logger.warning(
             "Failed to dispatch the pg_search BM25 index drop for deleted KB %s; "
+            "the index is now orphaned and has to be dropped by hand",
+            kb_id,
+            exc_info=True,
+        )
+
+    # Same for this KB's own partial HNSW index on ai.embeddings: its rows are
+    # gone with the CASCADE, but the index is not, and Postgres would go on
+    # evaluating its predicate on every write to the table.
+    try:
+        drop_per_kb_vector_index.delay(kb_id)
+    except Exception:
+        logger.warning(
+            "Failed to dispatch the per-knowledge-base vector index drop for deleted KB %s; "
             "the index is now orphaned and has to be dropped by hand",
             kb_id,
             exc_info=True,

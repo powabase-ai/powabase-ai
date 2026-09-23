@@ -404,6 +404,23 @@ def create_app(testing: bool = False):
                             "Start-up sweep for unfinished BM25 partitions failed",
                             exc_info=True,
                         )
+                    # A knowledge base that grew past the threshold before this
+                    # feature existed, or while no source was being indexed, has
+                    # nothing else to give it its own vector index -- and a
+                    # worker killed mid-build leaves an INVALID one that serves
+                    # no query and is maintained on every write. Both are
+                    # reconciled from here. Never raises.
+                    try:
+                        from .tasks.indexing import (
+                            dispatch_per_kb_vector_indexes_at_start,
+                        )
+
+                        dispatch_per_kb_vector_indexes_at_start(db.engine)
+                    except Exception:
+                        logger.warning(
+                            "Start-up sweep for per-knowledge-base vector indexes failed",
+                            exc_info=True,
+                        )
                 finally:
                     db.session.execute(text("SELECT pg_advisory_unlock(43)"))
                     db.session.commit()

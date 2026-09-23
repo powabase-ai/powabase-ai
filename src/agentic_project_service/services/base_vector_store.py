@@ -8,6 +8,7 @@ attributes and add their own storage methods.
 import json
 import logging
 import time
+import uuid
 from typing import Any
 
 from agentic.knowledge.model_config import HYBRID_DEFAULT_VECTOR_WEIGHT
@@ -61,6 +62,36 @@ VALID_TS_LANGUAGES = frozenset(
         "yiddish",
     }
 )
+
+
+def kb_sql_literal(knowledge_base_id: Any) -> str:
+    """A knowledge base id as a quoted SQL literal, or ValueError.
+
+    The embeddings-side ``knowledge_base_id`` predicate is interpolated rather
+    than bound, and this is the one gate between a caller's value and the SQL.
+    ``uuid.UUID`` accepts nothing that could carry a quote or a statement
+    separator, so the result is safe by construction; a value that is not a
+    UUID cannot match ``ai.embeddings.knowledge_base_id`` anyway (the column is
+    ``uuid``, so today it reaches the server and fails there instead).
+
+    Interpolated because a bound parameter defeats the whole point of the
+    per-knowledge-base partial HNSW index. Its predicate names one KB id as a
+    literal, and PostgreSQL will only use a partial index when the query's own
+    restriction clauses *prove* that predicate -- which a plan built for an
+    unknown parameter cannot do. psycopg prepares a statement after
+    ``prepare_threshold`` executions on a connection, and from the sixth
+    execution of the prepared statement PostgreSQL starts comparing its generic
+    plan against the custom ones. Measured, with the id bound: executions 1-10
+    took 1.0-1.8 ms on the partial index and executions 11 onwards took
+    54-72 ms on a bitmap scan plus an exact sort -- correct, but 50x slower,
+    for as long as that connection lives. With the id as a literal there is no
+    parameter to generalise, so the generic plan matches the partial index too
+    and every execution stays on it (measured 1.07 ms at the same point).
+    """
+    try:
+        return f"'{uuid.UUID(str(knowledge_base_id))}'"
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"knowledge_base_id is not a UUID: {knowledge_base_id!r}") from exc
 
 
 def ensure_embedding_index(session: Session, schema: str, dims: int) -> None:
@@ -310,11 +341,17 @@ class BasePgVectorStore:
     def _apply_iterative_scan(self) -> None:
         """Enable pgvector HNSW iterative scan for this transaction.
 
-        The HNSW index on ai.embeddings is global (spans all KBs) and the
-        vector query filters `knowledge_base_id` AFTER the approximate scan.
-        Without iterative scanning, pgvector emits only ~ef_search global
-        candidates before that filter, starving KB-scoped queries (often 0
-        rows). SET LOCAL keeps this scoped to the current transaction so it
+        The per-dimension HNSW index on ai.embeddings spans every KB, and for a
+        KB without a partial index of its own the vector query filters
+        `knowledge_base_id` AFTER the approximate scan. Without iterative
+        scanning, pgvector emits only ~ef_search global candidates before that
+        filter, starving KB-scoped queries (often 0 rows). A KB that has its own
+        partial index (`pg_vector_index`) does not need this -- its index holds
+        only its own rows, so nothing is filtered away after the scan -- but it
+        costs that KB nothing either, so the GUC is set unconditionally rather
+        than made to depend on a catalog lookup per search.
+
+        SET LOCAL keeps this scoped to the current transaction so it
         can't leak across pooled connections. The mode is a validated constant,
         safe to interpolate. No-op (and logged) if pgvector is too old to know
         the GUC — search still works, just without the fix.
@@ -434,6 +471,15 @@ class BasePgVectorStore:
         if not (1 <= effective_dims <= 8192):
             raise ValueError(f"dims must be between 1 and 8192, got {effective_dims}")
 
+        # The embeddings-side knowledge_base_id predicate is what lets the
+        # planner use this KB's partial HNSW index, if it has one: a partial
+        # index is only matched from a restriction clause on the relation it is
+        # on, and the planner does not reason through `e.item_id = c.id` to
+        # reach `c.knowledge_base_id`. Without it the plan picks the shared
+        # per-dimension index and post-filters -- verified by EXPLAIN with the
+        # partial index present. It is a literal, not a bind parameter, for the
+        # reason kb_sql_literal documents. The item-table filter stays: it is
+        # what keeps a row whose embedding outlived its item out of the answer.
         query = f"""
             SELECT
                 c.id,
@@ -444,6 +490,7 @@ class BasePgVectorStore:
             FROM "{self.schema}".{self.TABLE} c
             JOIN "{self.schema}".embeddings e ON e.item_id = c.id
             WHERE c.knowledge_base_id = :kb_id
+              AND e.knowledge_base_id = {kb_sql_literal(self.kb_id)}
               AND e.dims = :dims
         """
 
@@ -535,6 +582,10 @@ class BasePgVectorStore:
             f"(e.embedding::vector({effective_dims})) "
             f"<=> CAST(:embedding AS vector({effective_dims}))"
         )
+        # This leg already carried the embeddings-side knowledge_base_id
+        # predicate; it is a literal here for the same reason vector_search's is
+        # (see kb_sql_literal), so a prepared statement's generic plan can still
+        # match this KB's partial HNSW index.
         query = f"""
             WITH scored AS (
                 SELECT
@@ -546,7 +597,7 @@ class BasePgVectorStore:
                 FROM "{self.schema}".{self.TABLE} c
                 JOIN "{self.schema}".embeddings e ON e.item_id = c.id
                 WHERE c.knowledge_base_id = :kb_id
-                  AND e.knowledge_base_id = :kb_id
+                  AND e.knowledge_base_id = {kb_sql_literal(self.kb_id)}
                   AND e.dims = :dims
                   {source_filter}
             ),

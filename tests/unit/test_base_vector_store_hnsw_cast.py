@@ -19,6 +19,11 @@ from unittest.mock import MagicMock
 from agentic_project_service.services.base_vector_store import BasePgVectorStore
 
 
+# A real UUID: the embeddings-side knowledge_base_id predicate reaches SQL as a
+# literal (see BasePgVectorStore.kb_sql_literal), so the store validates it.
+_KB_ID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+
+
 class _FakeStore(BasePgVectorStore):
     TABLE = "graph_index_nodes"
     TEXT_COL = "text"
@@ -37,7 +42,7 @@ def _capture_statements(embedding):
         return iter([])
 
     session.execute = spy_execute
-    store = _FakeStore(db_session=session, knowledge_base_id="kb-test")
+    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
     asyncio.run(store.vector_search(embedding=embedding, top_k=10))
     assert captured, "vector_search did not execute any SQL"
     return captured
