@@ -510,11 +510,19 @@ def test_the_partial_index_answers_only_from_its_own_knowledge_base_in_order(
 ):
     """Every row comes from this knowledge base, ranked by similarity.
 
-    An earlier version of this docstring said the fixture could not show the
-    recall gap because the indexed knowledge base was 75% of the table and the
-    shared index's post-filter threw almost nothing away. It can now: the
-    knowledge base is 30% of the table, and the gap is pinned for real by
-    ``test_the_partial_index_returns_more_of_the_exact_answer_than_the_shared_one``.
+    An earlier version of this docstring explained that the fixture could not
+    show the benchmark's recall gap because the indexed knowledge base was 75%
+    of the table, so the shared index's post-filter threw almost nothing away.
+    The fixture is now in the regime where that post-filter does discard most of
+    what it returns, and recall was measured rather than reasoned about: at 30%
+    of the table the two indexes come out the same (0.41 recall at 20 either
+    way), and at 21% the partial index is better (0.39 against 0.18). Neither
+    number is asserted anywhere, on purpose -- absolute recall on a synthetic
+    fixture is an artifact of how the vectors were generated, and a spec built
+    on one would be pinning the generator. What is asserted is the part that
+    does not depend on it: exactness, in
+    ``test_the_new_shape_answers_exactly_where_the_old_one_was_approximate``.
+
     What stays here is the invariant that holds at every scale -- own knowledge
     base only, in similarity order -- with the index's completeness pinned by
     the next test.
