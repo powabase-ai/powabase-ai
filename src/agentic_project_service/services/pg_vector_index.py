@@ -16,13 +16,20 @@ A partial index fixes both, for the knowledge bases big enough to be worth one:
 
 Measured on a 56,000-row fixture at 1536 dimensions whose largest knowledge
 base held 12,000 rows (21% of the table), ``shared_buffers`` 128 MB,
-``hnsw.ef_search`` 40, top-20: the shared index answered in 2.3 ms warm with
-recall@20 = 0.825 against an exact scan (one of six query vectors returned none
-of the true top-20); the partial index answered in 1.7 ms warm with recall
-1.000. On a larger fixture (600,000 rows, a 73,290-row knowledge base) the
-same change moved warm p50 from 182 ms to 1.4 ms and cold p50 from 824 ms to
-225 ms, and the partial index was 573 MB and built in 15-50 s depending on
-``maintenance_work_mem``.
+``hnsw.ef_search`` 40, top-20: 2.3 ms warm on the shared index against 1.7 ms
+on the partial one. On a larger fixture (600,000 rows, a 73,290-row knowledge
+base) the same change moved warm p50 from 182 ms to 1.4 ms and cold p50 from
+824 ms to 225 ms, and the partial index was 573 MB and built in 15-50 s
+depending on ``maintenance_work_mem``.
+
+The *quality* half of the argument is not yet established at the scale that
+matters. The gain appears where one knowledge base is a small fraction of a
+large table, because there the shared index's post-filter throws away most of
+what it found; on the fixtures reachable from a test suite the indexed
+knowledge base is most of the table and the two are equally approximate at
+``hnsw.ef_search = 40`` (0.28 against 0.29 recall@20 -- a wash). What is pinned
+by tests is what holds at every scale: the partial index is *complete*, so an
+exhaustive search through it returns exactly an exact scan's top-k.
 
 Three properties shape this module:
 
@@ -33,19 +40,35 @@ Three properties shape this module:
   get there. So the index is useless without the matching predicate in
   ``base_vector_store`` -- verified by ``EXPLAIN``: with the partial index
   present and the old query shape, the plan still picks the shared index.
-* **A generic plan cannot match it either.** The predicate's ``knowledge_base_id``
-  is a literal in the index definition, so a plan built for an unknown
-  parameter cannot prove it. ``base_vector_store`` interpolates the (validated)
-  KB id into the SQL for exactly this reason; see
-  ``base_vector_store.kb_sql_literal``. Measured: with the id bound as a
-  parameter, psycopg's ``prepare_threshold`` prepares the statement and the
-  11th execution onwards falls back to a bitmap scan plus an exact sort --
-  1.1 ms to 57 ms, correct but 50x slower.
+* **A generic plan can only match it if it can prove the whole predicate.**
+  The predicate names a ``knowledge_base_id`` *and* a ``dims`` as literals, and
+  an unknown ``LIMIT`` separately prices an ordered index scan out. So
+  ``vector_search`` interpolates all three -- the KB id, ``dims`` and the limit
+  -- rather than binding them; ``base_vector_store.kb_sql_literal`` carries the
+  measured decomposition showing that any one of them left bound loses the
+  index in a generic plan. This matters because psycopg prepares a statement
+  after ``prepare_threshold`` executions and PostgreSQL then weighs its generic
+  plan against the custom ones: measured with the id bound, the 11th execution
+  onwards fell back to a bitmap scan plus an exact sort, 1.1 ms to 57 ms --
+  correct but 50x slower, for the life of that connection.
 * **``CREATE INDEX CONCURRENTLY`` cannot run inside a transaction** and can
   leave an ``INVALID`` index behind when it fails, so the build lives here, in
   an out-of-band task, with the same invalid-index repair the pg_search BM25
   path uses -- not in ``base_vector_store.ensure_embedding_index``, which runs
   inside the indexing transaction on purpose.
+
+**The index building is a no-op for a project whose knowledge bases are all
+below the threshold; the query change is not.** The embeddings-side predicate
+applies to every KB-scoped vector search from the moment it deploys, with or
+without a partial index, and for a knowledge base big enough that the planner
+had been reaching the shared index it can flip the plan to an exact bitmap scan
+and sort: measured 0.356 ms approximate to 3.540 ms exact at 9% selectivity,
+and 3.57 ms to 26.83 ms at 21%. Slower but correct, and only in the window
+between "big enough for the shared index to have been used" and the build
+threshold -- which is the window the threshold exists to close. A knowledge base
+whose searches already run an exact scan sees no flip at all, and neither do the
+small ones, which measured *faster* with the predicate (9.96 ms to 4.76 ms at
+1.4% selectivity, 19.50 ms to 13.00 ms at 4.3%).
 
 Nothing here touches the shared per-dimension index. Replacing it with a
 residual one (``WHERE dims = N AND knowledge_base_id NOT IN (...)``) is what
@@ -100,6 +123,12 @@ MAX_PER_KB_INDEXES = 200
 # cost of deciding is bounded by the threshold rather than by the size of the
 # knowledge base.
 _COUNT_HEADROOM = 1
+
+# Rough bytes of index per vector dimension, for the size a build is about to
+# reach for. Derived from one measurement -- 573 MB for 73,290 vectors at 1536
+# dimensions, i.e. about 5.3 bytes per dimension: four for the float plus HNSW's
+# own links. Only ever used in a log line, so being a little wrong is fine.
+_INDEX_BYTES_PER_DIMENSION = 6
 
 
 class PerKbVectorIndexBuildInProgress(RuntimeError):
@@ -288,11 +317,19 @@ def maintenance_work_mem_mb() -> int:
 
     A build that does not fit spills, and says so
     (``NOTICE: hnsw graph no longer fits into maintenance_work_mem``): measured
-    3.3x slower at 64 MB than at 1 GB for a 73,290-row, 1536-dimension index.
-    Raising it is therefore worth real time -- but it is memory the database
-    pod has to have, and the smallest project pods have 512 MiB in total, so
-    the default is deliberately modest and the bound is what stops an override
-    from turning a slow build into an OOM kill.
+    3.3x slower at 64 MB than at 1 GB for a 73,290-row, 1536-dimension index, so
+    raising it is worth real time. The default is deliberately modest because
+    this is memory the database has to have on top of ``shared_buffers``, and
+    the smallest project databases have 512 MiB in total -- for those, the
+    default is already about as far as it goes.
+
+    The registry's maximum is **not** a safety bound, and an earlier version of
+    this docstring wrongly claimed it was: 4096 MB against a 512 MiB database is
+    an eightfold overcommit, and nothing here can see how much memory the server
+    actually has (``SHOW shared_buffers`` is a fraction of it, not the total, and
+    a container's limit is not visible from SQL at all). The clamp enforces the
+    registry range and no more. An operator raising this has to know the
+    database's own memory; the range exists so a typo cannot ask for terabytes.
     """
     return _clamped_setting("VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB")
 
@@ -370,11 +407,17 @@ def bounded_row_count(conn, knowledge_base_id: Any, dims: Any, cap: int) -> int:
 def candidate_dims(conn, knowledge_base_id: Any, cap: int) -> list[int]:
     """Dimensions this knowledge base has enough rows at to be worth looking at.
 
-    Also bounded: the subquery reads at most ``cap`` rows, so a knowledge base
-    that holds two dimensions splits that budget between them and is measured
-    conservatively -- it may look smaller than it is and keep the shared index,
-    which is the safe direction. In practice a knowledge base holds one
-    embedding model at a time, so it has one dimension.
+    Also bounded: the subquery reads at most ``cap`` rows, in heap order. Two
+    consequences, both in the safe direction and both deliberate. A knowledge
+    base holding two dimensions splits that budget between them, so each looks
+    smaller than it is; and a dimension whose rows all sit past ``cap`` is not
+    seen at all. Either way the knowledge base keeps the shared index, which is
+    what it has today. In practice a knowledge base holds one embedding model at
+    a time -- a model change reindexes it -- so it has one dimension.
+
+    A dimension that already *has* an index is never missed: the caller unions
+    this with ``existing_per_kb_indexes``, so the model-change case (rows now at
+    a new dimension, an index still at the old one) is evaluated for dropping.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     rows = conn.execute(
@@ -416,6 +459,18 @@ def index_action(conn, knowledge_base_id: Any) -> str | None:
 # ---------------------------------------------------------------------------
 # Connections and locks
 # ---------------------------------------------------------------------------
+
+
+def estimated_index_mb(rows: int, dims: int) -> int:
+    """Roughly how much disk one of these indexes will take, for a log line.
+
+    There is no free-space precheck anywhere here because Postgres exposes no
+    free-space figure -- no catalog view or function reports what the
+    filesystem has left, and the index goes into the database's own tablespace.
+    So the size the build is reaching for is logged instead, which is what an
+    operator needs when a build fails on a full disk.
+    """
+    return max(1, rows * dims * _INDEX_BYTES_PER_DIMENSION // (1024 * 1024))
 
 
 def _autocommit_connection(engine):
@@ -479,14 +534,31 @@ def _reset_session_setting(conn, name: str) -> None:
             logger.debug("Could not invalidate the connection either", exc_info=True)
 
 
-def _build_in_progress(conn) -> bool:
-    """Is another backend running CREATE INDEX or REINDEX on ai.embeddings?"""
+def _build_in_progress(conn, kb_id: str, dims: int) -> bool:
+    """Is another backend building or reindexing *this* index right now?
+
+    Scoped to the one index, by ``index_relid``, not to ``ai.embeddings``. The
+    BM25 path's equivalent scopes by ``relid`` because each of its indexes is on
+    a relation of its own (that knowledge base's partition), so a relation is a
+    knowledge base there; here every index is on the one shared table, so the
+    same shape would report *any* concurrent build on it -- another knowledge
+    base's, or ``ensure_embedding_index`` creating a shared per-dimension one.
+    That matters because the start-up sweep dispatches every out-of-step
+    knowledge base at once, so with two large ones the builds overlap by
+    construction, at exactly the boot meant to clear an INVALID index.
+
+    ``pg_stat_progress_create_index.index_relid`` is populated for
+    ``CREATE INDEX CONCURRENTLY`` from the moment the catalog entry exists
+    (verified against PostgreSQL 15 -- the documentation's "during CREATE INDEX
+    it's 0" describes the non-concurrent case). An INVALID index always has a
+    catalog entry, which is the case this guard exists for.
+    """
     row = conn.execute(
         text(
             "SELECT 1 FROM pg_stat_progress_create_index "
-            "WHERE relid = to_regclass(:relation) AND pid <> pg_backend_pid()"
+            "WHERE index_relid = to_regclass(:index)::oid AND pid <> pg_backend_pid()"
         ),
-        {"relation": f'"{AI_SCHEMA}".embeddings'},
+        {"index": f'"{AI_SCHEMA}".{per_kb_index_name(kb_id, dims)}'},
     ).first()
     return row is not None
 
@@ -505,6 +577,19 @@ def _create_index(conn, kb_id: str, dims: int) -> None:
     are put back before the connection can return to the pool -- a pooled
     connection left with no statement timeout, or with a large
     ``maintenance_work_mem``, would carry them into unrelated work.
+
+    ``statement_timeout = 0`` because a concurrent build waits for every
+    transaction holding a conflicting snapshot and legitimately takes minutes on
+    a large knowledge base, so a bound would turn a slow build into a failed one
+    -- the same trade the BM25 index build makes. The cost is that one client
+    idle in a transaction can stall this build, and with it one worker slot,
+    indefinitely; it blocks no writes while it waits
+    (``ShareUpdateExclusiveLock`` only).
+
+    A build that runs out of disk leaves an INVALID index behind, and the next
+    ensure drops and rebuilds it rather than reporting it as built (see
+    ``_repair_invalid`` and its caller). ``estimated_index_mb`` says why there is
+    no free-space precheck.
     """
     conn.execute(text("SET statement_timeout = 0"))
     conn.execute(text(f"SET maintenance_work_mem = '{maintenance_work_mem_mb()}MB'"))
@@ -522,10 +607,12 @@ def _repair_invalid(conn, kb_id: str, dims: int) -> bool:
     index in place and marked invalid: it answers no query, Postgres still
     maintains it on every write, and ``IF NOT EXISTS`` makes a re-run a no-op,
     so without this the knowledge base would never get a usable index. Skipped
-    while a build is actually running on the table, which is the other reason
-    an index can be invalid.
+    while a build of this index is actually running, which is the other reason
+    an index can be invalid -- and a caller that gets ``False`` must *not* go on
+    to build, because ``IF NOT EXISTS`` would no-op against the name the invalid
+    index still holds and report a success that did not happen.
     """
-    if _build_in_progress(conn):
+    if _build_in_progress(conn, kb_id, dims):
         return False
     logger.warning(
         "Partial HNSW index %s.%s is INVALID and no build is running on %s.embeddings (an "
@@ -584,7 +671,29 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                 # Re-read under the lock: another caller may have finished
                 # between the survey above and this point.
                 valid = existing_per_kb_indexes(conn, kb_id).get(dims)
-                if valid is False and _repair_invalid(conn, kb_id, dims):
+                if valid is False:
+                    if not _repair_invalid(conn, kb_id, dims):
+                        # A build of this index is running, so the invalid entry
+                        # stays. Falling through would reach
+                        # `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, which
+                        # no-ops against the name the invalid index holds -- and
+                        # this would report the index as built while it answers
+                        # no query and is maintained on every write. Report what
+                        # is true and let the running build finish; the next
+                        # ensure repairs it if that build fails too. (The BM25
+                        # path does the same, for the same reason.)
+                        logger.info(
+                            "Leaving partial HNSW index %s.%s INVALID for now: another "
+                            "backend is building it",
+                            AI_SCHEMA,
+                            name,
+                        )
+                        return {
+                            "status": "building",
+                            "index": name,
+                            "built": built,
+                            "dropped": dropped,
+                        }
                     repaired.append(name)
                     valid = None
 
@@ -630,7 +739,8 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                 progress("building")
                 logger.info(
                     "Building partial HNSW index %s.%s for knowledge base %s (%s%d rows at %d "
-                    "dimensions, threshold %d)",
+                    "dimensions, threshold %d); expect roughly %d MB of index, and no write "
+                    "block",
                     AI_SCHEMA,
                     name,
                     kb_id,
@@ -638,6 +748,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                     rows,
                     dims,
                     build_at,
+                    estimated_index_mb(rows, dims),
                 )
                 _create_index(conn, kb_id, dims)
                 built.append(name)
@@ -701,8 +812,15 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
 # ``ai.embeddings`` once, which on a large project is seconds rather than
 # milliseconds; past this it is abandoned, because a start-up must not wait on
 # it. Nothing is lost by abandoning it: the next source to finish indexing in
-# each knowledge base dispatches the same reconcile.
-SWEEP_TIMEOUT_MS = 30_000
+# each knowledge base dispatches the same reconcile, and the catalog cases
+# (an INVALID index, an index whose knowledge base has emptied) are found
+# without this count at all.
+#
+# 5 s matches this codebase's other boot-path bound (the migrations' own
+# ``lock_timeout``) rather than being generous for its own sake. Measured 14 ms
+# over 66,000 embeddings, so about 1.1 s extrapolated to 5.3 million -- the
+# ceiling is for a pathological case, not the expected one.
+SWEEP_TIMEOUT_MS = 5_000
 
 _THRESHOLD_KEYS = ("VECTOR_PER_KB_INDEX_MIN_ROWS", "VECTOR_PER_KB_INDEX_DROP_ROWS")
 

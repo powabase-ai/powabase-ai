@@ -19,6 +19,7 @@ from agentic_project_service.services import pg_vector_index as pvi
 from agentic_project_service.services.base_vector_store import (
     BasePgVectorStore,
     kb_sql_literal,
+    validated_top_k,
 )
 from agentic_project_service.services.settings_registry import (
     SETTINGS_REGISTRY,
@@ -280,6 +281,56 @@ def test_hybrid_searchs_vector_leg_carries_the_predicate():
         lambda s: s.vector_search(embedding=[0.0] * 1536, top_k=10, _resolve=False)
     )
     assert f"e.knowledge_base_id = '{KB}'" in " ".join(_search_sql(statements).split())
+
+
+def test_vector_search_interpolates_dims_and_the_limit_too():
+    """All three values the index predicate and the LIMIT need must be literals.
+
+    Measured under ``plan_cache_mode = force_generic_plan``: with any one of the
+    knowledge base id, ``dims`` or the ``LIMIT`` left as a bind parameter, the
+    generic plan reaches no HNSW index at all and falls back to an exact sort.
+    The KB id and ``dims`` are both named in the partial index's predicate, and
+    an unknown ``LIMIT`` makes the planner assume a large fraction of the rows.
+    """
+    sql = _search_sql(_statements(lambda s: s.vector_search(embedding=[0.0] * 1536, top_k=7)))
+    normalized = " ".join(sql.split())
+    assert "e.dims = 1536" in normalized, sql
+    assert "LIMIT 7" in normalized, sql
+    assert ":dims" not in sql, f"dims must not be bound:\n{sql}"
+    assert ":top_k" not in sql, f"the limit must not be bound:\n{sql}"
+
+
+def test_vector_search_per_source_interpolates_dims_too():
+    sql = _search_sql(
+        _statements(
+            lambda s: s.vector_search_per_source(
+                embedding=[0.0] * 1536, per_source_k=2, source_cap=3
+            )
+        )
+    )
+    assert "e.dims = 1536" in " ".join(sql.split()), sql
+    assert ":dims" not in sql, sql
+
+
+@pytest.mark.parametrize("value,expected", [(0, 0), (1, 1), ("20", 20), (10_000, 10_000)])
+def test_validated_top_k_accepts_what_a_caller_can_legitimately_ask_for(value, expected):
+    # Zero is allowed because a bound ``LIMIT 0`` returned an empty answer
+    # rather than erroring, and that is not a behaviour worth changing here.
+    assert validated_top_k(value) == expected
+
+
+@pytest.mark.parametrize("bad", [-1, 10_001, "many", None, 1.5e9])
+def test_validated_top_k_refuses_anything_unsafe_to_interpolate(bad):
+    with pytest.raises(ValueError, match="top_k"):
+        validated_top_k(bad)
+
+
+def test_an_out_of_range_top_k_never_reaches_sql():
+    session = MagicMock()
+    session.execute = lambda *a, **k: pytest.fail("no SQL may be built for a bad top_k")
+    store = _ChunkStore(db_session=session, knowledge_base_id=KB)
+    with pytest.raises(ValueError, match="top_k"):
+        asyncio.run(store.vector_search(embedding=[0.0] * 1536, top_k=-5))
 
 
 def test_order_by_still_carries_the_cast_the_index_expression_needs():

@@ -64,34 +64,73 @@ VALID_TS_LANGUAGES = frozenset(
 )
 
 
+# Upper bound on ``top_k``, which the vector query interpolates rather than
+# binds (see ``kb_sql_literal``). Nothing upstream range-checks it -- the search
+# route takes it straight from the request body -- so this is where it is
+# checked. Generous: the per-source candidate pool is capped at 200 and hybrid
+# search doubles the caller's value, so nothing legitimate comes near.
+MAX_TOP_K = 10_000
+
+
 def kb_sql_literal(knowledge_base_id: Any) -> str:
     """A knowledge base id as a quoted SQL literal, or ValueError.
 
     The embeddings-side ``knowledge_base_id`` predicate is interpolated rather
     than bound, and this is the one gate between a caller's value and the SQL.
     ``uuid.UUID`` accepts nothing that could carry a quote or a statement
-    separator, so the result is safe by construction; a value that is not a
-    UUID cannot match ``ai.embeddings.knowledge_base_id`` anyway (the column is
-    ``uuid``, so today it reaches the server and fails there instead).
+    separator, and the result is the *canonical* form, so braces, a ``urn:``
+    prefix and surrounding whitespace are all normalised away. A value that is
+    not a UUID cannot match ``ai.embeddings.knowledge_base_id`` anyway (the
+    column is ``uuid``, so before this it reached the server and failed there).
 
-    Interpolated because a bound parameter defeats the whole point of the
-    per-knowledge-base partial HNSW index. Its predicate names one KB id as a
-    literal, and PostgreSQL will only use a partial index when the query's own
-    restriction clauses *prove* that predicate -- which a plan built for an
-    unknown parameter cannot do. psycopg prepares a statement after
-    ``prepare_threshold`` executions on a connection, and from the sixth
-    execution of the prepared statement PostgreSQL starts comparing its generic
-    plan against the custom ones. Measured, with the id bound: executions 1-10
-    took 1.0-1.8 ms on the partial index and executions 11 onwards took
-    54-72 ms on a bitmap scan plus an exact sort -- correct, but 50x slower,
-    for as long as that connection lives. With the id as a literal there is no
-    parameter to generalise, so the generic plan matches the partial index too
-    and every execution stays on it (measured 1.07 ms at the same point).
+    Interpolated because a bound parameter cannot prove the partial index's
+    predicate. PostgreSQL uses a partial index only when the query's own
+    restriction clauses *prove* the index predicate, and the per-knowledge-base
+    index names one KB id and one ``dims`` value as literals. A plan built
+    without knowing a parameter's value proves neither -- which matters because
+    psycopg prepares a statement after ``prepare_threshold`` executions on a
+    connection, and from the sixth execution of the prepared statement
+    PostgreSQL starts weighing its generic plan against the custom ones.
+
+    ``knowledge_base_id`` is not sufficient on its own, and that was measured
+    rather than assumed. Under ``plan_cache_mode = force_generic_plan``, on a
+    12,000-embedding fixture at 1536 dimensions with both indexes present:
+
+    | query shape | generic plan reaches |
+    |---|---|
+    | kb literal, ``dims`` and ``LIMIT`` bound | no HNSW index: Sort, cost 999 |
+    | kb literal, ``dims`` literal, ``LIMIT`` bound | no HNSW index: Sort, cost 999 |
+    | kb literal, ``dims`` bound, ``LIMIT`` literal | no HNSW index: Sort, cost 845 |
+    | **kb, ``dims`` and ``LIMIT`` all literal** | **the partial index**, cost 369 |
+    | kb bound, ``dims`` and ``LIMIT`` literal | the *shared* index, cost 533 |
+
+    So ``vector_search`` interpolates all three. ``dims`` is range-checked and
+    already interpolated into the distance cast, and ``top_k`` is checked
+    against ``MAX_TOP_K``; the last row is why the KB id has to be one of them.
     """
     try:
         return f"'{uuid.UUID(str(knowledge_base_id))}'"
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError(f"knowledge_base_id is not a UUID: {knowledge_base_id!r}") from exc
+
+
+def validated_top_k(top_k: Any) -> int:
+    """A row limit safe to interpolate into ``LIMIT``, or ValueError.
+
+    ``LIMIT`` is interpolated so a prepared statement's generic plan can still
+    reach the partial HNSW index (see ``kb_sql_literal``): with an unknown limit
+    the planner assumes it will be asked for a large fraction of the rows, which
+    prices an ordered index scan out and leaves an exact sort. Zero is allowed
+    because that is what a bound ``LIMIT 0`` did -- an empty answer, not an
+    error.
+    """
+    try:
+        value = int(top_k)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"top_k is not an integer: {top_k!r}") from exc
+    if not (0 <= value <= MAX_TOP_K):
+        raise ValueError(f"top_k must be between 0 and {MAX_TOP_K}, got {value}")
+    return value
 
 
 def ensure_embedding_index(session: Session, schema: str, dims: int) -> None:
@@ -470,6 +509,7 @@ class BasePgVectorStore:
         # allow type modifiers to come from a parameter; range-check guards it.
         if not (1 <= effective_dims <= 8192):
             raise ValueError(f"dims must be between 1 and 8192, got {effective_dims}")
+        effective_top_k = validated_top_k(top_k)
 
         # The embeddings-side knowledge_base_id predicate is what lets the
         # planner use this KB's partial HNSW index, if it has one: a partial
@@ -477,9 +517,15 @@ class BasePgVectorStore:
         # on, and the planner does not reason through `e.item_id = c.id` to
         # reach `c.knowledge_base_id`. Without it the plan picks the shared
         # per-dimension index and post-filters -- verified by EXPLAIN with the
-        # partial index present. It is a literal, not a bind parameter, for the
-        # reason kb_sql_literal documents. The item-table filter stays: it is
-        # what keeps a row whose embedding outlived its item out of the answer.
+        # partial index present. The item-table filter stays: it is what keeps a
+        # row whose embedding outlived its item out of the answer.
+        #
+        # Three values are interpolated rather than bound -- the KB id, `dims`
+        # and the LIMIT -- because a prepared statement's generic plan can only
+        # match the index's predicate when it can prove all of it, and the
+        # planner's estimate for an unknown LIMIT prices the ordered index scan
+        # out. kb_sql_literal has the measured table; all three are validated
+        # above. Anything else here stays bound.
         query = f"""
             SELECT
                 c.id,
@@ -491,13 +537,12 @@ class BasePgVectorStore:
             JOIN "{self.schema}".embeddings e ON e.item_id = c.id
             WHERE c.knowledge_base_id = :kb_id
               AND e.knowledge_base_id = {kb_sql_literal(self.kb_id)}
-              AND e.dims = :dims
+              AND e.dims = {effective_dims}
         """
 
         params: dict[str, Any] = {
             "embedding": embedding_str,
             "kb_id": self.kb_id,
-            "dims": effective_dims,
         }
 
         if item_ids is not None:
@@ -515,9 +560,8 @@ class BasePgVectorStore:
 
         query += f"""
             ORDER BY (e.embedding::vector({effective_dims})) <=> CAST(:embedding AS vector({effective_dims}))
-            LIMIT :top_k
+            LIMIT {effective_top_k}
         """
-        params["top_k"] = top_k
 
         try:
             self._apply_iterative_scan()
@@ -569,7 +613,6 @@ class BasePgVectorStore:
         params: dict[str, Any] = {
             "embedding": embedding_str,
             "kb_id": self.kb_id,
-            "dims": effective_dims,
             "per_source_k": per_source_k,
             "source_cap": source_cap,
             "threshold": similarity_threshold,
@@ -583,9 +626,12 @@ class BasePgVectorStore:
             f"<=> CAST(:embedding AS vector({effective_dims}))"
         )
         # This leg already carried the embeddings-side knowledge_base_id
-        # predicate; it is a literal here for the same reason vector_search's is
-        # (see kb_sql_literal), so a prepared statement's generic plan can still
-        # match this KB's partial HNSW index.
+        # predicate; it and `dims` are literals here for the same reason
+        # vector_search's are (see kb_sql_literal), so a prepared statement's
+        # generic plan can prove the partial index's whole predicate. Unlike
+        # vector_search this query has no outer LIMIT on the distance order -- it
+        # scores the whole knowledge base by design, so no HNSW index is used
+        # either way, and the remaining parameters stay bound.
         query = f"""
             WITH scored AS (
                 SELECT
@@ -598,7 +644,7 @@ class BasePgVectorStore:
                 JOIN "{self.schema}".embeddings e ON e.item_id = c.id
                 WHERE c.knowledge_base_id = :kb_id
                   AND e.knowledge_base_id = {kb_sql_literal(self.kb_id)}
-                  AND e.dims = :dims
+                  AND e.dims = {effective_dims}
                   {source_filter}
             ),
             ranked AS (

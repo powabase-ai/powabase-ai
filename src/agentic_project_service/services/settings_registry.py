@@ -1155,7 +1155,10 @@ def _build_registry() -> dict[str, SettingDef]:
                 "crossover where this starts paying was bracketed, not measured "
                 "exactly — a 2,000-row knowledge base is better off without one, a "
                 "73,290-row one is two orders of magnitude better off with one — so "
-                "the default sits deliberately at the conservative end."
+                "the default sits deliberately at the conservative end. Lowering it "
+                "below where a knowledge base actually benefits costs disk and write "
+                "throughput for nothing; raising it leaves a large knowledge base on "
+                "the project-wide index."
             ),
         ),
         SettingDef(
@@ -1191,10 +1194,12 @@ def _build_registry() -> dict[str, SettingDef]:
                 "set in the builder's own session only. A build that does not fit "
                 "spills and gets much slower: measured 3.3x slower at 64 MB than at "
                 "1 GB for a 73,290-vector, 1536-dimension index (50.6 s against "
-                "15.3 s), which needs roughly 500 MB to stay in memory. Raise it "
-                "only as far as the database has memory to spare — the smallest "
-                "project databases have 512 MiB in total, and this is memory the "
-                "build takes on top of shared_buffers."
+                "15.3 s), which needs roughly 500 MB to stay in memory. The range "
+                "here is a sanity limit, not a safety bound: nothing can see how "
+                "much memory the database actually has, so raising this is your "
+                "judgement against the database's own memory. It is taken on top of "
+                "shared_buffers, and the smallest project databases have 512 MiB in "
+                "total — for those the default is already about the limit."
             ),
         ),
     ]

@@ -3237,6 +3237,21 @@ def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
         raise retry from exc
 
 
+def _orphaned_vector_index_names(kb_id: str) -> list[str]:
+    """This KB's surviving partial HNSW index names, for a give-up log line. Never raises."""
+    try:
+        with db.engine.connect() as conn:
+            names = [
+                f"{pg_vector_index.AI_SCHEMA}.{pg_vector_index.per_kb_index_name(kb_id, dims)}"
+                for dims in sorted(pg_vector_index.existing_per_kb_indexes(conn, kb_id))
+            ]
+            conn.rollback()
+            return names
+    except Exception:
+        logger.debug("Could not list KB %s's vector indexes for the log", kb_id, exc_info=True)
+        return []
+
+
 @celery_app.task(bind=True, max_retries=PG_BM25_TASK_MAX_RETRIES)
 @billing.no_billing_context
 def drop_per_kb_vector_index(self, kb_id: str) -> dict:
@@ -3258,11 +3273,19 @@ def drop_per_kb_vector_index(self, kb_id: str) -> dict:
             raise
         reason = pg_vector_index.first_error_line(exc)
         if self.request.retries >= self.max_retries:
+            # Nothing comes back to this: the knowledge base row is already gone,
+            # so neither the indexing dispatch nor the start-up sweep will ever
+            # see it again. Name the indexes so an operator can drop them by
+            # hand, the way the route's dispatch-failure warning does.
             logger.error(
-                "Giving up on dropping the vector index(es) of KB %s after %d attempts: %s",
+                "Giving up on dropping the vector index(es) of KB %s after %d attempts: %s. "
+                "They are now orphaned — named after a knowledge base that no longer exists, "
+                "and maintained on every write to the embeddings table — and have to be "
+                "dropped by hand: %s",
                 kb_id,
                 self.request.retries + 1,
                 reason,
+                ", ".join(_orphaned_vector_index_names(kb_id)) or "(names unavailable)",
             )
             raise
         countdown = _pg_bm25_retry_countdown(self.request.retries)

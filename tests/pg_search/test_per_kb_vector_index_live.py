@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import threading
 import time
 import uuid
 
@@ -46,6 +47,10 @@ SOURCE = "9f8b1c2e-0000-4000-8000-0000000000aa"
 
 BIG_ROWS = 9_000
 SMALL_ROWS = 3_000
+
+# Any valid vector will do for a plan probe -- EXPLAIN prices the scan, it does
+# not care where in the space the query sits.
+_ZERO_VECTOR = "[" + ",".join(["0"] * DIMS) + "]"
 
 # Thresholds each test wants, injected through the settings reader so the real
 # clamping and hysteresis logic runs rather than being bypassed.
@@ -519,9 +524,12 @@ def test_the_real_code_path_keeps_the_index_past_the_prepare_threshold(
             cached_plan = "\n".join(
                 str(r[0])
                 for r in session.execute(
+                    # $1 is the embedding and $2 the item-table knowledge base
+                    # id -- the only two parameters the statement still has, in
+                    # the order they first appear in it.
                     text(
                         f"EXPLAIN EXECUTE {searches[0][0]} "
-                        f"('{_literal(query_vectors[0])}', '{KB_BIG}'::uuid, {DIMS}, 20)"
+                        f"('{_literal(query_vectors[0])}', '{KB_BIG}'::uuid)"
                     )
                 ).all()
             )
@@ -545,68 +553,129 @@ def test_the_real_code_path_keeps_the_index_past_the_prepare_threshold(
     )
 
 
-def _probe_sql(sql: str, embedding, *, bind_kb: bool) -> str:
-    """The store's query with only the knowledge base id left as a parameter.
+def _probe_sql(sql: str, embedding, *, bind: str) -> str:
+    """The store's real query, prepared, with one value moved back to a parameter.
 
-    Everything else becomes a literal, so ``PREPARE`` needs one parameter type
-    and ``EXECUTE`` needs no protocol-level parameters at all. That isolates the
-    one difference under test: whether the embeddings-side predicate names the
-    knowledge base or a placeholder.
+    Nothing is rewritten except the one thing under test. ``vector_search``
+    already emits ``dims`` and the ``LIMIT`` as literals and the knowledge base
+    id and embedding as parameters, so the "none" case below *is* production's
+    statement — which the earlier version of this helper was not: it inlined
+    ``:dims`` and ``:top_k`` itself and so pinned a shape the service never
+    sends.
+
+    ``bind`` names what to take back out of the SQL and hand to the planner as
+    an unknown: ``"kb"``, ``"dims"``, ``"limit"``, or ``"none"``.
     """
-    probe = (
-        sql.replace(":embedding", f"'{_literal(embedding)}'")
-        .replace(":dims", str(DIMS))
-        .replace(":top_k", "20")
-        .replace(":kb_id", "$1")
-    )
-    if bind_kb:
+    probe = sql.replace(":embedding", "$2").replace(":kb_id", "$1")
+    if bind == "kb":
         probe = probe.replace(f"e.knowledge_base_id = '{KB_BIG}'", "e.knowledge_base_id = $1")
         assert "e.knowledge_base_id = $1" in probe
+    elif bind == "dims":
+        probe = probe.replace(f"e.dims = {DIMS}", "e.dims = $3::int")
+        assert "e.dims = $3::int" in probe
+    elif bind == "limit":
+        probe = probe.replace("LIMIT 20", "LIMIT $3::int")
+        assert "LIMIT $3::int" in probe
+    else:
+        assert bind == "none", bind
     return probe
 
 
-def _generic_plan(session, statement: str, label: str) -> str:
+def _generic_plan(session, statement: str, label: str, *, extra_arg: str | None = None) -> str:
     """The plan PostgreSQL builds for ``statement`` knowing none of its parameters.
 
-    ``force_generic_plan`` is the same decision the planner makes on its own once
-    a statement has been prepared and its generic plan costs no more than the
+    ``force_generic_plan`` is the decision the planner makes on its own once a
+    statement has been prepared and its generic plan costs no more than the
     custom ones. Forcing it removes the dependence on that cost comparison,
     which is fixture-specific, and leaves the structural question: can a plan
-    built without the parameter's value prove the index predicate?
+    built without the parameters' values prove the index predicate?
+
+    The ``EXECUTE`` arguments are literals with casts rather than bound
+    parameters: an ``EXECUTE`` whose own arguments arrive through the extended
+    protocol cannot have their types inferred (``could not determine data type
+    of parameter $1``).
     """
+    types = "uuid, text" + (", int" if extra_arg else "")
+    args = f"'{KB_BIG}'::uuid, '{_ZERO_VECTOR}'::text" + (f", {extra_arg}" if extra_arg else "")
     session.execute(text("SET LOCAL plan_cache_mode = 'force_generic_plan'"))
-    session.execute(text(f"PREPARE {label} (uuid) AS {statement}"))
+    session.execute(text(f"PREPARE {label} ({types}) AS {statement}"))
     plan = "\n".join(
-        str(r[0])
-        for r in session.execute(text(f"EXPLAIN EXECUTE {label} ('{KB_BIG}'::uuid)")).all()
+        str(r[0]) for r in session.execute(text(f"EXPLAIN EXECUTE {label} ({args})")).all()
     )
     session.rollback()
     return plan
 
 
-def test_a_bound_kb_id_would_lose_the_index_in_a_generic_plan(
+def test_the_query_the_service_emits_keeps_the_index_in_a_generic_plan(
     engine, schema, settings, query_vectors
 ):
-    """Why the id is a literal: a generic plan cannot prove the index predicate."""
+    """The central claim, on production's own statement.
+
+    A prepared statement whose generic plan is chosen must still reach the
+    partial index. This is the case the previous version of this test got wrong:
+    it inlined ``dims`` and the ``LIMIT`` in the probe, so it passed on a query
+    the service did not send while the real one fell back to an exact sort.
+    """
+    name = _build_big_index(engine, settings)
+    sql, _ = _capture_search_sql(engine, KB_BIG, query_vectors[0])
+    assert ":dims" not in sql and ":top_k" not in sql, (
+        f"the service must emit dims and the limit as literals:\n{sql}"
+    )
+    with Session(engine) as session:
+        plan = _generic_plan(session, _probe_sql(sql, query_vectors[0], bind="none"), "real_probe")
+    assert f"Index Scan using {name}" in plan, plan
+
+
+@pytest.mark.parametrize(
+    "bind,extra_arg",
+    [("kb", None), ("dims", str(DIMS)), ("limit", "20")],
+)
+def test_binding_any_one_of_the_three_loses_the_index_in_a_generic_plan(
+    engine, schema, settings, query_vectors, bind, extra_arg
+):
+    """Why all three are literals, measured one at a time.
+
+    The knowledge base id and ``dims`` are both in the index predicate, so a
+    plan that cannot prove either cannot use the index; an unknown ``LIMIT``
+    makes the planner assume it will be asked for a large fraction of the rows,
+    which prices the ordered index scan out. Any one of them left bound is
+    enough to lose it -- which is what makes this a three-way requirement rather
+    than the one-way one the first version of this PR claimed.
+    """
     name = _build_big_index(engine, settings)
     sql, _ = _capture_search_sql(engine, KB_BIG, query_vectors[0])
     with Session(engine) as session:
         plan = _generic_plan(
-            session, _probe_sql(sql, query_vectors[0], bind_kb=True), "bound_probe"
+            session,
+            _probe_sql(sql, query_vectors[0], bind=bind),
+            f"bound_{bind}_probe",
+            extra_arg=extra_arg,
         )
-    assert name not in plan, f"a generic plan must not be able to match the predicate:\n{plan}"
+    assert name not in plan, f"binding {bind} must lose the partial index:\n{plan}"
 
 
-def test_the_literal_kb_id_keeps_the_index_in_a_generic_plan(
+def test_the_custom_plan_reaches_the_index_whatever_is_bound(
     engine, schema, settings, query_vectors
 ):
-    """The other half: with the id as a literal the generic plan matches it too."""
+    """The fallback is correct, not wrong: a custom plan always finds the index.
+
+    So the failure mode the three literals avoid is latency, never a wrong
+    answer -- the generic plan's alternative is an exact sort.
+    """
     name = _build_big_index(engine, settings)
     sql, _ = _capture_search_sql(engine, KB_BIG, query_vectors[0])
     with Session(engine) as session:
-        plan = _generic_plan(
-            session, _probe_sql(sql, query_vectors[0], bind_kb=False), "literal_probe"
+        session.execute(text("SET LOCAL plan_cache_mode = 'force_custom_plan'"))
+        session.execute(
+            text(f"PREPARE custom_probe (uuid, text) AS {_probe_sql(sql, None, bind='kb')}")
         )
+        plan = "\n".join(
+            str(r[0])
+            for r in session.execute(
+                text(f"EXPLAIN EXECUTE custom_probe ('{KB_BIG}'::uuid, '{_ZERO_VECTOR}'::text)")
+            ).all()
+        )
+        session.rollback()
     assert f"Index Scan using {name}" in plan, plan
 
 
@@ -750,6 +819,144 @@ def test_an_invalid_index_is_repaired_even_below_the_build_threshold(
         assert pvi.existing_per_kb_indexes(conn, KB_BIG) == {}
 
 
+def test_a_declined_repair_reports_building_and_never_claims_it_built(
+    engine, schema, settings, monkeypatch
+):
+    """The one case that must not report success.
+
+    When a build of this index is already running, the INVALID entry has to stay:
+    dropping it would pull the ground out from under that build. But the caller
+    must then stop, because ``CREATE INDEX CONCURRENTLY IF NOT EXISTS`` no-ops
+    against the name the invalid index still holds -- so falling through would
+    leave an index that answers no query, is maintained on every insert, and was
+    reported as built, with nothing coming back to it until the next source
+    finishes indexing or the pod restarts.
+
+    The on-disk post-condition is what this asserts: the index is still INVALID
+    afterwards, and its name appears in neither ``built`` nor
+    ``repaired_invalid_indexes``.
+    """
+    name = _build_big_index(engine, settings)
+    _invalidate(engine, name)
+    monkeypatch.setattr(pvi, "_build_in_progress", lambda conn, kb_id, dims: True)
+
+    outcome = pvi.ensure_per_kb_vector_index(KB_BIG, engine=engine)
+
+    assert outcome["status"] == "building", outcome
+    assert outcome["built"] == [], outcome
+    assert outcome["dropped"] == [], outcome
+    assert "repaired_invalid_indexes" not in outcome, outcome
+    with engine.connect() as conn:
+        assert pvi.existing_per_kb_indexes(conn, KB_BIG) == {DIMS: False}, (
+            "the invalid index must be left in place for the running build"
+        )
+
+
+def test_a_build_of_another_knowledge_bases_index_does_not_block_this_repair(
+    engine, schema, settings
+):
+    """``_build_in_progress`` is scoped to this index, not to ai.embeddings.
+
+    Every one of these indexes lives on the one shared table, so a check scoped
+    to the relation would report *any* concurrent build on it -- and the start-up
+    sweep dispatches every out-of-step knowledge base at once, so with two large
+    ones the builds overlap by construction, at exactly the boot meant to clear
+    an INVALID index.
+    """
+    _build_big_index(engine, settings)
+    ready = threading.Event()
+    done = threading.Event()
+    failures: list[BaseException] = []
+
+    # A reader with an open transaction: CREATE INDEX CONCURRENTLY waits for it
+    # before it starts building, and its progress row -- with index_relid already
+    # set -- is visible for the whole wait. That is what makes this deterministic
+    # rather than a race against a build that might finish first.
+    holder = engine.connect()
+    holder.execute(text(f"SELECT count(*) FROM {SCHEMA}.embeddings"))
+
+    def build_the_other_kbs_index():
+        try:
+            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                conn.execute(text(pvi.per_kb_index_ddl(KB_SMALL, DIMS)))
+        except BaseException as exc:  # pragma: no cover - surfaced by the assertions
+            failures.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=build_the_other_kbs_index, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 30
+        with engine.connect() as conn:
+            while time.monotonic() < deadline:
+                conn.execute(text("SELECT pg_stat_clear_snapshot()"))
+                if pvi._build_in_progress(conn, KB_SMALL, DIMS):
+                    ready.set()
+                    # The whole point: the same probe, for the knowledge base
+                    # whose index is NOT being built, must be False -- even
+                    # though the build is on the same relation.
+                    assert pvi._build_in_progress(conn, KB_BIG, DIMS) is False, (
+                        "another knowledge base's build must not look like this one's"
+                    )
+                    on_relation = conn.execute(
+                        text(
+                            "SELECT count(*) FROM pg_stat_progress_create_index "
+                            "WHERE relid = to_regclass(:rel)"
+                        ),
+                        {"rel": f"{SCHEMA}.embeddings"},
+                    ).scalar()
+                    conn.rollback()
+                    assert on_relation >= 1, (
+                        "a relation-scoped check would have seen this build and blocked "
+                        "the other knowledge base's repair"
+                    )
+                    break
+                conn.rollback()
+                time.sleep(0.02)
+    finally:
+        holder.rollback()
+        holder.close()
+        done.wait(timeout=60)
+        thread.join(timeout=60)
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text(pvi.per_kb_index_drop_ddl(KB_SMALL, DIMS)))
+
+    assert not failures, failures
+    assert ready.is_set(), "never observed the other knowledge base's build in progress"
+
+
+def test_the_index_cap_stops_a_build_and_says_so(engine, schema, settings, monkeypatch):
+    """The cap is a stated safety property, so it needs a test that fails without it.
+
+    The planner opens and locks every index of a relation while planning any
+    query on it, so unbounded per-knowledge-base indexes on ``ai.embeddings``
+    degrade every query on the table and eventually fail them outright with
+    ``out of shared memory``. Asserted on disk: no index exists afterwards.
+    """
+    monkeypatch.setattr(pvi, "per_kb_index_count", lambda conn: pvi.MAX_PER_KB_INDEXES)
+
+    outcome = pvi.ensure_per_kb_vector_index(KB_BIG, engine=engine)
+
+    assert outcome["status"] == "skipped", outcome
+    assert outcome["reason"] == "index_cap_reached", outcome
+    assert outcome["index_count"] == pvi.MAX_PER_KB_INDEXES, outcome
+    assert outcome["built"] == [], outcome
+    with engine.connect() as conn:
+        assert pvi.existing_per_kb_indexes(conn, KB_BIG) == {}, (
+            "the cap must be enforced before the index is created, not after"
+        )
+
+
+def test_the_cap_does_not_stop_a_build_one_below_it(engine, schema, settings, monkeypatch):
+    """The other side, so the test above cannot pass by never building at all."""
+    monkeypatch.setattr(pvi, "per_kb_index_count", lambda conn: pvi.MAX_PER_KB_INDEXES - 1)
+    outcome = pvi.ensure_per_kb_vector_index(KB_BIG, engine=engine)
+    assert outcome["built"] == [pvi.per_kb_index_name(KB_BIG, DIMS)], outcome
+    with engine.connect() as conn:
+        assert pvi.existing_per_kb_indexes(conn, KB_BIG) == {DIMS: True}
+
+
 def test_deleting_a_knowledge_base_drops_its_index(engine, schema, settings):
     name = _build_big_index(engine, settings)
     outcome = pvi.drop_per_kb_vector_indexes(KB_BIG, engine=engine)
@@ -844,7 +1051,6 @@ def test_a_concurrent_build_does_not_block_writes(engine, schema, settings):
     same knowledge base run throughout the build, and none of them may wait for
     anything like the build's duration.
     """
-    import threading
 
     stop = threading.Event()
     latencies: list[float] = []

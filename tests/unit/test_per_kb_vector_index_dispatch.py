@@ -237,6 +237,50 @@ def test_the_ensure_task_does_not_retry_a_real_failure(monkeypatch, retry_spy):
     retry_spy[idx.ensure_per_kb_vector_index.name].assert_not_called()
 
 
+def test_the_drop_task_names_the_orphans_when_it_gives_up(monkeypatch, caplog):
+    """Nothing comes back to an index whose knowledge base row is already gone.
+
+    So the last retry has to name it: the route's dispatch-failure path says "has
+    to be dropped by hand" and the task's exhaustion path must too, or an
+    operator has no way to find what is left behind.
+    """
+    import logging
+
+    from celery.exceptions import Retry
+
+    monkeypatch.setattr(
+        pvi,
+        "drop_per_kb_vector_indexes",
+        MagicMock(side_effect=pvi.PerKbVectorIndexBuildInProgress("held")),
+    )
+    monkeypatch.setattr(idx, "_orphaned_vector_index_names", lambda kb: ["ai.hnsw_kb_abc_1536"])
+    task = idx.drop_per_kb_vector_index
+    monkeypatch.setattr(task, "retry", MagicMock(side_effect=Retry("retry")))
+
+    # push_request is how Celery itself supplies a Context; `request` is a
+    # read-only property, so it cannot be monkeypatched.
+    task.push_request(retries=task.max_retries)
+    try:
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(pvi.PerKbVectorIndexBuildInProgress):
+                task.run(KB)
+    finally:
+        task.pop_request()
+    message = "\n".join(r.getMessage() for r in caplog.records)
+    assert "dropped by hand" in message, message
+    assert "ai.hnsw_kb_abc_1536" in message, message
+
+
+def test_the_boot_sweeps_count_is_bounded_short_enough_for_a_start_up():
+    """It runs on the boot path, after the migrations, before the lock is released.
+
+    Measured 14 ms over 66,000 embeddings -- about 1.1 s extrapolated to 5.3
+    million -- so the ceiling is for a pathological case. This codebase's other
+    boot-path bound is 5 s; anything much larger is a start-up that looks hung.
+    """
+    assert 0 < pvi.SWEEP_TIMEOUT_MS <= 10_000
+
+
 def test_the_ensure_task_returns_the_services_outcome(monkeypatch, retry_spy):
     outcome = {"status": "ready", "built": ["hnsw_kb_x_1536"], "dropped": []}
     monkeypatch.setattr(pvi, "ensure_per_kb_vector_index", MagicMock(return_value=outcome))
