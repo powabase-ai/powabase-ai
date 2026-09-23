@@ -1498,6 +1498,27 @@ def test_ensure_reports_its_progress_as_it_moves_and_builds():
     assert progress == ["moving", "building"]
 
 
+def test_a_progress_hook_that_raises_does_not_cost_us_the_index(caplog):
+    """The recorder writes a row of its own, so it can fail on its own account.
+
+    It runs mid-move, so an exception escaping it abandons that attempt and the
+    write block it already spent, for a bookkeeping failure that says nothing
+    about the build.
+    """
+    conn = _FakeConn(moved=5)
+
+    def raising_hook(status: str) -> None:
+        raise RuntimeError("could not record the build")
+
+    with caplog.at_level("WARNING"):
+        out = pgb.ensure_bm25_index(KB, engine=_FakeEngine(conn), on_progress=raising_hook)
+
+    assert out["status"] == "ready"
+    assert [s for s in _ddl(conn) if "USING bm25" in s]
+    record = next(r for r in caplog.records if "progress hook failed" in r.getMessage())
+    assert "could not record the build" in record.getMessage()
+
+
 def test_ensure_reports_building_for_an_attached_partition_that_has_no_index_yet():
     """A move whose commit landed but whose index build never ran."""
     conn = _FakeConn(relkinds=_with_partition())
