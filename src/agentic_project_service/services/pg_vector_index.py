@@ -156,8 +156,8 @@ MAX_PER_KB_INDEXES = 200
 
 # How many consecutive failed builds of one index are attempted before the
 # reconcile gives up on it. A build can fail for a reason no retry gets past --
-# a disk with no room for a 573 MB index is the one that has actually happened
-# -- and every source that finishes indexing dispatches another reconcile, so
+# a disk with no room for a 573 MB index is the obvious one -- and every source
+# that finishes indexing dispatches another reconcile, so
 # without a bound a permanently failing build is an unbounded loop of
 # drop-rebuild-fail, each attempt holding a worker slot with no statement
 # timeout and reaching for the disk that was full the last time.
