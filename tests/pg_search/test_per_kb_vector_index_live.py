@@ -14,16 +14,18 @@ schema alone; nothing here needs ``pg_search`` itself.
 
 The regime the fixture represents
 --------------------------------
-20 knowledge bases in one ``embeddings`` table of ~40,000 rows, with the
-indexed one at 30% of it and the others from 21% down to 1%. That is the shape
-this feature exists for -- one knowledge base is a *fraction* of a shared table
--- and it is deliberately not the shape an earlier version of this module used
-(2 knowledge bases, the target at 75%). The difference is not cosmetic. Three
-things are true here and false at 75%:
+60 knowledge bases in one ``embeddings`` table of ~40,000 rows, with the
+indexed one at 30% of it and the others from 21% down to under 1%. That is the
+shape this feature exists for -- one knowledge base is a *fraction* of a shared
+table, and a much larger fraction than the average one -- and it is deliberately
+not the shape an earlier version of this module used (2 knowledge bases, the
+target at 75%). The difference is not cosmetic. Three things are true here and
+false at 75%:
 
 - the planner's estimate for a *bound* ``knowledge_base_id`` is 1/n_distinct,
-  so 5% here against 50% there -- the regime a prepared statement's generic
-  plan actually meets in production;
+  so 1.7% here against 50% there -- the regime a prepared statement's generic
+  plan actually meets in production, and far enough below the indexed knowledge
+  base's real 30% to price its index out (see ``FILLER_KBS``);
 - a knowledge base below the build threshold is small in absolute terms as well
   as relative, which is the population the threshold decides for;
 - the shared per-dimension index post-filters away 70-99% of what it returns,
@@ -104,24 +106,46 @@ from agentic_project_service.services import pg_vector_index as pvi
 SCHEMA = "vector_perkb_live_test"
 DIMS = 384
 
-# Five knowledge bases the tests name, and fifteen more that exist only to put
-# n_distinct(knowledge_base_id) at 20. The row counts are the selectivities the
-# feature has to work at, as a share of the whole table (see the module
+# Five knowledge bases the tests name, and fifty-five more that exist only to
+# put n_distinct(knowledge_base_id) at 60. The row counts are the selectivities
+# the feature has to work at, as a share of the whole table (see the module
 # docstring): 30, 21, 5, 2 and 1 per cent.
+#
+# Sixty rather than twenty, and it is load-bearing rather than tidy. A generic
+# plan prices a *bound* knowledge base id at 1/n_distinct of the table, so how
+# far that estimate is from the indexed knowledge base's real share is set by
+# n_distinct and by that share together -- measured, the ordered index scan
+# survives a bound item-side id up to about share x n_distinct = 12 and is
+# priced out from about 18. At 20 knowledge bases and 30% this fixture sat at 6,
+# on the safe side of that edge, so the shape the fix is *for* -- one large
+# knowledge base among many average ones -- was the one shape the fixture did
+# not represent, and a spec for it would have asserted a regression the fixture
+# could not produce. At 60 it sits at 18. The filler rows shrink to keep the
+# table at ~40,000 and every named share unchanged, so nothing else in the
+# module moves.
 KB_BIG = "9f8b1c2e-0000-4000-8000-000000000001"
 KB_SMALL = "9f8b1c2e-0000-4000-8000-000000000002"
 KB_MED = "9f8b1c2e-0000-4000-8000-000000000003"
 KB_MID = "9f8b1c2e-0000-4000-8000-000000000004"
 KB_THIN = "9f8b1c2e-0000-4000-8000-000000000005"
-FILLER_KBS = [f"9f8b1c2e-0000-4000-8000-0000000000{10 + i:02d}" for i in range(15)]
+FILLER_KBS = [f"9f8b1c2e-0000-4000-8000-0000000000{10 + i:02d}" for i in range(55)]
 SOURCE = "9f8b1c2e-0000-4000-8000-0000000000aa"
+# A second source every fortieth chunk, which is what lets a ``source_ids``
+# restriction be a restriction: with one source per knowledge base the only
+# source_ids a spec could pass were "all of it" or "none of it", and the shape
+# section 12 needs is one that matches many more rows than ``top_k`` and a small
+# part of the knowledge base -- which is what a source is, one document among
+# many. In the indexed knowledge base that is 300 rows: 2.5% of it, and 15 times
+# ``top_k``.
+SOURCE_B = "9f8b1c2e-0000-4000-8000-0000000000ab"
+SOURCE_B_EVERY = 40
 
 BIG_ROWS = 12_000
 SMALL_ROWS = 800
 MED_ROWS = 8_400
 MID_ROWS = 2_000
 THIN_ROWS = 400
-FILLER_ROWS = 1_093
+FILLER_ROWS = 298
 
 ROW_COUNTS: list[tuple[str, int]] = [
     (KB_BIG, BIG_ROWS),
@@ -257,9 +281,10 @@ def fixture_schema(engine):
                 meta = json.dumps(
                     {"tier": "gold" if i % GOLD_EVERY == 0 else "silver", "kb": kb_id}
                 )
-                chunks.write(f"{item_id}\t{kb_id}\t{SOURCE}\tpassage {i}\t{meta}\n")
+                source = SOURCE_B if i % SOURCE_B_EVERY == 0 else SOURCE
+                chunks.write(f"{item_id}\t{kb_id}\t{source}\tpassage {i}\t{meta}\n")
                 embeddings.write(
-                    f"{item_id}\tchunks\t{kb_id}\t{SOURCE}\ttest-embed\t{DIMS}\t"
+                    f"{item_id}\tchunks\t{kb_id}\t{source}\ttest-embed\t{DIMS}\t"
                     f"{_literal(vectors[i])}\n"
                 )
             chunks.seek(0)
@@ -373,7 +398,25 @@ def _capture_search_sql(engine, kb_id, embedding, **kwargs):
         session.rollback()
     searches = [pair for pair in recorder.statements if "ORDER BY" in pair[0]]
     assert searches, f"the store issued no search query: {recorder.statements}"
-    return searches[0]
+    sql, params = searches[0]
+    # Asserted here, where the statement is taken, rather than in each spec that
+    # uses it: the knowledge base id reaches PostgreSQL as a literal on *both*
+    # sides of the join and nothing binds it. This is the property every plan
+    # spec below rests on, and it has to be checked positively -- an earlier
+    # version of ``_probe_sql`` rewrote ``:kb_id`` into ``$1`` unconditionally,
+    # so putting either id back on a parameter left the probes rewriting the
+    # regression into the shape under test and the whole module green.
+    assert ":kb_id" not in sql, (
+        "the store bound the knowledge base id; a generic plan cannot prove the "
+        f"partial index's predicate from a parameter:\n{sql}"
+    )
+    assert f"c.knowledge_base_id = '{kb_id}'" in sql, (
+        f"the item-side knowledge base id must be a literal:\n{sql}"
+    )
+    assert f"e.knowledge_base_id = '{kb_id}'" in sql, (
+        f"the embeddings-side knowledge base id must be a literal:\n{sql}"
+    )
+    return sql, params
 
 
 def _explain(session, sql: str, params: dict) -> str:
@@ -710,12 +753,26 @@ def _probe_sql(sql: str, embedding, *, bind: str) -> str:
     sends.
 
     ``bind`` names what to take back out of the SQL and hand to the planner as
-    an unknown: ``"kb"``, ``"dims"``, ``"limit"``, or ``"none"``.
+    an unknown: ``"kb"`` (the embeddings side), ``"kb_chunks"`` (the item side),
+    ``"dims"``, ``"limit"``, or ``"none"``.
+
+    Only ``:embedding`` is rewritten unconditionally, because ``PREPARE`` speaks
+    ``$n`` and that value is a parameter in production too. Nothing else is:
+    this helper used to append ``.replace(":kb_id", "$1")``, which was a no-op
+    against the fixed statement and an escape hatch against a broken one -- a
+    store that bound the knowledge base id again would have had the bind
+    rewritten back into a literal here, and every spec in the module would have
+    kept passing. ``_capture_search_sql`` now asserts the literal instead, and
+    the bound shapes are cases in the matrix below rather than accidents.
     """
-    probe = sql.replace(":embedding", "$2").replace(":kb_id", "$1")
+    assert ":kb_id" not in sql, f"nothing in this helper may rewrite a bind away:\n{sql}"
+    probe = sql.replace(":embedding", "$2")
     if bind == "kb":
         probe = probe.replace(f"e.knowledge_base_id = '{KB_BIG}'", "e.knowledge_base_id = $1")
         assert "e.knowledge_base_id = $1" in probe
+    elif bind == "kb_chunks":
+        probe = probe.replace(f"c.knowledge_base_id = '{KB_BIG}'", "c.knowledge_base_id = $1")
+        assert "c.knowledge_base_id = $1" in probe
     elif bind == "dims":
         probe = probe.replace(f"e.dims = {DIMS}", "e.dims = $3::int")
         assert "e.dims = $3::int" in probe
@@ -774,19 +831,35 @@ def test_the_query_the_service_emits_keeps_the_index_in_a_generic_plan(
 
 @pytest.mark.parametrize(
     "bind,extra_arg",
-    [("kb", None), ("dims", str(DIMS)), ("limit", "20")],
+    [("kb", None), ("kb_chunks", None), ("dims", str(DIMS)), ("limit", "20")],
 )
-def test_binding_any_one_of_the_three_loses_the_index_in_a_generic_plan(
+def test_binding_any_one_of_the_four_loses_the_index_in_a_generic_plan(
     engine, schema, settings, query_vectors, bind, extra_arg
 ):
-    """Why all three are literals, measured one at a time.
+    """Why all four values are literals, measured one at a time.
 
-    The knowledge base id and ``dims`` are both in the index predicate, so a
-    plan that cannot prove either cannot use the index; an unknown ``LIMIT``
-    makes the planner assume it will be asked for a large fraction of the rows,
-    which prices the ordered index scan out. Any one of them left bound is
-    enough to lose it -- which is what makes this a three-way requirement rather
-    than the one-way one the first version of this PR claimed.
+    The embeddings-side knowledge base id and ``dims`` are both in the index
+    predicate, so a plan that cannot prove either cannot use the index; an
+    unknown ``LIMIT`` makes the planner assume it will be asked for a large
+    fraction of the rows, which prices the ordered index scan out. Any one of
+    them left bound is enough to lose it -- which is what makes this a four-way
+    requirement rather than the one-way one the first version of this PR
+    claimed.
+
+    ``kb_chunks`` -- the *item*-side id, which is in no index predicate at all --
+    is the fourth, and it is here as a case because it used to be rewritten away:
+    it is not matchability that a bound item-side id costs but the row estimate
+    behind the cost comparison. A generic plan prices ``c.knowledge_base_id =
+    $1`` at ``1/n_distinct``, so on a table of many knowledge bases it expects a
+    fraction of the rows this one really has, which inflates the ordered index
+    scan and deflates the sort. Both push the same way and the index goes. It is
+    conditional on the fixture in a way none of the other three are: the effect
+    needs the indexed knowledge base to be several times the average one --
+    roughly ``share x n_distinct`` above 12-18 -- which is the population a
+    per-knowledge-base index exists for and the regime this module's fixture is
+    now built in (30% of 60 knowledge bases). At ``n_distinct`` 20 the same bind
+    keeps the index, which is why the fixture's filler count is load-bearing and
+    says so.
     """
     name = _build_big_index(engine, settings)
     sql, _ = _capture_search_sql(engine, KB_BIG, query_vectors[0])
@@ -1645,7 +1718,15 @@ def test_the_knowledge_base_the_default_threshold_leaves_out_is_the_measured_one
     # And the shares the module docstring's regime claim rests on.
     assert 0.28 < BIG_ROWS / TOTAL_ROWS < 0.32, BIG_ROWS / TOTAL_ROWS
     assert 0.19 < MED_ROWS / TOTAL_ROWS < 0.23, MED_ROWS / TOTAL_ROWS
-    assert len({kb for kb, _ in ROW_COUNTS}) == 20
+    n_distinct = len({kb for kb, _ in ROW_COUNTS})
+    assert n_distinct == 60, n_distinct
+    # The one number the bound-item-side-id spec depends on, pinned where the
+    # other fixture claims are. A generic plan prices a bound knowledge base id
+    # at 1/n_distinct, and the ordered index scan survives that underestimate
+    # while share x n_distinct stays below about 12; the regression the spec
+    # asserts needs it above about 18. Adding knowledge bases is safe, removing
+    # them is not, and this is where that is said out loud.
+    assert BIG_ROWS / TOTAL_ROWS * n_distinct >= 18, BIG_ROWS / TOTAL_ROWS * n_distinct
 
 
 # ---------------------------------------------------------------------------
@@ -2007,13 +2088,13 @@ def test_a_forced_index_scan_still_returns_every_row_that_matches(
     driven = list(query_vectors) * 2
     shared = f"idx_ai_embeddings_hnsw_{DIMS}"
     scans, answers = _drive_and_collect(engine, KB_BIG, driven, name, shared, item_ids=set(wanted))
-    assert scans[name] == len(driven), (
-        f"this spec is only worth anything on the forced index scan: {scans}"
-    )
+    # The scan counters are reported, not asserted. Whether a restricted search
+    # runs on the index at all is the store's decision and it is the one under
+    # change -- the answer is what the caller has, and the answer is the claim.
     for got in answers:
         assert sorted(got) == sorted(wanted), (
-            f"an ordered index scan under a LIMIT of 20 dropped rows that matched: "
-            f"{len(got)} of {len(wanted)}"
+            f"a search restricted to {len(wanted)} rows under a LIMIT of 20 dropped "
+            f"rows that matched: {len(got)} of {len(wanted)} (scans {scans})"
         )
 
     # And again with the generic plan pinned, which is what makes the re-run's
@@ -2030,11 +2111,222 @@ def test_a_forced_index_scan_still_returns_every_row_that_matches(
         plan_cache_mode="force_generic_plan",
         item_ids=set(wanted),
     )
-    assert scans[name] == len(driven), (
-        f"the generic plan must still be the forced index scan here: {scans}"
-    )
     for got in answers:
         assert sorted(got) == sorted(wanted), (
             "with the generic plan pinned, the re-run has to ask for a custom plan or it "
-            f"re-uses the plan that came up short: {len(got)} of {len(wanted)}"
+            f"re-uses the plan that came up short: {len(got)} of {len(wanted)} "
+            f"(scans {scans})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 12. A restriction with more matching rows than ``top_k``
+#
+# ``_search_again_exactly`` is what keeps a restricted search honest once the
+# exact sort is priced out, and its signal is ``len(items) < effective_top_k``.
+# That catches starvation *below* the limit. It cannot catch starvation *at* it:
+# a restriction that still matches more rows than ``top_k`` fills the LIMIT with
+# whatever the ordered scan happened to reach, and a full page of the wrong rows
+# is indistinguishable from a complete answer by row count alone. The suite's
+# other restricted-search spec,
+# ``test_a_forced_index_scan_still_returns_every_row_that_matches``, names 12
+# rows against a ``top_k`` of 20 -- deliberately the corner a row count does
+# catch, and until now the only corner anything here covered.
+#
+# So these two specs sit on the other side of the limit, and they assert what the
+# caller gets rather than how the store got it. Nothing below looks at an index
+# counter, at which branch of the store ran, or at whether a setting was
+# applied: how a restricted search is kept honest is the store's own decision and
+# it is under active change -- not entering the forcing block for a restricted
+# search satisfies these, and so would keeping the index and re-running on a
+# better signal than a row count. A spec that pinned either would go stale the
+# moment the other was chosen and would say nothing about the answer.
+#
+# They ask for two different things, and the difference is the caller's, not the
+# planner's:
+#
+# - rows the caller *named* must all come back, and the nearest of them first.
+#   The store's own docstring makes that commitment -- "a row the caller named
+#   and did not get is not a recall trade, it is a wrong answer" -- and nothing
+#   else in this module contradicts it.
+# - a restriction that *narrows a set* -- one source, a metadata filter -- cannot
+#   be held to an exact answer without giving up the index on every filtered
+#   search, which section 8 above requires the opposite way round. So what is
+#   asserted there is the weaker property that is not in tension with it:
+#   narrowing a search must not lose a row the wider search already found. A
+#   caller who filters a result set they have just seen is entitled to at least
+#   the rows they saw.
+#
+# Both are driven twice through the query vectors, because the failure this is
+# about survives plan caching: a plan built while the sort was priced out is
+# re-used for the life of the pooled connection. The second leg pins the generic
+# plan, which is the state a busy connection reaches on its own.
+#
+# What exact means is measured on the same statement with no index at all, once
+# per query vector, so the expectation is PostgreSQL's own and not a number
+# written down here.
+# ---------------------------------------------------------------------------
+
+# Ten times ``top_k``, and 1.7% of the indexed knowledge base: selective enough
+# that an ordered scan of its index has to work to fill a page of 20, and far
+# enough above the limit that a short answer is not the failure mode under test.
+NAMED_ITEMS = 200
+
+# The ``top_k`` every driving helper in this module searches with. Not a knob:
+# the specs below are about the relation between the number of matching rows and
+# the limit, so both ends of it have to be named in one place.
+TOP_K = 20
+
+
+@pytest.fixture(scope="module")
+def named_items(engine, fixture_schema):
+    """``NAMED_ITEMS`` chunk ids of the indexed knowledge base, by id order.
+
+    By id and not by distance, so the named set is unrelated to the query
+    vectors: the rows a search has to find are scattered through the index
+    rather than sitting in one neighbourhood of it.
+    """
+    with engine.connect() as conn:
+        ids = [
+            str(row[0])
+            for row in conn.execute(
+                text(
+                    f"SELECT id FROM {SCHEMA}.chunks WHERE knowledge_base_id = :kb "
+                    f"ORDER BY id LIMIT {NAMED_ITEMS}"
+                ),
+                {"kb": KB_BIG},
+            ).all()
+        ]
+        conn.rollback()
+    assert len(ids) == NAMED_ITEMS, len(ids)
+    return ids
+
+
+def _restricted_ids(engine, *, ids: list[str] | None = None, **kwargs) -> list[str]:
+    """The ids of KB_BIG the restriction really matches, from the database.
+
+    The restriction is spelled out here in SQL rather than taken from the store,
+    so what the specs below compare against is the question the caller asked and
+    not the store's own answer to it. ``ids`` narrows the search to a candidate
+    list, for asking which of an answer's rows match.
+    """
+    where = [f"knowledge_base_id = '{KB_BIG}'"]
+    params: dict = {}
+    if ids is not None:
+        where.append("id = ANY(CAST(:candidates AS uuid[]))")
+        params["candidates"] = "{" + ",".join(ids) + "}"
+    if "item_ids" in kwargs:
+        where.append("id = ANY(CAST(:named AS uuid[]))")
+        params["named"] = "{" + ",".join(kwargs["item_ids"]) + "}"
+    if "source_ids" in kwargs:
+        where.append("source_id = ANY(CAST(:srcs AS uuid[]))")
+        params["srcs"] = "{" + ",".join(kwargs["source_ids"]) + "}"
+    if "filter_metadata" in kwargs:
+        where.append("meta @> CAST(:meta AS jsonb)")
+        params["meta"] = json.dumps(kwargs["filter_metadata"])
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(f"SELECT id FROM {SCHEMA}.chunks WHERE " + " AND ".join(where)), params
+        ).all()
+        conn.rollback()
+    return [str(row[0]) for row in rows]
+
+
+def _matching_rows(engine, **kwargs) -> int:
+    """How many rows of KB_BIG the restriction really matches."""
+    return len(_restricted_ids(engine, **kwargs))
+
+
+def _matching_ids(engine, ids: list[str], **kwargs) -> list[str]:
+    """Which of ``ids`` the restriction matches, in the order given."""
+    keep = set(_restricted_ids(engine, ids=ids, **kwargs))
+    return [item_id for item_id in ids if item_id in keep]
+
+
+def test_a_restriction_the_caller_named_still_answers_exactly(
+    engine, schema, settings, query_vectors, named_items
+):
+    """``NAMED_ITEMS`` named rows, a ``top_k`` of 20, and the nearest 20 of them.
+
+    Ten times ``top_k`` matches, so the answer is a full page and nothing about it
+    looks wrong from the outside -- which is the whole case: the store's only
+    completeness signal is that the page came back short, and this page does not.
+    The exact answer is a full page too, which is asserted for the same reason: if
+    it were not, a wrong answer could pass as a short one.
+
+    The suite's other named-rows spec asks for 12 rows against a ``top_k`` of 20,
+    which the row count catches. This one is the half above the limit.
+    """
+    kwargs = {"item_ids": set(named_items)}
+    matching = _matching_rows(engine, **kwargs)
+    assert matching >= 10 * TOP_K, (
+        f"{matching} rows match; this spec is only about the case where more than "
+        f"top_k ({TOP_K}) do -- the one a row count cannot detect -- and it keeps a "
+        "margin of ten times rather than one row"
+    )
+
+    name = _build_big_index(engine, settings)
+    shared = f"idx_ai_embeddings_hnsw_{DIMS}"
+    exact = _exact_answers(engine, KB_BIG, query_vectors, **kwargs)
+    assert all(len(answer) == TOP_K for answer in exact), [len(a) for a in exact]
+
+    driven = list(query_vectors) * 2
+    for plan_cache_mode in (None, "force_generic_plan"):
+        scans, answers = _drive_and_collect(
+            engine, KB_BIG, driven, name, shared, plan_cache_mode=plan_cache_mode, **kwargs
+        )
+        for i, (got, wanted) in enumerate(zip(answers, exact * 2)):
+            assert got == wanted, (
+                f"a search restricted to {matching} named rows with top_k {TOP_K} "
+                f"returned a full page of {len(got)} that is not the {TOP_K} nearest "
+                f"of them: {len(set(got) - set(wanted))} of them do not belong "
+                f"(query vector {i % len(query_vectors)}, plan_cache_mode "
+                f"{plan_cache_mode or 'auto'}, scans {scans})"
+            )
+
+
+@pytest.mark.parametrize("restriction", ["source_ids", "filter_metadata"])
+def test_narrowing_a_search_never_loses_a_row_the_wider_one_found(
+    engine, schema, settings, query_vectors, restriction
+):
+    """The weaker claim, for the restrictions that narrow a set rather than name rows.
+
+    Exactness cannot be asked of these two without giving up the partial index on
+    every filtered search, which section 8 requires the other way round -- so what
+    is asserted is the part that is not in tension with it, and is still a wrong
+    answer when it fails: a caller who narrows a search they have already run
+    must get at least the rows they already saw.
+
+    Both restrictions match many more rows than ``top_k``, so this is the same
+    above-the-limit case as the spec above: the narrowed answer is a full page,
+    and a full page of rows the wider search never returned looks exactly like a
+    complete answer.
+
+    One spec per restriction rather than one for both, because the two are
+    estimated differently -- a source against an ordinary equality, a metadata
+    filter against a jsonb containment the planner estimates from an MCV list --
+    and a fix that repairs one can leave the other exactly as it was.
+    """
+    kwargs = {"source_ids": [SOURCE_B], "filter_metadata": FILTER_ONE_IN_FIVE}
+    kwargs = {restriction: kwargs[restriction]}
+    matching = _matching_rows(engine, **kwargs)
+    assert matching >= 10 * TOP_K, (matching, TOP_K)
+
+    name = _build_big_index(engine, settings)
+    shared = f"idx_ai_embeddings_hnsw_{DIMS}"
+    driven = list(query_vectors) * 2
+    _, wider = _drive_and_collect(engine, KB_BIG, driven, name, shared)
+    scans, narrowed = _drive_and_collect(engine, KB_BIG, driven, name, shared, **kwargs)
+    for i, (wide, narrow) in enumerate(zip(wider, narrowed)):
+        already_seen = _matching_ids(engine, wide, **kwargs)
+        assert len(narrow) == TOP_K, (
+            f"the narrowed search returned {len(narrow)} rows of {matching} that match, "
+            "so this is not the above-the-limit case any more"
+        )
+        missing = [item_id for item_id in already_seen if item_id not in narrow]
+        assert not missing, (
+            f"narrowing by {restriction} lost {len(missing)} of the {len(already_seen)} "
+            f"rows the unrestricted search had already returned, and still filled the "
+            f"page with {len(narrow)} rows (query vector {i % len(query_vectors)}, "
+            f"{matching} rows match the restriction, scans {scans})"
         )
