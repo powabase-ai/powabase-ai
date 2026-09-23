@@ -279,6 +279,16 @@ def index_lock_relation(knowledge_base_id: Any, dims: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Upper bound on how long the start-up sweep's settings read waits for a lock
+# on ``ai.project_settings``. Deliberately the same 5 s as ``SWEEP_TIMEOUT_MS``
+# and for the same reason: nothing a start-up does may wait without a bound.
+#
+# ``statement_timeout`` would not do on its own. This read is milliseconds of
+# work; what makes it slow is queueing, and queueing is what ``lock_timeout``
+# bounds while leaving a read that is merely slow alone.
+SETTINGS_READ_LOCK_TIMEOUT_MS = 5_000
+
+
 def read_overrides(conn, *keys: str) -> dict[str, int]:
     """These settings' stored overrides, read on a caller-supplied connection.
 
@@ -286,11 +296,28 @@ def read_overrides(conn, *keys: str) -> dict[str, int]:
     ``ai.project_settings`` that fails -- the table does not exist yet, which is
     exactly the state at the start-up sweep's first run on a new database --
     leaves that session's transaction aborted and takes the caller's next
-    statement with it. The start-up sweep shares a transaction with the boot
-    migrations, so it reads its settings here instead, on its own connection,
-    and falls back to the registry defaults if that read fails too.
+    statement with it. At start-up ``db.session`` is the boot's own transaction,
+    mid-flight and about to be committed, so the sweep reads its settings here
+    instead, on a connection of its own, and falls back to the registry defaults
+    if that read fails too.
+
+    ``lock_timeout`` because this is the one statement in the sweep that touches
+    a table the rest of the system takes DDL locks on. A nightly dump or other
+    long-lived snapshot holds a share lock for hours; a single ``ALTER`` queued
+    behind it then blocks every later reader, this one included -- and an
+    unbounded wait here is a start-up that never finishes, never passes
+    readiness, is restarted, and hangs again, with nothing in the log to say
+    why. Bounded, the wait becomes an error, the ``except`` below turns it into
+    the registry defaults, and the sweep carries on: a start-up that is a little
+    wrong about a threshold is worth far more than one that does not happen.
+    ``set_config(..., true)`` scopes it to this transaction, so nothing the
+    caller does afterwards inherits it.
     """
     try:
+        conn.execute(
+            text("SELECT set_config('lock_timeout', :ms, true)"),
+            {"ms": str(SETTINGS_READ_LOCK_TIMEOUT_MS)},
+        )
         rows = conn.execute(
             text(f'SELECT key, value FROM "{AI_SCHEMA}".project_settings WHERE key = ANY(:keys)'),
             {"keys": list(keys)},

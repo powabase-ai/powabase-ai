@@ -564,6 +564,114 @@ def _sweep(conn):
     return pvi.kbs_needing_a_per_kb_index(engine=_FakeEngine(conn))
 
 
+_SETTINGS_QUERY = "project_settings"
+_LOCK_TIMEOUT_SETTING = "set_config('lock_timeout'"
+
+
+class _LockQueuedConn(_FakeConn):
+    """A connection whose read of ``ai.project_settings`` is stuck behind a lock.
+
+    Models the queue the boot sweep really meets: a long-lived snapshot holds a
+    share lock on that table for hours, a single ``ALTER`` queues behind it, and
+    every later reader queues behind the ``ALTER``. A reader with no
+    ``lock_timeout`` gets no answer at all -- which at start-up is a process that
+    never finishes booting -- so here it raises ``_NeverReturned`` rather than
+    returning rows. A reader that bounded its wait first gets an answer: either
+    the rows, once the queue clears, or the cancellation this fake's
+    ``cancelling`` variant raises.
+
+    The bound has to have been set **on this connection and before the read**,
+    which is the whole of I1: a ``lock_timeout`` on another connection, or set
+    after the statement it is meant to bound, changes nothing.
+    """
+
+    class _NeverReturned(Exception):
+        """The read this fake was asked to make would still be waiting."""
+
+    def __init__(self, rows, cancelling=False):
+        super().__init__(answers=[(_SETTINGS_QUERY, rows)])
+        self.bounded_at: int | None = None
+        self.bound_before_the_read = False
+        self._cancelling = cancelling
+
+    def execute(self, clause, params=None):
+        sql = clause.text if hasattr(clause, "text") else str(clause)
+        if _LOCK_TIMEOUT_SETTING in sql:
+            self.bounded_at = len(self.statements)
+        elif _SETTINGS_QUERY in sql:
+            if self.bounded_at is None:
+                raise self._NeverReturned(
+                    "the settings read is queued behind a DDL request and nothing bounds it"
+                )
+            self.bound_before_the_read = True
+            if self._cancelling:
+                self.statements.append(" ".join(sql.split()))
+                self.params.append(params)
+                raise RuntimeError("canceling statement due to lock timeout")
+        return super().execute(clause, params)
+
+
+def test_the_boot_settings_read_bounds_its_lock_wait_before_it_makes_it():
+    """Without the bound this read is a start-up that never finishes.
+
+    The bounded count beside it protects the expensive statement; this is the
+    cheap one, and the only one touching a table the rest of the system takes
+    DDL locks on. Proved by a connection that refuses to answer an unbounded
+    read at all, so the overrides only come back if the bound was applied first
+    -- not merely that the string appears somewhere.
+    """
+    conn = _LockQueuedConn([("VECTOR_PER_KB_INDEX_MIN_ROWS", "12000")])
+    assert pvi.read_overrides(conn, *pvi._THRESHOLD_KEYS) == {
+        "VECTOR_PER_KB_INDEX_MIN_ROWS": 12_000
+    }
+    assert conn.bound_before_the_read
+    bound = conn.issued(_LOCK_TIMEOUT_SETTING)
+    assert len(bound) == 1, f"one bound, on this connection: {conn.statements}"
+    assert ", true)" in bound[0], (
+        "transaction-local, so the bound cannot ride a pooled connection into "
+        "unrelated work the way a session-level SET would"
+    )
+    assert conn.params[conn.bounded_at] == {"ms": str(pvi.SETTINGS_READ_LOCK_TIMEOUT_MS)}
+
+
+def test_a_settings_read_the_bound_cancels_becomes_the_registry_defaults():
+    """The bound turns a hang into an error, and the error into the defaults.
+
+    Which is the whole reason a bound is safe here: a start-up that is a little
+    wrong about a threshold reconciles the difference on the next indexed source
+    or the next start-up, and a start-up that does not happen does not.
+    """
+    conn = _LockQueuedConn([("VECTOR_PER_KB_INDEX_MIN_ROWS", "12000")], cancelling=True)
+    overrides = pvi.read_overrides(conn, *pvi._THRESHOLD_KEYS)
+    assert overrides == {}
+    assert pvi.thresholds(overrides) == (
+        SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"].default,
+        SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_DROP_ROWS"].default,
+    )
+    assert conn.rollbacks >= 1, "an aborted read must not leave the transaction open"
+
+
+class _BlockedSettingsSweepConn(_FakeConn):
+    """A sweep connection whose settings read is cancelled by its own bound."""
+
+    def execute(self, clause, params=None):
+        sql = clause.text if hasattr(clause, "text") else str(clause)
+        if _SETTINGS_QUERY in sql:
+            raise RuntimeError("canceling statement due to lock timeout")
+        return super().execute(clause, params)
+
+
+def test_a_settings_read_that_cannot_be_made_does_not_stop_the_boot_sweep():
+    """End to end: the sweep still clears the INVALID indexes it exists for."""
+    conn = _BlockedSettingsSweepConn(
+        answers=[
+            (_CATALOG_QUERY, [_index_row(_KBS[0], 1536, False)]),
+            (_COUNT_QUERY, [(_KBS[0], 1536, 3)]),
+        ]
+    )
+    assert _sweep(conn) == [_KBS[0]]
+
+
 def test_an_abandoned_boot_count_does_not_dispatch_every_indexed_knowledge_base(caplog):
     """A count that times out says nothing about any knowledge base.
 
