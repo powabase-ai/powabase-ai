@@ -154,7 +154,9 @@ def test_validate_setting_enforces_the_ranges(key, value, ok):
 
 
 def _stub_settings(monkeypatch, values: dict[str, int]):
-    monkeypatch.setattr(pvi, "get_setting", lambda key: values[key])
+    """Stub the settings read, filling in the build memory a caller did not name."""
+    filled = {"VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB": 128, **values}
+    monkeypatch.setattr(pvi, "get_setting", lambda key: filled[key])
 
 
 def test_thresholds_default_to_the_registry_values(monkeypatch):
@@ -348,3 +350,179 @@ def test_the_index_cap_is_far_below_where_planning_and_locks_degrade():
     # 513 locks per backend; 5,000 cost 25 ms and made the seventh concurrent
     # search fail with "out of shared memory".
     assert 0 < pvi.MAX_PER_KB_INDEXES <= 500
+
+
+# ---------------------------------------------------------------------------
+# A connection and an engine to run the service's own code against
+# ---------------------------------------------------------------------------
+
+
+class _Result:
+    """Just enough of a SQLAlchemy result for the three shapes this module reads."""
+
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def all(self):
+        return list(self._rows)
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+    def scalar(self):
+        return self._rows[0][0] if self._rows else None
+
+
+class _FakeConn:
+    """Records every statement, answers the ones a test names, fails one on request.
+
+    ``answers`` are ``(sql fragment, rows)`` pairs matched by substring, first
+    match winning, so a test names only the queries it cares about and
+    everything else comes back empty. ``fail_on`` is the fragment whose
+    statement raises, which is how the lifecycle specs put a failure exactly
+    where it hurts.
+    """
+
+    def __init__(self, answers=(), fail_on=None, exc=None):
+        self.answers = list(answers)
+        self.statements: list[str] = []
+        self.params: list[dict | None] = []
+        self.invalidated = False
+        self.rollbacks = 0
+        self._fail_on = fail_on
+        self._exc = exc if exc is not None else RuntimeError("statement failed")
+
+    def execute(self, clause, params=None):
+        sql = clause.text if hasattr(clause, "text") else str(clause)
+        self.statements.append(" ".join(sql.split()))
+        self.params.append(params)
+        if self._fail_on is not None and self._fail_on in sql:
+            raise self._exc
+        for fragment, rows in self.answers:
+            if fragment in sql:
+                return _Result(rows)
+        return _Result([])
+
+    def execution_options(self, **_kwargs):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def rollback(self):
+        self.rollbacks += 1
+
+    def invalidate(self):
+        self.invalidated = True
+
+    def issued(self, fragment: str) -> list[str]:
+        return [s for s in self.statements if fragment in s]
+
+
+class _FakeEngine:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def connect(self):
+        return self.conn
+
+
+def _raiser(exc):
+    def boom(*_args, **_kwargs):
+        raise exc
+
+    return boom
+
+
+# The catalog row shape both the ensure survey and the boot sweep read.
+def _index_row(kb_id: str, dims: int, valid: bool = True):
+    return (pvi.per_kb_index_name(kb_id, dims), valid)
+
+
+def _ensure(monkeypatch, conn, kb_id=KB, build_at=10_000, drop_below=5_000, **kwargs):
+    """Run the real ensure against a fake connection, with the thresholds fixed."""
+    _stub_settings(
+        monkeypatch,
+        {
+            "VECTOR_PER_KB_INDEX_MIN_ROWS": build_at,
+            "VECTOR_PER_KB_INDEX_DROP_ROWS": drop_below,
+        },
+    )
+    return pvi.ensure_per_kb_vector_index(kb_id, engine=_FakeEngine(conn), **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle: a build's session settings never ride a pooled connection out
+# ---------------------------------------------------------------------------
+
+
+def test_a_build_sets_both_session_settings_before_the_ddl_and_resets_both_after(monkeypatch):
+    monkeypatch.setattr(pvi, "maintenance_work_mem_mb", lambda: 256)
+    conn = _FakeConn()
+    pvi._create_index(conn, KB, 1536)
+    assert conn.statements == [
+        "SET statement_timeout = 0",
+        "SET maintenance_work_mem = '256MB'",
+        " ".join(pvi.per_kb_index_ddl(KB, 1536).split()),
+        "RESET maintenance_work_mem",
+        "RESET statement_timeout",
+    ]
+
+
+def test_a_failed_second_setting_never_leaves_the_connection_without_a_timeout(monkeypatch):
+    """``statement_timeout = 0`` must not outlive the build that needed it.
+
+    A session-level ``SET`` survives the pool's rollback-on-return, so a
+    connection handed back with no statement timeout carries that into
+    unrelated work for the rest of its life. Both ``SET``s therefore sit inside
+    the ``try`` whose ``finally`` puts them back -- if the second one raises,
+    the first is still undone.
+    """
+    monkeypatch.setattr(pvi, "maintenance_work_mem_mb", lambda: 128)
+    conn = _FakeConn(fail_on="SET maintenance_work_mem")
+    with pytest.raises(RuntimeError):
+        pvi._create_index(conn, KB, 1536)
+    assert conn.issued("SET statement_timeout = 0"), conn.statements
+    assert conn.issued("RESET statement_timeout") or conn.invalidated, conn.statements
+
+
+def test_the_build_memory_is_read_before_any_session_setting_is_raised(monkeypatch):
+    """The settings read is the other way into that leak, so it happens first."""
+    monkeypatch.setattr(
+        pvi, "maintenance_work_mem_mb", _raiser(RuntimeError("settings unreadable"))
+    )
+    conn = _FakeConn()
+    with pytest.raises(RuntimeError, match="settings unreadable"):
+        pvi._create_index(conn, KB, 1536)
+    assert conn.statements == [], "nothing may be set on a session we then abandon"
+
+
+def test_a_lock_release_that_fails_discards_the_connection():
+    """The lock is session-scoped, so a connection that keeps it must not be pooled."""
+    conn = _FakeConn(fail_on="pg_advisory_unlock")
+    pvi._release_lock(conn, pvi.index_lock_relation(KB, 1536))
+    assert conn.invalidated, "a pooled connection still holding the lock skips every later build"
+
+
+def test_a_reset_that_fails_discards_the_connection():
+    conn = _FakeConn(fail_on="RESET statement_timeout")
+    pvi._reset_session_setting(conn, "statement_timeout")
+    assert conn.invalidated
+
+
+def test_a_build_does_not_hold_the_settings_session_idle_in_a_transaction(monkeypatch):
+    """Two reads go through ``db.session``; neither ends the transaction they open.
+
+    A build would then occupy two connections, the second idle in a transaction
+    for the whole build -- and ``CREATE INDEX CONCURRENTLY`` waits for exactly
+    such a transaction, so the build would be waiting on its own task.
+    """
+    from agentic_project_service import db as db_module
+
+    session = MagicMock()
+    monkeypatch.setattr(db_module.db, "session", session)
+    _ensure(monkeypatch, _FakeConn())
+    session.rollback.assert_called()

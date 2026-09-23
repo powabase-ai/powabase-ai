@@ -534,6 +534,34 @@ def _reset_session_setting(conn, name: str) -> None:
             logger.debug("Could not invalidate the connection either", exc_info=True)
 
 
+def _release_settings_session() -> None:
+    """End the transaction a settings read left open on ``db.session``.
+
+    ``get_setting`` reads ``ai.project_settings`` through ``db.session`` and
+    nothing on that path commits or rolls back, so the session holds a
+    connection -- and an open transaction -- from the first threshold read until
+    the task ends. A build would then occupy two connections rather than one,
+    the second idle in a transaction for as long as the build runs, which is
+    minutes on a large knowledge base.
+
+    That is not only a wasted connection. ``CREATE INDEX CONCURRENTLY`` waits
+    for every transaction whose snapshot predates its own before it can finish,
+    so the build would be waiting on its own task's session -- the stall
+    ``_create_index``'s docstring warns about, caused by the build itself.
+
+    Only the out-of-band task calls the functions that call this, so there is
+    never caller work to lose. A session that was never opened, or no
+    application context at all (a test passing its own engine), is nothing to
+    give back.
+    """
+    try:
+        from ..db import db
+
+        db.session.rollback()
+    except Exception:
+        logger.debug("No settings session to give back", exc_info=True)
+
+
 def _build_in_progress(conn, kb_id: str, dims: int) -> bool:
     """Is another backend building or reindexing *this* index right now?
 
@@ -568,7 +596,7 @@ def _build_in_progress(conn, kb_id: str, dims: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _create_index(conn, kb_id: str, dims: int) -> None:
+def _create_index(conn, kb_id: str, dims: int, mem_mb: int | None = None) -> None:
     """Build one index online, with room to do it in memory.
 
     Session-level rather than ``SET LOCAL``: this connection is in AUTOCOMMIT
@@ -590,10 +618,21 @@ def _create_index(conn, kb_id: str, dims: int) -> None:
     ensure drops and rebuilds it rather than reporting it as built (see
     ``_repair_invalid`` and its caller). ``estimated_index_mb`` says why there is
     no free-space precheck.
+
+    Both ``SET``s are inside the ``try``, and ``mem_mb`` is known before the
+    first of them, so there is no window in which a statement can fail with a
+    setting raised and no ``finally`` to put it back. A session-level ``SET``
+    survives the pool's rollback-on-return, so a connection leaving that window
+    would carry ``statement_timeout = 0`` into unrelated work for the rest of
+    its life. ``mem_mb`` is passed in rather than read here for the same reason
+    it is read once per ensure: the read goes through ``db.session``
+    (``_release_settings_session``).
     """
-    conn.execute(text("SET statement_timeout = 0"))
-    conn.execute(text(f"SET maintenance_work_mem = '{maintenance_work_mem_mb()}MB'"))
+    if mem_mb is None:
+        mem_mb = maintenance_work_mem_mb()
     try:
+        conn.execute(text("SET statement_timeout = 0"))
+        conn.execute(text(f"SET maintenance_work_mem = '{mem_mb}MB'"))
         conn.execute(text(per_kb_index_ddl(kb_id, dims)))
     finally:
         _reset_session_setting(conn, "maintenance_work_mem")
@@ -650,6 +689,10 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
             on_progress(status)
 
     build_at, drop_below = thresholds()
+    mem_mb = maintenance_work_mem_mb()
+    # Both reads went through ``db.session``; give it back before a build that
+    # can run for minutes starts waiting on it.
+    _release_settings_session()
     cap = build_at + _COUNT_HEADROOM
     built: list[str] = []
     dropped: list[str] = []
@@ -750,7 +793,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                     build_at,
                     estimated_index_mb(rows, dims),
                 )
-                _create_index(conn, kb_id, dims)
+                _create_index(conn, kb_id, dims, mem_mb)
                 built.append(name)
             finally:
                 _release_lock(conn, lock)
