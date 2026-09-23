@@ -57,18 +57,33 @@ Three properties shape this module:
   path uses -- not in ``base_vector_store.ensure_embedding_index``, which runs
   inside the indexing transaction on purpose.
 
-**The index building is a no-op for a project whose knowledge bases are all
-below the threshold; the query change is not.** The embeddings-side predicate
-applies to every KB-scoped vector search from the moment it deploys, with or
-without a partial index, and for a knowledge base big enough that the planner
-had been reaching the shared index it can flip the plan to an exact bitmap scan
-and sort: measured 0.356 ms approximate to 3.540 ms exact at 9% selectivity,
-and 3.57 ms to 26.83 ms at 21%. Slower but correct, and only in the window
-between "big enough for the shared index to have been used" and the build
-threshold -- which is the window the threshold exists to close. A knowledge base
-whose searches already run an exact scan sees no flip at all, and neither do the
-small ones, which measured *faster* with the predicate (9.96 ms to 4.76 ms at
-1.4% selectivity, 19.50 ms to 13.00 ms at 4.3%).
+**No index gets built for a project whose knowledge bases are all below the
+threshold; the query change still applies to all of them.** The embeddings-side
+predicate applies to every KB-scoped vector search from the moment it deploys,
+with or without a partial index, and for a knowledge base big enough that the
+planner had been reaching the shared index it can flip the plan to an exact
+bitmap scan and sort: measured 0.356 ms approximate to 3.540 ms exact at 9%
+selectivity, 3.59 ms to 80 ms at 21%, and 129 ms at 30%. A knowledge base whose
+searches already run an exact scan sees no flip at all, and neither do the small
+ones, which measured *faster* with the predicate (9.96 ms to 4.76 ms at 1.4%
+selectivity, 19.50 ms to 13.00 ms at 4.3%).
+
+That window is a real cost and it is paid for something real: the plan it
+replaces was fast and quietly wrong. Measured against an exact scan over the
+same knowledge base, the old shape returned recall 0.65-0.70 -- it stopped as
+soon as the join had produced ``top_k`` rows of the wanted knowledge base --
+where the new one returns 1.0. So the trade in that window is lossy-fast for
+exact-slow, and the build threshold has to sit *below* the knowledge bases that
+land in it, which is what the 10,000-row default is for: the two knowledge bases
+where this was measured held 12.6k and 18k rows, and a 50,000-row threshold left
+both of them regressed with no index ever built.
+
+(The partial index is itself approximate, at recall 0.90 on that fixture. The
+exactness above is a property of the transitional plan, not of the destination.)
+
+The start-up sweep is not free for a small project either: it runs one grouped
+count over ``ai.embeddings`` on every boot, bounded by ``SWEEP_TIMEOUT_MS``,
+even when it then dispatches nothing.
 
 Nothing here touches the shared per-dimension index. Replacing it with a
 residual one (``WHERE dims = N AND knowledge_base_id NOT IN (...)``) is what
@@ -102,10 +117,24 @@ logger = logging.getLogger(__name__)
 # UUID's canonical form would need quoting for.
 INDEX_NAME_PREFIX = "hnsw_kb_"
 
-# pgvector's own bound on a vector's dimensions for an HNSW index; the same
-# range ``ensure_embedding_index`` enforces.
+# pgvector's own bound on a vector's dimensions; the same range
+# ``ensure_embedding_index`` enforces, and the range an index *name* is derived
+# for -- an existing index has to be found and dropped whatever its dimension.
 MIN_DIMS = 1
 MAX_DIMS = 8192
+
+# pgvector refuses an HNSW index on a vector wider than this, so a partial HNSW
+# index above it cannot be built at all: the attempt fails, and under
+# CONCURRENTLY it fails *after* the catalog entry exists, leaving an INVALID
+# index behind that answers no query and is maintained on every write. Embedding
+# models of 3,072 dimensions are in ordinary use and ``MAX_DIMS`` lets them
+# through, which is why this is a second, lower limit rather than a tightening of
+# that one. A knowledge base above it is declined once, at WARNING, and
+# ``index_action`` stops asking -- otherwise every source that finished indexing
+# dispatched the same doomed build, each attempt holding a worker slot with no
+# statement timeout. Its searches stay exact: the shared per-dimension index is
+# HNSW too, so there is no index of any kind to fall back to at this width.
+MAX_HNSW_DIMS = 2_000
 
 # Ceiling on how many of these a single project may hold. The planner opens and
 # locks *every* index of a relation while planning any query on it, so partial
@@ -114,9 +143,14 @@ MAX_DIMS = 8192
 # 513 locks per backend (comfortable), while 5,000 cost 25 ms of planning and
 # made the seventh concurrent search fail with "out of shared memory". 200 is
 # far below the point where either matters, and at the default threshold it
-# already means 10 million indexed rows in one project. A project that reaches
+# already means two million indexed rows in one project. A project that reaches
 # it keeps the shared index for the rest of its knowledge bases and says so at
 # WARNING, rather than quietly degrading every query on the table.
+#
+# The cap is soft under concurrency: two workers reconciling different knowledge
+# bases hold different locks and count the same catalog, so the overshoot is
+# bounded by one index per worker running at that moment, which is far inside the
+# margin above.
 MAX_PER_KB_INDEXES = 200
 
 # Bounded counts never read more than this many rows past the threshold, so the
@@ -133,6 +167,21 @@ _INDEX_BYTES_PER_DIMENSION = 6
 
 class PerKbVectorIndexBuildInProgress(RuntimeError):
     """Another caller holds the build lock for this index."""
+
+
+class PerKbVectorIndexDropFailed(RuntimeError):
+    """An index could not be dropped for a reason a retry cannot get past.
+
+    Raised rather than reported because the only caller is the deleted knowledge
+    base's drop, where nothing comes back: the row these indexes are named after
+    is gone, so neither the indexing dispatch nor the start-up sweep will ever
+    look at them again.
+    """
+
+    def __init__(self, message: str, dropped_indexes=(), failed_indexes=()):
+        super().__init__(message)
+        self.dropped_indexes = list(dropped_indexes)
+        self.failed_indexes = list(failed_indexes)
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +205,12 @@ def _validated_dims(dims: Any) -> int:
 
     PostgreSQL does not accept a type modifier from a parameter, so ``dims``
     reaches SQL as a literal in both the index expression and its predicate.
+
+    ``int()`` coerces rather than rejects, so a float truncates (``1536.9`` ->
+    ``1536``) and ``True`` becomes ``1``. Surprising, and left alone: the value
+    is range-checked either way, so nothing unsafe reaches SQL, and no caller
+    can get here with a non-integer -- ``dims`` comes from an embedding vector's
+    length or from ``pg_class.relname``.
     """
     try:
         value = int(dims)
@@ -200,6 +255,18 @@ def per_kb_index_drop_ddl(knowledge_base_id: Any, dims: Any) -> str:
     """DROP statement for one knowledge base's partial HNSW index."""
     name = per_kb_index_name(knowledge_base_id, dims)
     return f'DROP INDEX CONCURRENTLY IF EXISTS "{AI_SCHEMA}".{name}'
+
+
+# ``_`` matches any single character in a LIKE pattern and ``%`` any run of
+# them, and every one of these index names carries two underscores. Escaped, the
+# catalog lookups below match the literal names they are derived from and
+# nothing else, which is what their docstrings claim.
+_LIKE_WILDCARDS = str.maketrans({"\\": "\\\\", "_": "\\_", "%": "\\%"})
+
+
+def _like_prefix(prefix: str) -> str:
+    """``prefix`` as a LIKE pattern matching it literally, for ``ESCAPE '\\'``."""
+    return prefix.translate(_LIKE_WILDCARDS) + "%"
 
 
 def index_lock_relation(knowledge_base_id: Any, dims: Any) -> str:
@@ -291,8 +358,12 @@ def thresholds(overrides: dict[str, int] | None = None) -> tuple[int, int]:
     bracketed, not bisected: at 2,000 rows the planner does not use a partial
     index at all (an exact bitmap scan and sort is genuinely cheaper, and
     exact), and at 73,290 rows the partial index is two orders of magnitude
-    faster. The defaults sit deliberately at the conservative end of that
-    bracket, and a project that measures its own crossover can move them.
+    faster. Inside that bracket the defaults are set by where the *regression*
+    is rather than by where the win is largest: the embeddings-side predicate
+    costs 80 ms at 21% selectivity and 129 ms at 30%, measured in knowledge
+    bases of 12.6k and 18k rows, and a build threshold above those leaves them
+    slower with no index to compensate. A project that measures its own
+    crossover can move both.
 
     ``overrides`` is for a caller that cannot read settings through
     ``db.session``; see ``read_overrides``.
@@ -343,8 +414,9 @@ def existing_per_kb_indexes(conn, knowledge_base_id: Any) -> dict[int, bool]:
     """``{dims: is_valid}`` for this knowledge base's partial HNSW indexes.
 
     Read by name rather than by parsing predicates: the name is derived from
-    the KB's UUID and the dimension, so the catalog lookup is an equality match
-    on ``pg_class.relname`` and cannot mistake another KB's index for this
+    the KB's UUID and the dimension, so the catalog lookup is a literal prefix
+    match on ``pg_class.relname`` -- wildcards escaped, so the underscores in
+    the name are underscores -- and cannot mistake another KB's index for this
     one's.
     """
     kb_hex = uuid.UUID(_validated_kb_id(knowledge_base_id)).hex
@@ -354,9 +426,10 @@ def existing_per_kb_indexes(conn, knowledge_base_id: Any) -> dict[int, bool]:
             "SELECT c.relname, i.indisvalid FROM pg_class c "
             "JOIN pg_index i ON i.indexrelid = c.oid "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE n.nspname = :schema AND c.relkind = 'i' AND c.relname LIKE :prefix"
+            r"WHERE n.nspname = :schema AND c.relkind = 'i' "
+            r"AND c.relname LIKE :prefix ESCAPE '\'"
         ),
-        {"schema": AI_SCHEMA, "prefix": prefix + "%"},
+        {"schema": AI_SCHEMA, "prefix": _like_prefix(prefix)},
     ).all()
     found: dict[int, bool] = {}
     for relname, valid in rows:
@@ -373,9 +446,10 @@ def per_kb_index_count(conn) -> int:
             text(
                 "SELECT count(*) FROM pg_class c "
                 "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE n.nspname = :schema AND c.relkind = 'i' AND c.relname LIKE :prefix"
+                r"WHERE n.nspname = :schema AND c.relkind = 'i' "
+                r"AND c.relname LIKE :prefix ESCAPE '\'"
             ),
-            {"schema": AI_SCHEMA, "prefix": INDEX_NAME_PREFIX + "%"},
+            {"schema": AI_SCHEMA, "prefix": _like_prefix(INDEX_NAME_PREFIX)},
         ).scalar()
         or 0
     )
@@ -437,7 +511,10 @@ def index_action(conn, knowledge_base_id: Any) -> str | None:
 
     Cheap enough for the indexing path to call once per source: one catalog
     lookup plus one bounded count per dimension in play. Never raises for a
-    knowledge base that has no embeddings at all.
+    knowledge base that has no embeddings at all, and never asks for a build
+    ``MAX_HNSW_DIMS`` makes impossible -- this runs once per source that
+    finishes indexing, so anything it asks for that cannot succeed is asked for
+    again and again.
     """
     build_at, drop_below = thresholds()
     existing = existing_per_kb_indexes(conn, knowledge_base_id)
@@ -449,9 +526,11 @@ def index_action(conn, knowledge_base_id: Any) -> str | None:
     for dims in sorted(set(candidate_dims(conn, knowledge_base_id, cap)) | set(existing)):
         rows = bounded_row_count(conn, knowledge_base_id, dims, cap)
         if dims in existing:
-            if rows < drop_below:
+            if rows <= drop_below:
                 return "drop"
-        elif rows >= build_at:
+        elif rows >= build_at and dims <= MAX_HNSW_DIMS:
+            # Above ``MAX_HNSW_DIMS`` the build cannot succeed, so asking for it
+            # once per indexed source would be a doomed task per source.
             return "build"
     return None
 
@@ -469,6 +548,12 @@ def estimated_index_mb(rows: int, dims: int) -> int:
     filesystem has left, and the index goes into the database's own tablespace.
     So the size the build is reaching for is logged instead, which is what an
     operator needs when a build fails on a full disk.
+
+    ``rows`` is normally a *bounded* count that stops just past the build
+    threshold, which makes this a floor and not an estimate: a knowledge base
+    ten times the threshold builds an index ten times this size. The caller
+    says so in the log line rather than printing a number that reads like the
+    whole answer.
     """
     return max(1, rows * dims * _INDEX_BYTES_PER_DIMENSION // (1024 * 1024))
 
@@ -534,6 +619,34 @@ def _reset_session_setting(conn, name: str) -> None:
             logger.debug("Could not invalidate the connection either", exc_info=True)
 
 
+def _release_settings_session() -> None:
+    """End the transaction a settings read left open on ``db.session``.
+
+    ``get_setting`` reads ``ai.project_settings`` through ``db.session`` and
+    nothing on that path commits or rolls back, so the session holds a
+    connection -- and an open transaction -- from the first threshold read until
+    the task ends. A build would then occupy two connections rather than one,
+    the second idle in a transaction for as long as the build runs, which is
+    minutes on a large knowledge base.
+
+    That is not only a wasted connection. ``CREATE INDEX CONCURRENTLY`` waits
+    for every transaction whose snapshot predates its own before it can finish,
+    so the build would be waiting on its own task's session -- the stall
+    ``_create_index``'s docstring warns about, caused by the build itself.
+
+    Only the out-of-band task calls the functions that call this, so there is
+    never caller work to lose. A session that was never opened, or no
+    application context at all (a test passing its own engine), is nothing to
+    give back.
+    """
+    try:
+        from ..db import db
+
+        db.session.rollback()
+    except Exception:
+        logger.debug("No settings session to give back", exc_info=True)
+
+
 def _build_in_progress(conn, kb_id: str, dims: int) -> bool:
     """Is another backend building or reindexing *this* index right now?
 
@@ -568,7 +681,7 @@ def _build_in_progress(conn, kb_id: str, dims: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _create_index(conn, kb_id: str, dims: int) -> None:
+def _create_index(conn, kb_id: str, dims: int, mem_mb: int | None = None) -> None:
     """Build one index online, with room to do it in memory.
 
     Session-level rather than ``SET LOCAL``: this connection is in AUTOCOMMIT
@@ -590,10 +703,21 @@ def _create_index(conn, kb_id: str, dims: int) -> None:
     ensure drops and rebuilds it rather than reporting it as built (see
     ``_repair_invalid`` and its caller). ``estimated_index_mb`` says why there is
     no free-space precheck.
+
+    Both ``SET``s are inside the ``try``, and ``mem_mb`` is known before the
+    first of them, so there is no window in which a statement can fail with a
+    setting raised and no ``finally`` to put it back. A session-level ``SET``
+    survives the pool's rollback-on-return, so a connection leaving that window
+    would carry ``statement_timeout = 0`` into unrelated work for the rest of
+    its life. ``mem_mb`` is passed in rather than read here for the same reason
+    it is read once per ensure: the read goes through ``db.session``
+    (``_release_settings_session``).
     """
-    conn.execute(text("SET statement_timeout = 0"))
-    conn.execute(text(f"SET maintenance_work_mem = '{maintenance_work_mem_mb()}MB'"))
+    if mem_mb is None:
+        mem_mb = maintenance_work_mem_mb()
     try:
+        conn.execute(text("SET statement_timeout = 0"))
+        conn.execute(text(f"SET maintenance_work_mem = '{mem_mb}MB'"))
         conn.execute(text(per_kb_index_ddl(kb_id, dims)))
     finally:
         _reset_session_setting(conn, "maintenance_work_mem")
@@ -625,22 +749,53 @@ def _repair_invalid(conn, kb_id: str, dims: int) -> bool:
     return True
 
 
+def outcome_needs_another_attempt(outcome: dict) -> bool:
+    """Did this ensure leave work only a later run can finish?
+
+    True for exactly one case: an ``INVALID`` index that had to be left in place
+    because a build of it is still running. Nothing else comes back to that
+    knowledge base on its own -- the index answers no query and is maintained on
+    every write until a reconcile runs again -- whereas a plain lock conflict
+    means another caller is doing this index's work right now and will finish it.
+
+    Meant for the caller that can actually reschedule (the task), so the
+    condition lives here with the code that produces it rather than being
+    re-derived from the dict.
+    """
+    return bool(outcome.get("reschedule"))
+
+
 def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=None) -> dict:
     """Give this knowledge base a partial HNSW index per dimension it is big enough for.
 
     Idempotent, and a no-op whenever a partial index is not the right answer:
-    too few rows, one already there and valid, or the project already at
-    ``MAX_PER_KB_INDEXES``. Below ``VECTOR_PER_KB_INDEX_DROP_ROWS`` an index
-    that exists is dropped, so a knowledge base that shrinks -- sources deleted,
-    a reindex to a different embedding model -- does not keep paying for one.
-    An ``INVALID`` index is dropped and rebuilt.
+    too few rows, one already there and valid, more dimensions than pgvector
+    will build an HNSW index for, or the project already at
+    ``MAX_PER_KB_INDEXES``. At or below ``VECTOR_PER_KB_INDEX_DROP_ROWS`` an
+    index that exists is dropped, so a knowledge base that shrinks -- sources
+    deleted, a reindex to a different embedding model -- does not keep paying
+    for one. An ``INVALID`` index is dropped and rebuilt.
 
     ``on_progress(status)`` is called with ``"building"`` before each build and
     ``"dropping"`` before each drop.
 
-    Returns a dict with ``status`` in ``ready`` (nothing left to do),
-    ``building`` (another caller holds this index's lock), or ``skipped`` with
-    a ``reason``, plus the names built and dropped.
+    Every dimension in play is attempted: one dimension being locked, declined
+    or over the cap no longer abandons the rest, because a knowledge base that
+    has just changed embedding model has an index to drop at the old dimension
+    and one to build at the new one.
+
+    Returns a dict with ``status``:
+
+    * ``ready`` -- nothing left to do, and ``built``/``dropped`` say what was
+      done. ``repaired_invalid_indexes`` lists the INVALID indexes dropped.
+    * ``building`` -- at least one dimension belongs to another caller right
+      now. ``reason`` distinguishes ``build_lock_held`` (that caller is doing
+      the work) from ``invalid_index_build_in_progress``, which also sets
+      ``reschedule`` -- see ``outcome_needs_another_attempt``.
+    * ``skipped`` with a ``reason`` of ``index_cap_reached`` or
+      ``dims_above_hnsw_limit`` -- a build this project or this embedding width
+      cannot have. ``building`` outranks both, because it is the one that is
+      still moving.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
@@ -650,10 +805,18 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
             on_progress(status)
 
     build_at, drop_below = thresholds()
+    mem_mb = maintenance_work_mem_mb()
+    # Both reads went through ``db.session``; give it back before a build that
+    # can run for minutes starts waiting on it.
+    _release_settings_session()
     cap = build_at + _COUNT_HEADROOM
     built: list[str] = []
     dropped: list[str] = []
     repaired: list[str] = []
+    blocked: list[str] = []
+    reschedule: str | None = None
+    cap_reached: int | None = None
+    above_limit: list[int] = []
 
     with _autocommit_connection(engine) as conn:
         existing = existing_per_kb_indexes(conn, kb_id)
@@ -665,8 +828,10 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
             name = per_kb_index_name(kb_id, dims)
             lock = index_lock_relation(kb_id, dims)
             if not _try_lock(conn, lock):
-                # Whoever holds it is building or dropping this very index.
-                return {"status": "building", "index": name, "built": built, "dropped": dropped}
+                # Whoever holds it is building or dropping this very index, and
+                # will finish it. The other dimensions are still ours.
+                blocked.append(name)
+                continue
             try:
                 # Re-read under the lock: another caller may have finished
                 # between the survey above and this point.
@@ -678,43 +843,68 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         # `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, which
                         # no-ops against the name the invalid index holds -- and
                         # this would report the index as built while it answers
-                        # no query and is maintained on every write. Report what
-                        # is true and let the running build finish; the next
-                        # ensure repairs it if that build fails too. (The BM25
+                        # no query and is maintained on every write. (The BM25
                         # path does the same, for the same reason.)
-                        logger.info(
-                            "Leaving partial HNSW index %s.%s INVALID for now: another "
-                            "backend is building it",
+                        #
+                        # We hold this index's build lock, so that build belongs
+                        # to no live caller of this module: it is an orphan
+                        # backend, most often from a worker that did not survive
+                        # its own build. Nothing else comes back to this
+                        # knowledge base, so the outcome asks to be run again.
+                        logger.warning(
+                            "Partial HNSW index %s.%s is INVALID and a build of it is still "
+                            "running, so it has to be left in place: dropping it would pull "
+                            "the ground out from under that build, and a rebuild would "
+                            "no-op against the name it holds and report an index that "
+                            "answers no query as built. Its backend outlived whatever "
+                            "started it (this caller holds the build lock). Until a later "
+                            "reconcile succeeds, every insert into %s.embeddings maintains "
+                            "an index no search can use",
                             AI_SCHEMA,
                             name,
+                            AI_SCHEMA,
                         )
-                        return {
-                            "status": "building",
-                            "index": name,
-                            "built": built,
-                            "dropped": dropped,
-                        }
+                        blocked.append(name)
+                        reschedule = reschedule or name
+                        continue
                     repaired.append(name)
                     valid = None
 
                 rows = bounded_row_count(conn, kb_id, dims, cap)
                 if valid is True:
-                    if rows < drop_below:
+                    if rows <= drop_below:
                         progress("dropping")
                         logger.info(
                             "Dropping partial HNSW index %s.%s: knowledge base %s now has "
-                            "fewer than %d rows at %d dimensions",
+                            "%d rows at %d dimensions, at or below the drop threshold of %d",
                             AI_SCHEMA,
                             name,
                             kb_id,
-                            drop_below,
+                            rows,
                             dims,
+                            drop_below,
                         )
                         conn.execute(text(per_kb_index_drop_ddl(kb_id, dims)))
                         dropped.append(name)
                     continue
 
                 if rows < build_at:
+                    continue
+                if dims > MAX_HNSW_DIMS:
+                    logger.warning(
+                        "Not building partial HNSW index %s.%s: %d dimensions is above "
+                        "pgvector's HNSW limit of %d, so this build would fail every time it "
+                        "was attempted, and is not attempted or dispatched again. Searches of "
+                        "knowledge base %s stay exact -- at this width no HNSW index is "
+                        "possible at all, the shared per-dimension one included -- until it "
+                        "is reindexed with a narrower embedding model",
+                        AI_SCHEMA,
+                        name,
+                        dims,
+                        MAX_HNSW_DIMS,
+                        kb_id,
+                    )
+                    above_limit.append(dims)
                     continue
                 total = per_kb_index_count(conn)
                 if total >= MAX_PER_KB_INDEXES:
@@ -729,28 +919,33 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         total,
                         MAX_PER_KB_INDEXES,
                     )
-                    return {
-                        "status": "skipped",
-                        "reason": "index_cap_reached",
-                        "index_count": total,
-                        "built": built,
-                        "dropped": dropped,
-                    }
+                    cap_reached = total
+                    continue
                 progress("building")
+                bounded = rows >= cap
+                floor = "at least " if bounded else ""
                 logger.info(
                     "Building partial HNSW index %s.%s for knowledge base %s (%s%d rows at %d "
-                    "dimensions, threshold %d); expect roughly %d MB of index, and no write "
-                    "block",
+                    "dimensions, threshold %d); it needs %s%d MB of disk, and blocks no "
+                    "writes.%s",
                     AI_SCHEMA,
                     name,
                     kb_id,
-                    "at least " if rows >= cap else "",
+                    floor,
                     rows,
                     dims,
                     build_at,
+                    floor,
                     estimated_index_mb(rows, dims),
+                    (
+                        f" Both figures are floors: the row count stops at {cap}, so a "
+                        f"knowledge base ten times that size builds an index ten times this "
+                        f"one."
+                        if bounded
+                        else ""
+                    ),
                 )
-                _create_index(conn, kb_id, dims)
+                _create_index(conn, kb_id, dims, mem_mb)
                 built.append(name)
             finally:
                 _release_lock(conn, lock)
@@ -758,6 +953,21 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     outcome: dict = {"status": "ready", "built": built, "dropped": dropped}
     if repaired:
         outcome["repaired_invalid_indexes"] = repaired
+    if above_limit:
+        outcome["dims_above_hnsw_limit"] = above_limit
+        outcome.update({"status": "skipped", "reason": "dims_above_hnsw_limit"})
+    if cap_reached is not None:
+        outcome.update(
+            {"status": "skipped", "reason": "index_cap_reached", "index_count": cap_reached}
+        )
+    if blocked:
+        # Still moving somewhere, which outranks a skip: reported last so its
+        # reason is the one that survives.
+        outcome["status"] = "building"
+        outcome["index"] = reschedule or blocked[0]
+        outcome["reason"] = "invalid_index_build_in_progress" if reschedule else "build_lock_held"
+        if reschedule:
+            outcome["reschedule"] = True
     return outcome
 
 
@@ -771,7 +981,11 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
     since.
 
     A transient database error is re-raised so the task retries rather than
-    reporting a drop that did not happen.
+    reporting a drop that did not happen, and a *permanent* one raises
+    ``PerKbVectorIndexDropFailed`` for the same reason turned up to ERROR: it is
+    the case where the index really is orphaned, and no retry, dispatch or
+    start-up sweep will ever reach it again. Every dimension is attempted first,
+    so one index that cannot be dropped does not strand the others.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
@@ -800,7 +1014,24 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
                 _release_lock(conn, lock)
 
     if failed:
-        return {"status": "partial", "indexes": dropped, "failed_indexes": failed}
+        names = ", ".join(f"{AI_SCHEMA}.{name}" for name in failed)
+        logger.error(
+            "Could not drop %d of deleted knowledge base %s's partial HNSW index(es), for a "
+            "reason a retry cannot get past: %s. They are orphaned -- named after a knowledge "
+            "base that no longer exists, answering no query, and maintained by Postgres on "
+            "every write to %s.embeddings -- and have to be dropped by hand. Dropped "
+            "successfully: %s",
+            len(failed),
+            kb_id,
+            names,
+            AI_SCHEMA,
+            ", ".join(dropped) or "(none)",
+        )
+        raise PerKbVectorIndexDropFailed(
+            f"could not drop {names} of deleted knowledge base {kb_id}",
+            dropped_indexes=dropped,
+            failed_indexes=failed,
+        )
     return {"status": "dropped", "indexes": dropped}
 
 
@@ -816,11 +1047,30 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
 # (an INVALID index, an index whose knowledge base has emptied) are found
 # without this count at all.
 #
-# 5 s matches this codebase's other boot-path bound (the migrations' own
-# ``lock_timeout``) rather than being generous for its own sake. Measured 14 ms
-# over 66,000 embeddings, so about 1.1 s extrapolated to 5.3 million -- the
-# ceiling is for a pathological case, not the expected one.
+# 5 s is not borrowed from another bound -- the migrations' own boot-path
+# ``lock_timeout`` is 10 s. It comes from the measurement: 14 ms over 66,000
+# embeddings, so about 1.1 s extrapolated to 5.3 million rows. That leaves
+# several times the slowest count worth waiting for, while staying short enough
+# that a start-up cannot look hung on it.
 SWEEP_TIMEOUT_MS = 5_000
+
+# Upper bound on how many reconciles one start-up sets off. ``MAX_PER_KB_INDEXES``
+# caps how many of these indexes a project may hold, not how many builds may be
+# in flight, and every dispatched build runs with ``statement_timeout = 0`` and
+# asks for ``maintenance_work_mem`` of its own. The first boot after this
+# deploys, on a project with 30 knowledge bases over the threshold -- exactly the
+# population the feature is for -- would otherwise queue 30 of them at once,
+# against a database that may have 512 MiB in total. 10 bounds that at about
+# 1.3 GB of build memory at the default setting even if the queue runs them all
+# in parallel, and is more than a project crosses the threshold with between two
+# boots in practice.
+#
+# Nothing is dropped by the cap: the next source to finish indexing in each
+# knowledge base dispatches the same reconcile, and so does the next start-up.
+# The ``INVALID`` indexes are first in the list because they answer no query
+# while Postgres maintains them on every write, so they are the ones that must
+# not be deferred.
+MAX_SWEEP_DISPATCH = 10
 
 _THRESHOLD_KEYS = ("VECTOR_PER_KB_INDEX_MIN_ROWS", "VECTOR_PER_KB_INDEX_DROP_ROWS")
 
@@ -829,11 +1079,19 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
     """Knowledge bases whose partial HNSW indexes are out of step, for the start-up sweep.
 
     Three cases, in one pass: a knowledge base at or above the build threshold
-    with no index, one below the drop threshold that has one, and one whose
-    index is ``INVALID``. The last two are read from the catalog, which is
-    cheap; the first needs the grouped count, which is not, so it runs under
-    ``SWEEP_TIMEOUT_MS`` and an abandoned count leaves the catalog cases to be
-    dispatched on their own.
+    with no index, one at or below the drop threshold that has one, and one whose
+    index is ``INVALID``. The last of those is read from the catalog, which is
+    cheap; the first two need the grouped count, which is not, so it runs under
+    ``SWEEP_TIMEOUT_MS``.
+
+    An abandoned count is not evidence about any knowledge base, so when it
+    fails nothing is concluded from it -- only the ``INVALID`` indexes are
+    returned. In particular the "a knowledge base whose rows are all gone still
+    has its index" case cannot be told apart from a count that never ran, so it
+    is only considered when the count finished.
+
+    At most ``MAX_SWEEP_DISPATCH`` ids come back, because each one can start an
+    unbounded index build.
 
     Never raises, and never touches ``db.session``: this runs inside the boot's
     migration transaction, where a failing statement would abort the boot's own
@@ -850,9 +1108,10 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
                     "SELECT c.relname, i.indisvalid FROM pg_class c "
                     "JOIN pg_index i ON i.indexrelid = c.oid "
                     "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                    "WHERE n.nspname = :schema AND c.relkind = 'i' AND c.relname LIKE :prefix"
+                    r"WHERE n.nspname = :schema AND c.relkind = 'i' "
+                    r"AND c.relname LIKE :prefix ESCAPE '\'"
                 ),
-                {"schema": AI_SCHEMA, "prefix": INDEX_NAME_PREFIX + "%"},
+                {"schema": AI_SCHEMA, "prefix": _like_prefix(INDEX_NAME_PREFIX)},
             ).all()
             indexed: dict[str, list[int]] = {}
             for relname, valid in rows:
@@ -874,6 +1133,7 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
         )
         return []
 
+    counted_ok = True
     try:
         with engine.connect() as conn:
             conn.execute(
@@ -888,20 +1148,37 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
             ).all()
             conn.rollback()
     except Exception as exc:
+        counted_ok = False
         logger.warning(
-            "Could not count embeddings per knowledge base at start-up (%s); the knowledge "
-            "bases that need an index are picked up as their sources finish indexing",
+            "Could not count embeddings per knowledge base at start-up (%s); only the "
+            "knowledge bases whose index is INVALID are reconciled now, and the rest are "
+            "picked up as their sources finish indexing or at the next start-up",
             first_error_line(exc),
         )
         counted = []
 
-    for kb_id, dims, count in counted:
-        has_index = int(dims) in indexed.get(kb_id, ())
-        if (not has_index and count >= build_at) or (has_index and count < drop_below):
-            needing[kb_id] = None
-    # A knowledge base whose rows are all gone still has its index, and the
-    # grouped count above cannot see it (no rows, no group).
-    for kb_id in indexed:
-        if not any(r[0] == kb_id for r in counted):
-            needing[kb_id] = None
-    return list(needing)
+    if counted_ok:
+        for kb_id, dims, count in counted:
+            has_index = int(dims) in indexed.get(kb_id, ())
+            if (not has_index and count >= build_at) or (has_index and count <= drop_below):
+                needing[kb_id] = None
+        # A knowledge base whose rows are all gone still has its index, and the
+        # grouped count above cannot see it (no rows, no group). Only sound
+        # because the count finished: an abandoned one is empty for a reason
+        # that says nothing about any knowledge base.
+        for kb_id in indexed:
+            if not any(r[0] == kb_id for r in counted):
+                needing[kb_id] = None
+
+    pending = list(needing)
+    if len(pending) > MAX_SWEEP_DISPATCH:
+        logger.warning(
+            "%d knowledge bases need their partial HNSW index reconciled; dispatching the "
+            "first %d and leaving %d for their next indexed source or the next start-up, "
+            "because each dispatch can start an index build with no statement timeout",
+            len(pending),
+            MAX_SWEEP_DISPATCH,
+            len(pending) - MAX_SWEEP_DISPATCH,
+        )
+        pending = pending[:MAX_SWEEP_DISPATCH]
+    return pending
