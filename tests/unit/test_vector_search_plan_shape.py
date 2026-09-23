@@ -15,13 +15,20 @@ before the live suite has to catch it with a scan counter.
 import asyncio
 from unittest.mock import MagicMock
 
-from agentic_project_service.services.base_vector_store import BasePgVectorStore
+import pytest
+
+from agentic_project_service.services.base_vector_store import (
+    PER_KB_HNSW_EF_SEARCH,
+    BasePgVectorStore,
+)
 
 _KB_ID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
 
-# Deliberately not "on": a restore that hardcodes the default would pass
-# against a fixture whose prior value *was* the default.
+# Deliberately not the defaults ("on" and "40"): a restore that hardcodes what
+# the setting usually is would pass against a fixture whose prior value *was* that.
 ENABLE_SORT_WAS = "off"
+EF_SEARCH_WAS = "55"
+PLAN_CACHE_MODE_WAS = "force_generic_plan"
 
 
 class _FakeStore(BasePgVectorStore):
@@ -30,14 +37,29 @@ class _FakeStore(BasePgVectorStore):
     SEARCH_TEXT_COL = "text"
 
 
-def _capture(*, partial_index: bool = False, **kwargs) -> list[tuple[str, dict]]:
+class _FakeDocumentStore(BasePgVectorStore):
+    """A store on one of the other item tables ``ai.embeddings`` holds.
+
+    Same inherited ``vector_search``, different ``TABLE`` -- which is the whole of
+    what tells the two apart, and what the partial index's predicate does not
+    know about.
+    """
+
+    TABLE = "full_documents"
+    TEXT_COL = "summary"
+    SEARCH_TEXT_COL = "summary"
+
+
+def _capture(
+    *, partial_index: bool = False, store: type[BasePgVectorStore] = _FakeStore, **kwargs
+) -> list[tuple[str, dict]]:
     """Every statement ``vector_search`` executes, with the parameters it binds.
 
     ``partial_index`` is the answer the store's catalog probe gets back: whether
     this knowledge base has a valid partial HNSW index. It decides a branch, so
-    the fake has to be able to answer both ways. ``ENABLE_SORT_WAS`` is the value
-    the probe reports ``enable_sort`` currently has, so a spec can tell a restore
-    from a hardcoded ``on``.
+    the fake has to be able to answer both ways. ``ENABLE_SORT_WAS`` and
+    ``EF_SEARCH_WAS`` are the values the probe reports those settings currently
+    have, so a spec can tell a restore from a hardcoded default.
     """
     session = MagicMock()
     captured: list[tuple[str, dict]] = []
@@ -46,16 +68,36 @@ def _capture(*, partial_index: bool = False, **kwargs) -> list[tuple[str, dict]]
         sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
         captured.append((sql, dict(params or {})))
         if "to_regclass" in sql:
-            return iter([(ENABLE_SORT_WAS, partial_index)])
+            return iter([(ENABLE_SORT_WAS, EF_SEARCH_WAS, partial_index)])
+        if "current_setting('plan_cache_mode')" in sql:
+            return _scalar(PLAN_CACHE_MODE_WAS)
         return iter([])
 
     session.execute = spy_execute
-    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
+    store_under_test = store(db_session=session, knowledge_base_id=_KB_ID)
     kwargs.setdefault("embedding", [0.0] * 1536)
     kwargs.setdefault("top_k", 10)
-    asyncio.run(store.vector_search(**kwargs))
+    asyncio.run(store_under_test.vector_search(**kwargs))
     assert captured, "vector_search did not execute any SQL"
     return captured
+
+
+def _scalar(value):
+    """A result object whose ``.scalar()`` answers, for the one read that uses it."""
+    result = MagicMock()
+    result.scalar.return_value = value
+    result.__iter__ = lambda self: iter([(value,)])
+    return result
+
+
+def _writes(statements: list[tuple[str, dict]], guc: str) -> list[int]:
+    """Indices of the statements that *change* ``guc``.
+
+    Not every statement mentioning it: the probe and the plan-cache save read the
+    current value, and a reader is not a writer. Without this distinction a spec
+    that means "this setting was applied" passes on the read alone.
+    """
+    return _settings(statements, f"set_config('{guc}'")
 
 
 def _search(statements: list[tuple[str, dict]]) -> tuple[str, dict]:
@@ -132,20 +174,21 @@ def test_a_filtered_search_asks_for_a_custom_plan():
     execution plan against the value it actually has.
     """
     statements = _capture(filter_metadata={"tag": "a"})
-    forced = _settings(statements, "plan_cache_mode")
+    forced = _writes(statements, "plan_cache_mode")
     assert forced, (
         "a filtered search must ask for a custom plan, or it loses the partial "
         f"index once the statement is prepared; statements: {statements}"
     )
     normalized = "".join(statements[forced[0]][0].split()).lower()
-    assert "setlocalplan_cache_mode" in normalized, statements[forced[0]][0]
-    assert "force_custom_plan" in normalized, statements[forced[0]][0]
+    assert "set_config('plan_cache_mode','force_custom_plan',true)" in normalized, statements[
+        forced[0]
+    ][0]
 
 
 def test_the_custom_plan_request_precedes_the_search():
     """``SET LOCAL`` only reaches a statement that runs after it, same transaction."""
     statements = _capture(filter_metadata={"tag": "a"})
-    first_set = _settings(statements, "plan_cache_mode")[0]
+    first_set = _writes(statements, "plan_cache_mode")[0]
     search_at = next(i for i, (sql, _) in enumerate(statements) if "ORDER BY" in sql)
     assert first_set < search_at, f"plan_cache_mode set after the search: {statements}"
 
@@ -170,8 +213,10 @@ def test_the_custom_plan_request_is_transaction_scoped():
     """Session-level would follow the connection back into the pool and make
     every later search on it replan."""
     statements = _capture(filter_metadata={"tag": "a"})
-    sql = statements[_settings(statements, "plan_cache_mode")[0]][0]
-    assert "SET LOCAL" in sql, f"the setting must not outlive the transaction:\n{sql}"
+    sql = statements[_writes(statements, "plan_cache_mode")[0]][0]
+    assert "true" in "".join(sql.split()).lower(), (
+        f"the setting must not outlive the transaction:\n{sql}"
+    )
 
 
 def test_the_custom_plan_request_follows_the_argument_not_the_sql_text():
@@ -184,7 +229,7 @@ def test_the_custom_plan_request_follows_the_argument_not_the_sql_text():
     """
     for filter_metadata in ({"tag": "a"}, {"a": 1, "b": 2}, {"nested": {"x": [1, 2]}}):
         statements = _capture(filter_metadata=filter_metadata)
-        assert _settings(statements, "plan_cache_mode"), (
+        assert _writes(statements, "plan_cache_mode"), (
             f"no custom plan requested for {filter_metadata}: {statements}"
         )
 
@@ -195,7 +240,7 @@ def test_a_filter_combined_with_other_predicates_still_asks_for_a_custom_plan():
         item_ids={"3f2504e0-4f89-11d3-9a0c-0305e82c3302"},
         source_ids=["3f2504e0-4f89-11d3-9a0c-0305e82c3303"],
     )
-    assert _settings(statements, "plan_cache_mode"), statements
+    assert _writes(statements, "plan_cache_mode"), statements
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +257,8 @@ def test_a_filter_combined_with_other_predicates_still_asks_for_a_custom_plan():
 
 
 def _enable_sort(statements: list[tuple[str, dict]]) -> list[int]:
-    """Indices of the statements that *change* ``enable_sort``.
-
-    Not every statement mentioning it: the probe reads the current value, and a
-    reader is not a writer.
-    """
-    return _settings(statements, "set_config('enable_sort'")
+    """Indices of the statements that *change* ``enable_sort``."""
+    return _writes(statements, "enable_sort")
 
 
 def test_a_search_asks_whether_this_knowledge_base_has_a_valid_partial_index():
@@ -305,17 +346,78 @@ def test_the_restore_puts_back_the_value_the_probe_read():
     )
 
 
-def test_a_two_key_filtered_search_prices_the_sort_out_as_well():
-    """The defect that made this fix necessary rather than deferrable.
+def test_a_filtered_search_keeps_the_sort_and_still_asks_for_a_custom_plan():
+    """A metadata filter gets the custom plan and *not* the sort penalty.
 
-    ``jsonb @>`` has no statistics, so two keys estimate near zero rows and the
-    sort looks free even to a custom plan that knows the filter's value. Measured:
-    0 of 12 executions on the partial index, repaired to 12 of 12. Asking for a
-    custom plan is not enough on its own, so both settings have to be here.
+    The two settings answer different questions and this is where they part. The
+    custom plan is what gets the filter's value to the planner, and it helps every
+    filtered search. Pricing the sort out helps only the unfiltered one: measured
+    at 1536 dimensions through ``vector_search``, a one-source ``source_ids``
+    search went 22.7 -> 28.5 ms at recall 1.00 -> 0.49, a 200-item ``item_ids``
+    search 11.0 -> 37.8 ms at 1.00 -> 0.80, and a filter matching no row
+    3.0 -> 38.3 ms. Slower and less accurate, on a search whose restriction the
+    caller wrote down and expects to be honoured.
     """
     statements = _capture(partial_index=True, filter_metadata={"tier": "gold", "kb": "a"})
+    assert _writes(statements, "plan_cache_mode"), statements
+    assert not _enable_sort(statements), (
+        "a filtered search must keep the plan the planner chooses for it; pricing "
+        f"the sort out makes it slower and less complete: {statements}"
+    )
+
+
+@pytest.mark.parametrize(
+    "restriction",
+    [
+        {"item_ids": {"3f2504e0-4f89-11d3-9a0c-0305e82c3302"}},
+        {"item_ids": set()},
+        {"source_ids": ["3f2504e0-4f89-11d3-9a0c-0305e82c3303"]},
+        {"source_ids": []},
+        {"filter_metadata": {"tier": "gold"}},
+    ],
+    ids=["item_ids", "empty-item_ids", "source_ids", "empty-source_ids", "filter_metadata"],
+)
+def test_a_restricted_search_does_not_enter_the_gate_at_all(restriction):
+    """Every restriction the search accepts, including the empty ones.
+
+    The gate's probe answers "does this knowledge base have a valid partial
+    index", which is not "is this search better off on it". An empty id set is the
+    most starved restriction there is -- it matches nothing -- so keying on
+    ``is not None`` rather than truthiness is load-bearing, and pinned here.
+    """
+    statements = _capture(partial_index=True, **restriction)
+    assert not _enable_sort(statements), statements
+    assert not _writes(statements, "hnsw.ef_search"), statements
+    assert len([s for s, _ in statements if "ORDER BY" in s]) == 1, (
+        f"a restricted search must run once, on the planner's own plan: {statements}"
+    )
+
+
+def test_the_gate_is_only_for_the_item_table_it_was_measured_on():
+    """``ai.embeddings`` is polymorphic and four stores inherit this search.
+
+    The partial index's predicate and the probe name ``(knowledge_base_id, dims)``
+    only, so a knowledge base whose embeddings are mostly chunks but whose search
+    routes to a document-level store passes the probe and is driven into an HNSW
+    walk of rows that cannot join: measured 2.2 -> 25.9 ms and recall 1.00 -> 0.33
+    on a 40-row table. The other stores keep the planner's own choice.
+    """
+    statements = _capture(partial_index=True, store=_FakeDocumentStore)
+    assert not _enable_sort(statements), (
+        "only the chunks store may be steered onto the partial index; the probe "
+        f"cannot tell which item table the embeddings belong to: {statements}"
+    )
+    assert not _writes(statements, "hnsw.ef_search"), statements
+
+
+def test_the_chunks_store_is_the_one_that_does_enter_it():
+    """The other half of the spec above: the restriction must not be vacuous.
+
+    Without this, making ``vector_search`` skip the gate for *every* store would
+    leave the spec above green.
+    """
+    statements = _capture(partial_index=True, store=_FakeStore)
     assert _enable_sort(statements), statements
-    assert _settings(statements, "plan_cache_mode"), statements
 
 
 # ---------------------------------------------------------------------------
@@ -324,10 +426,10 @@ def test_a_two_key_filtered_search_prices_the_sort_out_as_well():
 
 
 def test_a_short_answer_is_asked_again_with_the_sort_available():
-    """An ordered index scan can starve a selective restriction; an exact scan cannot.
+    """An ordered index scan can starve the ``LIMIT``; an exact scan cannot.
 
-    Measured at 384 dimensions: a ``top_k`` of 20 restricted to 12 named items of
-    a 12,000-row knowledge base came back with 11 of them from the forced index
+    Measured at 384 dimensions: a ``top_k`` of 20 against 12 matching rows of a
+    12,000-row knowledge base came back with 11 of them from the forced index
     scan, and all 12 from the exact scan the planner picks on its own. So a short
     answer is re-run -- and the re-run asks for a custom plan, or it would be
     handed the plan that came up short.
@@ -343,9 +445,180 @@ def test_a_short_answer_is_asked_again_with_the_sort_available():
     assert restored < searches[1], (
         f"the re-run has to happen with the sort available again: {statements}"
     )
-    replanned = [i for i in _settings(statements, "plan_cache_mode") if i < searches[1]]
+    replanned = [i for i in _writes(statements, "plan_cache_mode") if i < searches[1]]
     assert replanned and replanned[-1] > searches[0], (
         f"the re-run must ask for a custom plan, between the two searches: {statements}"
+    )
+
+
+def test_the_re_runs_custom_plan_is_put_back_too():
+    """The re-run's replan must not outlive the search either.
+
+    The same argument as the filtered case below it: in the single-knowledge-base
+    fast path this session is the request's, so a ``plan_cache_mode`` left on
+    makes the hybrid keyword leg, the metadata reads and the billing writes all
+    replan for the rest of the transaction.
+    """
+    statements = _capture(partial_index=True)
+    touched = _writes(statements, "plan_cache_mode")
+    assert len(touched) == 2, f"expected one set and one restore: {statements}"
+    assert statements[touched[1]][1].get("prior") == PLAN_CACHE_MODE_WAS, (
+        f"the restore must bind the value that was read, not a guess: {statements[touched[1]]}"
+    )
+
+
+def test_a_shorter_re_run_does_not_replace_a_longer_first_answer():
+    """Both plans read the same rows under the same LIMIT, so normally the re-run
+    is at least as complete. A second plan that comes back *shorter* is evidence
+    of nothing, and letting it win would turn this net into a way to lose rows."""
+    session = MagicMock()
+    row = ("11111111-1111-4111-8111-111111111111", "text", 0.5, None, {})
+    answers = [[row, row], []]
+
+    def spy_execute(text_obj, params=None):
+        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
+        if "to_regclass" in sql:
+            return iter([(ENABLE_SORT_WAS, EF_SEARCH_WAS, True)])
+        if "current_setting('plan_cache_mode')" in sql:
+            return _scalar(PLAN_CACHE_MODE_WAS)
+        if "ORDER BY" in sql:
+            return iter(answers.pop(0))
+        return iter([])
+
+    session.execute = spy_execute
+    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
+    items = asyncio.run(store.vector_search(embedding=[0.0] * 1536, top_k=10))
+    assert not answers, "both searches must have run for this spec to mean anything"
+    assert len(items) == 2, f"the longer of the two answers must be kept, got {items}"
+
+
+# ---------------------------------------------------------------------------
+# hnsw.ef_search, which decides how accurate the index scan is once it happens
+# ---------------------------------------------------------------------------
+
+
+def test_ef_search_is_raised_for_a_search_on_this_knowledge_bases_own_index():
+    """Recall degrades with the *absolute* size of the index, not the selectivity.
+
+    Measured on real embeddings: 0.997 at 400 rows, 0.915 at 12,000, and the build
+    threshold is 10,000 -- a knowledge base several times that projects to about
+    0.85 at pgvector's default 40. 120 measured 0.973 at 12,000 rows for 2.96 ms,
+    still 12x faster than the exact scan it replaces.
+    """
+    statements = _capture(partial_index=True)
+    raised = _writes(statements, "hnsw.ef_search")
+    assert raised, f"nothing raised hnsw.ef_search on an indexed search: {statements}"
+    assert statements[raised[0]][1].get("ef") == str(PER_KB_HNSW_EF_SEARCH), statements[raised[0]]
+    normalized = "".join(statements[raised[0]][0].split()).lower()
+    assert "true" in normalized, (
+        f"a session-level ef_search would follow the connection into the pool: {normalized}"
+    )
+
+
+def test_the_raised_ef_search_stays_inside_the_supported_band():
+    """80-400, and the upper bound is a planner cliff rather than taste.
+
+    pgvector's HNSW cost estimate scales with this setting, and past roughly
+    600-800 a knowledge base's own partial index prices *above* the shared
+    per-dimension index and the planner flips to the shared one -- reproduced at
+    12,000 rows, where 600 kept the partial index at 6.9 ms and 800 took the
+    shared index at 18.8 ms with lower recall. A value outside the band inverts
+    the whole mechanism, silently.
+    """
+    assert 80 <= PER_KB_HNSW_EF_SEARCH <= 400, PER_KB_HNSW_EF_SEARCH
+
+
+def test_ef_search_is_left_alone_without_an_index_to_be_accurate_on():
+    """It decides accuracy once the planner is on an index, so with no index of
+    this knowledge base's own there is nothing for it to decide -- and raising it
+    would slow the shared index's post-filtered scan for no recall."""
+    statements = _capture(partial_index=False)
+    assert not _writes(statements, "hnsw.ef_search"), statements
+
+
+def test_ef_search_is_restored_to_the_value_the_probe_read():
+    """Not pgvector's default 40: whatever this transaction already had.
+
+    ``hybrid_search`` and the reranker read on this same session afterwards.
+    """
+    statements = _capture(partial_index=True)
+    touched = _writes(statements, "hnsw.ef_search")
+    assert len(touched) == 2, f"expected one set and one restore: {statements}"
+    assert statements[touched[1]][1].get("prior") == EF_SEARCH_WAS, statements[touched[1]]
+    search_at = next(i for i, (sql, _) in enumerate(statements) if "ORDER BY" in sql)
+    assert touched[0] < search_at < touched[1], statements
+
+
+def test_ef_search_is_read_in_a_way_that_survives_a_database_without_pgvector():
+    """It is pgvector's GUC, not PostgreSQL's.
+
+    A plain ``current_setting`` on an unknown name raises, which would fail the
+    whole probe -- and with it the gate -- on any database where the extension is
+    not loaded. ``missing_ok`` makes that answer NULL instead.
+    """
+    probe = BasePgVectorStore._PARTIAL_INDEX_PROBE
+    normalized = "".join(probe.split()).lower()
+    assert "current_setting('hnsw.ef_search',true)" in normalized, probe
+
+
+def test_a_database_without_pgvector_sets_no_ef_search():
+    """The NULL above must not become a ``set_config`` of the string "None"."""
+    session = MagicMock()
+    captured: list[tuple[str, dict]] = []
+
+    def spy_execute(text_obj, params=None):
+        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
+        captured.append((sql, dict(params or {})))
+        if "to_regclass" in sql:
+            return iter([(ENABLE_SORT_WAS, None, True)])
+        if "current_setting('plan_cache_mode')" in sql:
+            return _scalar(PLAN_CACHE_MODE_WAS)
+        return iter([])
+
+    session.execute = spy_execute
+    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
+    asyncio.run(store.vector_search(embedding=[0.0] * 1536, top_k=10))
+    assert not _writes(captured, "hnsw.ef_search"), captured
+    assert _enable_sort(captured), (
+        f"the rest of the gate still applies without pgvector's GUC: {captured}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The probe's own failure, which must not take the caller's transaction with it
+# ---------------------------------------------------------------------------
+
+
+def test_the_probe_runs_in_a_savepoint():
+    """A probe that errors must not leave the caller on an aborted transaction.
+
+    The handler logs "may fall back to an exact scan" and swallows. Without a
+    savepoint that sentence is the opposite of what happens: the search that
+    follows fails with ``InFailedSqlTransaction`` and the caller gets an error
+    about a statement it never wrote.
+    """
+    session = MagicMock()
+    nested = MagicMock()
+    session.begin_nested.return_value = nested
+    captured: list[str] = []
+
+    def spy_execute(text_obj, params=None):
+        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
+        captured.append(sql)
+        if "to_regclass" in sql:
+            raise RuntimeError("catalog read cancelled")
+        return iter([])
+
+    session.execute = spy_execute
+    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
+    items = asyncio.run(store.vector_search(embedding=[0.0] * 1536, top_k=10))
+    assert items == []
+    assert session.begin_nested.called, (
+        "the probe must run in a savepoint, or its failure aborts the caller's "
+        f"transaction: {captured}"
+    )
+    assert any("ORDER BY" in sql for sql in captured), (
+        f"the search must still run after a failed probe: {captured}"
     )
 
 

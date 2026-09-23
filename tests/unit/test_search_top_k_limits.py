@@ -81,17 +81,44 @@ def _hybrid(top_k: int) -> list:
 def test_hybrid_search_halves_the_effective_ceiling():
     """It fetches ``top_k * 2`` candidates per leg before fusing them.
 
-    So the largest ``top_k`` a hybrid caller can ask for is MAX_TOP_K // 2, and
-    the number in the error names the doubled value -- which is exactly the
-    surprise worth pinning, because nothing else says the documented limit is
-    not the limit.
+    So the largest ``top_k`` a hybrid caller can ask for is MAX_TOP_K // 2.
     """
     ceiling = MAX_TOP_K // 2
     assert _hybrid(ceiling) == []
 
-    with pytest.raises(ValueError) as exc:
+    with pytest.raises(ValueError, match="top_k"):
         _hybrid(ceiling + 1)
-    assert str(MAX_TOP_K + 2) in str(exc.value), str(exc.value)
+
+
+def test_the_hybrid_ceiling_is_reported_as_a_number_the_caller_sent():
+    """The refusal has to name limits the caller can act on.
+
+    Left to the vector leg, the message came back as "top_k must be between 0 and
+    10000, got 10002" for a caller who sent 5001 -- a ceiling twice the real one
+    and a value they never typed, on the only route where the documented limit is
+    not the limit.
+    """
+    with pytest.raises(ValueError) as exc:
+        _hybrid(MAX_TOP_K // 2 + 1)
+    message = str(exc.value)
+    assert str(MAX_TOP_K // 2) in message, message
+    assert str(MAX_TOP_K // 2 + 1) in message, message
+    assert str(MAX_TOP_K + 2) not in message, message
+
+
+def test_an_infinite_top_k_is_a_refusal_and_not_an_internal_error():
+    """Python's JSON parser accepts bare ``Infinity``, so this arrives from a body.
+
+    ``int(float('inf'))`` raises ``OverflowError``, which is neither ``TypeError``
+    nor ``ValueError`` -- so before this it escaped the guard as a 500 where every
+    other unusable ``top_k`` is a 400.
+    """
+    session, executed = _spy_session()
+    store = _FakeStore(db_session=session, knowledge_base_id=KB)
+    for value in (float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="top_k"):
+            asyncio.run(store.vector_search(embedding=[0.0] * 1536, top_k=value))
+    assert executed == [], f"the guard has to precede the SQL, executed: {executed}"
 
 
 # ---------------------------------------------------------------------------

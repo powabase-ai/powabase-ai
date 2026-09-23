@@ -211,14 +211,30 @@ def test_a_filter_that_is_not_an_object_never_reaches_the_database(method, bad):
 
 @pytest.mark.parametrize("method", _METHODS)
 @pytest.mark.parametrize("falsy", [[], "", 0, False], ids=["empty-list", "empty-str", "0", "False"])
-def test_a_falsy_filter_still_adds_no_clause(method, falsy):
-    """The guard sits after the falsy short-circuit, on purpose.
+def test_a_falsy_non_object_filter_is_refused_like_any_other(method, falsy):
+    """The type check sits *before* the falsy short-circuit, and that is the point.
 
-    These have never added a clause and have never raised, so the guard must not
-    start rejecting them: the set of inputs that filter nothing is unchanged.
+    These used to be the quiet half of a malformed filter: a truthy non-object
+    (``["premium"]``) raised, while ``[]``, ``""``, ``0`` and ``False`` dropped the
+    clause and answered with the whole knowledge base. Of the two failures,
+    widening a scoped search is the worse one, and it was the one with no error
+    and no log. Both halves are now the same 400.
+    """
+    with pytest.raises(ValueError, match="filter_metadata must be a JSON object"):
+        _search_sql(method, filter_metadata=falsy)
+
+
+@pytest.mark.parametrize("method", _METHODS)
+@pytest.mark.parametrize("empty", [None, {}], ids=["None", "empty-object"])
+def test_an_absent_or_empty_object_filter_still_adds_no_clause(method, empty):
+    """The two inputs that mean "no filter" keep meaning it.
+
+    Reordering the checks above must not turn "filter on nothing" into an error:
+    every caller that omits the argument passes ``None``, and a stored config with
+    an empty object has always searched the whole knowledge base.
     """
     session = _spy_session()
-    _run_search(session, method, filter_metadata=falsy)
+    _run_search(session, method, filter_metadata=empty)
     for sql, params in session.calls:
         assert "c.meta @>" not in sql
         assert "filter_metadata" not in params
