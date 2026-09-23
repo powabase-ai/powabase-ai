@@ -14,16 +14,18 @@ schema alone; nothing here needs ``pg_search`` itself.
 
 The regime the fixture represents
 --------------------------------
-20 knowledge bases in one ``embeddings`` table of ~40,000 rows, with the
-indexed one at 30% of it and the others from 21% down to 1%. That is the shape
-this feature exists for -- one knowledge base is a *fraction* of a shared table
--- and it is deliberately not the shape an earlier version of this module used
-(2 knowledge bases, the target at 75%). The difference is not cosmetic. Three
-things are true here and false at 75%:
+60 knowledge bases in one ``embeddings`` table of ~40,000 rows, with the
+indexed one at 30% of it and the others from 21% down to under 1%. That is the
+shape this feature exists for -- one knowledge base is a *fraction* of a shared
+table, and a much larger fraction than the average one -- and it is deliberately
+not the shape an earlier version of this module used (2 knowledge bases, the
+target at 75%). The difference is not cosmetic. Three things are true here and
+false at 75%:
 
 - the planner's estimate for a *bound* ``knowledge_base_id`` is 1/n_distinct,
-  so 5% here against 50% there -- the regime a prepared statement's generic
-  plan actually meets in production;
+  so 1.7% here against 50% there -- the regime a prepared statement's generic
+  plan actually meets in production, and far enough below the indexed knowledge
+  base's real 30% to price its index out (see ``FILLER_KBS``);
 - a knowledge base below the build threshold is small in absolute terms as well
   as relative, which is the population the threshold decides for;
 - the shared per-dimension index post-filters away 70-99% of what it returns,
@@ -104,16 +106,29 @@ from agentic_project_service.services import pg_vector_index as pvi
 SCHEMA = "vector_perkb_live_test"
 DIMS = 384
 
-# Five knowledge bases the tests name, and fifteen more that exist only to put
-# n_distinct(knowledge_base_id) at 20. The row counts are the selectivities the
-# feature has to work at, as a share of the whole table (see the module
+# Five knowledge bases the tests name, and fifty-five more that exist only to
+# put n_distinct(knowledge_base_id) at 60. The row counts are the selectivities
+# the feature has to work at, as a share of the whole table (see the module
 # docstring): 30, 21, 5, 2 and 1 per cent.
+#
+# Sixty rather than twenty, and it is load-bearing rather than tidy. A generic
+# plan prices a *bound* knowledge base id at 1/n_distinct of the table, so how
+# far that estimate is from the indexed knowledge base's real share is set by
+# n_distinct and by that share together -- measured, the ordered index scan
+# survives a bound item-side id up to about share x n_distinct = 12 and is
+# priced out from about 18. At 20 knowledge bases and 30% this fixture sat at 6,
+# on the safe side of that edge, so the shape the fix is *for* -- one large
+# knowledge base among many average ones -- was the one shape the fixture did
+# not represent, and a spec for it would have asserted a regression the fixture
+# could not produce. At 60 it sits at 18. The filler rows shrink to keep the
+# table at ~40,000 and every named share unchanged, so nothing else in the
+# module moves.
 KB_BIG = "9f8b1c2e-0000-4000-8000-000000000001"
 KB_SMALL = "9f8b1c2e-0000-4000-8000-000000000002"
 KB_MED = "9f8b1c2e-0000-4000-8000-000000000003"
 KB_MID = "9f8b1c2e-0000-4000-8000-000000000004"
 KB_THIN = "9f8b1c2e-0000-4000-8000-000000000005"
-FILLER_KBS = [f"9f8b1c2e-0000-4000-8000-0000000000{10 + i:02d}" for i in range(15)]
+FILLER_KBS = [f"9f8b1c2e-0000-4000-8000-0000000000{10 + i:02d}" for i in range(55)]
 SOURCE = "9f8b1c2e-0000-4000-8000-0000000000aa"
 
 BIG_ROWS = 12_000
@@ -121,7 +136,7 @@ SMALL_ROWS = 800
 MED_ROWS = 8_400
 MID_ROWS = 2_000
 THIN_ROWS = 400
-FILLER_ROWS = 1_093
+FILLER_ROWS = 298
 
 ROW_COUNTS: list[tuple[str, int]] = [
     (KB_BIG, BIG_ROWS),
@@ -373,7 +388,25 @@ def _capture_search_sql(engine, kb_id, embedding, **kwargs):
         session.rollback()
     searches = [pair for pair in recorder.statements if "ORDER BY" in pair[0]]
     assert searches, f"the store issued no search query: {recorder.statements}"
-    return searches[0]
+    sql, params = searches[0]
+    # Asserted here, where the statement is taken, rather than in each spec that
+    # uses it: the knowledge base id reaches PostgreSQL as a literal on *both*
+    # sides of the join and nothing binds it. This is the property every plan
+    # spec below rests on, and it has to be checked positively -- an earlier
+    # version of ``_probe_sql`` rewrote ``:kb_id`` into ``$1`` unconditionally,
+    # so putting either id back on a parameter left the probes rewriting the
+    # regression into the shape under test and the whole module green.
+    assert ":kb_id" not in sql, (
+        "the store bound the knowledge base id; a generic plan cannot prove the "
+        f"partial index's predicate from a parameter:\n{sql}"
+    )
+    assert f"c.knowledge_base_id = '{kb_id}'" in sql, (
+        f"the item-side knowledge base id must be a literal:\n{sql}"
+    )
+    assert f"e.knowledge_base_id = '{kb_id}'" in sql, (
+        f"the embeddings-side knowledge base id must be a literal:\n{sql}"
+    )
+    return sql, params
 
 
 def _explain(session, sql: str, params: dict) -> str:
@@ -710,12 +743,26 @@ def _probe_sql(sql: str, embedding, *, bind: str) -> str:
     sends.
 
     ``bind`` names what to take back out of the SQL and hand to the planner as
-    an unknown: ``"kb"``, ``"dims"``, ``"limit"``, or ``"none"``.
+    an unknown: ``"kb"`` (the embeddings side), ``"kb_chunks"`` (the item side),
+    ``"dims"``, ``"limit"``, or ``"none"``.
+
+    Only ``:embedding`` is rewritten unconditionally, because ``PREPARE`` speaks
+    ``$n`` and that value is a parameter in production too. Nothing else is:
+    this helper used to append ``.replace(":kb_id", "$1")``, which was a no-op
+    against the fixed statement and an escape hatch against a broken one -- a
+    store that bound the knowledge base id again would have had the bind
+    rewritten back into a literal here, and every spec in the module would have
+    kept passing. ``_capture_search_sql`` now asserts the literal instead, and
+    the bound shapes are cases in the matrix below rather than accidents.
     """
-    probe = sql.replace(":embedding", "$2").replace(":kb_id", "$1")
+    assert ":kb_id" not in sql, f"nothing in this helper may rewrite a bind away:\n{sql}"
+    probe = sql.replace(":embedding", "$2")
     if bind == "kb":
         probe = probe.replace(f"e.knowledge_base_id = '{KB_BIG}'", "e.knowledge_base_id = $1")
         assert "e.knowledge_base_id = $1" in probe
+    elif bind == "kb_chunks":
+        probe = probe.replace(f"c.knowledge_base_id = '{KB_BIG}'", "c.knowledge_base_id = $1")
+        assert "c.knowledge_base_id = $1" in probe
     elif bind == "dims":
         probe = probe.replace(f"e.dims = {DIMS}", "e.dims = $3::int")
         assert "e.dims = $3::int" in probe
@@ -774,19 +821,35 @@ def test_the_query_the_service_emits_keeps_the_index_in_a_generic_plan(
 
 @pytest.mark.parametrize(
     "bind,extra_arg",
-    [("kb", None), ("dims", str(DIMS)), ("limit", "20")],
+    [("kb", None), ("kb_chunks", None), ("dims", str(DIMS)), ("limit", "20")],
 )
-def test_binding_any_one_of_the_three_loses_the_index_in_a_generic_plan(
+def test_binding_any_one_of_the_four_loses_the_index_in_a_generic_plan(
     engine, schema, settings, query_vectors, bind, extra_arg
 ):
-    """Why all three are literals, measured one at a time.
+    """Why all four values are literals, measured one at a time.
 
-    The knowledge base id and ``dims`` are both in the index predicate, so a
-    plan that cannot prove either cannot use the index; an unknown ``LIMIT``
-    makes the planner assume it will be asked for a large fraction of the rows,
-    which prices the ordered index scan out. Any one of them left bound is
-    enough to lose it -- which is what makes this a three-way requirement rather
-    than the one-way one the first version of this PR claimed.
+    The embeddings-side knowledge base id and ``dims`` are both in the index
+    predicate, so a plan that cannot prove either cannot use the index; an
+    unknown ``LIMIT`` makes the planner assume it will be asked for a large
+    fraction of the rows, which prices the ordered index scan out. Any one of
+    them left bound is enough to lose it -- which is what makes this a four-way
+    requirement rather than the one-way one the first version of this PR
+    claimed.
+
+    ``kb_chunks`` -- the *item*-side id, which is in no index predicate at all --
+    is the fourth, and it is here as a case because it used to be rewritten away:
+    it is not matchability that a bound item-side id costs but the row estimate
+    behind the cost comparison. A generic plan prices ``c.knowledge_base_id =
+    $1`` at ``1/n_distinct``, so on a table of many knowledge bases it expects a
+    fraction of the rows this one really has, which inflates the ordered index
+    scan and deflates the sort. Both push the same way and the index goes. It is
+    conditional on the fixture in a way none of the other three are: the effect
+    needs the indexed knowledge base to be several times the average one --
+    roughly ``share x n_distinct`` above 12-18 -- which is the population a
+    per-knowledge-base index exists for and the regime this module's fixture is
+    now built in (30% of 60 knowledge bases). At ``n_distinct`` 20 the same bind
+    keeps the index, which is why the fixture's filler count is load-bearing and
+    says so.
     """
     name = _build_big_index(engine, settings)
     sql, _ = _capture_search_sql(engine, KB_BIG, query_vectors[0])
@@ -1645,7 +1708,15 @@ def test_the_knowledge_base_the_default_threshold_leaves_out_is_the_measured_one
     # And the shares the module docstring's regime claim rests on.
     assert 0.28 < BIG_ROWS / TOTAL_ROWS < 0.32, BIG_ROWS / TOTAL_ROWS
     assert 0.19 < MED_ROWS / TOTAL_ROWS < 0.23, MED_ROWS / TOTAL_ROWS
-    assert len({kb for kb, _ in ROW_COUNTS}) == 20
+    n_distinct = len({kb for kb, _ in ROW_COUNTS})
+    assert n_distinct == 60, n_distinct
+    # The one number the bound-item-side-id spec depends on, pinned where the
+    # other fixture claims are. A generic plan prices a bound knowledge base id
+    # at 1/n_distinct, and the ordered index scan survives that underestimate
+    # while share x n_distinct stays below about 12; the regression the spec
+    # asserts needs it above about 18. Adding knowledge bases is safe, removing
+    # them is not, and this is where that is said out loud.
+    assert BIG_ROWS / TOTAL_ROWS * n_distinct >= 18, BIG_ROWS / TOTAL_ROWS * n_distinct
 
 
 # ---------------------------------------------------------------------------
