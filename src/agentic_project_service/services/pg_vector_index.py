@@ -740,21 +740,20 @@ def recorded_build_failures(conn, kb_id: str, dims: int) -> int:
     """How many consecutive builds of this index have failed, from the catalog.
 
     Zero for an index that has never failed, that does not exist, or whose
-    comment says something else -- a comment is a place anyone may write, so an
-    unreadable one is treated as no record rather than as a reason to stop.
+    comment says something else: a comment is a place anyone may write, and one
+    this module did not write is no evidence that a build is doomed.
+
+    A read that *fails* is not swallowed, unlike the two writes below. It is an
+    ordinary catalog read on the caller's connection, so a failure here means
+    every other read around it would fail too, and swallowing it would hand the
+    caller back an aborted transaction while reporting a fact. Both callers
+    already handle that: the reconcile lets it fail the run, and the dispatch
+    check turns it into "this knowledge base keeps whatever it has".
     """
-    try:
-        comment = conn.execute(
-            text("SELECT obj_description(to_regclass(:index)::oid, 'pg_class')"),
-            {"index": _qualified_index(kb_id, dims)},
-        ).scalar()
-    except Exception as exc:
-        logger.debug(
-            "Could not read the build history of %s (%s); treating it as none",
-            _qualified_index(kb_id, dims),
-            first_error_line(exc),
-        )
-        return 0
+    comment = conn.execute(
+        text("SELECT obj_description(to_regclass(:index)::oid, 'pg_class')"),
+        {"index": _qualified_index(kb_id, dims)},
+    ).scalar()
     match = _BUILD_FAILURES_PATTERN.match(comment or "")
     return int(match.group(1)) if match else 0
 

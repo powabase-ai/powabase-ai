@@ -932,6 +932,19 @@ def test_a_build_that_succeeds_forgets_the_failures_before_it(monkeypatch):
     assert len(cleared) == 1 and cleared[0].endswith("IS NULL"), conn.statements
 
 
+def test_a_comment_this_module_did_not_write_is_not_a_build_history(monkeypatch):
+    """The comment is a place anyone may write, and giving up needs evidence.
+
+    An index someone has annotated by hand must not be read as doomed, and must
+    not be read as having failed some number of times either.
+    """
+    conn = _ensure_conn(existing=[_index_row(KB, 1536, False)], rows_by_dims={1536: 20_000})
+    conn.answers.insert(0, (_FAILURE_RECORD_QUERY, [("dropping this on Monday, see ticket 41",)]))
+    assert pvi.recorded_build_failures(conn, KB, 1536) == 0
+    outcome = _ensure(monkeypatch, conn)
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+
+
 def test_a_build_that_has_failed_the_limit_is_not_attempted_again(monkeypatch, caplog):
     """Where the drop-rebuild-fail loop stops.
 
