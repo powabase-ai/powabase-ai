@@ -920,8 +920,8 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                 floor = "at least " if bounded else ""
                 logger.info(
                     "Building partial HNSW index %s.%s for knowledge base %s (%s%d rows at %d "
-                    "dimensions, threshold %d); it needs %s%d MB of disk%s, and blocks no "
-                    "writes",
+                    "dimensions, threshold %d); it needs %s%d MB of disk, and blocks no "
+                    "writes.%s",
                     AI_SCHEMA,
                     name,
                     kb_id,
@@ -932,9 +932,9 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                     floor,
                     estimated_index_mb(rows, dims),
                     (
-                        f" -- both figures are floors, because the row count stops at {cap}, "
-                        f"so a knowledge base ten times that builds an index ten times this "
-                        f"size"
+                        f" Both figures are floors: the row count stops at {cap}, so a "
+                        f"knowledge base ten times that size builds an index ten times this "
+                        f"one."
                         if bounded
                         else ""
                     ),
