@@ -122,10 +122,28 @@ def metadata_filter_clause(filter_metadata: dict | None) -> tuple[str, dict[str,
     ``meta @> '{"a": 1}' AND meta @> '{"b": 2}'`` matches.
 
     Returns ``("", {})`` for an empty or absent filter, so the caller appends
-    nothing and binds nothing.
+    nothing and binds nothing. A filter that is present but not an object is
+    rejected rather than bound: ``jsonb @> <array|string|number|boolean>`` does
+    not error, it is simply false, so binding one would turn a malformed filter
+    into an empty result with nothing logged — indistinguishable, on the agent
+    path, from "nothing relevant". A ``ValueError`` reaches the search route's
+    400 instead. The order matters: the falsy short-circuit comes first, so the
+    set of inputs that add no clause is exactly what it has always been.
+
+    Two conventions the caller has to match: the filtered item table is aliased
+    ``c``, and the bound parameter is named ``filter_metadata``.
+
+    This is containment, not equality — ``{"a": {"b": 1}}`` matches a row whose
+    ``meta`` is ``{"a": {"b": 1, "c": 2}}``. Note the bm25s file-index keyword
+    leg does not come through here: it filters in Python with ``==`` on each
+    key, which is stricter, and the two have never agreed on nested values.
     """
     if not filter_metadata:
         return "", {}
+    if not isinstance(filter_metadata, dict):
+        raise ValueError(
+            f"filter_metadata must be a JSON object, got {type(filter_metadata).__name__}"
+        )
     return (
         f" AND c.meta @> CAST(:{METADATA_FILTER_PARAM} AS jsonb)",
         {METADATA_FILTER_PARAM: json.dumps(filter_metadata)},

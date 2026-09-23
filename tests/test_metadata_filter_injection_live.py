@@ -260,42 +260,99 @@ def test_an_empty_filter_filters_nothing(search, session):
         assert _texts(search(session, filter_metadata=empty)) == {t for t, _ in DOCS[KB_A]}
 
 
-@pytest.mark.parametrize("search", SEARCHES)
-def test_keys_that_are_not_identifiers_are_matched_as_written(search, session):
-    """Nested, dotted, spaced and non-ASCII keys are ordinary jsonb keys.
+ODD_KEY_TEXT = "alpha four hiking notes"
+ODD_KEYS = {
+    "doc.lang": "de",
+    "two words": "yes",
+    "Sprache": "Übersetzung",
+    "outer": {"inner": "value"},
+}
 
-    None of these could work while the key was part of the statement: a dot or a
-    space ended the bind-parameter name, and the rest became SQL. They are the
-    reason to bind the filter rather than screen the keys.
+
+@pytest.fixture
+def odd_key_row(engine):
+    """One extra KB_A row carrying keys that are not identifiers.
+
+    Added and removed per test rather than written into the module fixture, so
+    every other test here still sees exactly the rows DOCS declares and the file
+    does not depend on collection order.
     """
-    session.execute(
-        text(f"""
-            UPDATE {SCHEMA}.chunks SET meta = meta || CAST(:extra AS jsonb)
-            WHERE knowledge_base_id = CAST(:kb AS uuid) AND text = :body
-        """),
-        {
-            "kb": KB_A,
-            "body": "alpha one hiking notes",
-            "extra": json.dumps(
-                {
-                    "doc.lang": "de",
-                    "two words": "yes",
-                    "Sprache": "Übersetzung",
-                    "outer": {"inner": "value"},
-                }
-            ),
-        },
-    )
-    session.commit()
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        item_id = conn.execute(
+            text(f"""
+                INSERT INTO {SCHEMA}.chunks (knowledge_base_id, source_id, text, meta)
+                VALUES (CAST(:kb AS uuid), CAST(:src AS uuid), :body, CAST(:meta AS jsonb))
+                RETURNING id
+            """),
+            {"kb": KB_A, "src": SOURCE, "body": ODD_KEY_TEXT, "meta": json.dumps(ODD_KEYS)},
+        ).scalar()
+        conn.execute(
+            text(f"""
+                INSERT INTO {SCHEMA}.embeddings (item_id, knowledge_base_id, dims, embedding)
+                VALUES (CAST(:item AS uuid), CAST(:kb AS uuid), :dims, CAST(:emb AS vector))
+            """),
+            {"item": str(item_id), "kb": KB_A, "dims": DIMS, "emb": json.dumps(EMBEDDING)},
+        )
+    yield
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(
+            text(f"DELETE FROM {SCHEMA}.embeddings WHERE item_id = CAST(:item AS uuid)"),
+            {"item": str(item_id)},
+        )
+        conn.execute(
+            text(f"DELETE FROM {SCHEMA}.chunks WHERE id = CAST(:item AS uuid)"),
+            {"item": str(item_id)},
+        )
 
+
+@pytest.mark.parametrize("search", SEARCHES)
+def test_keys_that_are_not_identifiers_are_matched_as_written(search, session, odd_key_row):
+    """Nested, dotted and spaced keys are ordinary jsonb keys.
+
+    A dot or a space ended the bind-parameter name and the rest became SQL, so
+    these keys could not work while the key was part of the statement. (A
+    non-ASCII key like ``Sprache`` did work before — SQLAlchemy's bind-name
+    pattern is unicode-aware — and is here because it must keep working.) They
+    are the reason to bind the filter rather than screen the keys.
+    """
     for filter_metadata in (
         {"doc.lang": "de"},
         {"two words": "yes"},
         {"Sprache": "Übersetzung"},
         {"outer": {"inner": "value"}},
     ):
-        assert _texts(search(session, filter_metadata=filter_metadata)) == {
-            "alpha one hiking notes"
-        }, filter_metadata
+        assert _texts(search(session, filter_metadata=filter_metadata)) == {ODD_KEY_TEXT}, (
+            filter_metadata
+        )
 
     assert search(session, filter_metadata={"outer": {"inner": "other"}}) == []
+
+
+# ---------------------------------------------------------------------------
+# A filter that is not an object
+# ---------------------------------------------------------------------------
+
+
+def test_containment_against_a_non_object_is_false_rather_than_an_error(session):
+    """Why a non-object filter has to be refused in Python.
+
+    Postgres does not complain about `jsonb @> <array|string|number|boolean>`; it
+    answers false. So binding one would answer the request with no rows, no error
+    and no log line — which on the agent path reads as "nothing relevant".
+    """
+    for literal in ('["a", "b"]', '"hello"', "42", "true"):
+        answer = session.execute(
+            text("SELECT CAST(:meta AS jsonb) @> CAST(:filter AS jsonb)"),
+            {"meta": '{"lang": "de"}', "filter": literal},
+        ).scalar()
+        assert answer is False, literal
+    session.rollback()
+
+
+@pytest.mark.parametrize("search", SEARCHES)
+@pytest.mark.parametrize(
+    "bad", [["premium"], "premium", 42, True], ids=["list", "str", "int", "bool"]
+)
+def test_a_filter_that_is_not_an_object_is_refused(search, session, bad):
+    with pytest.raises(ValueError, match="filter_metadata must be a JSON object"):
+        search(session, filter_metadata=bad)

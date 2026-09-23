@@ -105,15 +105,24 @@ jobs:
       # needs only this job's database -- no pg_search. So does
       # tests/test_metadata_filter_injection_live.py, which pins that a metadata
       # filter cannot widen a search past the knowledge base it is scoped to.
+      # The skip guard matters for test_metadata_filter_injection_live.py: it
+      # skips itself when DATABASE_URL is unset or pgvector is missing, and a
+      # security regression test that can quietly stop running is worse than one
+      # that fails.
       - name: Run store tests
-        run: >-
-          uv run --no-sync pytest
-          tests/test_graph_index_store.py
-          tests/test_full_text_search_timeout_live.py
-          tests/test_metadata_filter_injection_live.py
-          tests/test_extraction_redelivery_store.py
-          tests/test_index_source_retry.py
-          -q
+        run: |
+          set -o pipefail
+          uv run --no-sync pytest \
+            tests/test_graph_index_store.py \
+            tests/test_full_text_search_timeout_live.py \
+            tests/test_metadata_filter_injection_live.py \
+            tests/test_extraction_redelivery_store.py \
+            tests/test_index_source_retry.py \
+            -q -rs | tee pytest-store.log
+          if grep -Eq "[0-9]+ skipped" pytest-store.log; then
+            echo "::error::the store tier skipped tests; this job must run all of them"
+            exit 1
+          fi
 
   # tests/pg_search exercises the Postgres-native BM25 path for real: the
   # partitioning and extension migrations, row-level security through the

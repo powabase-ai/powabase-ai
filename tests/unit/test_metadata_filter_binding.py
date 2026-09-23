@@ -14,7 +14,7 @@ metadata in SQL. The companion live file proves what the rows do.
 import asyncio
 import json
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -56,9 +56,8 @@ def _spy_session():
     return session
 
 
-def _search_sql(method: str, **kwargs) -> tuple[str, dict]:
-    """Run one search against a spy session, return its main statement."""
-    session = _spy_session()
+def _run_search(session, method: str, **kwargs) -> None:
+    """Drive one of the three searches that filter on metadata in SQL."""
     store = _ChunkStore(db_session=session, knowledge_base_id=KB)
     if method == "vector_search":
         asyncio.run(store.vector_search(embedding=[0.0] * 8, top_k=5, **kwargs))
@@ -68,6 +67,12 @@ def _search_sql(method: str, **kwargs) -> tuple[str, dict]:
         asyncio.run(store.pg_bm25_search("hiking", top_k=5, **kwargs))
     else:  # pragma: no cover - guards a typo in a parametrisation
         raise AssertionError(f"unknown method {method}")
+
+
+def _search_sql(method: str, **kwargs) -> tuple[str, dict]:
+    """Run one search against a spy session, return its main statement."""
+    session = _spy_session()
+    _run_search(session, method, **kwargs)
     main = [(sql, params) for sql, params in session.calls if "c.meta @>" in sql]
     assert main, f"no statement with a metadata filter; statements: {session.calls}"
     return main[-1]
@@ -88,21 +93,22 @@ def _bm25_partition_exists(monkeypatch):
 
 
 @pytest.mark.parametrize("method", _METHODS)
-def test_a_crafted_filter_key_never_reaches_the_statement(method):
-    sql, params = _search_sql(method, filter_metadata={"lang": "de", CROSS_KB_KEY: 1})
-    assert OTHER_KB not in sql, f"a filter key put another knowledge base in the SQL:\n{sql}"
-    assert " OR " not in sql, f"a filter key put a disjunction in the SQL:\n{sql}"
-    assert "--" not in sql, f"a filter key put a comment in the SQL:\n{sql}"
+@pytest.mark.parametrize("crafted", [CROSS_KB_KEY, ORACLE_KEY], ids=["cross-kb", "oracle"])
+def test_a_crafted_filter_key_never_reaches_the_statement(method, crafted):
+    """The statement is the one an ordinary two-key filter produces, byte for byte.
+
+    Asserting the crafted text is absent is weaker than it looks — a statement
+    that happens not to contain ``OR`` today would pass it. Equality against a
+    benign filter of the same size cannot pass by accident: the key material has
+    to be somewhere, and the only place left is the bound value.
+    """
+    sql, params = _search_sql(method, filter_metadata={"lang": "de", crafted: 1})
+    benign, _ = _search_sql(method, filter_metadata={"lang": "de", "tier": 1})
+    assert sql == benign, f"a filter key changed the statement:\n{sql}"
+    assert crafted not in sql
+    assert OTHER_KB not in sql
     # The key travels as data instead, inside the one bound value.
-    assert CROSS_KB_KEY in json.loads(params["filter_metadata"])
-
-
-@pytest.mark.parametrize("method", _METHODS)
-def test_a_boolean_oracle_key_never_reaches_the_statement(method):
-    sql, params = _search_sql(method, filter_metadata={"lang": "de", ORACLE_KEY: 1})
-    assert "pg_authid" not in sql, f"a filter key put a subquery in the SQL:\n{sql}"
-    assert "SELECT count" not in sql, f"a filter key put a subquery in the SQL:\n{sql}"
-    assert ORACLE_KEY in json.loads(params["filter_metadata"])
+    assert crafted in json.loads(params["filter_metadata"])
 
 
 @pytest.mark.parametrize("method", _METHODS)
@@ -156,16 +162,102 @@ def test_an_ordinary_filter_is_bound_verbatim(method, filter_metadata):
 @pytest.mark.parametrize("empty", [None, {}])
 def test_an_empty_filter_adds_no_clause_and_binds_nothing(method, empty):
     session = _spy_session()
-    store = _ChunkStore(db_session=session, knowledge_base_id=KB)
-    if method == "vector_search":
-        asyncio.run(store.vector_search(embedding=[0.0] * 8, top_k=5, filter_metadata=empty))
-    elif method == "full_text_search":
-        asyncio.run(store.full_text_search("hiking", top_k=5, filter_metadata=empty))
-    else:
-        asyncio.run(store.pg_bm25_search("hiking", top_k=5, filter_metadata=empty))
+    _run_search(session, method, filter_metadata=empty)
     for sql, params in session.calls:
         assert "c.meta @>" not in sql
         assert "filter_metadata" not in params
+
+
+# ---------------------------------------------------------------------------
+# A filter that is not an object is refused, not quietly answered with nothing
+# ---------------------------------------------------------------------------
+
+# Every one of these is truthy, so it reaches the clause builder. Bound as jsonb
+# they would all be valid SQL and all false — `jsonb @> <array|string|number>`
+# does not error — so the search would answer 200 with no rows and no log line.
+NON_OBJECT_FILTERS = [
+    pytest.param(["a", "b"], id="list"),
+    pytest.param("hello", id="string"),
+    pytest.param(42, id="int"),
+    pytest.param(3.5, id="float"),
+    pytest.param(True, id="bool"),
+    pytest.param(("a",), id="tuple"),
+]
+
+
+@pytest.mark.parametrize("method", _METHODS)
+@pytest.mark.parametrize("bad", NON_OBJECT_FILTERS)
+def test_a_filter_that_is_not_an_object_is_refused(method, bad):
+    """A malformed filter must fail loudly rather than silently return nothing.
+
+    An empty result set is indistinguishable from "nothing matched", so a typo in
+    a stored knowledge-base config would make that knowledge base invisible for
+    as long as the config stood. ValueError is what the search route turns into a
+    400 — see test_the_route_answers_400_for_a_filter_that_is_not_an_object.
+    """
+    with pytest.raises(ValueError, match="filter_metadata must be a JSON object"):
+        _search_sql(method, filter_metadata=bad)
+
+
+@pytest.mark.parametrize("method", _METHODS)
+@pytest.mark.parametrize("bad", NON_OBJECT_FILTERS)
+def test_a_filter_that_is_not_an_object_never_reaches_the_database(method, bad):
+    """The refusal happens before the search statement is executed."""
+    session = _spy_session()
+    with pytest.raises(ValueError):
+        _run_search(session, method, filter_metadata=bad)
+    assert [sql for sql, _ in session.calls if "c.meta @>" in sql] == []
+
+
+@pytest.mark.parametrize("method", _METHODS)
+@pytest.mark.parametrize("falsy", [[], "", 0, False], ids=["empty-list", "empty-str", "0", "False"])
+def test_a_falsy_filter_still_adds_no_clause(method, falsy):
+    """The guard sits after the falsy short-circuit, on purpose.
+
+    These have never added a clause and have never raised, so the guard must not
+    start rejecting them: the set of inputs that filter nothing is unchanged.
+    """
+    session = _spy_session()
+    _run_search(session, method, filter_metadata=falsy)
+    for sql, params in session.calls:
+        assert "c.meta @>" not in sql
+        assert "filter_metadata" not in params
+
+
+def test_the_route_answers_400_for_a_filter_that_is_not_an_object():
+    """The helper's ValueError reaches the caller as a 400, not a 500.
+
+    The search route already has `except ValueError`; this drives the real route
+    with the real exception the real helper raises, so the two halves are pinned
+    together rather than each assumed.
+    """
+    from flask import Flask
+
+    from agentic_project_service.routes import knowledge_bases as kb_route
+    from agentic_project_service.services.base_vector_store import metadata_filter_clause
+
+    app = Flask(__name__)
+    app.register_blueprint(kb_route.knowledge_bases_bp)
+    kb_id = str(uuid.uuid4())
+
+    with (
+        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "authenticated"}),
+        patch("agentic_project_service.routes.knowledge_bases.db"),
+        patch(
+            "agentic_project_service.services.knowledge_search.search_knowledge_base",
+            side_effect=lambda **kw: metadata_filter_clause(kw["filter_metadata"]),
+        ),
+        app.test_client() as client,
+    ):
+        resp = client.post(
+            f"/api/knowledge-bases/{kb_id}/search",
+            headers={"Authorization": "Bearer fake.jwt.token"},
+            json={"query": "hiking", "filter_metadata": ["premium"]},
+        )
+
+    assert resp.status_code == 400, resp.data[:300]
+    assert "filter_metadata must be a JSON object" in resp.get_json()["error"]
+    assert "list" in resp.get_json()["error"]
 
 
 # ---------------------------------------------------------------------------
