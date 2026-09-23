@@ -104,6 +104,34 @@ def ensure_embedding_index(session: Session, schema: str, dims: int) -> None:
         )
 
 
+METADATA_FILTER_PARAM = "filter_metadata"
+
+
+def metadata_filter_clause(filter_metadata: dict | None) -> tuple[str, dict[str, str]]:
+    """SQL fragment and bound parameter for a metadata containment filter.
+
+    The whole filter is bound as ONE jsonb value and compared server-side, so no
+    part of it — keys included — reaches the SQL text. This used to be assembled
+    one key at a time, with the key interpolated into the statement as the name
+    of its own bind parameter (``:filter_{key}``); a key is caller data, so a key
+    carrying SQL of its own became part of the WHERE clause.
+
+    One ``@>`` over the whole object says the same thing as one per pair: jsonb
+    object containment holds only when every pair on the right is contained on
+    the left, so ``meta @> '{"a": 1, "b": 2}'`` matches exactly the rows
+    ``meta @> '{"a": 1}' AND meta @> '{"b": 2}'`` matches.
+
+    Returns ``("", {})`` for an empty or absent filter, so the caller appends
+    nothing and binds nothing.
+    """
+    if not filter_metadata:
+        return "", {}
+    return (
+        f" AND c.meta @> CAST(:{METADATA_FILTER_PARAM} AS jsonb)",
+        {METADATA_FILTER_PARAM: json.dumps(filter_metadata)},
+    )
+
+
 _QUERY_CANCELED = "57014"
 
 
@@ -461,10 +489,9 @@ class BasePgVectorStore:
             query += " AND c.source_id = ANY(CAST(:source_ids AS uuid[]))"
             params["source_ids"] = "{" + ",".join(source_ids) + "}"
 
-        if filter_metadata:
-            for key, value in filter_metadata.items():
-                query += f" AND c.meta @> CAST(:filter_{key} AS jsonb)"
-                params[f"filter_{key}"] = json.dumps({key: value})
+        filter_sql, filter_params = metadata_filter_clause(filter_metadata)
+        query += filter_sql
+        params.update(filter_params)
 
         query += f"""
             ORDER BY (e.embedding::vector({effective_dims})) <=> CAST(:embedding AS vector({effective_dims}))
@@ -669,10 +696,9 @@ class BasePgVectorStore:
             search_query += " AND c.source_id = ANY(CAST(:source_ids AS uuid[]))"
             params["source_ids"] = "{" + ",".join(source_ids) + "}"
 
-        if filter_metadata:
-            for key, value in filter_metadata.items():
-                search_query += f" AND c.meta @> CAST(:filter_{key} AS jsonb)"
-                params[f"filter_{key}"] = json.dumps({key: value})
+        filter_sql, filter_params = metadata_filter_clause(filter_metadata)
+        search_query += filter_sql
+        params.update(filter_params)
 
         search_query += f"""
             ORDER BY ts_rank(to_tsvector(CAST(:ts_language AS regconfig), c.{self.SEARCH_TEXT_COL}), websearch_to_tsquery(CAST(:ts_language AS regconfig), :query)) DESC
@@ -794,10 +820,9 @@ class BasePgVectorStore:
             search_query += " AND c.source_id = ANY(CAST(:source_ids AS uuid[]))"
             params["source_ids"] = "{" + ",".join(source_ids) + "}"
 
-        if filter_metadata:
-            for key, value in filter_metadata.items():
-                search_query += f" AND c.meta @> CAST(:filter_{key} AS jsonb)"
-                params[f"filter_{key}"] = json.dumps({key: value})
+        filter_sql, filter_params = metadata_filter_clause(filter_metadata)
+        search_query += filter_sql
+        params.update(filter_params)
 
         search_query += """
             ORDER BY pdb.score(c.id) DESC
