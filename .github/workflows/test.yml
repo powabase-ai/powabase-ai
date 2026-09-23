@@ -53,8 +53,21 @@ jobs:
 
       # --no-sync: the step above already resolved and materialized the venv;
       # this stops uv re-resolving mid-suite.
+      #
+      # The skip guard the `store` and `pg_search` jobs have, for the same
+      # reason: everything this tier can skip is gated on TEST_REDIS_URL, which
+      # this job sets, so a skip here means the gate stopped matching the
+      # environment and those tests silently stopped running. Measured on this
+      # configuration -- the service above, TEST_REDIS_URL set -- the tier
+      # reports no skips at all.
       - name: Run unit tests
-        run: uv run --no-sync pytest tests/unit -q
+        run: |
+          set -o pipefail
+          uv run --no-sync pytest tests/unit -q -rs | tee pytest-unit.log
+          if grep -Eq "[0-9]+ skipped" pytest-unit.log; then
+            echo "::error::the unit tier skipped tests; this job must run all of them"
+            exit 1
+          fi
 
   # SQL that no gate executes is SQL nobody finds out about: a cast or column
   # change would make the graph_index document outline silently disappear from
