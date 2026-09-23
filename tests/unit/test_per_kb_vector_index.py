@@ -124,8 +124,8 @@ def test_the_three_settings_are_registered_with_conservative_defaults():
     build = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"]
     drop = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_DROP_ROWS"]
     mem = SETTINGS_REGISTRY["VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB"]
-    assert (build.type, build.default) == ("int", 50000)
-    assert (drop.type, drop.default) == ("int", 25000)
+    assert (build.type, build.default) == ("int", 10000)
+    assert (drop.type, drop.default) == ("int", 5000)
     assert (mem.type, mem.default) == ("int", 128)
     assert drop.default < build.default, "the defaults must carry the hysteresis"
     assert mem.max == 4096, "unbounded build memory would OOM the smallest project pods"
@@ -141,7 +141,11 @@ def test_the_three_settings_are_registered_with_conservative_defaults():
         ("VECTOR_PER_KB_INDEX_MIN_ROWS", 999, False),
         ("VECTOR_PER_KB_INDEX_MIN_ROWS", 1000, True),
         ("VECTOR_PER_KB_INDEX_MIN_ROWS", 10_000_001, False),
-        ("VECTOR_PER_KB_INDEX_DROP_ROWS", 0, True),
+        # 0 is rejected: the drop test is "fewer than this", so at 0 it can
+        # never be true and a knowledge base whose rows are all gone would keep
+        # an index of nothing, re-dispatched by the sweep on every boot.
+        ("VECTOR_PER_KB_INDEX_DROP_ROWS", 0, False),
+        ("VECTOR_PER_KB_INDEX_DROP_ROWS", 1, True),
         ("VECTOR_PER_KB_INDEX_DROP_ROWS", -1, False),
         ("VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB", 63, False),
         ("VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB", 64, True),
@@ -161,11 +165,11 @@ def test_thresholds_default_to_the_registry_values(monkeypatch):
     _stub_settings(
         monkeypatch,
         {
-            "VECTOR_PER_KB_INDEX_MIN_ROWS": 50000,
-            "VECTOR_PER_KB_INDEX_DROP_ROWS": 25000,
+            "VECTOR_PER_KB_INDEX_MIN_ROWS": 10000,
+            "VECTOR_PER_KB_INDEX_DROP_ROWS": 5000,
         },
     )
-    assert pvi.thresholds() == (50000, 25000)
+    assert pvi.thresholds() == (10000, 5000)
 
 
 def test_thresholds_clamp_a_stored_value_outside_the_registrys_bounds(monkeypatch):
@@ -180,7 +184,7 @@ def test_thresholds_clamp_a_stored_value_outside_the_registrys_bounds(monkeypatc
     )
     build_at, drop_below = pvi.thresholds()
     assert build_at == 1000, "below the registry minimum must be pulled up to it"
-    assert drop_below == 0
+    assert drop_below == 1, "a stored 0 is an unreachable drop test; the minimum is 1"
 
 
 @pytest.mark.parametrize("stored_drop", [50000, 60000])
