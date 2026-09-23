@@ -1343,6 +1343,11 @@ def test_the_real_code_path_keeps_the_index_under_a_forced_generic_plan(
 # between the two cannot be read as "the filter was too selective".
 FILTER_ONE_IN_FIVE = {"tier": "gold"}
 FILTER_EVERYTHING = {"kb": KB_BIG}
+# Two keys, which is two bound `@>` operators and two interpolated key names --
+# the shape the metadata-filter hardening changes. Whichever of the two changes
+# lands second, the merged vector_search is a shape neither suite had executed:
+# this one never passed a filter, and the other has no partial index.
+FILTER_TWO_KEYS = {"tier": "gold", "kb": KB_BIG}
 
 
 def test_a_filtered_search_reaches_the_partial_index_under_a_custom_plan(
@@ -1351,9 +1356,12 @@ def test_a_filtered_search_reaches_the_partial_index_under_a_custom_plan(
     """The control the next two specs need: the filter alone loses nothing.
 
     A custom plan knows the filter's value, estimates it, and still chooses the
-    partial index. So whatever the generic-plan specs below find is about plan
-    caching, not about filtering. Measured: 12 of 12 on the partial index at
-    1.4-1.9 ms with either filter.
+    partial index. So what the generic-plan spec below finds for these two
+    filters is about plan caching, not about filtering. Measured: 12 of 12 on
+    the partial index at 1.4-1.9 ms with either.
+
+    One key, both of them, deliberately: with two the custom plan loses the
+    index as well, which is a different defect and has its own spec.
     """
     name = _build_big_index(engine, settings)
     for filter_metadata in (FILTER_ONE_IN_FIVE, FILTER_EVERYTHING):
@@ -1371,9 +1379,47 @@ def test_a_filtered_search_reaches_the_partial_index_under_a_custom_plan(
         )
 
 
+def test_a_two_key_filter_reaches_the_partial_index_under_a_custom_plan(
+    engine, schema, settings, query_vectors
+):
+    """Two metadata keys lose the index even when the planner knows their values.
+
+    ``jsonb @>`` has no statistics, so each key contributes a fixed guess and the
+    planner multiplies them: two keys put the estimate near zero, an ordered
+    index scan then looks like it would have to walk the whole index to fill a
+    LIMIT of 20, and it is priced out. Measured on this fixture: 0 of 12
+    executions on the partial index under ``force_custom_plan``, where a
+    single-key filter gets 12 of 12.
+
+    That matters for the shape of the fix. Forcing a custom plan for filtered
+    searches repairs the single-key case -- verified by simulating it here -- and
+    does not repair this one, because this one is not about plan caching at all.
+    Two keys is an ordinary request: the search route takes a whole
+    ``filter_metadata`` object.
+    """
+    name = _build_big_index(engine, settings)
+    scans, prepared = _drive_searches(
+        engine,
+        KB_BIG,
+        query_vectors,
+        plan_cache_mode="force_custom_plan",
+        index_name=name,
+        filter_metadata=FILTER_TWO_KEYS,
+    )
+    assert prepared, "the driver never prepared the filtered search statement"
+    assert scans[name] == _DRIVEN_EXECUTIONS, (
+        f"a two-key filtered search used the partial index for only {scans[name]} of "
+        f"{_DRIVEN_EXECUTIONS} executions under a custom plan ({scans})"
+    )
+
+
 @pytest.mark.parametrize(
     "filter_metadata,selectivity",
-    [(FILTER_ONE_IN_FIVE, "one row in five"), (FILTER_EVERYTHING, "every row")],
+    [
+        (FILTER_ONE_IN_FIVE, "one row in five"),
+        (FILTER_EVERYTHING, "every row"),
+        (FILTER_TWO_KEYS, "one row in five, through two keys"),
+    ],
 )
 def test_a_filtered_search_keeps_the_index_under_a_forced_generic_plan(
     engine, schema, settings, query_vectors, filter_metadata, selectivity
