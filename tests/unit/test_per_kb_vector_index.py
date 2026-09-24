@@ -511,6 +511,19 @@ def _raiser(exc):
     return boom
 
 
+def _comments_written(conn) -> list[str]:
+    """The comment *bodies* the reconcile wrote, as the server would store them.
+
+    ``conn.issued`` hands back whole ``COMMENT ON INDEX ... IS '<body>'`` statements
+    and every reader in the module takes the body, so a spec that hands a reader the
+    statement is asking it a question it is never asked -- which passed only while the
+    four patterns were free to match anywhere in any string. They are not
+    (``_COMMENT_MARKER``), and a spec about what is on record should read what is on
+    record.
+    """
+    return [statement.split("'")[-2] for statement in conn.issued(_FAILURE_COMMENT_DDL)]
+
+
 def _recorded(comment: str | None) -> tuple[int, str | None]:
     """``(permanent failures, definition fingerprint)`` a written comment records.
 
@@ -1604,7 +1617,7 @@ def test_a_definition_drop_is_not_counted_against_either_build_budget(monkeypatc
     conn = _ensure_conn(existing=[_stale_row()], rows_by_dims={1536: 20_000}, fail_on="DROP INDEX")
     with pytest.raises(RuntimeError):
         _ensure(monkeypatch, conn)
-    written = conn.issued(_FAILURE_COMMENT_DDL)
+    written = _comments_written(conn)
     assert written, "the attempt is on record, or nothing bounds the next one"
     for one in written:
         assert pvi.build_failures_in(one) == 0, one
@@ -2085,9 +2098,9 @@ def test_a_failed_build_counts_itself_on_the_index_it_leaves_behind(monkeypatch)
     conn = _ensure_conn(rows_by_dims={1536: 20_000}, fail_on="CREATE INDEX")
     with pytest.raises(RuntimeError):
         _ensure(monkeypatch, conn)
-    written = conn.issued(_FAILURE_COMMENT_DDL)
-    assert len(written) == 1, conn.statements
-    assert pvi.per_kb_index_name(KB, 1536) in written[0]
+    assert len(conn.issued(_FAILURE_COMMENT_DDL)) == 1, conn.statements
+    assert pvi.per_kb_index_name(KB, 1536) in conn.issued(_FAILURE_COMMENT_DDL)[0]
+    written = _comments_written(conn)
     assert pvi.build_failures_in(written[0]) == 1, written
     # The permanent direction, which nothing pinned: making the non-transient branch
     # increment ``interrupted`` too passed every tier. The two counts are reported side
@@ -2110,7 +2123,7 @@ def test_each_failure_counts_on_from_the_last_one(monkeypatch):
     )
     with pytest.raises(RuntimeError):
         _ensure(monkeypatch, conn)
-    written = conn.issued(_FAILURE_COMMENT_DDL)
+    written = _comments_written(conn)
     assert pvi.build_failures_in(written[0]) == 2, written
 
 
@@ -2126,7 +2139,7 @@ def test_a_build_that_succeeds_forgets_the_failures_before_it(monkeypatch):
     )
     outcome = _ensure(monkeypatch, conn)
     assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
-    cleared = conn.issued(_FAILURE_COMMENT_DDL)
+    cleared = _comments_written(conn)
     assert len(cleared) == 1, conn.statements
     assert "consecutive" not in cleared[0], cleared
     assert pvi.per_kb_index_fingerprint(KB, 1536) in cleared[0], cleared
@@ -2143,7 +2156,7 @@ def test_a_build_that_succeeds_records_the_definition_it_built_from(monkeypatch)
     conn = _ensure_conn(rows_by_dims={1536: 20_000})
     outcome = _ensure(monkeypatch, conn)
     assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
-    written = conn.issued(_FAILURE_COMMENT_DDL)
+    written = _comments_written(conn)
     assert len(written) == 1, conn.statements
     assert pvi.per_kb_index_fingerprint(KB, 1536) in written[0], written
 
@@ -2245,7 +2258,7 @@ def test_a_repair_drop_that_fails_counts_the_attempt_too(monkeypatch):
     with pytest.raises(RuntimeError):
         _ensure(monkeypatch, conn)
     assert conn.issued("CREATE INDEX") == [], "the drop failed; nothing was rebuilt"
-    written = conn.issued(_FAILURE_COMMENT_DDL)
+    written = _comments_written(conn)
     assert written, "an uncounted attempt is an unbounded loop"
     assert pvi.build_failures_in(written[0]) == 2, written
 
@@ -2298,7 +2311,7 @@ def test_a_transient_build_failure_spends_the_other_bound_not_this_one(monkeypat
     conn = _ensure_conn(rows_by_dims={1536: 20_000}, fail_on="CREATE INDEX", exc=_transient_exc())
     with pytest.raises(Exception, match="lock timeout"):
         _ensure(monkeypatch, conn)
-    written = conn.issued(_FAILURE_COMMENT_DDL)
+    written = _comments_written(conn)
     assert len(written) == 1, conn.statements
     assert pvi.build_failures_in(written[0]) == 0, written
     assert pvi.interrupted_builds_in(written[0]) == 1, written
@@ -2320,7 +2333,7 @@ def test_a_transient_build_failure_keeps_the_attempts_already_on_record(monkeypa
     )
     with pytest.raises(Exception, match="lock timeout"):
         _ensure(monkeypatch, conn)
-    written = conn.issued(_FAILURE_COMMENT_DDL)
+    written = _comments_written(conn)
     assert written, "an uncounted attempt is an unbounded loop"
     assert pvi.build_failures_in(written[0]) == 2, written
     assert pvi.interrupted_builds_in(written[0]) == 5, written
@@ -2337,7 +2350,7 @@ def test_a_transient_repair_drop_failure_spends_the_larger_bound_too(monkeypatch
     )
     with pytest.raises(Exception, match="lock timeout"):
         _ensure(monkeypatch, conn)
-    written = conn.issued(_FAILURE_COMMENT_DDL)
+    written = _comments_written(conn)
     assert written, conn.statements
     for one in written:
         assert pvi.build_failures_in(one) == 1, one
@@ -2358,7 +2371,7 @@ def test_a_failed_build_records_todays_definition_because_it_built_that_index(mo
     conn = _ensure_conn(rows_by_dims={1536: 20_000}, fail_on="CREATE INDEX")
     with pytest.raises(RuntimeError):
         _ensure(monkeypatch, conn)
-    written = conn.issued(_FAILURE_COMMENT_DDL)
+    written = _comments_written(conn)
     assert len(written) == 1, conn.statements
     assert pvi.definition_fingerprint_in(written[0]) == _current_fingerprint(KB, 1536), written
 
@@ -2380,7 +2393,7 @@ def test_a_failed_repair_drop_leaves_the_definition_the_index_really_carries(mon
     )
     with pytest.raises(RuntimeError):
         _ensure(monkeypatch, conn)
-    written = conn.issued(_FAILURE_COMMENT_DDL)
+    written = _comments_written(conn)
     assert written, "an uncounted attempt is an unbounded loop"
     assert pvi.build_failures_in(written[0]) == 1, written
     assert pvi.definition_fingerprint_in(written[0]) == older, written
@@ -2408,7 +2421,7 @@ def test_a_mis_stamped_definition_would_certify_a_stale_index_for_ever(monkeypat
     )
     with pytest.raises(RuntimeError):
         _ensure(monkeypatch, conn)
-    preserved = conn.issued(_FAILURE_COMMENT_DDL)[0].split("'")[-2]
+    preserved = _comments_written(conn)[0]
 
     # What ``REINDEX`` leaves: valid again, the old predicate, and that same comment.
     reindexed = _ensure_conn(

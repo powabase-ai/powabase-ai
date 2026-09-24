@@ -349,31 +349,68 @@ MAX_CONSECUTIVE_DEFINITION_REBUILDS = 3
 # Nothing in the wording may be ``:word``: ``COMMENT ON`` takes no parameter, so
 # this is interpolated, and ``text()`` would read that as a bind parameter.
 #
-# Three independent facts share the one comment, so it is composed of sentences
+# Four independent facts share the one comment, so it is composed of sentences
 # and each is read back by a pattern of its own rather than the whole comment
 # being matched at once. The counts keep their fixed order -- failed, then
-# interrupted -- so an operator reads the same shape every time, and the
-# fingerprint comes last because it is the one fact a *valid* index carries.
+# interrupted, then unsettled rebuilds -- so an operator reads the same shape every
+# time, and the fingerprint comes last because it is the one fact a *valid* index
+# carries.
+#
+# The prose about an INVALID index comes after all three counts rather than between
+# them. It used to sit before the rebuild count, which put a sentence describing "a
+# valid index still answering searches" inside prose calling the index INVALID --
+# and that pair is producible here, by a repair drop that fails after a drift drop
+# (``_count_a_failed_repair_drop`` reads the rebuild count back and keeps it). Two
+# incompatible claims about the same object in one string, in the comment an
+# operator reads first.
 _BUILD_FAILURES_SENTENCE = "{n} consecutive failed attempts to build this partial HNSW index."
 _INTERRUPTED_BUILDS_SENTENCE = "{n} consecutive builds of this partial HNSW index were interrupted."
 _INVALID_INDEX_PROSE = (
-    "The last attempt left it INVALID, and while it is, it answers no query and is "
-    "maintained on every write. Drop it once the cause is fixed; the next reconcile "
-    "then builds it again. A REINDEX makes it valid without clearing this comment, "
-    "so the counts above are the history of that attempt and not a claim about the "
-    "index now. The definition below is a claim about the index now: it is what the "
-    "index on disk was built from, reindexed or not."
+    "The last build attempt left it INVALID, and while it is, it answers no query and "
+    "is maintained on every write. Drop it once the cause is fixed; the next reconcile "
+    "then builds it again. A REINDEX makes it valid without clearing this comment, so "
+    "every count above is a history of attempts and not a claim about the index now. "
+    "The definition below is a claim about the index now: it is what the index on disk "
+    "was built from, reindexed or not."
 )
 _REBUILDS_SENTENCE = (
     "{n} consecutive rebuilds of this partial HNSW index for a definition change have not settled."
 )
 _DEFINITION_SENTENCE = "Built from definition {fp}."
 
+# Every comment this module writes starts with this, and every reader refuses one
+# that does not.
+#
+# The four sentences above are ordinary English about an ordinary object, so a
+# runbook note, a hand-off or a ticket summary written into the same comment can
+# quote one of them back verbatim -- and the fourth fact is the one where being
+# misread is silent and permanent. A note quoting the rebuild sentence reads as
+# ``MAX_CONSECUTIVE_DEFINITION_REBUILDS`` consecutive rebuilds and freezes the index
+# for ever with no log line, where the equivalent build-count quote is loud (the
+# give-up ERROR names the index and both counts) and self-limiting (the operator
+# drop it asks for re-arms the build).
+#
+# Anchoring the four patterns to sentence starts would close a sentence quoted
+# mid-comment and not one quoted at the front of it; requiring this closes all four
+# at once, in one place. It fails in the safe direction: a comment this module
+# cannot vouch for records nothing, so the index reads as one with no history and no
+# definition -- the state every reader here already handles, and the one an index
+# built before this module existed is in.
+#
+# It is not a signature and cannot be one: an operator may copy it along with the
+# rest, and a ``pg_class`` comment is a place anyone may write. What it separates is
+# a comment this module composed from a comment that merely talks about it.
+_COMMENT_MARKER = "[per-kb-hnsw]"
+
 # Each pattern matches its own whole sentence, not a prefix of it, because the
 # sentences now sit beside each other and beside prose. The original count
 # pattern was anchored at the start of the comment, which composition makes
 # impossible; a long distinctive phrase is the stricter test anyway -- "a comment
 # is a place anyone may write, and one this module did not write is no evidence".
+#
+# None of them is ever run against a comment that does not start with
+# ``_COMMENT_MARKER`` (``_module_written``), which is what keeps "a long
+# distinctive phrase" from being a phrase anyone can write back.
 _BUILD_FAILURES_PATTERN = re.compile(
     r"(\d+) consecutive failed attempts to build this partial HNSW index\."
 )
@@ -1226,25 +1263,37 @@ def per_kb_index_comment(
     ``None`` when there is nothing to record, which is what ``COMMENT ON ... IS
     NULL`` writes. The prose about an INVALID index is appended only when one of the
     two *build* counts is being recorded, because that is the only time the index is
-    INVALID -- a rebuild count sits on a valid index that is still answering
-    searches.
+    INVALID -- and it is appended after **all three** counts, including the rebuild
+    count, which describes a valid index still answering searches. The two are
+    producible together, so the prose may not be allowed to swallow one of them.
 
     Composed here, and read back by the four ``_in`` functions below, so the
     wording lives in one place and a reworded sentence moves both directions at
-    once.
+    once. Everything composed here is prefixed with ``_COMMENT_MARKER``, which is
+    what those readers require.
     """
     parts: list[str] = []
     if failures:
         parts.append(_BUILD_FAILURES_SENTENCE.format(n=int(failures)))
     if interrupted:
         parts.append(_INTERRUPTED_BUILDS_SENTENCE.format(n=int(interrupted)))
-    if parts:
-        parts.append(_INVALID_INDEX_PROSE)
     if rebuilds:
         parts.append(_REBUILDS_SENTENCE.format(n=int(rebuilds)))
+    if failures or interrupted:
+        parts.append(_INVALID_INDEX_PROSE)
     if fingerprint:
         parts.append(_DEFINITION_SENTENCE.format(fp=fingerprint))
-    return " ".join(parts) or None
+    return " ".join([_COMMENT_MARKER, *parts]) if parts else None
+
+
+def _module_written(comment: str | None) -> str:
+    """The comment this module may read facts out of, or an empty string.
+
+    Every reader below goes through this, so the four patterns are only ever run
+    against a comment this module composed. See ``_COMMENT_MARKER``.
+    """
+    body = comment or ""
+    return body if body.startswith(_COMMENT_MARKER) else ""
 
 
 def build_failures_in(comment: str | None) -> int:
@@ -1254,13 +1303,13 @@ def build_failures_in(comment: str | None) -> int:
     these comments in bulk, as a column of the catalog SELECT it already runs,
     rather than one round trip per index on the boot path.
     """
-    match = _BUILD_FAILURES_PATTERN.search(comment or "")
+    match = _BUILD_FAILURES_PATTERN.search(_module_written(comment))
     return int(match.group(1)) if match else 0
 
 
 def interrupted_builds_in(comment: str | None) -> int:
     """The consecutive interrupted-build count a comment records, or zero."""
-    match = _INTERRUPTED_BUILDS_PATTERN.search(comment or "")
+    match = _INTERRUPTED_BUILDS_PATTERN.search(_module_written(comment))
     return int(match.group(1)) if match else 0
 
 
@@ -1273,7 +1322,7 @@ def definition_rebuilds_in(comment: str | None) -> int:
     means the drop-and-rebuild the drift detector asks for is not completing. See
     ``MAX_CONSECUTIVE_DEFINITION_REBUILDS`` for what it bounds and what it cannot.
     """
-    match = _REBUILDS_PATTERN.search(comment or "")
+    match = _REBUILDS_PATTERN.search(_module_written(comment))
     return int(match.group(1)) if match else 0
 
 
@@ -1284,7 +1333,7 @@ def definition_fingerprint_in(comment: str | None) -> str | None:
     commented by hand, and for one whose comment says something else entirely --
     all of which are treated as a definition this module cannot vouch for.
     """
-    match = _DEFINITION_PATTERN.search(comment or "")
+    match = _DEFINITION_PATTERN.search(_module_written(comment))
     return match.group(1) if match else None
 
 
