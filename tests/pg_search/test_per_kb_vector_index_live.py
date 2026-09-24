@@ -352,7 +352,7 @@ def settings(monkeypatch):
     return values
 
 
-def _drop_all_partial_indexes(engine) -> None:
+def _drop_all_partial_indexes(engine, schema: str = SCHEMA) -> None:
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         names = [
             row[0]
@@ -362,11 +362,11 @@ def _drop_all_partial_indexes(engine) -> None:
                     "ON n.oid = c.relnamespace WHERE n.nspname = :s AND c.relkind = 'i' "
                     "AND c.relname LIKE 'hnsw_kb_%'"
                 ),
-                {"s": SCHEMA},
+                {"s": schema},
             ).all()
         ]
         for name in names:
-            conn.execute(text(f'DROP INDEX CONCURRENTLY IF EXISTS "{SCHEMA}".{name}'))
+            conn.execute(text(f'DROP INDEX CONCURRENTLY IF EXISTS "{schema}".{name}'))
 
 
 # ---------------------------------------------------------------------------
@@ -1335,6 +1335,294 @@ def test_a_concurrent_build_does_not_block_writes(engine, schema, settings):
             ),
             {"kb": KB_BIG},
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. What the index covers: one population, not four
+#
+# ``ai.embeddings`` holds the vectors of four different item tables, and
+# ``item_table`` is NOT NULL and one of those four values. A knowledge base can
+# therefore hold more than one population at once -- chunks and whole documents,
+# chunks and graph nodes -- and the index this feature builds is named by the
+# knowledge base and the dimension only. So an index built for such a knowledge
+# base spans every population in it, while the search this feature steers onto
+# that index joins ``chunks`` and can only ever return chunk rows.
+#
+# That is not a tidiness point, it is recall. The ordered scan walks the index by
+# distance and the join throws away everything that is not a chunk, so the rows
+# the caller gets are drawn from whatever the scan reached before the limit was
+# filled -- and the deeper the scan has to go, the more of the real top-k it never
+# sees. This fixture is the smallest one that shows it: the same 3,000 chunk
+# rows, the same query vectors, once with 7,000 whole-document embeddings beside
+# them in the same knowledge base and once without.
+#
+# The claim is asserted at the answer, not at the DDL. An index definition that
+# names ``item_table`` is evidence of an intention; recall against an exact scan
+# of the chunk rows is evidence of the outcome, and it is the outcome that moved
+# (measured on this fixture over two runs, mean recall at 20 over six query
+# vectors, both runs through the real store on an index it built itself: 0.53-0.57
+# with the second population in the index against 0.82-0.83 without, and 0.05-0.10
+# at the worst vector against 0.60).
+# Both runs assert the index served every execution, because an exact scan
+# answers with recall 1.00 and a comparison that quietly stopped using the index
+# would read as a pass.
+#
+# The twin knowledge base is what makes the recall number mean something. HNSW
+# recall on this fixture's clustered vectors is well below 1.00 even over one
+# population -- the vectors within a cluster are near-ties -- so an absolute bar
+# would be a fixture constant rather than a claim. The twin holds the chunk
+# population and nothing else, so it measures what this search's recall is
+# *allowed* to be, from the same rows and the same queries.
+#
+# Thresholds of its own, deliberately low: the row count that decides whether to
+# build is the other half of this question (a knowledge base that crosses the
+# threshold on the *sum* over its populations, and would not cross it on chunks
+# alone), and pinning that belongs where the counting is unit-testable. These
+# specs are about what the index covers once there is one, so both knowledge bases
+# here are above the threshold either way and the gate is not the variable.
+# ---------------------------------------------------------------------------
+
+MIXED_SCHEMA = f"{SCHEMA}_populations"
+# Two knowledge bases with the same chunk population, from the same vectors, so
+# the only difference between them is the second population in one of them.
+KB_TWO_POPULATIONS = "9f8b1c2e-0000-4000-8000-0000000000f1"
+KB_ONE_POPULATION = "9f8b1c2e-0000-4000-8000-0000000000f2"
+POPULATION_CHUNK_ROWS = 3_000
+# More rows than the chunk population rather than fewer: a knowledge base indexed
+# at the page or whole-document level alongside its chunks is the ordinary case,
+# not a corner, and the harm scales with how much of the index cannot join.
+POPULATION_OTHER_ROWS = 7_000
+
+
+@pytest.fixture(scope="module")
+def mixed_population_schema(engine):
+    """A second scratch schema: one knowledge base with two populations, one with one."""
+    raw_dsn = engine.url.set(drivername="postgresql").render_as_string(hide_password=False)
+    with psycopg.connect(raw_dsn, autocommit=True) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {MIXED_SCHEMA} CASCADE")
+        conn.execute(f"CREATE SCHEMA {MIXED_SCHEMA}")
+        conn.execute(f"""
+            CREATE TABLE {MIXED_SCHEMA}.chunks (
+                id uuid PRIMARY KEY,
+                knowledge_base_id uuid NOT NULL,
+                source_id uuid NOT NULL,
+                text text NOT NULL,
+                meta jsonb DEFAULT '{{}}'::jsonb
+            )
+        """)
+        conn.execute(f"""
+            CREATE TABLE {MIXED_SCHEMA}.embeddings (
+                id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                item_id uuid NOT NULL,
+                item_table varchar(50) NOT NULL,
+                knowledge_base_id uuid NOT NULL,
+                source_id uuid NOT NULL,
+                embedding_model varchar(255) NOT NULL,
+                dims smallint NOT NULL,
+                embedding vector NOT NULL,
+                CONSTRAINT embeddings_item_id_embedding_model_key UNIQUE (item_id, embedding_model)
+            )
+        """)
+        conn.execute(f"CREATE INDEX ON {MIXED_SCHEMA}.chunks (knowledge_base_id)")
+        conn.execute(f"CREATE INDEX ON {MIXED_SCHEMA}.embeddings (item_id)")
+        conn.execute(f"CREATE INDEX ON {MIXED_SCHEMA}.embeddings (knowledge_base_id)")
+        # Serial builds here too, for the reason the first fixture gives.
+        conn.execute(f"ALTER TABLE {MIXED_SCHEMA}.embeddings SET (parallel_workers = 0)")
+
+        rng = np.random.default_rng(777)
+        chunk_vectors = _vectors(rng, POPULATION_CHUNK_ROWS)
+        other_vectors = _vectors(rng, POPULATION_OTHER_ROWS)
+        chunks = io.StringIO()
+        embeddings = io.StringIO()
+        for kb_id in (KB_TWO_POPULATIONS, KB_ONE_POPULATION):
+            for i in range(POPULATION_CHUNK_ROWS):
+                item_id = str(uuid.uuid4())
+                meta = json.dumps({"tier": "gold", "kb": kb_id})
+                chunks.write(f"{item_id}\t{kb_id}\t{SOURCE}\tpassage {i}\t{meta}\n")
+                embeddings.write(
+                    f"{item_id}\tchunks\t{kb_id}\t{SOURCE}\ttest-embed\t{DIMS}\t"
+                    f"{_literal(chunk_vectors[i])}\n"
+                )
+        # The second population, in one of the two knowledge bases. No rows in any
+        # item table to match them: an embedding of a whole document is not a
+        # chunk, so a chunk search's join drops it however it was reached, which
+        # is the whole point -- these are index entries that cannot answer.
+        for i in range(POPULATION_OTHER_ROWS):
+            embeddings.write(
+                f"{uuid.uuid4()}\tfull_documents\t{KB_TWO_POPULATIONS}\t{SOURCE}\t"
+                f"test-embed\t{DIMS}\t{_literal(other_vectors[i])}\n"
+            )
+        chunks.seek(0)
+        embeddings.seek(0)
+        with conn.cursor() as cur:
+            with cur.copy(
+                f"COPY {MIXED_SCHEMA}.chunks (id, knowledge_base_id, source_id, text, meta) "
+                "FROM STDIN"
+            ) as copy:
+                copy.write(chunks.read())
+            with cur.copy(
+                f"COPY {MIXED_SCHEMA}.embeddings (item_id, item_table, knowledge_base_id, "
+                "source_id, embedding_model, dims, embedding) FROM STDIN"
+            ) as copy:
+                copy.write(embeddings.read())
+        conn.execute(f"VACUUM ANALYZE {MIXED_SCHEMA}.embeddings")
+        conn.execute(f"VACUUM ANALYZE {MIXED_SCHEMA}.chunks")
+    yield MIXED_SCHEMA
+    with psycopg.connect(raw_dsn, autocommit=True) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {MIXED_SCHEMA} CASCADE")
+
+
+@pytest.fixture
+def mixed_population(engine, mixed_population_schema, monkeypatch):
+    """The service pointed at that schema, with thresholds both populations clear."""
+    monkeypatch.setattr(pvi, "AI_SCHEMA", MIXED_SCHEMA)
+    values = {
+        "VECTOR_PER_KB_INDEX_MIN_ROWS": 1_000,
+        "VECTOR_PER_KB_INDEX_DROP_ROWS": 500,
+        "VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB": _MEM_MB,
+    }
+    monkeypatch.setattr(pvi, "get_setting", lambda key: values[key])
+    monkeypatch.setattr(pvi, "read_overrides", lambda conn, *keys: dict(values))
+    _drop_all_partial_indexes(engine, MIXED_SCHEMA)
+    yield MIXED_SCHEMA
+    _drop_all_partial_indexes(engine, MIXED_SCHEMA)
+
+
+def _item_tables_of(engine, kb_id: str, schema: str) -> dict[str, int]:
+    """How many embeddings each item table holds for one knowledge base."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                f"SELECT item_table, count(*) FROM {schema}.embeddings "
+                "WHERE knowledge_base_id = CAST(:kb AS uuid) GROUP BY item_table"
+            ),
+            {"kb": kb_id},
+        ).all()
+        conn.rollback()
+    return {str(table): int(count) for table, count in rows}
+
+
+def _indexed_tuples(engine, name: str, schema: str) -> int:
+    """How many tuples the index holds, from the catalog rather than from its DDL.
+
+    ``pg_class.reltuples`` on the index relation is set by the build, so this is a
+    measurement of what the index covers and not a reading of the predicate that
+    was meant to decide it -- which is the difference the recall numbers above
+    turn on.
+    """
+    with engine.connect() as conn:
+        count = conn.execute(
+            text(
+                "SELECT c.reltuples FROM pg_class c JOIN pg_namespace n "
+                "ON n.oid = c.relnamespace WHERE n.nspname = :s AND c.relname = :n"
+            ),
+            {"s": schema, "n": name},
+        ).scalar()
+        conn.rollback()
+    assert count is not None, f"no such index in {schema}: {name}"
+    return int(count)
+
+
+def _recall_of_the_real_search(engine, kb_id: str, vectors, *, schema: str):
+    """``(scans, mean recall, worst recall)`` for the store's own unrestricted search.
+
+    The expectation is PostgreSQL's own answer to the same statement with index
+    scans off, once per query vector, so nothing about the right answer is written
+    down here.
+    """
+    name = pvi.per_kb_index_name(kb_id, DIMS)
+    exact = _exact_answers(engine, kb_id, vectors, schema=schema)
+    assert all(len(answer) == TOP_K for answer in exact), [len(a) for a in exact]
+    scans, answers = _drive_and_collect(engine, kb_id, vectors, name, schema=schema)
+    hits = [len(set(got) & set(want)) / len(want) for got, want in zip(answers, exact)]
+    return scans[name], sum(hits) / len(hits), min(hits)
+
+
+def test_a_knowledge_base_with_two_item_tables_gets_an_index_of_one_population(
+    engine, mixed_population, query_vectors
+):
+    """The index covers the population the search can join, and the answer shows it.
+
+    Two knowledge bases, the same 3,000 chunk rows built from the same vectors,
+    each given its own index by the real service path. One of them also holds
+    7,000 whole-document embeddings, which no chunk search can ever return.
+
+    Four assertions, and the order is the argument:
+
+    - the fixture really is what it claims -- two populations in one knowledge base
+      and one in the other;
+    - both indexes hold the same number of tuples, which is the chunk population.
+      An index that spans the knowledge base's other populations holds 10,000
+      where its twin holds 3,000;
+    - the index served every execution on both, without which the recall
+      comparison below would be comparing an exact scan against an index scan and
+      would pass for the wrong reason;
+    - and the recall the search gets is the recall the same rows and the same
+      queries give through an index that holds nothing else. Measured with the
+      second population in the index: 0.53-0.57 mean and 0.05-0.10 at the worst
+      vector, against 0.82-0.83 and 0.60.
+
+    The margins are there because the two index builds see their rows in a
+    different heap order and an HNSW graph is built in the order it reads, so the
+    twins are not required to agree to the row; they are required to agree within
+    a few rows of a 20-row page.
+    """
+    two = _item_tables_of(engine, KB_TWO_POPULATIONS, MIXED_SCHEMA)
+    one = _item_tables_of(engine, KB_ONE_POPULATION, MIXED_SCHEMA)
+    assert two == {"chunks": POPULATION_CHUNK_ROWS, "full_documents": POPULATION_OTHER_ROWS}, two
+    assert one == {"chunks": POPULATION_CHUNK_ROWS}, one
+
+    for kb_id in (KB_TWO_POPULATIONS, KB_ONE_POPULATION):
+        outcome = pvi.ensure_per_kb_vector_index(kb_id, engine=engine)
+        assert outcome["built"] == [pvi.per_kb_index_name(kb_id, DIMS)], outcome
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(f"ANALYZE {MIXED_SCHEMA}.embeddings"))
+
+    covered = {
+        kb_id: _indexed_tuples(engine, pvi.per_kb_index_name(kb_id, DIMS), MIXED_SCHEMA)
+        for kb_id in (KB_TWO_POPULATIONS, KB_ONE_POPULATION)
+    }
+    # Everything is measured before anything is asserted, so a failure of the
+    # first claim still reports what it cost at the answer -- which is the half of
+    # this that an index definition cannot tell anyone.
+    scans_two, mean_two, worst_two = _recall_of_the_real_search(
+        engine, KB_TWO_POPULATIONS, query_vectors, schema=MIXED_SCHEMA
+    )
+    scans_one, mean_one, worst_one = _recall_of_the_real_search(
+        engine, KB_ONE_POPULATION, query_vectors, schema=MIXED_SCHEMA
+    )
+    measured = (
+        f"(two populations: {covered[KB_TWO_POPULATIONS]} tuples indexed, recall "
+        f"{mean_two:.3f} mean / {worst_two:.3f} worst over {scans_two} index scans; "
+        f"one population: {covered[KB_ONE_POPULATION]} tuples indexed, recall "
+        f"{mean_one:.3f} mean / {worst_one:.3f} worst over {scans_one} index scans)"
+    )
+
+    assert covered[KB_ONE_POPULATION] == POPULATION_CHUNK_ROWS, (covered, measured)
+    assert covered[KB_TWO_POPULATIONS] == covered[KB_ONE_POPULATION], (
+        f"the index built for a knowledge base with two populations holds "
+        f"{covered[KB_TWO_POPULATIONS]} tuples where the one built for the same chunk "
+        f"population alone holds {covered[KB_ONE_POPULATION]}; the difference is "
+        f"{POPULATION_OTHER_ROWS} entries a chunk search can reach and can never "
+        f"return {measured}"
+    )
+    assert scans_two == len(query_vectors) and scans_one == len(query_vectors), (
+        "both searches have to go through the knowledge base's own index for the "
+        f"recall below to be about the index at all: {scans_two} and {scans_one} of "
+        f"{len(query_vectors)} executions did"
+    )
+    assert mean_two >= mean_one - 0.05, (
+        f"a chunk search on a knowledge base that also holds {POPULATION_OTHER_ROWS} "
+        f"whole-document embeddings returned {mean_two:.3f} of the exact answer, where "
+        f"the same {POPULATION_CHUNK_ROWS} chunk rows and the same queries return "
+        f"{mean_one:.3f} through an index holding only them; the scan is walking "
+        "entries that cannot join"
+    )
+    assert worst_two >= worst_one - 0.20, (
+        f"the worst query vector returned {worst_two:.3f} of the exact answer against "
+        f"{worst_one:.3f} on the single-population twin; the tail is where a scan that "
+        "has to walk past rows it cannot return runs out of budget first"
+    )
 
 
 # ---------------------------------------------------------------------------
