@@ -104,6 +104,52 @@ def ensure_embedding_index(session: Session, schema: str, dims: int) -> None:
         )
 
 
+METADATA_FILTER_PARAM = "filter_metadata"
+
+
+def metadata_filter_clause(filter_metadata: dict | None) -> tuple[str, dict[str, str]]:
+    """SQL fragment and bound parameter for a metadata containment filter.
+
+    The whole filter is bound as ONE jsonb value and compared server-side, so no
+    part of it — keys included — reaches the SQL text. This used to be assembled
+    one key at a time, with the key interpolated into the statement as the name
+    of its own bind parameter (``:filter_{key}``); a key is caller data, so a key
+    carrying SQL of its own became part of the WHERE clause.
+
+    One ``@>`` over the whole object says the same thing as one per pair: jsonb
+    object containment holds only when every pair on the right is contained on
+    the left, so ``meta @> '{"a": 1, "b": 2}'`` matches exactly the rows
+    ``meta @> '{"a": 1}' AND meta @> '{"b": 2}'`` matches.
+
+    Returns ``("", {})`` for an empty or absent filter, so the caller appends
+    nothing and binds nothing. A filter that is present but not an object is
+    rejected rather than bound: ``jsonb @> <array|string|number|boolean>`` does
+    not error, it is simply false, so binding one would turn a malformed filter
+    into an empty result with nothing logged — indistinguishable, on the agent
+    path, from "nothing relevant". A ``ValueError`` reaches the search route's
+    400 instead. The order matters: the falsy short-circuit comes first, so the
+    set of inputs that add no clause is exactly what it has always been.
+
+    Two conventions the caller has to match: the filtered item table is aliased
+    ``c``, and the bound parameter is named ``filter_metadata``.
+
+    This is containment, not equality — ``{"a": {"b": 1}}`` matches a row whose
+    ``meta`` is ``{"a": {"b": 1, "c": 2}}``. Note the bm25s file-index keyword
+    leg does not come through here: it filters in Python with ``==`` on each
+    key, which is stricter, and the two have never agreed on nested values.
+    """
+    if not filter_metadata:
+        return "", {}
+    if not isinstance(filter_metadata, dict):
+        raise ValueError(
+            f"filter_metadata must be a JSON object, got {type(filter_metadata).__name__}"
+        )
+    return (
+        f" AND c.meta @> CAST(:{METADATA_FILTER_PARAM} AS jsonb)",
+        {METADATA_FILTER_PARAM: json.dumps(filter_metadata)},
+    )
+
+
 _QUERY_CANCELED = "57014"
 
 
@@ -461,10 +507,9 @@ class BasePgVectorStore:
             query += " AND c.source_id = ANY(CAST(:source_ids AS uuid[]))"
             params["source_ids"] = "{" + ",".join(source_ids) + "}"
 
-        if filter_metadata:
-            for key, value in filter_metadata.items():
-                query += f" AND c.meta @> CAST(:filter_{key} AS jsonb)"
-                params[f"filter_{key}"] = json.dumps({key: value})
+        filter_sql, filter_params = metadata_filter_clause(filter_metadata)
+        query += filter_sql
+        params.update(filter_params)
 
         query += f"""
             ORDER BY (e.embedding::vector({effective_dims})) <=> CAST(:embedding AS vector({effective_dims}))
@@ -669,10 +714,9 @@ class BasePgVectorStore:
             search_query += " AND c.source_id = ANY(CAST(:source_ids AS uuid[]))"
             params["source_ids"] = "{" + ",".join(source_ids) + "}"
 
-        if filter_metadata:
-            for key, value in filter_metadata.items():
-                search_query += f" AND c.meta @> CAST(:filter_{key} AS jsonb)"
-                params[f"filter_{key}"] = json.dumps({key: value})
+        filter_sql, filter_params = metadata_filter_clause(filter_metadata)
+        search_query += filter_sql
+        params.update(filter_params)
 
         search_query += f"""
             ORDER BY ts_rank(to_tsvector(CAST(:ts_language AS regconfig), c.{self.SEARCH_TEXT_COL}), websearch_to_tsquery(CAST(:ts_language AS regconfig), :query)) DESC
@@ -794,10 +838,9 @@ class BasePgVectorStore:
             search_query += " AND c.source_id = ANY(CAST(:source_ids AS uuid[]))"
             params["source_ids"] = "{" + ",".join(source_ids) + "}"
 
-        if filter_metadata:
-            for key, value in filter_metadata.items():
-                search_query += f" AND c.meta @> CAST(:filter_{key} AS jsonb)"
-                params[f"filter_{key}"] = json.dumps({key: value})
+        filter_sql, filter_params = metadata_filter_clause(filter_metadata)
+        search_query += filter_sql
+        params.update(filter_params)
 
         search_query += """
             ORDER BY pdb.score(c.id) DESC

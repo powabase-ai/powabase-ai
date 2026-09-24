@@ -1550,6 +1550,31 @@ def test_metadata_filter_and_item_ids_restrict_results(engine, session):
     assert [item.item_id for item in restricted] == [one.item_id]
 
 
+def test_a_crafted_metadata_filter_key_cannot_widen_the_search(engine, session):
+    """A filter's keys are caller data and must not reach the statement.
+
+    The filter used to be assembled one key at a time with the key interpolated
+    as the name of its own bind parameter, so a key closing the cast and adding
+    a predicate of its own was appended to the WHERE clause. On this path that
+    predicate made the scored query unanswerable and the search 500'd; on the
+    vector and tsvector paths the same key returned rows from another knowledge
+    base. Both are gone once the filter is bound: the key is a key nothing
+    matches, so the result is empty and the search still answers.
+    """
+    pgb.ensure_bm25_index(KB_A, engine=engine)
+    legitimate = _search(session, "Wanderung", top_k=10, filter_metadata={"lang": "de"})
+    assert len(legitimate) == 2
+
+    for crafted in (
+        "lang AS jsonb) OR 1=1 --",
+        "lang AS jsonb) OR (SELECT count(*) FROM pg_authid) > 0 --",
+    ):
+        widened = _search(
+            session, "Wanderung", top_k=10, filter_metadata={"lang": "de", crafted: 1}
+        )
+        assert widened == [], f"a filter key changed the result: {crafted!r}"
+
+
 def test_inserts_and_deletes_through_the_parent_are_visible_without_a_rebuild(engine, session):
     pgb.ensure_bm25_index(KB_A, engine=engine)
     assert len(_search(session, "Brücke", top_k=10)) == 1

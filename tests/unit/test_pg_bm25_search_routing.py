@@ -148,10 +148,16 @@ def test_item_ids_are_bound_as_a_uuid_array():
 
 
 def test_filter_metadata_is_bound_as_jsonb_containment():
+    """The whole filter is one bound value, keys included.
+
+    It used to be one clause per key with the key interpolated into the
+    statement as its own bind parameter's name — see
+    tests/unit/test_metadata_filter_binding.py.
+    """
     calls, _ = _capture(filter_metadata={"lang": "de"})
     sql, params = calls[-1]
-    assert "c.meta @> CAST(:filter_lang AS jsonb)" in sql
-    assert params["filter_lang"] == '{"lang": "de"}'
+    assert "c.meta @> CAST(:filter_metadata AS jsonb)" in sql
+    assert params["filter_metadata"] == '{"lang": "de"}'
 
 
 def test_scores_land_on_the_retrieved_items():
