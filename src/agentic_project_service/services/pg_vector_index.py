@@ -168,9 +168,26 @@ MAX_PER_KB_INDEXES = 200
 # timeout and reaching for the disk that was full the last time.
 #
 # ``MAX_HNSW_DIMS`` guards the one failure that can be predicted from the
-# catalog. This guards the rest, which can only be learnt by trying: three
-# attempts, because a lost connection or a server restart mid-build is a
-# failure a retry really does get past, and a single failure is not evidence.
+# catalog. This guards the rest, which can only be learnt by trying.
+#
+# Only a failure ``is_transient_db_error`` does *not* recognise is counted. The
+# task that runs these builds already retries a transient one six times, so
+# counting them here would let a single contention episode that outlasts those
+# retries write "3 consecutive failed attempts" and turn the index off until an
+# operator drops it by hand. An earlier version of this comment justified three
+# attempts rather than one with "a lost connection or a server restart mid-build",
+# which has it backwards twice over: those are transient, so they are not counted
+# at all, and they could not have been counted anyway -- the write that records an
+# attempt needs the connection that just died. Three rather than one is instead
+# because a permanent-looking failure may still be a one-off (a disk that was full
+# and has been cleared), and because the only remedy for reaching the bound is a
+# manual ``DROP INDEX``.
+#
+# It also only covers a build that got as far as creating a catalog entry, which
+# is where the count is kept: a ``CREATE INDEX CONCURRENTLY`` that fails before
+# that -- a syntax error, a missing relation, a refused permission -- leaves
+# nothing to write the count on, so those failures are unbounded here and bounded
+# only by the task's own retry policy.
 MAX_CONSECUTIVE_BUILD_FAILURES = 3
 
 # Where that count is kept. There is no builds table -- the logs are the whole
@@ -798,6 +815,28 @@ def _record_build_failure(conn, kb_id: str, dims: int, failures: int) -> None:
         )
 
 
+def _count_a_failed_attempt(
+    conn, kb_id: str, dims: int, prior_failures: int, exc: BaseException
+) -> None:
+    """Record this attempt against the bound -- unless a retry can get past it.
+
+    ``MAX_CONSECUTIVE_BUILD_FAILURES`` is three, and reaching it stops the index
+    being built or dispatched until an operator drops it by hand. The task that
+    runs these builds retries a transient failure six times, so a contention
+    episode that outlasts three of those retries would otherwise spend the whole
+    budget on failures the bound was never meant to count.
+
+    A transient failure still has to *keep* the count, though: the repair drop
+    that precedes a rebuild takes the record away with the index it is written
+    on, so writing nothing here would hand the whole budget back on every
+    episode. It is rewritten unchanged instead.
+    """
+    if not is_transient_db_error(exc):
+        _record_build_failure(conn, kb_id, dims, prior_failures + 1)
+    elif prior_failures:
+        _record_build_failure(conn, kb_id, dims, prior_failures)
+
+
 def _clear_build_failure_record(conn, kb_id: str, dims: int) -> None:
     """Forget the failures once a build has succeeded: the count is consecutive."""
     try:
@@ -901,13 +940,13 @@ def _create_index(
         conn.execute(text("SET lock_timeout = 0"))
         conn.execute(text(f"SET maintenance_work_mem = '{mem_mb}MB'"))
         conn.execute(text(per_kb_index_ddl(kb_id, dims)))
-    except Exception:
+    except Exception as exc:
         # Where the loop is bounded: the attempt is counted on the INVALID index
         # the failure just left behind, so the next reconcile -- in another
         # process, after a deploy, whenever -- can see how many times this has
         # already been tried. ``prior_failures`` is the count read before the
         # repair drop took the previous record away with the index.
-        _record_build_failure(conn, kb_id, dims, prior_failures + 1)
+        _count_a_failed_attempt(conn, kb_id, dims, prior_failures, exc)
         raise
     else:
         if prior_failures:
@@ -964,7 +1003,7 @@ def _drop_index(conn, kb_id: str, dims: int) -> None:
         _reset_session_setting(conn, "statement_timeout")
 
 
-def _repair_invalid(conn, kb_id: str, dims: int) -> bool:
+def _repair_invalid(conn, kb_id: str, dims: int, prior_failures: int = 0) -> bool:
     """Drop an INVALID index left behind by a failed concurrent build.
 
     ``CREATE INDEX CONCURRENTLY`` that is cancelled, killed or fails leaves the
@@ -975,6 +1014,14 @@ def _repair_invalid(conn, kb_id: str, dims: int) -> bool:
     an index can be invalid -- and a caller that gets ``False`` must *not* go on
     to build, because ``IF NOT EXISTS`` would no-op against the name the invalid
     index still holds and report a success that did not happen.
+
+    A drop that *raises* is counted against ``MAX_CONSECUTIVE_BUILD_FAILURES``
+    under the same rule the build's own failure is, because it is the same
+    attempt: this is the second way one reconcile of an INVALID index can end
+    without an index, and counting only the first left the bound reachable from
+    one side and not the other. Measured before it was: five consecutive
+    reconciles whose repair drop failed each recorded one failure and each asked
+    for a build again, because the count is written past this point, in the build.
     """
     if _build_in_progress(conn, kb_id, dims):
         return False
@@ -985,7 +1032,11 @@ def _repair_invalid(conn, kb_id: str, dims: int) -> bool:
         per_kb_index_name(kb_id, dims),
         AI_SCHEMA,
     )
-    _drop_index(conn, kb_id, dims)
+    try:
+        _drop_index(conn, kb_id, dims)
+    except Exception as exc:
+        _count_a_failed_attempt(conn, kb_id, dims, prior_failures, exc)
+        raise
     return True
 
 
@@ -1124,7 +1175,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         )
                         doomed.append(dims)
                         continue
-                    if not _repair_invalid(conn, kb_id, dims):
+                    if not _repair_invalid(conn, kb_id, dims, prior_failures):
                         # A build of this index is running, so the invalid entry
                         # stays. Falling through would reach
                         # `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, which

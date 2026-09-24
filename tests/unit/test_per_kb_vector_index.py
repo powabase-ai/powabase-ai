@@ -961,6 +961,158 @@ def test_a_comment_this_module_did_not_write_is_not_a_build_history(monkeypatch)
     assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
 
 
+def _transient_exc(sqlstate: str = "55P03", statement: str = "CREATE INDEX"):
+    """A database failure the pg_search path already classifies as transient.
+
+    55P03 is ``lock_not_available``: a genuine lock conflict, which is what a
+    concurrent build meets when another caller is holding the table -- and the
+    Celery task retries it six times.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    class _Orig(Exception):
+        pass
+
+    orig = _Orig("canceling statement due to lock timeout")
+    orig.sqlstate = sqlstate
+    return OperationalError(statement, {}, orig)
+
+
+class _CatalogStateConn(_FakeConn):
+    """A connection whose index comment survives the reconcile that wrote it.
+
+    The failure bound lives in the index's own ``pg_class`` comment, so a spec
+    about the bound being *reached* has to read back what the previous attempt
+    wrote. This keeps that one piece of catalog state, which is what lets a
+    sequence of reconciles be driven the way the ones against a real server were.
+    """
+
+    def __init__(self, *args, comment=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.comment = comment
+
+    def execute(self, clause, params=None):
+        sql = clause.text if hasattr(clause, "text") else str(clause)
+        if _FAILURE_COMMENT_DDL in sql:
+            self.statements.append(" ".join(sql.split()))
+            self.params.append(params)
+            self.comment = None if sql.rstrip().endswith("IS NULL") else sql.split("'")[-2]
+            return _Result([])
+        if _FAILURE_RECORD_QUERY in sql:
+            self.statements.append(" ".join(sql.split()))
+            self.params.append(params)
+            return _Result([(self.comment,)] if self.comment else [])
+        return super().execute(clause, params)
+
+
+def test_a_repair_drop_that_fails_counts_the_attempt_too(monkeypatch):
+    """The other way a reconcile of an INVALID index ends without building.
+
+    The attempt is counted in the build, so a repair drop that raises used to
+    return before anything counted it: five consecutive reconciles against a real
+    server each recorded ``failures=1`` and each asked for a build again, which is
+    the unbounded drop-rebuild-fail loop with the bound stepped around.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)],
+        rows_by_dims={1536: 20_000},
+        failures=1,
+        fail_on="DROP INDEX",
+    )
+    with pytest.raises(RuntimeError):
+        _ensure(monkeypatch, conn)
+    assert conn.issued("CREATE INDEX") == [], "the drop failed; nothing was rebuilt"
+    written = conn.issued(_FAILURE_COMMENT_DDL)
+    assert written, "an uncounted attempt is an unbounded loop"
+    assert _failure_comment(2) in written[0], written
+
+
+def test_repair_drops_that_keep_failing_reach_the_give_up_bound(monkeypatch, caplog):
+    """The loop itself, driven the way it was driven against a real server.
+
+    Reconcile after reconcile, with the index's comment carried between them the
+    way the catalog carries it. Without the attempt being counted this never
+    terminates: every run reports ``failures=1`` and asks for a build again.
+    """
+    outcomes = []
+    conn = _CatalogStateConn(
+        answers=[
+            (_CATALOG_QUERY, [_index_row(KB, 1536, False)]),
+            ("GROUP BY dims", [(1536,)]),
+            (_INDEX_COUNT_QUERY, [(1,)]),
+            (_ROW_COUNT_QUERY, [(20_000,)]),
+            (_LOCK_QUERY, [(True,)]),
+        ],
+        fail_on="DROP INDEX",
+    )
+    for _ in range(pvi.MAX_CONSECUTIVE_BUILD_FAILURES):
+        with pytest.raises(RuntimeError):
+            _ensure(monkeypatch, conn)
+    with caplog.at_level(logging.ERROR):
+        outcomes.append(_ensure(monkeypatch, conn))
+    assert outcomes[-1]["reason"] == "build_repeatedly_failed", outcomes
+    assert pvi.index_action(conn, KB) is None, "and nothing dispatches it again"
+    assert "by hand" in caplog.text
+
+
+def test_a_transient_build_failure_does_not_burn_an_attempt(monkeypatch):
+    """Three failures disable the index until an operator drops it by hand.
+
+    So the bound has to count only the failures a retry cannot get past. The task
+    that runs this classifies a lock conflict as transient and retries it six
+    times; one contention episode outlasting three of those retries would
+    otherwise write "3 consecutive failed attempts" and turn the index off for
+    good.
+    """
+    conn = _ensure_conn(
+        rows_by_dims={1536: 20_000}, fail_on="CREATE INDEX", exc=_transient_exc()
+    )
+    with pytest.raises(Exception, match="lock timeout"):
+        _ensure(monkeypatch, conn)
+    assert conn.issued(_FAILURE_COMMENT_DDL) == [], conn.statements
+
+
+def test_a_transient_build_failure_keeps_the_attempts_already_on_record(monkeypatch):
+    """Not counting it must not un-count the ones before it either.
+
+    The repair drop takes the record away with the index it is written on, so a
+    transient failure after a repair would otherwise reset the count to zero and
+    hand back the whole budget on every contention episode.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)],
+        rows_by_dims={1536: 20_000},
+        failures=2,
+        fail_on="CREATE INDEX",
+        exc=_transient_exc(),
+    )
+    with pytest.raises(Exception, match="lock timeout"):
+        _ensure(monkeypatch, conn)
+    written = conn.issued(_FAILURE_COMMENT_DDL)
+    assert written and _failure_comment(2) in written[0], written
+
+
+def test_a_transient_repair_drop_failure_does_not_burn_an_attempt(monkeypatch):
+    """The repair drop counts under the same rule, so it does not count this one.
+
+    The count on record may be rewritten -- it is the same number -- but it may
+    not advance: a lock conflict on the repair drop is what the task's own six
+    retries are for.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)],
+        rows_by_dims={1536: 20_000},
+        failures=1,
+        fail_on="DROP INDEX",
+        exc=_transient_exc(statement="DROP INDEX"),
+    )
+    with pytest.raises(Exception, match="lock timeout"):
+        _ensure(monkeypatch, conn)
+    for written in conn.issued(_FAILURE_COMMENT_DDL):
+        assert _failure_comment(1) in written, written
+        assert _failure_comment(2) not in written, written
+
+
 def test_a_build_that_has_failed_the_limit_is_not_attempted_again(monkeypatch, caplog):
     """Where the drop-rebuild-fail loop stops.
 
