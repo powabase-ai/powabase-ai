@@ -594,12 +594,65 @@ def test_a_lock_release_that_fails_discards_the_connection():
     conn = _FakeConn(fail_on="pg_advisory_unlock")
     pvi._release_lock(conn, pvi.index_lock_relation(KB, 1536))
     assert conn.invalidated, "a pooled connection still holding the lock skips every later build"
+    assert conn.rollbacks >= 1, "and the loop it is shared with has to be able to go on"
 
 
 def test_a_reset_that_fails_discards_the_connection():
     conn = _FakeConn(fail_on="RESET statement_timeout")
     pvi._reset_session_setting(conn, "statement_timeout")
     assert conn.invalidated
+    assert conn.rollbacks >= 1
+
+
+class _DiscardedConnectionConn(_FakeConn):
+    """A connection that behaves as a real one does after ``invalidate()``.
+
+    Measured against a real server on the AUTOCOMMIT connection this loop runs
+    on: after ``invalidate()`` the next statement raises ``PendingRollbackError``
+    ("Can't reconnect until invalid transaction is rolled back"), and it goes on
+    raising until the connection is rolled back. ``PendingRollbackError`` is not
+    classified as a transient database error either, so a connection lost
+    mid-loop would fail the run without the retry that exists for exactly that.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.discarded = False
+
+    def invalidate(self):
+        super().invalidate()
+        self.discarded = True
+
+    def rollback(self):
+        super().rollback()
+        self.discarded = False
+
+    def execute(self, clause, params=None):
+        if self.discarded:
+            raise RuntimeError("Can't reconnect until invalid transaction is rolled back")
+        return super().execute(clause, params)
+
+
+def test_a_discarded_loop_connection_is_given_back_so_the_rest_of_the_loop_runs(monkeypatch):
+    """The reconcile shares one connection across every dimension in play.
+
+    So a ``RESET`` that fails at the first dimension must not take the second with
+    it: a knowledge base that has just changed embedding model has an index to drop
+    at the old dimension and one to build at the new one.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 768), _index_row(KB, 1536)],
+        dims_present=(768, 1536),
+        rows_by_dims={768: 0, 1536: 0},
+        cls=_DiscardedConnectionConn,
+        fail_on="RESET lock_timeout",
+    )
+    outcome = _ensure(monkeypatch, conn)
+    assert conn.invalidated, "the connection that could not be reset must not be pooled"
+    assert outcome["dropped"] == [
+        pvi.per_kb_index_name(KB, 768),
+        pvi.per_kb_index_name(KB, 1536),
+    ], outcome
 
 
 def test_a_build_does_not_hold_the_settings_session_idle_in_a_transaction(monkeypatch):
@@ -815,9 +868,7 @@ def test_the_boot_sweep_leaves_out_an_index_at_the_failure_bound(caplog):
         for kb in _KBS[: pvi.MAX_SWEEP_DISPATCH]
     ]
     repairable = _sweep_index_row(_KBS[pvi.MAX_SWEEP_DISPATCH], 1536, False)
-    conn = _FakeConn(
-        answers=[(_SWEEP_CATALOG_QUERY, doomed + [repairable])], fail_on=_COUNT_QUERY
-    )
+    conn = _FakeConn(answers=[(_SWEEP_CATALOG_QUERY, doomed + [repairable])], fail_on=_COUNT_QUERY)
     with caplog.at_level(logging.WARNING):
         assert _sweep(conn) == [_KBS[pvi.MAX_SWEEP_DISPATCH]]
     assert str(pvi.MAX_SWEEP_DISPATCH) in caplog.text, (
@@ -1287,9 +1338,7 @@ def test_a_transient_build_failure_does_not_burn_an_attempt(monkeypatch):
     otherwise write "3 consecutive failed attempts" and turn the index off for
     good.
     """
-    conn = _ensure_conn(
-        rows_by_dims={1536: 20_000}, fail_on="CREATE INDEX", exc=_transient_exc()
-    )
+    conn = _ensure_conn(rows_by_dims={1536: 20_000}, fail_on="CREATE INDEX", exc=_transient_exc())
     with pytest.raises(Exception, match="lock timeout"):
         _ensure(monkeypatch, conn)
     assert conn.issued(_FAILURE_COMMENT_DDL) == [], conn.statements

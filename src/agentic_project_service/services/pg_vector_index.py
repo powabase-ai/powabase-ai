@@ -484,12 +484,23 @@ def thresholds(overrides: dict[str, int] | None = None) -> tuple[int, int]:
     bracketed, not bisected: at 2,000 rows the planner does not use a partial
     index at all (an exact bitmap scan and sort is genuinely cheaper, and
     exact), and at 73,290 rows the partial index is two orders of magnitude
-    faster. Inside that bracket the defaults are set by where the *regression*
-    is rather than by where the win is largest: the embeddings-side predicate
-    costs 80 ms at 21% selectivity and 129 ms at 30%, measured in knowledge
-    bases of 12.6k and 18k rows, and a build threshold above those leaves them
-    slower with no index to compensate. A project that measures its own
-    crossover can move both.
+    faster.
+
+    **The 50,000 default deliberately leaves a regression window unindexed, and a
+    project with a knowledge base in it should lower this setting.** The
+    embeddings-side predicate applies from the moment this deploys, with or
+    without a partial index, and in roughly the 10,000-25,000-row band at 1536
+    dimensions it replaces a fast approximate plan with a slow exact one: measured
+    6.18 ms at recall 0.608 against 50.35 ms at recall 1.000 for 10,000 rows, and
+    4.35 ms at 0.575 against 132.48 ms at 1.000 for 20,000. The same 10,000-row
+    knowledge base *with an index of its own* answers in 1.83 ms at recall 1.000 --
+    so at the default it is 27x slower than it needs to be, for nothing. The width
+    of the band is fixture-dependent; its existence is not, and it reproduced on a
+    fixture built for a different question. The default is high anyway, because an
+    index that is built and never scanned is paid for on every write (see the
+    module docstring), so the remedy is per project: measure that the index is
+    really scanned, then lower ``VECTOR_PER_KB_INDEX_MIN_ROWS`` past the knowledge
+    base's size. A project that measures its own crossover can move both.
 
     ``overrides`` is for a caller that cannot read settings through
     ``db.session``; see ``read_overrides``.
@@ -657,9 +668,15 @@ def candidate_dims(conn, knowledge_base_id: Any, cap: int) -> list[int]:
 def index_action(conn, knowledge_base_id: Any) -> str | None:
     """``"build"``, ``"drop"`` or None -- is there anything to reconcile here?
 
-    Cheap enough for the indexing path to call once per source: one catalog
-    lookup plus one bounded count per dimension in play. Never raises for a
-    knowledge base that has no embeddings at all.
+    Cheap enough for the indexing path to call once per source, but not free, and
+    the number matters at the shipped threshold: one catalog lookup plus two
+    bounded reads per dimension in play, each stopping at ``build_at + 1``. At the
+    50,000-row default that is a cap of 50,001 twice over, so **up to about 100,000
+    index rows read per dispatch** -- the dimension survey and then the count --
+    and once more per further dimension. Both are index-only reads of one knowledge
+    base's slice, which is why this is still the cheap side of dispatching a build
+    that would read the whole slice; a project that lowers the threshold lowers
+    this with it. Never raises for a knowledge base that has no embeddings at all.
 
     Nothing is asked for here that the reconcile would decline, because this runs
     once per source that finishes indexing: a build the width forbids
@@ -746,6 +763,33 @@ def _try_lock(conn, relation: str) -> bool:
     return bool(conn.execute(text(partition_build_lock_sql()), {"relation": relation}).scalar())
 
 
+def _discard_connection(conn) -> None:
+    """Throw this connection's backend away, and leave the handle usable.
+
+    ``invalidate()`` on its own is only half of it. Every caller here shares one
+    connection across the whole reconcile loop, and measured against a real server
+    on exactly that AUTOCOMMIT connection, the statement after ``invalidate()``
+    raises ``PendingRollbackError`` -- "Can't reconnect until invalid transaction
+    is rolled back" -- and goes on raising until the rollback. That error is not
+    classified as a transient database error, so a connection lost at one
+    dimension would fail the run without the retry that exists for exactly that,
+    and would take the other dimensions with it: a knowledge base that has just
+    changed embedding model has an index to drop at the old dimension and one to
+    build at the new one.
+
+    The rollback is what lets the handle reconnect; it rolls nothing back that the
+    caller wanted, because the backend it belonged to is already gone.
+    """
+    try:
+        conn.invalidate()
+    except Exception:
+        logger.debug("Could not invalidate the connection", exc_info=True)
+    try:
+        conn.rollback()
+    except Exception:
+        logger.debug("Could not give the invalidated connection back", exc_info=True)
+
+
 def _release_lock(conn, relation: str) -> None:
     """Give the session-scoped lock back, or throw the session away.
 
@@ -762,10 +806,7 @@ def _release_lock(conn, relation: str) -> None:
             relation,
             exc_info=True,
         )
-        try:
-            conn.invalidate()
-        except Exception:
-            logger.debug("Could not invalidate the connection either", exc_info=True)
+        _discard_connection(conn)
 
 
 def _reset_session_setting(conn, name: str) -> None:
@@ -784,10 +825,7 @@ def _reset_session_setting(conn, name: str) -> None:
             name,
             first_error_line(exc),
         )
-        try:
-            conn.invalidate()
-        except Exception:
-            logger.debug("Could not invalidate the connection either", exc_info=True)
+        _discard_connection(conn)
 
 
 def _release_settings_session() -> None:
