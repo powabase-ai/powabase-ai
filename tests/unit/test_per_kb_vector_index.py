@@ -1203,9 +1203,20 @@ class _PopulationConn(_FakeConn):
     def execute(self, clause, params=None):
         sql = clause.text if hasattr(clause, "text") else str(clause)
         if "GROUP BY dims" in sql:
-            # The dimension survey, which is deliberately not restricted.
+            # The dimension survey, answered from the same rows and under the same
+            # rule as the two counts: a survey that stops naming ``item_table`` is
+            # answered from every population, which is how a dimension only another
+            # population has reached the loop and crowded out one over the threshold.
             self._record(sql, params)
-            return _Result([(d,) for d in sorted({d for d, _ in self.population})])
+            wanted = self._restricted_to(sql, params)
+            return _Result(
+                [
+                    (d,)
+                    for d in sorted(
+                        {d for d, table in self.population if wanted is None or table == wanted}
+                    )
+                ]
+            )
         if _ROW_COUNT_QUERY in sql:
             self._record(sql, params)
             wanted = self._restricted_to(sql, params)
@@ -1290,6 +1301,46 @@ def test_an_index_whose_own_population_has_drained_is_dropped(monkeypatch):
     assert pvi.index_action(conn, KB) == "drop"
     outcome = _ensure(monkeypatch, conn, build_at=10_000, drop_below=5_000)
     assert outcome["dropped"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+
+
+def test_another_population_cannot_crowd_the_chunk_dimension_out_of_the_survey(monkeypatch):
+    """The survey gates the count, so an unrestricted survey is a decision too.
+
+    Measured: 30,000 ``full_documents`` at 64 dimensions written first, then 30,000
+    chunks at 128, threshold 1,000 -- the unrestricted survey returned ``[64]``, the
+    count at 64 returned 0, ``index_action`` returned None, and 30,000 chunk rows
+    thirty times over the threshold were never dispatched. Only the next boot
+    recovered it, and a restart is not a recovery for a running project.
+    """
+    two_populations = {(64, "full_documents"): 30_000, (128, "chunks"): 30_000}
+    conn = _population_conn(two_populations)
+    _at_ten_thousand(monkeypatch)
+    assert pvi.candidate_dims(conn, KB, 10_001) == [128], (
+        "the survey has to look at the population the index would cover"
+    )
+    assert pvi.index_action(conn, KB) == "build"
+    outcome = _ensure(monkeypatch, _population_conn(two_populations))
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 128)], outcome
+
+
+def test_the_survey_and_the_count_agree_about_which_rows_they_are_about(monkeypatch):
+    """All four places that decide eligibility name the one constant.
+
+    The predicate, the reconcile's count, the boot sweep's count and now the
+    dimension survey. Read off the statements, because a query that still binds a
+    value for ``item_table`` while no longer naming it in its SQL is answered by
+    Postgres from every population.
+    """
+    conn = _population_conn({(1536, "chunks"): 12_000, (1536, "graph_index_nodes"): 40_000})
+    _ensure(monkeypatch, conn)
+    deciding = [
+        st
+        for st in conn.statements
+        if "GROUP BY dims" in st or _ROW_COUNT_QUERY in st or _COUNT_QUERY in st
+    ]
+    assert deciding, conn.statements
+    for statement in deciding:
+        assert "item_table = :item_table" in statement, statement
 
 
 def test_the_boot_sweep_counts_only_the_population_the_index_covers():

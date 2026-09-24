@@ -716,6 +716,25 @@ def bounded_row_count(conn, knowledge_base_id: Any, dims: Any, cap: int) -> int:
     knowledge base whose chunks are gone loses the index even if its other
     populations are large, which is right, because the index covered only the
     chunks.
+
+    **Not the index-only read an earlier version of this docstring claimed, and
+    the ``LIMIT`` does not bound what it reads.** Measured on 60,000 rows (30,000
+    chunks, 30,000 ``full_documents``) with the two btrees this repo's own live
+    fixture creates -- ``(item_id)`` and ``(knowledge_base_id)`` -- this plans as a
+    sequential scan with all three predicates as *heap* filters:
+    ``Rows Removed by Filter: 30000``, ``Buffers: shared hit=3737``, 10.8 ms. The
+    ``LIMIT`` bounds the rows it *returns*, not the rows it reads to find them, so a
+    knowledge base with a large other population and few chunks reads the whole
+    slice. The ``item_table`` clause made this strictly worse by adding a second
+    unindexed filter, for a count ``index_action`` runs once per source that
+    finishes indexing.
+
+    A btree on ``(knowledge_base_id, item_table, dims)`` would make it the
+    index-only read the decision wants. **Deliberately not added here:** no
+    migration in this repository creates ``ai.embeddings``, so there is nowhere in
+    this PR to put one, and which btrees a real project database already carries
+    could not be confirmed from here -- the numbers above are against this repo's
+    fixture and nothing else. It belongs in the follow-up that owns the table.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     return int(
@@ -753,23 +772,38 @@ def candidate_dims(conn, knowledge_base_id: Any, cap: int) -> list[int]:
     this with ``existing_per_kb_indexes``, so the model-change case (rows now at
     a new dimension, an index still at the old one) is evaluated for dropping.
 
-    Not restricted to ``PER_KB_INDEX_ITEM_TABLE``, unlike the count that decides.
-    This only says which dimensions are worth *looking* at, and the look is
-    ``bounded_row_count``, which is restricted -- so a dimension only the other
-    populations have reaches the loop and is declined there. Restricting here as
-    well would save that one bounded count and cost the survey a predicate on
-    every dimension's read, which is the wrong trade for a query whose job is to
-    be cheap.
+    Restricted to ``PER_KB_INDEX_ITEM_TABLE``, like the count that decides, and an
+    earlier version of this was not -- which made the ``cap`` budget spendable by a
+    population the decision then ignores. Measured: 4,000 (here 30,000)
+    ``full_documents`` rows at 64 dimensions written first, then chunks at 128,
+    threshold 1,000 -- the unrestricted survey returned ``[64]``,
+    ``bounded_row_count`` at 64 returned 0, ``index_action`` returned None, and
+    30,000 chunk rows well above the threshold were never dispatched at all. The
+    boot sweep recovers it, but a restart is not a recovery for a running project.
+
+    The cost is real and is the reason it was not restricted: the ``LIMIT`` now has
+    to read past the other populations to find ``cap`` rows of this one, 0.77 ms to
+    2.87 ms on that fixture. It is not a *new* cost, though --
+    ``bounded_row_count`` already carries the same filter and took 4.13 ms in the
+    same call -- so this adds no worst case the decision did not already have, and
+    the btree named there fixes both at once. What it buys is that every query
+    deciding eligibility agrees about which rows the index covers, which is what
+    ``PER_KB_INDEX_ITEM_TABLE`` exists to make true.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     rows = conn.execute(
         text(
             "SELECT dims FROM (SELECT dims FROM "
             f'"{AI_SCHEMA}".embeddings '
-            "WHERE knowledge_base_id = CAST(:kb AS uuid) LIMIT :cap) s "
+            "WHERE knowledge_base_id = CAST(:kb AS uuid) AND item_table = :item_table "
+            "LIMIT :cap) s "
             "GROUP BY dims ORDER BY count(*) DESC"
         ),
-        {"kb": kb_id, "cap": max(1, int(cap))},
+        {
+            "kb": kb_id,
+            "cap": max(1, int(cap)),
+            "item_table": PER_KB_INDEX_ITEM_TABLE,
+        },
     ).all()
     return [int(r[0]) for r in rows if MIN_DIMS <= int(r[0]) <= MAX_DIMS]
 
