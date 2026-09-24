@@ -288,12 +288,26 @@ def ensure_embedding_index(session: Session, schema: str, dims: int) -> None:
     **This index is load-bearing for every knowledge base without a partial one,
     and narrowing it is sequenced.** It is the index a KB-scoped vector search
     falls back to, so it must keep covering every row of its dimension until the
+    last process still issuing the *older* query shape is gone. "Once the
     embeddings-side ``knowledge_base_id`` predicate (see ``kb_sql_literal``) has
-    deployed everywhere. Replacing it with a residual index that excludes the
-    knowledge bases holding their own partial index is the planned follow-up and
-    the reason that ordering matters: the older query shape matches no HNSW
-    index at all against a residual one and degenerates to a sequential scan.
-    ``pg_vector_index``'s module docstring holds the constraint in full.
+    deployed everywhere" is the weaker statement and not the constraint: a rolling
+    deploy runs both shapes side by side, and the old shape matches no HNSW index
+    at all against a residual one and sequential-scans ``ai.embeddings`` for as
+    long as it lives.
+
+    Replacing this index with a residual one that excludes the knowledge bases
+    holding their own partial index is the planned follow-up, tracked as **#88**,
+    which carries that constraint in its strict form. Its predicate has to exclude
+    the *population* a per-knowledge-base index covers rather than the whole
+    knowledge base -- ``AND NOT (knowledge_base_id IN (...) AND item_table =
+    'chunks')``, not ``AND knowledge_base_id NOT IN (...)`` -- because that index
+    holds ``chunks`` alone (see ``PER_KB_INDEX_ITEM_TABLE``). Written the weaker
+    way, a covered knowledge base's ``full_documents``, ``graph_index_nodes`` and
+    ``doc2json_documents`` embeddings are excluded from the per-KB index by
+    ``item_table`` and from the residual one by ``knowledge_base_id``, so they end
+    up with no HNSW index at all and every document-store vector search on that
+    knowledge base sequential-scans the table. ``pg_vector_index``'s module
+    docstring holds the constraint in full.
     """
     dims = int(dims)
     if not (1 <= dims <= 8192):
@@ -835,9 +849,19 @@ class BasePgVectorStore:
             yield
         finally:
             try:
-                self.session.execute(
-                    text("SELECT set_config('enable_indexscan', :prior, true)"), {"prior": prior}
-                )
+                # Savepointed like the two above, and for the caller's sake rather
+                # than this block's: the rows are already off the cursor when this
+                # runs, so a bare failure here would hand back a search that
+                # answered and a transaction that no longer works, and the error
+                # would surface on whatever the caller did next. When the
+                # transaction is already aborted -- the usual reason to be here at
+                # all -- the savepoint cannot be taken either and this logs exactly
+                # as it did before.
+                with self.session.begin_nested():
+                    self.session.execute(
+                        text("SELECT set_config('enable_indexscan', :prior, true)"),
+                        {"prior": prior},
+                    )
             except Exception as e:
                 logger.debug(
                     "Could not restore enable_indexscan=%s after a vector search on KB %s: %s",
@@ -1076,15 +1100,23 @@ class BasePgVectorStore:
         still reaches the index at pgvector's default recall -- which is what that
         handler says happens.
 
-        The *restores* are not savepointed, and that is a smaller gap left
-        deliberately rather than an oversight. The failure they actually meet is a
-        transaction the search already aborted, where a savepoint cannot be taken
-        either and the settings die with the transaction anyway. A restore that
-        fails on an otherwise healthy transaction does leave the caller's
-        transaction aborted after this block has returned -- injected at the
-        restore alone and confirmed -- but that is a statement the search's answer
-        does not depend on, and the caller's own ``rollback`` is what follows a
-        failed request.
+        **The restores are savepointed too, and they had to be.** Eight statements
+        issue from the two blocks, not five: three of them are restores, and a
+        failure there is worse than it looks rather than harmless. The rows are
+        already off the cursor by then, so a bare failure hands the caller a search
+        that *answered* and a transaction that no longer works, and the error
+        surfaces on whatever the request does next -- resolving the items,
+        reranking, a write. Injected at each restore on its own, before:
+
+        | failure injected at | restores bare | restores savepointed |
+        |---|---|---|
+        | ``set_config('enable_indexscan', prior)`` | answers, then the **caller's transaction is aborted** | answers, transaction usable |
+        | ``set_config('enable_sort', prior)`` | answers, then the **caller's transaction is aborted** | answers, transaction usable |
+        | ``set_config('hnsw.ef_search', prior)`` | not reached on a fresh connection (the probe read NULL) | same |
+
+        This cannot make the common case worse: the failure a restore usually meets
+        is a transaction the search itself aborted, and there the savepoint cannot
+        be taken either, so the handler logs exactly what it logged before.
         """
         # Not inside the try below: both arguments have already been validated by
         # the caller, so a failure here is a programming error and should not be
@@ -1194,10 +1226,13 @@ class BasePgVectorStore:
             # is as readable in a captured statement list as the set was.
             if prior_ef_search is not None:
                 try:
-                    self.session.execute(
-                        text("SELECT set_config('hnsw.ef_search', :prior, true)"),
-                        {"prior": prior_ef_search},
-                    )
+                    # In a savepoint for the caller's sake: see the note on the
+                    # restore in ``_insisting_on_an_exact_search``.
+                    with self.session.begin_nested():
+                        self.session.execute(
+                            text("SELECT set_config('hnsw.ef_search', :prior, true)"),
+                            {"prior": prior_ef_search},
+                        )
                 except Exception as e:
                     logger.debug(
                         "Could not restore hnsw.ef_search=%s after a vector search on KB %s: %s",
@@ -1206,9 +1241,10 @@ class BasePgVectorStore:
                         e,
                     )
             try:
-                self.session.execute(
-                    text("SELECT set_config('enable_sort', :prior, true)"), {"prior": prior}
-                )
+                with self.session.begin_nested():
+                    self.session.execute(
+                        text("SELECT set_config('enable_sort', :prior, true)"), {"prior": prior}
+                    )
             except Exception as e:
                 logger.debug(
                     "Could not restore enable_sort=%s after a vector search on KB %s: %s",
