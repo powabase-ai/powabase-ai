@@ -8,11 +8,14 @@ produced ``top_k`` rows of the knowledge base it wanted -- which is both slow
 population (the true top-k *within* one knowledge base needs far more
 candidates than ``hnsw.ef_search`` emits globally).
 
-A partial index fixes both, for the knowledge bases big enough to be worth one:
+A partial index fixes both, for the knowledge bases big enough to be worth one --
+counting only the one item population it covers, because ``ai.embeddings`` is
+polymorphic (``PER_KB_INDEX_ITEM_TABLE``):
 
     CREATE INDEX CONCURRENTLY hnsw_kb_<hex>_<dims> ON ai.embeddings
       USING hnsw ((embedding::vector(<dims>)) vector_cosine_ops)
-      WHERE knowledge_base_id = '<kb>' AND dims = <dims>;
+      WHERE knowledge_base_id = '<kb>' AND dims = <dims>
+        AND item_table = 'chunks';
 
 Measured on a 56,000-row fixture at 1536 dimensions whose largest knowledge
 base held 12,000 rows (21% of the table), ``shared_buffers`` 128 MB,
@@ -118,6 +121,32 @@ from .settings_registry import SETTINGS_REGISTRY, get_setting
 
 logger = logging.getLogger(__name__)
 
+# The one item population these indexes cover. ``ai.embeddings`` is polymorphic --
+# ``item_table`` is a NOT NULL column on it, and four item tables share the
+# relation -- so an index whose predicate names only ``(knowledge_base_id, dims)``
+# spans all four. A knowledge base then crossed the build threshold on the *sum*
+# over its populations and got one index mixing them, and the chunk search this
+# feature steers onto it walked entries that cannot join: measured at 1536
+# dimensions, the same 1,000 chunk rows scored recall 0.858 indexed alone against
+# 0.383 in an index that also held 9,000 ``full_documents`` rows, and 6,000 chunk
+# rows 0.925 against 0.812 with 6,000 graph-node rows beside them, tail minimum
+# 0.700 against 0.300.
+#
+# So the predicate names it, and both counts that decide eligibility are restricted
+# to it, which makes a knowledge base's eligibility a fact about the population the
+# index will actually cover.
+#
+# The index *name* is deliberately not qualified by it. There is only ever one
+# population indexed, so there is nothing to disambiguate, and the name is the key
+# every catalog lookup, drop path and failure record in this module is derived
+# from -- a second component would be a rename of all of them for no gain. If a
+# second population is ever indexed, that is when the name has to grow.
+#
+# This is the single source of the string: ``base_vector_store`` needs the same
+# literal in the search query for the planner to be able to prove the predicate,
+# and it already imports this module, so it imports this rather than restating it.
+PER_KB_INDEX_ITEM_TABLE = "chunks"
+
 # Index names are ``hnsw_kb_<32 hex>_<dims>``: 8 + 32 + 1 + 4 = 45 bytes at
 # most, inside Postgres' 63-byte identifier limit, and free of the dashes a
 # UUID's canonical form would need quoting for.
@@ -168,9 +197,26 @@ MAX_PER_KB_INDEXES = 200
 # timeout and reaching for the disk that was full the last time.
 #
 # ``MAX_HNSW_DIMS`` guards the one failure that can be predicted from the
-# catalog. This guards the rest, which can only be learnt by trying: three
-# attempts, because a lost connection or a server restart mid-build is a
-# failure a retry really does get past, and a single failure is not evidence.
+# catalog. This guards the rest, which can only be learnt by trying.
+#
+# Only a failure ``is_transient_db_error`` does *not* recognise is counted. The
+# task that runs these builds already retries a transient one six times, so
+# counting them here would let a single contention episode that outlasts those
+# retries write "3 consecutive failed attempts" and turn the index off until an
+# operator drops it by hand. An earlier version of this comment justified three
+# attempts rather than one with "a lost connection or a server restart mid-build",
+# which has it backwards twice over: those are transient, so they are not counted
+# at all, and they could not have been counted anyway -- the write that records an
+# attempt needs the connection that just died. Three rather than one is instead
+# because a permanent-looking failure may still be a one-off (a disk that was full
+# and has been cleared), and because the only remedy for reaching the bound is a
+# manual ``DROP INDEX``.
+#
+# It also only covers a build that got as far as creating a catalog entry, which
+# is where the count is kept: a ``CREATE INDEX CONCURRENTLY`` that fails before
+# that -- a syntax error, a missing relation, a refused permission -- leaves
+# nothing to write the count on, so those failures are unbounded here and bounded
+# only by the task's own retry policy.
 MAX_CONSECUTIVE_BUILD_FAILURES = 3
 
 # Where that count is kept. There is no builds table -- the logs are the whole
@@ -274,6 +320,12 @@ def per_kb_index_ddl(knowledge_base_id: Any, dims: Any) -> str:
     value -- and the index would cover rows the query's own ``e.dims``
     predicate excludes.
 
+    ``item_table`` likewise, because ``ai.embeddings`` is polymorphic and this
+    index covers one population of it; see ``PER_KB_INDEX_ITEM_TABLE`` for what
+    mixing them cost. The search query has to carry the same literal or the
+    planner cannot prove the predicate and matches no partial index at all -- a
+    half-landed change is slow, not wrong.
+
     The operator class and the cast match the shared per-dimension index
     exactly. Both are load-bearing: the index is on an *expression*, so a query
     whose ``ORDER BY`` does not contain the same ``::vector(N)`` cast matches no
@@ -285,7 +337,8 @@ def per_kb_index_ddl(knowledge_base_id: Any, dims: Any) -> str:
         f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {per_kb_index_name(kb_id, n)} "
         f'ON "{AI_SCHEMA}".embeddings '
         f"USING hnsw ((embedding::vector({n})) vector_cosine_ops) "
-        f"WHERE knowledge_base_id = '{kb_id}' AND dims = {n}"
+        f"WHERE knowledge_base_id = '{kb_id}' AND dims = {n} "
+        f"AND item_table = '{PER_KB_INDEX_ITEM_TABLE}'"
     )
 
 
@@ -431,12 +484,23 @@ def thresholds(overrides: dict[str, int] | None = None) -> tuple[int, int]:
     bracketed, not bisected: at 2,000 rows the planner does not use a partial
     index at all (an exact bitmap scan and sort is genuinely cheaper, and
     exact), and at 73,290 rows the partial index is two orders of magnitude
-    faster. Inside that bracket the defaults are set by where the *regression*
-    is rather than by where the win is largest: the embeddings-side predicate
-    costs 80 ms at 21% selectivity and 129 ms at 30%, measured in knowledge
-    bases of 12.6k and 18k rows, and a build threshold above those leaves them
-    slower with no index to compensate. A project that measures its own
-    crossover can move both.
+    faster.
+
+    **The 50,000 default deliberately leaves a regression window unindexed, and a
+    project with a knowledge base in it should lower this setting.** The
+    embeddings-side predicate applies from the moment this deploys, with or
+    without a partial index, and in roughly the 10,000-25,000-row band at 1536
+    dimensions it replaces a fast approximate plan with a slow exact one: measured
+    6.18 ms at recall 0.608 against 50.35 ms at recall 1.000 for 10,000 rows, and
+    4.35 ms at 0.575 against 132.48 ms at 1.000 for 20,000. The same 10,000-row
+    knowledge base *with an index of its own* answers in 1.83 ms at recall 1.000 --
+    so at the default it is 27x slower than it needs to be, for nothing. The width
+    of the band is fixture-dependent; its existence is not, and it reproduced on a
+    fixture built for a different question. The default is high anyway, because an
+    index that is built and never scanned is paid for on every write (see the
+    module docstring), so the remedy is per project: measure that the index is
+    really scanned, then lower ``VECTOR_PER_KB_INDEX_MIN_ROWS`` past the knowledge
+    base's size. A project that measures its own crossover can move both.
 
     ``overrides`` is for a caller that cannot read settings through
     ``db.session``; see ``read_overrides``.
@@ -529,12 +593,20 @@ def per_kb_index_count(conn) -> int:
 
 
 def bounded_row_count(conn, knowledge_base_id: Any, dims: Any, cap: int) -> int:
-    """Rows this knowledge base has at this dimension, counted no further than ``cap``.
+    """Indexable rows this KB has at this dimension, counted no further than ``cap``.
 
     The decision only needs to know which side of a threshold the count falls
     on, so the count stops there. Without the bound this would read every
     embedding of the largest knowledge base in the project on every source that
     finishes indexing.
+
+    Restricted to ``PER_KB_INDEX_ITEM_TABLE``, because that is the population the
+    index will cover: counting the others too let a knowledge base cross the
+    threshold on the sum and be given an index that mostly indexes rows its
+    searches cannot use. It cuts the same way for the drop threshold -- a
+    knowledge base whose chunks are gone loses the index even if its other
+    populations are large, which is right, because the index covered only the
+    chunks.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     return int(
@@ -543,9 +615,15 @@ def bounded_row_count(conn, knowledge_base_id: Any, dims: Any, cap: int) -> int:
                 "SELECT count(*) FROM (SELECT 1 FROM "
                 f'"{AI_SCHEMA}".embeddings '
                 "WHERE knowledge_base_id = CAST(:kb AS uuid) AND dims = :dims "
+                "AND item_table = :item_table "
                 "LIMIT :cap) s"
             ),
-            {"kb": kb_id, "dims": _validated_dims(dims), "cap": max(1, int(cap))},
+            {
+                "kb": kb_id,
+                "dims": _validated_dims(dims),
+                "cap": max(1, int(cap)),
+                "item_table": PER_KB_INDEX_ITEM_TABLE,
+            },
         ).scalar()
         or 0
     )
@@ -565,6 +643,14 @@ def candidate_dims(conn, knowledge_base_id: Any, cap: int) -> list[int]:
     A dimension that already *has* an index is never missed: the caller unions
     this with ``existing_per_kb_indexes``, so the model-change case (rows now at
     a new dimension, an index still at the old one) is evaluated for dropping.
+
+    Not restricted to ``PER_KB_INDEX_ITEM_TABLE``, unlike the count that decides.
+    This only says which dimensions are worth *looking* at, and the look is
+    ``bounded_row_count``, which is restricted -- so a dimension only the other
+    populations have reaches the loop and is declined there. Restricting here as
+    well would save that one bounded count and cost the survey a predicate on
+    every dimension's read, which is the wrong trade for a query whose job is to
+    be cheap.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     rows = conn.execute(
@@ -582,9 +668,15 @@ def candidate_dims(conn, knowledge_base_id: Any, cap: int) -> list[int]:
 def index_action(conn, knowledge_base_id: Any) -> str | None:
     """``"build"``, ``"drop"`` or None -- is there anything to reconcile here?
 
-    Cheap enough for the indexing path to call once per source: one catalog
-    lookup plus one bounded count per dimension in play. Never raises for a
-    knowledge base that has no embeddings at all.
+    Cheap enough for the indexing path to call once per source, but not free, and
+    the number matters at the shipped threshold: one catalog lookup plus two
+    bounded reads per dimension in play, each stopping at ``build_at + 1``. At the
+    50,000-row default that is a cap of 50,001 twice over, so **up to about 100,000
+    index rows read per dispatch** -- the dimension survey and then the count --
+    and once more per further dimension. Both are index-only reads of one knowledge
+    base's slice, which is why this is still the cheap side of dispatching a build
+    that would read the whole slice; a project that lowers the threshold lowers
+    this with it. Never raises for a knowledge base that has no embeddings at all.
 
     Nothing is asked for here that the reconcile would decline, because this runs
     once per source that finishes indexing: a build the width forbids
@@ -671,6 +763,33 @@ def _try_lock(conn, relation: str) -> bool:
     return bool(conn.execute(text(partition_build_lock_sql()), {"relation": relation}).scalar())
 
 
+def _discard_connection(conn) -> None:
+    """Throw this connection's backend away, and leave the handle usable.
+
+    ``invalidate()`` on its own is only half of it. Every caller here shares one
+    connection across the whole reconcile loop, and measured against a real server
+    on exactly that AUTOCOMMIT connection, the statement after ``invalidate()``
+    raises ``PendingRollbackError`` -- "Can't reconnect until invalid transaction
+    is rolled back" -- and goes on raising until the rollback. That error is not
+    classified as a transient database error, so a connection lost at one
+    dimension would fail the run without the retry that exists for exactly that,
+    and would take the other dimensions with it: a knowledge base that has just
+    changed embedding model has an index to drop at the old dimension and one to
+    build at the new one.
+
+    The rollback is what lets the handle reconnect; it rolls nothing back that the
+    caller wanted, because the backend it belonged to is already gone.
+    """
+    try:
+        conn.invalidate()
+    except Exception:
+        logger.debug("Could not invalidate the connection", exc_info=True)
+    try:
+        conn.rollback()
+    except Exception:
+        logger.debug("Could not give the invalidated connection back", exc_info=True)
+
+
 def _release_lock(conn, relation: str) -> None:
     """Give the session-scoped lock back, or throw the session away.
 
@@ -687,10 +806,7 @@ def _release_lock(conn, relation: str) -> None:
             relation,
             exc_info=True,
         )
-        try:
-            conn.invalidate()
-        except Exception:
-            logger.debug("Could not invalidate the connection either", exc_info=True)
+        _discard_connection(conn)
 
 
 def _reset_session_setting(conn, name: str) -> None:
@@ -709,10 +825,7 @@ def _reset_session_setting(conn, name: str) -> None:
             name,
             first_error_line(exc),
         )
-        try:
-            conn.invalidate()
-        except Exception:
-            logger.debug("Could not invalidate the connection either", exc_info=True)
+        _discard_connection(conn)
 
 
 def _release_settings_session() -> None:
@@ -766,6 +879,16 @@ def recorded_build_failures(conn, kb_id: str, dims: int) -> int:
         text("SELECT obj_description(to_regclass(:index)::oid, 'pg_class')"),
         {"index": _qualified_index(kb_id, dims)},
     ).scalar()
+    return build_failures_in(comment)
+
+
+def build_failures_in(comment: str | None) -> int:
+    """The consecutive-failure count a ``pg_class`` comment records, or zero.
+
+    Split out from ``recorded_build_failures`` because the start-up sweep reads
+    these comments in bulk, as a column of the catalog SELECT it already runs,
+    rather than one round trip per index on the boot path.
+    """
     match = _BUILD_FAILURES_PATTERN.match(comment or "")
     return int(match.group(1)) if match else 0
 
@@ -796,6 +919,28 @@ def _record_build_failure(conn, kb_id: str, dims: int, failures: int) -> None:
             failures,
             first_error_line(exc),
         )
+
+
+def _count_a_failed_attempt(
+    conn, kb_id: str, dims: int, prior_failures: int, exc: BaseException
+) -> None:
+    """Record this attempt against the bound -- unless a retry can get past it.
+
+    ``MAX_CONSECUTIVE_BUILD_FAILURES`` is three, and reaching it stops the index
+    being built or dispatched until an operator drops it by hand. The task that
+    runs these builds retries a transient failure six times, so a contention
+    episode that outlasts three of those retries would otherwise spend the whole
+    budget on failures the bound was never meant to count.
+
+    A transient failure still has to *keep* the count, though: the repair drop
+    that precedes a rebuild takes the record away with the index it is written
+    on, so writing nothing here would hand the whole budget back on every
+    episode. It is rewritten unchanged instead.
+    """
+    if not is_transient_db_error(exc):
+        _record_build_failure(conn, kb_id, dims, prior_failures + 1)
+    elif prior_failures:
+        _record_build_failure(conn, kb_id, dims, prior_failures)
 
 
 def _clear_build_failure_record(conn, kb_id: str, dims: int) -> None:
@@ -865,6 +1010,18 @@ def _create_index(
     indefinitely; it blocks no writes while it waits
     (``ShareUpdateExclusiveLock`` only).
 
+    ``lock_timeout = 0`` for the same trade and the same wait, because
+    ``statement_timeout`` does not cover it. ``CREATE INDEX CONCURRENTLY``'s
+    first phase waits for every transaction that could still write a row the
+    build has not seen, and it waits on that transaction's *virtual transaction
+    id* -- a lock wait, which ``lock_timeout`` bounds and ``statement_timeout``
+    does not. A role-level ``lock_timeout`` is exactly as realistic as a
+    role-level ``statement_timeout``: images in ordinary use ship an application
+    role with both set to a few seconds. Measured against a real server with a
+    role-level ``lock_timeout`` of 2 s and one open write transaction, the build
+    failed in 2.02 s, five attempts out of five, leaving the INVALID index this
+    function then has to count.
+
     A build that runs out of disk leaves an INVALID index behind, and the next
     ensure drops and rebuilds it rather than reporting it as built (see
     ``_repair_invalid`` and its caller). ``estimated_index_mb`` says why there is
@@ -886,21 +1043,23 @@ def _create_index(
         mem_mb = maintenance_work_mem_mb()
     try:
         conn.execute(text("SET statement_timeout = 0"))
+        conn.execute(text("SET lock_timeout = 0"))
         conn.execute(text(f"SET maintenance_work_mem = '{mem_mb}MB'"))
         conn.execute(text(per_kb_index_ddl(kb_id, dims)))
-    except Exception:
+    except Exception as exc:
         # Where the loop is bounded: the attempt is counted on the INVALID index
         # the failure just left behind, so the next reconcile -- in another
         # process, after a deploy, whenever -- can see how many times this has
         # already been tried. ``prior_failures`` is the count read before the
         # repair drop took the previous record away with the index.
-        _record_build_failure(conn, kb_id, dims, prior_failures + 1)
+        _count_a_failed_attempt(conn, kb_id, dims, prior_failures, exc)
         raise
     else:
         if prior_failures:
             _clear_build_failure_record(conn, kb_id, dims)
     finally:
         _reset_session_setting(conn, "maintenance_work_mem")
+        _reset_session_setting(conn, "lock_timeout")
         _reset_session_setting(conn, "statement_timeout")
 
 
@@ -917,6 +1076,17 @@ def _drop_index(conn, kb_id: str, dims: int) -> None:
     2 s role timeout and one open write transaction -- cancelled after 2.02 s,
     leaving exactly that state.
 
+    ``lock_timeout = 0`` because ``statement_timeout`` never bounded that wait in
+    the first place, and is therefore not the setting that has been cancelling
+    these drops. The wait is on the conflicting transaction's *virtual
+    transaction id*, which is a lock wait: ``statement_timeout`` does not cover
+    it and ``lock_timeout`` does. Measured on the same server with a role-level
+    ``lock_timeout`` of 2 s: the drop failed in 2.01 s, five attempts out of
+    five, leaving ``indisvalid = false, indisready = true`` -- and on this
+    function's other caller, a deleted knowledge base's drop, that state is
+    permanent, because the row the index is named after is gone and nothing will
+    reconcile it again.
+
     An ensure finds that state on its next run and repairs it. The deleted
     knowledge base's drop cannot: the row these indexes are named after is gone,
     so neither ``index_action`` nor the start-up sweep will ever look at them
@@ -932,12 +1102,14 @@ def _drop_index(conn, kb_id: str, dims: int) -> None:
     """
     try:
         conn.execute(text("SET statement_timeout = 0"))
+        conn.execute(text("SET lock_timeout = 0"))
         conn.execute(text(per_kb_index_drop_ddl(kb_id, dims)))
     finally:
+        _reset_session_setting(conn, "lock_timeout")
         _reset_session_setting(conn, "statement_timeout")
 
 
-def _repair_invalid(conn, kb_id: str, dims: int) -> bool:
+def _repair_invalid(conn, kb_id: str, dims: int, prior_failures: int = 0) -> bool:
     """Drop an INVALID index left behind by a failed concurrent build.
 
     ``CREATE INDEX CONCURRENTLY`` that is cancelled, killed or fails leaves the
@@ -948,6 +1120,14 @@ def _repair_invalid(conn, kb_id: str, dims: int) -> bool:
     an index can be invalid -- and a caller that gets ``False`` must *not* go on
     to build, because ``IF NOT EXISTS`` would no-op against the name the invalid
     index still holds and report a success that did not happen.
+
+    A drop that *raises* is counted against ``MAX_CONSECUTIVE_BUILD_FAILURES``
+    under the same rule the build's own failure is, because it is the same
+    attempt: this is the second way one reconcile of an INVALID index can end
+    without an index, and counting only the first left the bound reachable from
+    one side and not the other. Measured before it was: five consecutive
+    reconciles whose repair drop failed each recorded one failure and each asked
+    for a build again, because the count is written past this point, in the build.
     """
     if _build_in_progress(conn, kb_id, dims):
         return False
@@ -958,7 +1138,11 @@ def _repair_invalid(conn, kb_id: str, dims: int) -> bool:
         per_kb_index_name(kb_id, dims),
         AI_SCHEMA,
     )
-    _drop_index(conn, kb_id, dims)
+    try:
+        _drop_index(conn, kb_id, dims)
+    except Exception as exc:
+        _count_a_failed_attempt(conn, kb_id, dims, prior_failures, exc)
+        raise
     return True
 
 
@@ -1097,7 +1281,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         )
                         doomed.append(dims)
                         continue
-                    if not _repair_invalid(conn, kb_id, dims):
+                    if not _repair_invalid(conn, kb_id, dims, prior_failures):
                         # A build of this index is running, so the invalid entry
                         # stays. Falling through would reach
                         # `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, which
@@ -1359,11 +1543,33 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
     cheap; the first two need the grouped count, which is not, so it runs under
     ``SWEEP_TIMEOUT_MS``.
 
+    That count is restricted to ``PER_KB_INDEX_ITEM_TABLE`` for the reason
+    ``bounded_row_count`` is: the two thresholds are about the population the index
+    covers, and this query and that one have to agree about which rows those are or
+    the boot dispatches builds the reconcile then declines.
+
+    An ``INVALID`` index that has already reached
+    ``MAX_CONSECUTIVE_BUILD_FAILURES`` is not one of them: the reconcile would
+    read the same count and decline, so dispatching it only spends one of
+    ``MAX_SWEEP_DISPATCH`` places -- and because the list is ``INVALID``-first,
+    that many given-up indexes would fill it on every boot. Its history comes from
+    the comment column on the catalog SELECT above, not from a read per index. It
+    is still dispatched for the other two reasons: giving up on the *repair* is not
+    giving up on the *drop*, and a knowledge base that has since fallen below the
+    drop threshold wants the index gone -- which is also what re-arms the build.
+
     An abandoned count is not evidence about any knowledge base, so when it
     fails nothing is concluded from it -- only the ``INVALID`` indexes are
     returned. In particular the "a knowledge base whose rows are all gone still
     has its index" case cannot be told apart from a count that never ran, so it
     is only considered when the count finished.
+
+    One case it does not catch: an index at a dimension the knowledge base no
+    longer has any rows at -- an embedding model change, where the grouped count
+    has a group for the new dimension and none for the old one, so neither the
+    "no index" nor the "all rows gone" test fires for the stale one. Left to
+    ``index_action``, which unions the dimensions in play with the dimensions that
+    have an index and asks for the drop on the next source that finishes indexing.
 
     At most ``MAX_SWEEP_DISPATCH`` ids come back, because each one can start an
     unbounded index build.
@@ -1374,13 +1580,15 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
     """
     engine = _engine(engine)
     needing: dict[str, None] = {}
+    given_up: list[str] = []
 
     try:
         with engine.connect() as conn:
             build_at, drop_below = thresholds(read_overrides(conn, *_THRESHOLD_KEYS))
             rows = conn.execute(
                 text(
-                    "SELECT c.relname, i.indisvalid FROM pg_class c "
+                    "SELECT c.relname, i.indisvalid, obj_description(c.oid, 'pg_class') "
+                    "FROM pg_class c "
                     "JOIN pg_index i ON i.indexrelid = c.oid "
                     "JOIN pg_namespace n ON n.oid = c.relnamespace "
                     r"WHERE n.nspname = :schema AND c.relkind = 'i' "
@@ -1389,7 +1597,7 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
                 {"schema": AI_SCHEMA, "prefix": _like_prefix(INDEX_NAME_PREFIX)},
             ).all()
             indexed: dict[str, list[int]] = {}
-            for relname, valid in rows:
+            for relname, valid, comment in rows:
                 body = relname[len(INDEX_NAME_PREFIX) :]
                 kb_hex, _, dims_part = body.rpartition("_")
                 if len(kb_hex) != 32 or not dims_part.isdigit():
@@ -1400,6 +1608,15 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
                     continue
                 indexed.setdefault(kb_id, []).append(int(dims_part))
                 if not valid:
+                    if build_failures_in(comment) >= MAX_CONSECUTIVE_BUILD_FAILURES:
+                        # Nothing would come of dispatching this one: the reconcile
+                        # reads the same count and declines. Left in the list it
+                        # would take one of ``MAX_SWEEP_DISPATCH`` places -- and the
+                        # list is INVALID-first, so that many given-up indexes would
+                        # consume the whole start-up budget on every boot while a
+                        # repairable one was never reached.
+                        given_up.append(f"{AI_SCHEMA}.{relname}")
+                        continue
                     needing[kb_id] = None
             conn.rollback()
     except Exception:
@@ -1407,6 +1624,21 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
             "Could not read the per-knowledge-base HNSW indexes at start-up", exc_info=True
         )
         return []
+
+    if given_up:
+        logger.warning(
+            "%d partial HNSW index(es) are INVALID after %d consecutive failed builds, so this "
+            "start-up does not reconcile them: %s%s. Each answers no query and is maintained on "
+            "every write to %s.embeddings until an operator drops it by hand, which is also what "
+            "lets a later reconcile try again",
+            len(given_up),
+            MAX_CONSECUTIVE_BUILD_FAILURES,
+            ", ".join(given_up[:MAX_SWEEP_DISPATCH]),
+            f" (and {len(given_up) - MAX_SWEEP_DISPATCH} more)"
+            if len(given_up) > MAX_SWEEP_DISPATCH
+            else "",
+            AI_SCHEMA,
+        )
 
     counted_ok = True
     try:
@@ -1418,8 +1650,10 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
             counted = conn.execute(
                 text(
                     "SELECT knowledge_base_id::text, dims, count(*) FROM "
-                    f'"{AI_SCHEMA}".embeddings GROUP BY 1, 2'
-                )
+                    f'"{AI_SCHEMA}".embeddings '
+                    "WHERE item_table = :item_table GROUP BY 1, 2"
+                ),
+                {"item_table": PER_KB_INDEX_ITEM_TABLE},
             ).all()
             conn.rollback()
     except Exception as exc:

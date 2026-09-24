@@ -96,9 +96,16 @@ def test_create_ddl_matches_the_expression_and_operator_class_the_query_orders_b
     assert "USING hnsw ((embedding::vector(1536)) vector_cosine_ops)" in ddl
 
 
-def test_create_ddl_predicate_names_the_kb_and_the_dimension():
+def test_create_ddl_predicate_names_the_kb_the_dimension_and_the_one_population():
+    """``ai.embeddings`` is polymorphic, so an index over all of it is not the index.
+
+    Without ``item_table`` the index spans four item tables and the chunk search
+    steered onto it walks entries that cannot join -- measured recall 0.858 against
+    0.383 for the same 1,000 chunk rows once 9,000 document rows shared the index.
+    """
     ddl = pvi.per_kb_index_ddl(KB, 1536)
     assert f"WHERE knowledge_base_id = '{KB}' AND dims = 1536" in ddl
+    assert f"AND item_table = '{pvi.PER_KB_INDEX_ITEM_TABLE}'" in ddl
 
 
 def test_create_ddl_is_concurrent_because_a_build_must_not_block_writes():
@@ -489,9 +496,23 @@ def _failure_comment(failures: int) -> str:
     return pvi._BUILD_FAILURES_COMMENT.format(n=failures)
 
 
-# The catalog row shape both the ensure survey and the boot sweep read.
+# The catalog row shape the ensure survey reads.
 def _index_row(kb_id: str, dims: int, valid: bool = True):
     return (pvi.per_kb_index_name(kb_id, dims), valid)
+
+
+def _sweep_index_row(kb_id: str, dims: int, valid: bool = True, failures: int = 0):
+    """The boot sweep's catalog row, which carries the index's build history too.
+
+    Read in the same pass as ``indisvalid`` so the sweep can tell an INVALID index
+    worth repairing from one that has already been given up on, with no extra
+    query.
+    """
+    return (
+        pvi.per_kb_index_name(kb_id, dims),
+        valid,
+        _failure_comment(failures) if failures else None,
+    )
 
 
 def _ensure(monkeypatch, conn, kb_id=KB, build_at=10_000, drop_below=5_000, **kwargs):
@@ -511,15 +532,30 @@ def _ensure(monkeypatch, conn, kb_id=KB, build_at=10_000, drop_below=5_000, **kw
 # ---------------------------------------------------------------------------
 
 
-def test_a_build_sets_both_session_settings_before_the_ddl_and_resets_both_after(monkeypatch):
+def test_a_build_sets_its_session_settings_before_the_ddl_and_resets_every_one_after(monkeypatch):
     monkeypatch.setattr(pvi, "maintenance_work_mem_mb", lambda: 256)
     conn = _FakeConn()
     pvi._create_index(conn, KB, 1536)
     assert conn.statements == [
         "SET statement_timeout = 0",
+        "SET lock_timeout = 0",
         "SET maintenance_work_mem = '256MB'",
         " ".join(pvi.per_kb_index_ddl(KB, 1536).split()),
         "RESET maintenance_work_mem",
+        "RESET lock_timeout",
+        "RESET statement_timeout",
+    ]
+
+
+def test_a_drop_lifts_both_timeouts_and_puts_both_back(monkeypatch):
+    """The drop waits in the same two ways the build does, so it lifts the same two."""
+    conn = _FakeConn()
+    pvi._drop_index(conn, KB, 1536)
+    assert conn.statements == [
+        "SET statement_timeout = 0",
+        "SET lock_timeout = 0",
+        " ".join(pvi.per_kb_index_drop_ddl(KB, 1536).split()),
+        "RESET lock_timeout",
         "RESET statement_timeout",
     ]
 
@@ -537,8 +573,9 @@ def test_a_failed_second_setting_never_leaves_the_connection_without_a_timeout(m
     conn = _FakeConn(fail_on="SET maintenance_work_mem")
     with pytest.raises(RuntimeError):
         pvi._create_index(conn, KB, 1536)
-    assert conn.issued("SET statement_timeout = 0"), conn.statements
-    assert conn.issued("RESET statement_timeout") or conn.invalidated, conn.statements
+    for setting in ("statement_timeout", "lock_timeout"):
+        assert conn.issued(f"SET {setting} = 0"), conn.statements
+        assert conn.issued(f"RESET {setting}") or conn.invalidated, conn.statements
 
 
 def test_the_build_memory_is_read_before_any_session_setting_is_raised(monkeypatch):
@@ -557,12 +594,65 @@ def test_a_lock_release_that_fails_discards_the_connection():
     conn = _FakeConn(fail_on="pg_advisory_unlock")
     pvi._release_lock(conn, pvi.index_lock_relation(KB, 1536))
     assert conn.invalidated, "a pooled connection still holding the lock skips every later build"
+    assert conn.rollbacks >= 1, "and the loop it is shared with has to be able to go on"
 
 
 def test_a_reset_that_fails_discards_the_connection():
     conn = _FakeConn(fail_on="RESET statement_timeout")
     pvi._reset_session_setting(conn, "statement_timeout")
     assert conn.invalidated
+    assert conn.rollbacks >= 1
+
+
+class _DiscardedConnectionConn(_FakeConn):
+    """A connection that behaves as a real one does after ``invalidate()``.
+
+    Measured against a real server on the AUTOCOMMIT connection this loop runs
+    on: after ``invalidate()`` the next statement raises ``PendingRollbackError``
+    ("Can't reconnect until invalid transaction is rolled back"), and it goes on
+    raising until the connection is rolled back. ``PendingRollbackError`` is not
+    classified as a transient database error either, so a connection lost
+    mid-loop would fail the run without the retry that exists for exactly that.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.discarded = False
+
+    def invalidate(self):
+        super().invalidate()
+        self.discarded = True
+
+    def rollback(self):
+        super().rollback()
+        self.discarded = False
+
+    def execute(self, clause, params=None):
+        if self.discarded:
+            raise RuntimeError("Can't reconnect until invalid transaction is rolled back")
+        return super().execute(clause, params)
+
+
+def test_a_discarded_loop_connection_is_given_back_so_the_rest_of_the_loop_runs(monkeypatch):
+    """The reconcile shares one connection across every dimension in play.
+
+    So a ``RESET`` that fails at the first dimension must not take the second with
+    it: a knowledge base that has just changed embedding model has an index to drop
+    at the old dimension and one to build at the new one.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 768), _index_row(KB, 1536)],
+        dims_present=(768, 1536),
+        rows_by_dims={768: 0, 1536: 0},
+        cls=_DiscardedConnectionConn,
+        fail_on="RESET lock_timeout",
+    )
+    outcome = _ensure(monkeypatch, conn)
+    assert conn.invalidated, "the connection that could not be reset must not be pooled"
+    assert outcome["dropped"] == [
+        pvi.per_kb_index_name(KB, 768),
+        pvi.per_kb_index_name(KB, 1536),
+    ], outcome
 
 
 def test_a_build_does_not_hold_the_settings_session_idle_in_a_transaction(monkeypatch):
@@ -589,6 +679,9 @@ _KBS = [str(uuid.UUID(int=n)) for n in range(1, 40)]
 
 _COUNT_QUERY = "GROUP BY 1, 2"
 _CATALOG_QUERY = "i.indisvalid"
+# The sweep reads the index's comment in the same pass, so its catalog SELECT is
+# not the ensure survey's and the fakes answer them separately.
+_SWEEP_CATALOG_QUERY = "obj_description(c.oid, 'pg_class') FROM pg_class"
 
 
 def _sweep(conn):
@@ -696,7 +789,7 @@ def test_a_settings_read_that_cannot_be_made_does_not_stop_the_boot_sweep():
     """End to end: the sweep still clears the INVALID indexes it exists for."""
     conn = _BlockedSettingsSweepConn(
         answers=[
-            (_CATALOG_QUERY, [_index_row(_KBS[0], 1536, False)]),
+            (_SWEEP_CATALOG_QUERY, [_sweep_index_row(_KBS[0], 1536, False)]),
             (_COUNT_QUERY, [(_KBS[0], 1536, 3)]),
         ]
     )
@@ -711,8 +804,8 @@ def test_an_abandoned_boot_count_does_not_dispatch_every_indexed_knowledge_base(
     every indexed knowledge base -- up to ``MAX_PER_KB_INDEXES`` unbounded
     builds against the database that was already struggling.
     """
-    healthy = [_index_row(kb, 1536) for kb in _KBS[:5]]
-    conn = _FakeConn(answers=[(_CATALOG_QUERY, healthy)], fail_on=_COUNT_QUERY)
+    healthy = [_sweep_index_row(kb, 1536) for kb in _KBS[:5]]
+    conn = _FakeConn(answers=[(_SWEEP_CATALOG_QUERY, healthy)], fail_on=_COUNT_QUERY)
     with caplog.at_level(logging.WARNING):
         assert _sweep(conn) == []
     assert "Could not count embeddings" in caplog.text
@@ -720,8 +813,8 @@ def test_an_abandoned_boot_count_does_not_dispatch_every_indexed_knowledge_base(
 
 def test_an_invalid_index_is_still_dispatched_when_the_boot_count_is_abandoned():
     """The catalog cases need no count, which is what the count's warning promises."""
-    rows = [_index_row(_KBS[0], 1536, False), _index_row(_KBS[1], 1536, True)]
-    conn = _FakeConn(answers=[(_CATALOG_QUERY, rows)], fail_on=_COUNT_QUERY)
+    rows = [_sweep_index_row(_KBS[0], 1536, False), _sweep_index_row(_KBS[1], 1536, True)]
+    conn = _FakeConn(answers=[(_SWEEP_CATALOG_QUERY, rows)], fail_on=_COUNT_QUERY)
     assert _sweep(conn) == [_KBS[0]]
 
 
@@ -729,7 +822,7 @@ def test_a_knowledge_base_whose_rows_are_all_gone_is_dispatched_when_the_count_r
     """The other side of the guard: an emptied knowledge base has no group at all."""
     conn = _FakeConn(
         answers=[
-            (_CATALOG_QUERY, [_index_row(_KBS[0], 1536)]),
+            (_SWEEP_CATALOG_QUERY, [_sweep_index_row(_KBS[0], 1536)]),
             (_COUNT_QUERY, [(_KBS[1], 1536, 100)]),
         ]
     )
@@ -738,8 +831,8 @@ def test_a_knowledge_base_whose_rows_are_all_gone_is_dispatched_when_the_count_r
 
 def test_the_boot_sweep_caps_how_many_reconciles_one_start_up_sets_off(caplog):
     """Every dispatch can start an unbounded build; the index cap does not bound those."""
-    rows = [_index_row(kb, 1536, False) for kb in _KBS[: pvi.MAX_SWEEP_DISPATCH + 4]]
-    conn = _FakeConn(answers=[(_CATALOG_QUERY, rows)])
+    rows = [_sweep_index_row(kb, 1536, False) for kb in _KBS[: pvi.MAX_SWEEP_DISPATCH + 4]]
+    conn = _FakeConn(answers=[(_SWEEP_CATALOG_QUERY, rows)])
     with caplog.at_level(logging.WARNING):
         pending = _sweep(conn)
     assert len(pending) == pvi.MAX_SWEEP_DISPATCH
@@ -752,13 +845,70 @@ def test_the_capped_dispatch_keeps_the_invalid_indexes_ahead_of_the_rest():
     over_threshold = _KBS[1 : pvi.MAX_SWEEP_DISPATCH + 5]
     conn = _FakeConn(
         answers=[
-            (_CATALOG_QUERY, [_index_row(_KBS[0], 1536, False)]),
+            (_SWEEP_CATALOG_QUERY, [_sweep_index_row(_KBS[0], 1536, False)]),
             (_COUNT_QUERY, [(kb, 1536, 60_000) for kb in over_threshold]),
         ]
     )
     pending = _sweep(conn)
     assert len(pending) == pvi.MAX_SWEEP_DISPATCH
     assert pending[0] == _KBS[0], "the INVALID index must not be the one left behind"
+
+
+def test_the_boot_sweep_leaves_out_an_index_at_the_failure_bound(caplog):
+    """A start-up budget spent on builds nothing will attempt.
+
+    Measured against a real server: ``failures=3``, ``index_action`` already
+    ``None``, and the sweep returned the knowledge base anyway. The list is
+    INVALID-first and truncated to ``MAX_SWEEP_DISPATCH``, so that many given-up
+    indexes consume the whole budget on every boot while a repairable one is never
+    reached.
+    """
+    doomed = [
+        _sweep_index_row(kb, 1536, False, failures=pvi.MAX_CONSECUTIVE_BUILD_FAILURES)
+        for kb in _KBS[: pvi.MAX_SWEEP_DISPATCH]
+    ]
+    repairable = _sweep_index_row(_KBS[pvi.MAX_SWEEP_DISPATCH], 1536, False)
+    conn = _FakeConn(answers=[(_SWEEP_CATALOG_QUERY, doomed + [repairable])], fail_on=_COUNT_QUERY)
+    with caplog.at_level(logging.WARNING):
+        assert _sweep(conn) == [_KBS[pvi.MAX_SWEEP_DISPATCH]]
+    assert str(pvi.MAX_SWEEP_DISPATCH) in caplog.text, (
+        "an index no reconcile will attempt again needs an operator, so the boot says so"
+    )
+
+
+def test_an_index_one_attempt_short_of_the_bound_is_still_dispatched():
+    """The positive control: the bound is the bound, not a fear of failure."""
+    rows = [_sweep_index_row(_KBS[0], 1536, False, failures=pvi.MAX_CONSECUTIVE_BUILD_FAILURES - 1)]
+    conn = _FakeConn(answers=[(_SWEEP_CATALOG_QUERY, rows)], fail_on=_COUNT_QUERY)
+    assert _sweep(conn) == [_KBS[0]]
+
+
+def test_a_given_up_index_whose_knowledge_base_shrank_is_still_dispatched_to_be_dropped():
+    """Only the *repair* is given up on; the index still costs every write.
+
+    A knowledge base at or below the drop threshold wants that index gone, and
+    dropping it is also what re-arms the build, so this is the one dispatch a
+    given-up index must still get.
+    """
+    rows = [_sweep_index_row(_KBS[0], 1536, False, failures=pvi.MAX_CONSECUTIVE_BUILD_FAILURES)]
+    conn = _FakeConn(
+        answers=[
+            (_SWEEP_CATALOG_QUERY, rows),
+            (_COUNT_QUERY, [(_KBS[0], 1536, 1)]),
+        ]
+    )
+    assert _sweep(conn) == [_KBS[0]]
+
+
+def test_the_sweeps_failure_history_comes_from_the_query_it_already_runs():
+    """No second round trip per index: one column on the catalog SELECT."""
+    conn = _FakeConn()
+    _sweep(conn)
+    catalog = conn.issued(_SWEEP_CATALOG_QUERY)
+    assert len(catalog) == 1, conn.statements
+    assert conn.issued("obj_description(to_regclass") == [], (
+        "a per-index read would be one round trip per index on the boot path"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +949,146 @@ def _ensure_conn(
         ],
         **kwargs,
     )
+
+
+# -- eligibility is decided on the population the index covers ---------------
+
+
+class _PopulationConn(_FakeConn):
+    """A connection backed by row counts per ``(dims, item_table)``, like the table.
+
+    Both queries that decide eligibility are answered from the same rows, each
+    honouring its own ``item_table`` bind when it has one and summing every
+    population when it does not. So these specs are about what the decision comes
+    out as for a given table, not about the text of a query -- a count that stops
+    restricting itself answers with the sum and the decision moves.
+    """
+
+    def __init__(self, population, *args, kb_id=KB, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.population = dict(population)
+        self.kb_id = kb_id
+
+    def _record(self, sql, params):
+        self.statements.append(" ".join(sql.split()))
+        self.params.append(params)
+
+    @staticmethod
+    def _restricted_to(sql, params):
+        """The population this statement actually restricts itself to, or None.
+
+        Read from the *statement*, not from the bound parameters, because that is
+        what the server reads. A query that stops naming ``item_table`` while still
+        binding a value for it is answered from every population here, exactly as
+        Postgres would answer it -- which is the false green a bound-parameter
+        assertion gives instead.
+        """
+        return (params or {}).get("item_table") if "item_table = :item_table" in sql else None
+
+    def execute(self, clause, params=None):
+        sql = clause.text if hasattr(clause, "text") else str(clause)
+        if "GROUP BY dims" in sql:
+            # The dimension survey, which is deliberately not restricted.
+            self._record(sql, params)
+            return _Result([(d,) for d in sorted({d for d, _ in self.population})])
+        if _ROW_COUNT_QUERY in sql:
+            self._record(sql, params)
+            wanted = self._restricted_to(sql, params)
+            rows = sum(
+                n
+                for (d, table), n in self.population.items()
+                if d == int(params["dims"]) and (wanted is None or table == wanted)
+            )
+            return _Result([(min(rows, int(params["cap"])),)])
+        if _COUNT_QUERY in sql:
+            self._record(sql, params)
+            wanted = self._restricted_to(sql, params)
+            grouped: dict[int, int] = {}
+            for (d, table), n in self.population.items():
+                if wanted is None or table == wanted:
+                    grouped[d] = grouped.get(d, 0) + n
+            return _Result([(self.kb_id, d, n) for d, n in sorted(grouped.items())])
+        return super().execute(clause, params)
+
+
+def _population_conn(population, existing=(), index_count=1, **kwargs):
+    return _PopulationConn(
+        population,
+        answers=[
+            (_FAILURE_RECORD_QUERY, []),
+            (_SWEEP_CATALOG_QUERY, [_sweep_index_row(KB, d) for d in existing]),
+            (_CATALOG_QUERY, [_index_row(KB, d) for d in existing]),
+            (_INDEX_COUNT_QUERY, [(index_count,)]),
+            (_LOCK_QUERY, [(True,)]),
+            (
+                _SETTINGS_QUERY,
+                [
+                    ("VECTOR_PER_KB_INDEX_MIN_ROWS", "10000"),
+                    ("VECTOR_PER_KB_INDEX_DROP_ROWS", "5000"),
+                ],
+            ),
+        ],
+        **kwargs,
+    )
+
+
+_MIXED = {(1536, "chunks"): 3_000, (1536, "full_documents"): 7_000}
+_CHUNKS_ONLY = {(1536, "chunks"): 12_000}
+
+
+def _at_ten_thousand(monkeypatch):
+    """The thresholds ``_ensure`` fixes, for the dispatch check that reads them too."""
+    _stub_settings(
+        monkeypatch,
+        {"VECTOR_PER_KB_INDEX_MIN_ROWS": 10_000, "VECTOR_PER_KB_INDEX_DROP_ROWS": 5_000},
+    )
+
+
+def test_a_knowledge_base_over_the_threshold_only_on_the_sum_gets_no_index(monkeypatch):
+    """10,000 rows across four populations is not 10,000 rows the index can serve.
+
+    The index covers one item table, so a knowledge base whose chunk population is
+    3,000 would get an index that mostly indexes rows its chunk searches cannot
+    join -- which is the recall loss measured at 0.858 -> 0.383.
+    """
+    _at_ten_thousand(monkeypatch)
+    conn = _population_conn(_MIXED)
+    assert pvi.index_action(conn, KB) is None
+    outcome = _ensure(monkeypatch, conn, build_at=10_000)
+    assert outcome["built"] == [], outcome
+    assert conn.issued("CREATE INDEX") == [], conn.statements
+
+
+def test_a_knowledge_base_over_the_threshold_on_its_own_population_still_gets_one(monkeypatch):
+    """The positive control, on the same fake table with the other populations gone."""
+    _at_ten_thousand(monkeypatch)
+    conn = _population_conn(_CHUNKS_ONLY)
+    assert pvi.index_action(conn, KB) == "build"
+    outcome = _ensure(monkeypatch, conn, build_at=10_000)
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+
+
+def test_an_index_whose_own_population_has_drained_is_dropped(monkeypatch):
+    """The drop threshold cuts the same way, because the index covered only chunks."""
+    _at_ten_thousand(monkeypatch)
+    conn = _population_conn(
+        {(1536, "chunks"): 10, (1536, "full_documents"): 40_000}, existing=(1536,)
+    )
+    assert pvi.index_action(conn, KB) == "drop"
+    outcome = _ensure(monkeypatch, conn, build_at=10_000, drop_below=5_000)
+    assert outcome["dropped"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+
+
+def test_the_boot_sweep_counts_only_the_population_the_index_covers():
+    """The sweep's grouped count is a second query and had the same defect.
+
+    A knowledge base whose four populations sum past the build threshold but whose
+    chunk population does not must not have a build dispatched at start-up: the
+    reconcile counts the chunks and declines, so the dispatch is a build slot and a
+    boot spent on nothing.
+    """
+    assert _sweep(_population_conn(_MIXED)) == []
+    assert _sweep(_population_conn(_CHUNKS_ONLY)) == [KB]
 
 
 # -- the disk-size log, which is the only free-space signal there can be ------
@@ -943,6 +1233,156 @@ def test_a_comment_this_module_did_not_write_is_not_a_build_history(monkeypatch)
     assert pvi.recorded_build_failures(conn, KB, 1536) == 0
     outcome = _ensure(monkeypatch, conn)
     assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+
+
+def _transient_exc(sqlstate: str = "55P03", statement: str = "CREATE INDEX"):
+    """A database failure the pg_search path already classifies as transient.
+
+    55P03 is ``lock_not_available``: a genuine lock conflict, which is what a
+    concurrent build meets when another caller is holding the table -- and the
+    Celery task retries it six times.
+    """
+    from sqlalchemy.exc import OperationalError
+
+    class _Orig(Exception):
+        pass
+
+    orig = _Orig("canceling statement due to lock timeout")
+    orig.sqlstate = sqlstate
+    return OperationalError(statement, {}, orig)
+
+
+class _CatalogStateConn(_FakeConn):
+    """A connection whose index comment survives the reconcile that wrote it.
+
+    The failure bound lives in the index's own ``pg_class`` comment, so a spec
+    about the bound being *reached* has to read back what the previous attempt
+    wrote. This keeps that one piece of catalog state, which is what lets a
+    sequence of reconciles be driven the way the ones against a real server were.
+    """
+
+    def __init__(self, *args, comment=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.comment = comment
+
+    def execute(self, clause, params=None):
+        sql = clause.text if hasattr(clause, "text") else str(clause)
+        if _FAILURE_COMMENT_DDL in sql:
+            self.statements.append(" ".join(sql.split()))
+            self.params.append(params)
+            self.comment = None if sql.rstrip().endswith("IS NULL") else sql.split("'")[-2]
+            return _Result([])
+        if _FAILURE_RECORD_QUERY in sql:
+            self.statements.append(" ".join(sql.split()))
+            self.params.append(params)
+            return _Result([(self.comment,)] if self.comment else [])
+        return super().execute(clause, params)
+
+
+def test_a_repair_drop_that_fails_counts_the_attempt_too(monkeypatch):
+    """The other way a reconcile of an INVALID index ends without building.
+
+    The attempt is counted in the build, so a repair drop that raises used to
+    return before anything counted it: five consecutive reconciles against a real
+    server each recorded ``failures=1`` and each asked for a build again, which is
+    the unbounded drop-rebuild-fail loop with the bound stepped around.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)],
+        rows_by_dims={1536: 20_000},
+        failures=1,
+        fail_on="DROP INDEX",
+    )
+    with pytest.raises(RuntimeError):
+        _ensure(monkeypatch, conn)
+    assert conn.issued("CREATE INDEX") == [], "the drop failed; nothing was rebuilt"
+    written = conn.issued(_FAILURE_COMMENT_DDL)
+    assert written, "an uncounted attempt is an unbounded loop"
+    assert _failure_comment(2) in written[0], written
+
+
+def test_repair_drops_that_keep_failing_reach_the_give_up_bound(monkeypatch, caplog):
+    """The loop itself, driven the way it was driven against a real server.
+
+    Reconcile after reconcile, with the index's comment carried between them the
+    way the catalog carries it. Without the attempt being counted this never
+    terminates: every run reports ``failures=1`` and asks for a build again.
+    """
+    outcomes = []
+    conn = _CatalogStateConn(
+        answers=[
+            (_CATALOG_QUERY, [_index_row(KB, 1536, False)]),
+            ("GROUP BY dims", [(1536,)]),
+            (_INDEX_COUNT_QUERY, [(1,)]),
+            (_ROW_COUNT_QUERY, [(20_000,)]),
+            (_LOCK_QUERY, [(True,)]),
+        ],
+        fail_on="DROP INDEX",
+    )
+    for _ in range(pvi.MAX_CONSECUTIVE_BUILD_FAILURES):
+        with pytest.raises(RuntimeError):
+            _ensure(monkeypatch, conn)
+    with caplog.at_level(logging.ERROR):
+        outcomes.append(_ensure(monkeypatch, conn))
+    assert outcomes[-1]["reason"] == "build_repeatedly_failed", outcomes
+    assert pvi.index_action(conn, KB) is None, "and nothing dispatches it again"
+    assert "by hand" in caplog.text
+
+
+def test_a_transient_build_failure_does_not_burn_an_attempt(monkeypatch):
+    """Three failures disable the index until an operator drops it by hand.
+
+    So the bound has to count only the failures a retry cannot get past. The task
+    that runs this classifies a lock conflict as transient and retries it six
+    times; one contention episode outlasting three of those retries would
+    otherwise write "3 consecutive failed attempts" and turn the index off for
+    good.
+    """
+    conn = _ensure_conn(rows_by_dims={1536: 20_000}, fail_on="CREATE INDEX", exc=_transient_exc())
+    with pytest.raises(Exception, match="lock timeout"):
+        _ensure(monkeypatch, conn)
+    assert conn.issued(_FAILURE_COMMENT_DDL) == [], conn.statements
+
+
+def test_a_transient_build_failure_keeps_the_attempts_already_on_record(monkeypatch):
+    """Not counting it must not un-count the ones before it either.
+
+    The repair drop takes the record away with the index it is written on, so a
+    transient failure after a repair would otherwise reset the count to zero and
+    hand back the whole budget on every contention episode.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)],
+        rows_by_dims={1536: 20_000},
+        failures=2,
+        fail_on="CREATE INDEX",
+        exc=_transient_exc(),
+    )
+    with pytest.raises(Exception, match="lock timeout"):
+        _ensure(monkeypatch, conn)
+    written = conn.issued(_FAILURE_COMMENT_DDL)
+    assert written and _failure_comment(2) in written[0], written
+
+
+def test_a_transient_repair_drop_failure_does_not_burn_an_attempt(monkeypatch):
+    """The repair drop counts under the same rule, so it does not count this one.
+
+    The count on record may be rewritten -- it is the same number -- but it may
+    not advance: a lock conflict on the repair drop is what the task's own six
+    retries are for.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)],
+        rows_by_dims={1536: 20_000},
+        failures=1,
+        fail_on="DROP INDEX",
+        exc=_transient_exc(statement="DROP INDEX"),
+    )
+    with pytest.raises(Exception, match="lock timeout"):
+        _ensure(monkeypatch, conn)
+    for written in conn.issued(_FAILURE_COMMENT_DDL):
+        assert _failure_comment(1) in written, written
+        assert _failure_comment(2) not in written, written
 
 
 def test_a_build_that_has_failed_the_limit_is_not_attempted_again(monkeypatch, caplog):
@@ -1189,19 +1629,29 @@ def test_a_transient_drop_failure_is_re_raised_untouched_for_the_retry(caplog):
 
 
 class _TimeoutCancellingConn(_FakeConn):
-    """A server with a statement timeout of its own, as a role or database has.
+    """A server with a timeout of its own, as a role or database has.
 
     ``DROP INDEX CONCURRENTLY`` waits for every transaction whose snapshot could
-    still be using the index, exactly as the build does, so a timeout the drop
-    did not ask for cancels it mid-wait. Here that is modelled where it happens:
-    the DROP raises unless the timeout was lifted on this connection first, and
-    the ``RESET`` puts it back, so a second drop is unprotected again if the
-    lifting is not per-drop.
+    still be using the index, and ``CREATE INDEX CONCURRENTLY`` waits for every
+    transaction that could still write a row it has not seen, so a timeout the
+    DDL did not ask for cancels it mid-wait. Here that is modelled where it
+    happens: the concurrent DDL raises unless ``SETTING`` was lifted on this
+    connection first, and the ``RESET`` puts it back, so a second one is
+    unprotected again if the lifting is not per-statement.
 
     Against a real server the cancelled drop leaves the index ``indisvalid =
     false`` -- maintained on every insert, answering no query -- which the
     deleted knowledge base's path can never come back to.
+
+    ``SETTING`` is the name of the timeout, because there are two and they cover
+    different waits: ``statement_timeout`` does not cover a lock wait at all, and
+    both of these waits are lock waits (on a virtual transaction id). Subclassed
+    rather than parametrized inside ``execute`` so each subclass is a server with
+    exactly one of them set, which is how the bound is proved to be lifted for
+    its own reason and not by the other one's ``SET``.
     """
+
+    SETTING = "statement_timeout"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1210,24 +1660,43 @@ class _TimeoutCancellingConn(_FakeConn):
 
     def execute(self, clause, params=None):
         sql = clause.text if hasattr(clause, "text") else str(clause)
-        if "SET statement_timeout = 0" in sql:
+        if f"SET {self.SETTING} = 0" in sql:
             self.timeout_lifted = True
-        elif "RESET statement_timeout" in sql:
+        elif f"RESET {self.SETTING}" in sql:
             self.timeout_lifted = False
-        elif "DROP INDEX CONCURRENTLY" in sql and not self.timeout_lifted:
+        elif "INDEX CONCURRENTLY" in sql and not self.timeout_lifted:
             self.statements.append(" ".join(sql.split()))
             self.cancelled.append(sql)
-            raise RuntimeError("canceling statement due to statement timeout")
+            raise RuntimeError(f"canceling statement due to {self.SETTING}")
         return super().execute(clause, params)
 
 
-def test_a_deleted_knowledge_bases_drops_are_not_cancelled_by_a_statement_timeout():
+class _LockTimeoutCancellingConn(_TimeoutCancellingConn):
+    """The same server with a role-level ``lock_timeout`` instead.
+
+    ``statement_timeout`` does not bound a lock wait, and both phases these two
+    statements block in are lock waits: ``CREATE INDEX CONCURRENTLY``'s
+    ``WaitForLockers`` and ``DROP INDEX CONCURRENTLY``'s wait for conflicting
+    snapshots both wait on a ``virtualxid`` lock. Measured against a real server
+    with a role-level ``lock_timeout`` of 2 s and one open write transaction:
+    the build failed in 2.02 s, five times out of five, and the drop in 2.01 s,
+    leaving the index ``indisvalid = false, indisready = true``.
+    """
+
+    SETTING = "lock_timeout"
+
+
+_TIMEOUT_SERVERS = [_TimeoutCancellingConn, _LockTimeoutCancellingConn]
+
+
+@pytest.mark.parametrize("cls", _TIMEOUT_SERVERS)
+def test_a_deleted_knowledge_bases_drops_are_not_cancelled_by_a_timeout(cls):
     """This is the path a cancelled drop strands for good.
 
     Both dimensions, because the timeout is lifted per drop: the ``RESET`` after
     the first one leaves the second exposed unless it lifts it again.
     """
-    conn = _drop_conn(dims=(768, 1536), cls=_TimeoutCancellingConn)
+    conn = _drop_conn(dims=(768, 1536), cls=cls)
     outcome = pvi.drop_per_kb_vector_indexes(KB, engine=_FakeEngine(conn))
     assert conn.cancelled == [], conn.statements
     assert outcome == {
@@ -1239,22 +1708,26 @@ def test_a_deleted_knowledge_bases_drops_are_not_cancelled_by_a_statement_timeou
     )
 
 
-def test_a_drop_below_the_threshold_is_not_cancelled_by_a_statement_timeout(monkeypatch):
-    conn = _ensure_conn(
-        existing=[_index_row(KB, 1536)], rows_by_dims={1536: 0}, cls=_TimeoutCancellingConn
-    )
+@pytest.mark.parametrize("cls", _TIMEOUT_SERVERS)
+def test_a_drop_below_the_threshold_is_not_cancelled_by_a_timeout(monkeypatch, cls):
+    conn = _ensure_conn(existing=[_index_row(KB, 1536)], rows_by_dims={1536: 0}, cls=cls)
     outcome = _ensure(monkeypatch, conn)
     assert conn.cancelled == [], conn.statements
     assert outcome["dropped"] == [pvi.per_kb_index_name(KB, 1536)], outcome
     assert not conn.timeout_lifted
 
 
-def test_the_repair_of_an_invalid_index_is_not_cancelled_by_a_statement_timeout(monkeypatch):
-    """A cancelled repair drop is the one that loops: it leaves what it came to clear."""
+@pytest.mark.parametrize("cls", _TIMEOUT_SERVERS)
+def test_the_repair_of_an_invalid_index_is_not_cancelled_by_a_timeout(monkeypatch, cls):
+    """A cancelled repair drop is the one that loops: it leaves what it came to clear.
+
+    The build that follows it is covered by the same run: it waits in
+    ``WaitForLockers`` for the same reason and the fake cancels either statement.
+    """
     conn = _ensure_conn(
         existing=[_index_row(KB, 1536, False)],
         rows_by_dims={1536: 20_000},
-        cls=_TimeoutCancellingConn,
+        cls=cls,
     )
     outcome = _ensure(monkeypatch, conn)
     assert conn.cancelled == [], conn.statements
