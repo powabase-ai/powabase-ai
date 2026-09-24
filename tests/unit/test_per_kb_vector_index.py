@@ -412,7 +412,6 @@ def test_the_index_cap_is_far_below_where_planning_and_locks_degrade():
 _CURRENT = object()
 
 
-
 class _Result:
     """Just enough of a SQLAlchemy result for the three shapes this module reads."""
 
@@ -1473,9 +1472,7 @@ def test_a_definition_drop_is_not_counted_against_the_failure_budget(monkeypatch
     repair drop of an INVALID index counts against the bound, and a drift drop must
     not be confused with it.
     """
-    conn = _ensure_conn(
-        existing=[_stale_row()], rows_by_dims={1536: 20_000}, fail_on="DROP INDEX"
-    )
+    conn = _ensure_conn(existing=[_stale_row()], rows_by_dims={1536: 20_000}, fail_on="DROP INDEX")
     with pytest.raises(RuntimeError):
         _ensure(monkeypatch, conn)
     assert conn.issued(_FAILURE_COMMENT_DDL) == [], conn.statements
@@ -1648,17 +1645,22 @@ def test_the_build_log_gives_the_row_count_and_the_index_size_as_floors(monkeypa
     with caplog.at_level(logging.INFO):
         outcome = _ensure(monkeypatch, conn, build_at=10_000)
     assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)]
-    assert "at least 10001 rows" in caplog.text, caplog.text
+    assert "at least 10001 chunk rows" in caplog.text, caplog.text
     assert f"at least {pvi.estimated_index_mb(10_001, 1536)} MB" in caplog.text, caplog.text
     assert "floor" in caplog.text, "the qualifier has to be unmistakable, not implied"
 
 
 def test_the_build_log_does_not_hedge_a_count_that_is_exact(monkeypatch, caplog):
-    """The negative control: an unbounded count must be reported as the number it is."""
+    """The negative control: an unbounded count must be reported as the number it is.
+
+    "chunk rows" rather than "rows", because the count is restricted to the one
+    population the index covers -- an operator comparing the figure to the knowledge
+    base's size would otherwise find it short by the other three.
+    """
     conn = _ensure_conn(rows_by_dims={1536: 10_000})
     with caplog.at_level(logging.INFO):
         _ensure(monkeypatch, conn, build_at=10_000)
-    assert "10000 rows" in caplog.text
+    assert "10000 chunk rows" in caplog.text
     assert "at least" not in caplog.text, caplog.text
 
 

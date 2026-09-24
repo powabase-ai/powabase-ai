@@ -76,10 +76,18 @@ replaces was fast and quietly wrong. Measured against an exact scan over the
 same knowledge base, the old shape returned recall 0.65-0.70 -- it stopped as
 soon as the join had produced ``top_k`` rows of the wanted knowledge base --
 where the new one returns 1.0. So the trade in that window is lossy-fast for
-exact-slow. Whether it is a regression at all is fixture-dependent -- the two
-knowledge bases where it was measured held 12.6k and 18k rows, and a second
-fixture built independently measured the new shape 3.6x *faster* at the same
-recall -- and the 50,000-row default deliberately leaves that window unindexed.
+exact-slow.
+
+**Whether a given project has that window at all depends on its table shape, not
+on its embedding width.** Both the flip and its absence are decided by a cost
+race between an approximate index scan and an exact one, and that race is decided
+by how large the knowledge base is relative to the table, how the rows are laid
+out and what is cached -- the two knowledge bases where the regression was
+measured held 12.6k and 18k rows, and a second fixture built independently
+measured the new shape 3.6x *faster* at the same recall. Stating the window as a
+property of the width would be the same mistake as stating the planner's choice
+that way. The 50,000-row default deliberately leaves the measured window
+unindexed, and a project finds out whether it has one by measuring its own.
 The reason is the other side of the trade: an index can be built, maintained on
 every write and never scanned, because in some storage layouts the planner
 prefers the project-wide index even for a knowledge base that owns one. Until
@@ -216,6 +224,13 @@ MAX_PER_KB_INDEXES = 200
 # -- a syntax error, a missing relation, a refused permission -- leaves nothing to
 # write the count on, so those failures are unbounded here and bounded only by the
 # task's own retry policy.
+#
+# ``XX000 internal_error`` is counted here, and the BM25 sibling deliberately
+# excuses it (``Bm25IndexBuildFailed``, for a known pg_search bug that makes a
+# concurrent build fail under writes). The two disagree on purpose: that bug is in
+# the bm25 index type, and an HNSW build has no equivalent, so here an internal
+# error is a failure like any other. If pgvector ever grows one, this is where the
+# exception would go.
 MAX_CONSECUTIVE_BUILD_FAILURES = 3
 
 # The same bound for a build that failed for a reason ``is_transient_db_error``
@@ -266,12 +281,8 @@ MAX_CONSECUTIVE_INTERRUPTED_BUILDS = 25
 # being matched at once. The counts keep their fixed order -- failed, then
 # interrupted -- so an operator reads the same shape every time, and the
 # fingerprint comes last because it is the one fact a *valid* index carries.
-_BUILD_FAILURES_SENTENCE = (
-    "{n} consecutive failed attempts to build this partial HNSW index."
-)
-_INTERRUPTED_BUILDS_SENTENCE = (
-    "{n} consecutive builds of this partial HNSW index were interrupted."
-)
+_BUILD_FAILURES_SENTENCE = "{n} consecutive failed attempts to build this partial HNSW index."
+_INTERRUPTED_BUILDS_SENTENCE = "{n} consecutive builds of this partial HNSW index were interrupted."
 _INVALID_INDEX_PROSE = (
     "It is INVALID: it answers no query and is maintained on every write. Drop it "
     "once the cause is fixed; the next reconcile then builds it again."
@@ -548,9 +559,17 @@ def thresholds(overrides: dict[str, int] | None = None) -> tuple[int, int]:
     6.18 ms at recall 0.608 against 50.35 ms at recall 1.000 for 10,000 rows, and
     4.35 ms at 0.575 against 132.48 ms at 1.000 for 20,000. The same 10,000-row
     knowledge base *with an index of its own* answers in 1.83 ms at recall 1.000 --
-    so at the default it is 27x slower than it needs to be, for nothing. The width
-    of the band is fixture-dependent; its existence is not, and it reproduced on a
-    fixture built for a different question. The default is high anyway, because an
+    so at the default it is 27x slower than it needs to be, for nothing.
+
+    Neither edge of "roughly 10,000-25,000" was measured: 20,000 was slow, 30,000
+    was unchanged, so 25,000 is an interpolation between them, and nothing below
+    10,000 was tried. And the band is a property of the *fixture*, existence
+    included -- an earlier version of this said its existence was not, which
+    contradicts the module docstring eight hundred lines above and is wrong the same
+    way: the flip is a cost race decided by table shape, and one independently built
+    fixture measured the new shape *faster* at the same recall with no window at
+    all. So this is a shape to look for in a project, not a range to trust. The
+    default is high anyway, because an
     index that is built and never scanned is paid for on every write (see the
     module docstring), so the remedy is per project: measure that the index is
     really scanned, then lower ``VECTOR_PER_KB_INDEX_MIN_ROWS`` past the knowledge
@@ -1698,11 +1717,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                     # or whose dimension pgvector will not index at all, is dropped
                     # here whatever its history: the drop is what re-arms the build,
                     # and refusing it was what stranded the index for ever.
-                    if (
-                        build_is_given_up(comment)
-                        and rows > drop_below
-                        and dims <= MAX_HNSW_DIMS
-                    ):
+                    if build_is_given_up(comment) and rows > drop_below and dims <= MAX_HNSW_DIMS:
                         logger.error(
                             "Giving up on partial HNSW index %s.%s: %d consecutive builds of "
                             "it have failed and %d were interrupted, so this one is not "
@@ -1843,8 +1858,8 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                 progress("building", dims=dims, rows=rows, rows_are_a_floor=floored)
                 floor = "at least " if floored else ""
                 logger.info(
-                    "Building partial HNSW index %s.%s for knowledge base %s (%s%d rows at %d "
-                    "dimensions, threshold %d); it needs %s%d MB of disk, and blocks no "
+                    "Building partial HNSW index %s.%s for knowledge base %s (%s%d chunk rows at "
+                    "%d dimensions, threshold %d); it needs %s%d MB of disk, and blocks no "
                     "writes.%s",
                     AI_SCHEMA,
                     name,
@@ -1928,6 +1943,14 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
     the opposite case: another caller is working on this index right now, so the
     whole drop is worth retrying rather than partly completing, and the retry
     reaches the dimensions this attempt did not.
+
+    "Permanent" here means only "not on ``is_transient_db_error``'s list", and that
+    list is about a *statement* failing. Some whole-server conditions are not on it
+    -- ``53300 too_many_connections`` is the reachable one -- so a connection storm
+    during a knowledge base's deletion raises the ERROR below about an orphaned
+    index that in fact drops cleanly on the next attempt. The ERROR says so rather
+    than the classifier being widened here: it is shared with the BM25 path, where
+    the same sqlstate means something else.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
@@ -1961,8 +1984,10 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
             "Could not drop %d of deleted knowledge base %s's partial HNSW index(es), for a "
             "reason a retry cannot get past: %s. They are orphaned -- named after a knowledge "
             "base that no longer exists, answering no query, and maintained by Postgres on "
-            "every write to %s.embeddings -- and have to be dropped by hand. Dropped "
-            "successfully: %s",
+            "every write to %s.embeddings -- and have to be dropped by hand. Check the "
+            "warning above each name first: a whole-server condition that is not classified "
+            "as transient, such as too_many_connections, reaches this message too, and that "
+            "drop succeeds on the next attempt. Dropped successfully: %s",
             len(failed),
             kb_id,
             names,
