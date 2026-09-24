@@ -590,6 +590,82 @@ def test_the_probe_runs_in_a_savepoint():
     )
 
 
+def test_the_exact_searchs_own_setting_runs_in_a_savepoint():
+    """The twin of the spec above, on the other half of the symmetry.
+
+    ``_insisting_on_an_exact_search`` reads a setting and writes one, and either
+    statement can be cancelled like any other. Without a savepoint that failure
+    leaves the caller's transaction aborted, so the search that follows raises
+    ``InFailedSqlTransaction`` while the handler logs that it had merely degraded
+    -- proved live both ways: the probe's failure in the mirrored block warns and
+    the search still answers, this one's failure warned and the search raised.
+
+    Two assertions, because either alone passes something broken: the savepoint has
+    to be taken, *and* the search has to still run after the failure.
+    """
+    session = MagicMock()
+    captured: list[str] = []
+
+    def spy_execute(text_obj, params=None):
+        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
+        captured.append(sql)
+        if "current_setting('enable_indexscan')" in sql:
+            raise RuntimeError("cancelled")
+        return iter([])
+
+    session.execute = spy_execute
+    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
+    items = asyncio.run(
+        store.vector_search(
+            embedding=[0.0] * 1536,
+            top_k=10,
+            source_ids=["3f2504e0-4f89-11d3-9a0c-0305e82c3303"],
+        )
+    )
+    assert items == []
+    assert session.begin_nested.called, (
+        "the setting must be read and written in a savepoint, or its failure "
+        f"aborts the caller's transaction: {captured}"
+    )
+    assert any("ORDER BY" in sql for sql in captured), (
+        f"the search must still run after the setting could not be applied: {captured}"
+    )
+
+
+def test_a_setting_that_could_not_be_applied_is_not_restored_either():
+    """Nothing was changed, so there is nothing to put back.
+
+    A restore on this path would be a second statement inside a transaction the
+    savepoint has just rolled back to -- and it would bind a value read from a
+    statement that raised.
+    """
+    session = MagicMock()
+    captured: list[tuple[str, dict]] = []
+
+    def spy_execute(text_obj, params=None):
+        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
+        captured.append((sql, dict(params or {})))
+        if "set_config('enable_indexscan'" in sql:
+            raise RuntimeError("cancelled")
+        if "current_setting('enable_indexscan')" in sql:
+            return _scalar(ENABLE_INDEXSCAN_WAS)
+        return iter([])
+
+    session.execute = spy_execute
+    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
+    asyncio.run(
+        store.vector_search(
+            embedding=[0.0] * 1536,
+            top_k=10,
+            item_ids=["3f2504e0-4f89-11d3-9a0c-0305e82c3302"],
+        )
+    )
+    assert len(_writes(captured, "enable_indexscan")) == 1, (
+        f"only the attempt that failed; no restore of a setting never made: {captured}"
+    )
+    assert any("ORDER BY" in sql for sql, _ in captured), captured
+
+
 # ---------------------------------------------------------------------------
 # The diversity-floor path, which deliberately keeps the planner's own plan
 # ---------------------------------------------------------------------------

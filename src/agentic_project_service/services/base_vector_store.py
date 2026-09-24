@@ -616,7 +616,11 @@ class BasePgVectorStore:
         the transaction; restored before returning, because ``hybrid_search`` runs
         its keyword leg on this same session and a keyword ranking wants its index
         scans back. A failure on either side degrades latency or exactness rather
-        than erroring, so both are logged, not raised.
+        than erroring, so both are logged, not raised -- and the read and the set
+        run in a savepoint, without which "degrades rather than errors" would be
+        false: an aborted transaction makes the search itself raise. Rolling back
+        to the savepoint is what lets the warning describe the plan the search
+        actually gets.
 
         **What it costs, split honestly.** Three statements -- read the prior, set
         it, put it back -- and the plan they produce. Measured separately, 18
@@ -652,15 +656,35 @@ class BasePgVectorStore:
         """
         prior: str | None = None
         try:
-            prior = str(
-                self.session.execute(text("SELECT current_setting('enable_indexscan')")).scalar()
-            )
-            self.session.execute(text("SELECT set_config('enable_indexscan', 'off', true)"))
+            # In a savepoint, the same way the mirrored block's probe is, and for
+            # the same reason: either of these statements can be cancelled like
+            # any other, and without a savepoint that failure leaves the caller's
+            # transaction aborted -- so the search below would raise
+            # ``InFailedSqlTransaction`` while this line claimed it had merely
+            # degraded. Rolling back to the savepoint is what makes the warning
+            # true. Verified on a live server all three ways: a released savepoint
+            # keeps a transaction-local ``set_config`` in force, a rolled-back one
+            # undoes it and leaves the transaction usable, and without one the next
+            # statement in the transaction is refused.
+            with self.session.begin_nested():
+                prior = str(
+                    self.session.execute(
+                        text("SELECT current_setting('enable_indexscan')")
+                    ).scalar()
+                )
+                self.session.execute(text("SELECT set_config('enable_indexscan', 'off', true)"))
         except Exception as e:  # pragma: no cover - needs a live server
+            # What actually happens now: the setting is back where it was, the
+            # transaction is usable, and the search runs on the plan the planner
+            # picks for itself. At the width production runs that plan is the exact
+            # one anyway; at narrow widths, where a vector is stored inline, it can
+            # be an ordered index scan that answers with a full page of rows that
+            # are not the nearest ones among those the caller named.
             logger.warning(
-                "Could not price the approximate index out for KB %s: %s; a restricted "
-                "vector search may answer from an approximate scan and miss rows the "
-                "caller named",
+                "Could not price the approximate index out for KB %s: %s; this "
+                "restricted vector search will run on the planner's own plan, which "
+                "at narrow vector widths can be an approximate index scan returning "
+                "a full page of rows that are not the nearest matching ones",
                 self.kb_id,
                 e,
             )
