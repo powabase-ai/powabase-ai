@@ -96,9 +96,16 @@ def test_create_ddl_matches_the_expression_and_operator_class_the_query_orders_b
     assert "USING hnsw ((embedding::vector(1536)) vector_cosine_ops)" in ddl
 
 
-def test_create_ddl_predicate_names_the_kb_and_the_dimension():
+def test_create_ddl_predicate_names_the_kb_the_dimension_and_the_one_population():
+    """``ai.embeddings`` is polymorphic, so an index over all of it is not the index.
+
+    Without ``item_table`` the index spans four item tables and the chunk search
+    steered onto it walks entries that cannot join -- measured recall 0.858 against
+    0.383 for the same 1,000 chunk rows once 9,000 document rows shared the index.
+    """
     ddl = pvi.per_kb_index_ddl(KB, 1536)
     assert f"WHERE knowledge_base_id = '{KB}' AND dims = 1536" in ddl
+    assert f"AND item_table = '{pvi.PER_KB_INDEX_ITEM_TABLE}'" in ddl
 
 
 def test_create_ddl_is_concurrent_because_a_build_must_not_block_writes():
@@ -891,6 +898,146 @@ def _ensure_conn(
         ],
         **kwargs,
     )
+
+
+# -- eligibility is decided on the population the index covers ---------------
+
+
+class _PopulationConn(_FakeConn):
+    """A connection backed by row counts per ``(dims, item_table)``, like the table.
+
+    Both queries that decide eligibility are answered from the same rows, each
+    honouring its own ``item_table`` bind when it has one and summing every
+    population when it does not. So these specs are about what the decision comes
+    out as for a given table, not about the text of a query -- a count that stops
+    restricting itself answers with the sum and the decision moves.
+    """
+
+    def __init__(self, population, *args, kb_id=KB, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.population = dict(population)
+        self.kb_id = kb_id
+
+    def _record(self, sql, params):
+        self.statements.append(" ".join(sql.split()))
+        self.params.append(params)
+
+    @staticmethod
+    def _restricted_to(sql, params):
+        """The population this statement actually restricts itself to, or None.
+
+        Read from the *statement*, not from the bound parameters, because that is
+        what the server reads. A query that stops naming ``item_table`` while still
+        binding a value for it is answered from every population here, exactly as
+        Postgres would answer it -- which is the false green a bound-parameter
+        assertion gives instead.
+        """
+        return (params or {}).get("item_table") if "item_table = :item_table" in sql else None
+
+    def execute(self, clause, params=None):
+        sql = clause.text if hasattr(clause, "text") else str(clause)
+        if "GROUP BY dims" in sql:
+            # The dimension survey, which is deliberately not restricted.
+            self._record(sql, params)
+            return _Result([(d,) for d in sorted({d for d, _ in self.population})])
+        if _ROW_COUNT_QUERY in sql:
+            self._record(sql, params)
+            wanted = self._restricted_to(sql, params)
+            rows = sum(
+                n
+                for (d, table), n in self.population.items()
+                if d == int(params["dims"]) and (wanted is None or table == wanted)
+            )
+            return _Result([(min(rows, int(params["cap"])),)])
+        if _COUNT_QUERY in sql:
+            self._record(sql, params)
+            wanted = self._restricted_to(sql, params)
+            grouped: dict[int, int] = {}
+            for (d, table), n in self.population.items():
+                if wanted is None or table == wanted:
+                    grouped[d] = grouped.get(d, 0) + n
+            return _Result([(self.kb_id, d, n) for d, n in sorted(grouped.items())])
+        return super().execute(clause, params)
+
+
+def _population_conn(population, existing=(), index_count=1, **kwargs):
+    return _PopulationConn(
+        population,
+        answers=[
+            (_FAILURE_RECORD_QUERY, []),
+            (_SWEEP_CATALOG_QUERY, [_sweep_index_row(KB, d) for d in existing]),
+            (_CATALOG_QUERY, [_index_row(KB, d) for d in existing]),
+            (_INDEX_COUNT_QUERY, [(index_count,)]),
+            (_LOCK_QUERY, [(True,)]),
+            (
+                _SETTINGS_QUERY,
+                [
+                    ("VECTOR_PER_KB_INDEX_MIN_ROWS", "10000"),
+                    ("VECTOR_PER_KB_INDEX_DROP_ROWS", "5000"),
+                ],
+            ),
+        ],
+        **kwargs,
+    )
+
+
+_MIXED = {(1536, "chunks"): 3_000, (1536, "full_documents"): 7_000}
+_CHUNKS_ONLY = {(1536, "chunks"): 12_000}
+
+
+def _at_ten_thousand(monkeypatch):
+    """The thresholds ``_ensure`` fixes, for the dispatch check that reads them too."""
+    _stub_settings(
+        monkeypatch,
+        {"VECTOR_PER_KB_INDEX_MIN_ROWS": 10_000, "VECTOR_PER_KB_INDEX_DROP_ROWS": 5_000},
+    )
+
+
+def test_a_knowledge_base_over_the_threshold_only_on_the_sum_gets_no_index(monkeypatch):
+    """10,000 rows across four populations is not 10,000 rows the index can serve.
+
+    The index covers one item table, so a knowledge base whose chunk population is
+    3,000 would get an index that mostly indexes rows its chunk searches cannot
+    join -- which is the recall loss measured at 0.858 -> 0.383.
+    """
+    _at_ten_thousand(monkeypatch)
+    conn = _population_conn(_MIXED)
+    assert pvi.index_action(conn, KB) is None
+    outcome = _ensure(monkeypatch, conn, build_at=10_000)
+    assert outcome["built"] == [], outcome
+    assert conn.issued("CREATE INDEX") == [], conn.statements
+
+
+def test_a_knowledge_base_over_the_threshold_on_its_own_population_still_gets_one(monkeypatch):
+    """The positive control, on the same fake table with the other populations gone."""
+    _at_ten_thousand(monkeypatch)
+    conn = _population_conn(_CHUNKS_ONLY)
+    assert pvi.index_action(conn, KB) == "build"
+    outcome = _ensure(monkeypatch, conn, build_at=10_000)
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+
+
+def test_an_index_whose_own_population_has_drained_is_dropped(monkeypatch):
+    """The drop threshold cuts the same way, because the index covered only chunks."""
+    _at_ten_thousand(monkeypatch)
+    conn = _population_conn(
+        {(1536, "chunks"): 10, (1536, "full_documents"): 40_000}, existing=(1536,)
+    )
+    assert pvi.index_action(conn, KB) == "drop"
+    outcome = _ensure(monkeypatch, conn, build_at=10_000, drop_below=5_000)
+    assert outcome["dropped"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+
+
+def test_the_boot_sweep_counts_only_the_population_the_index_covers():
+    """The sweep's grouped count is a second query and had the same defect.
+
+    A knowledge base whose four populations sum past the build threshold but whose
+    chunk population does not must not have a build dispatched at start-up: the
+    reconcile counts the chunks and declines, so the dispatch is a build slot and a
+    boot spent on nothing.
+    """
+    assert _sweep(_population_conn(_MIXED)) == []
+    assert _sweep(_population_conn(_CHUNKS_ONLY)) == [KB]
 
 
 # -- the disk-size log, which is the only free-space signal there can be ------

@@ -8,11 +8,14 @@ produced ``top_k`` rows of the knowledge base it wanted -- which is both slow
 population (the true top-k *within* one knowledge base needs far more
 candidates than ``hnsw.ef_search`` emits globally).
 
-A partial index fixes both, for the knowledge bases big enough to be worth one:
+A partial index fixes both, for the knowledge bases big enough to be worth one --
+counting only the one item population it covers, because ``ai.embeddings`` is
+polymorphic (``PER_KB_INDEX_ITEM_TABLE``):
 
     CREATE INDEX CONCURRENTLY hnsw_kb_<hex>_<dims> ON ai.embeddings
       USING hnsw ((embedding::vector(<dims>)) vector_cosine_ops)
-      WHERE knowledge_base_id = '<kb>' AND dims = <dims>;
+      WHERE knowledge_base_id = '<kb>' AND dims = <dims>
+        AND item_table = 'chunks';
 
 Measured on a 56,000-row fixture at 1536 dimensions whose largest knowledge
 base held 12,000 rows (21% of the table), ``shared_buffers`` 128 MB,
@@ -117,6 +120,32 @@ from .pg_bm25_index import (
 from .settings_registry import SETTINGS_REGISTRY, get_setting
 
 logger = logging.getLogger(__name__)
+
+# The one item population these indexes cover. ``ai.embeddings`` is polymorphic --
+# ``item_table`` is a NOT NULL column on it, and four item tables share the
+# relation -- so an index whose predicate names only ``(knowledge_base_id, dims)``
+# spans all four. A knowledge base then crossed the build threshold on the *sum*
+# over its populations and got one index mixing them, and the chunk search this
+# feature steers onto it walked entries that cannot join: measured at 1536
+# dimensions, the same 1,000 chunk rows scored recall 0.858 indexed alone against
+# 0.383 in an index that also held 9,000 ``full_documents`` rows, and 6,000 chunk
+# rows 0.925 against 0.812 with 6,000 graph-node rows beside them, tail minimum
+# 0.700 against 0.300.
+#
+# So the predicate names it, and both counts that decide eligibility are restricted
+# to it, which makes a knowledge base's eligibility a fact about the population the
+# index will actually cover.
+#
+# The index *name* is deliberately not qualified by it. There is only ever one
+# population indexed, so there is nothing to disambiguate, and the name is the key
+# every catalog lookup, drop path and failure record in this module is derived
+# from -- a second component would be a rename of all of them for no gain. If a
+# second population is ever indexed, that is when the name has to grow.
+#
+# This is the single source of the string: ``base_vector_store`` needs the same
+# literal in the search query for the planner to be able to prove the predicate,
+# and it already imports this module, so it imports this rather than restating it.
+PER_KB_INDEX_ITEM_TABLE = "chunks"
 
 # Index names are ``hnsw_kb_<32 hex>_<dims>``: 8 + 32 + 1 + 4 = 45 bytes at
 # most, inside Postgres' 63-byte identifier limit, and free of the dashes a
@@ -291,6 +320,12 @@ def per_kb_index_ddl(knowledge_base_id: Any, dims: Any) -> str:
     value -- and the index would cover rows the query's own ``e.dims``
     predicate excludes.
 
+    ``item_table`` likewise, because ``ai.embeddings`` is polymorphic and this
+    index covers one population of it; see ``PER_KB_INDEX_ITEM_TABLE`` for what
+    mixing them cost. The search query has to carry the same literal or the
+    planner cannot prove the predicate and matches no partial index at all -- a
+    half-landed change is slow, not wrong.
+
     The operator class and the cast match the shared per-dimension index
     exactly. Both are load-bearing: the index is on an *expression*, so a query
     whose ``ORDER BY`` does not contain the same ``::vector(N)`` cast matches no
@@ -302,7 +337,8 @@ def per_kb_index_ddl(knowledge_base_id: Any, dims: Any) -> str:
         f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {per_kb_index_name(kb_id, n)} "
         f'ON "{AI_SCHEMA}".embeddings '
         f"USING hnsw ((embedding::vector({n})) vector_cosine_ops) "
-        f"WHERE knowledge_base_id = '{kb_id}' AND dims = {n}"
+        f"WHERE knowledge_base_id = '{kb_id}' AND dims = {n} "
+        f"AND item_table = '{PER_KB_INDEX_ITEM_TABLE}'"
     )
 
 
@@ -546,12 +582,20 @@ def per_kb_index_count(conn) -> int:
 
 
 def bounded_row_count(conn, knowledge_base_id: Any, dims: Any, cap: int) -> int:
-    """Rows this knowledge base has at this dimension, counted no further than ``cap``.
+    """Indexable rows this KB has at this dimension, counted no further than ``cap``.
 
     The decision only needs to know which side of a threshold the count falls
     on, so the count stops there. Without the bound this would read every
     embedding of the largest knowledge base in the project on every source that
     finishes indexing.
+
+    Restricted to ``PER_KB_INDEX_ITEM_TABLE``, because that is the population the
+    index will cover: counting the others too let a knowledge base cross the
+    threshold on the sum and be given an index that mostly indexes rows its
+    searches cannot use. It cuts the same way for the drop threshold -- a
+    knowledge base whose chunks are gone loses the index even if its other
+    populations are large, which is right, because the index covered only the
+    chunks.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     return int(
@@ -560,9 +604,15 @@ def bounded_row_count(conn, knowledge_base_id: Any, dims: Any, cap: int) -> int:
                 "SELECT count(*) FROM (SELECT 1 FROM "
                 f'"{AI_SCHEMA}".embeddings '
                 "WHERE knowledge_base_id = CAST(:kb AS uuid) AND dims = :dims "
+                "AND item_table = :item_table "
                 "LIMIT :cap) s"
             ),
-            {"kb": kb_id, "dims": _validated_dims(dims), "cap": max(1, int(cap))},
+            {
+                "kb": kb_id,
+                "dims": _validated_dims(dims),
+                "cap": max(1, int(cap)),
+                "item_table": PER_KB_INDEX_ITEM_TABLE,
+            },
         ).scalar()
         or 0
     )
@@ -582,6 +632,14 @@ def candidate_dims(conn, knowledge_base_id: Any, cap: int) -> list[int]:
     A dimension that already *has* an index is never missed: the caller unions
     this with ``existing_per_kb_indexes``, so the model-change case (rows now at
     a new dimension, an index still at the old one) is evaluated for dropping.
+
+    Not restricted to ``PER_KB_INDEX_ITEM_TABLE``, unlike the count that decides.
+    This only says which dimensions are worth *looking* at, and the look is
+    ``bounded_row_count``, which is restricted -- so a dimension only the other
+    populations have reaches the loop and is declined there. Restricting here as
+    well would save that one bounded count and cost the survey a predicate on
+    every dimension's read, which is the wrong trade for a query whose job is to
+    be cheap.
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     rows = conn.execute(
@@ -1447,6 +1505,11 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
     cheap; the first two need the grouped count, which is not, so it runs under
     ``SWEEP_TIMEOUT_MS``.
 
+    That count is restricted to ``PER_KB_INDEX_ITEM_TABLE`` for the reason
+    ``bounded_row_count`` is: the two thresholds are about the population the index
+    covers, and this query and that one have to agree about which rows those are or
+    the boot dispatches builds the reconcile then declines.
+
     An ``INVALID`` index that has already reached
     ``MAX_CONSECUTIVE_BUILD_FAILURES`` is not one of them: the reconcile would
     read the same count and decline, so dispatching it only spends one of
@@ -1549,8 +1612,10 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
             counted = conn.execute(
                 text(
                     "SELECT knowledge_base_id::text, dims, count(*) FROM "
-                    f'"{AI_SCHEMA}".embeddings GROUP BY 1, 2'
-                )
+                    f'"{AI_SCHEMA}".embeddings '
+                    "WHERE item_table = :item_table GROUP BY 1, 2"
+                ),
+                {"item_table": PER_KB_INDEX_ITEM_TABLE},
             ).all()
             conn.rollback()
     except Exception as exc:
