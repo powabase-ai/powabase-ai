@@ -20,6 +20,7 @@ import pytest
 from agentic_project_service.services.base_vector_store import (
     PER_KB_HNSW_EF_SEARCH,
     BasePgVectorStore,
+    item_table_sql_literal,
 )
 
 _KB_ID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
@@ -51,7 +52,11 @@ class _FakeDocumentStore(BasePgVectorStore):
 
 
 def _capture(
-    *, partial_index: bool = False, store: type[BasePgVectorStore] = _FakeStore, **kwargs
+    *,
+    partial_index: bool = False,
+    store: type[BasePgVectorStore] = _FakeStore,
+    ef_search_was: str | None = EF_SEARCH_WAS,
+    **kwargs,
 ) -> list[tuple[str, dict]]:
     """Every statement ``vector_search`` executes, with the parameters it binds.
 
@@ -60,6 +65,12 @@ def _capture(
     the fake has to be able to answer both ways. ``ENABLE_SORT_WAS`` and
     ``EF_SEARCH_WAS`` are the values the probe reports those settings currently
     have, so a spec can tell a restore from a hardcoded default.
+
+    ``ef_search_was`` is ``None`` for the case a real fresh connection is always
+    in: pgvector registers ``hnsw.ef_search`` on the first *use of the vector
+    type*, so until then the probe's ``current_setting(..., true)`` answers NULL.
+    Hardcoding a value here left that branch -- the only one a pooled
+    connection's first search takes -- unexercised.
     """
     session = MagicMock()
     captured: list[tuple[str, dict]] = []
@@ -68,7 +79,7 @@ def _capture(
         sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
         captured.append((sql, dict(params or {})))
         if "to_regclass" in sql:
-            return iter([(ENABLE_SORT_WAS, EF_SEARCH_WAS, partial_index)])
+            return iter([(ENABLE_SORT_WAS, ef_search_was, partial_index)])
         if "current_setting('enable_indexscan')" in sql:
             return _scalar(ENABLE_INDEXSCAN_WAS)
         return iter([])
@@ -157,6 +168,53 @@ def test_a_bad_knowledge_base_id_is_rejected_on_both_sides():
         assert "knowledge_base_id" in str(exc), exc
     else:
         raise AssertionError("a non-UUID knowledge base id must raise")
+
+
+@pytest.mark.parametrize(
+    ("store", "item_table"),
+    [(_FakeStore, "chunks"), (_FakeDocumentStore, "full_documents")],
+    ids=["chunks", "documents"],
+)
+def test_the_item_table_reaches_sql_as_a_literal_too(store, item_table):
+    """``ai.embeddings`` is polymorphic, so the index is one population by predicate.
+
+    A knowledge base crosses the build threshold on the *sum* over its item tables.
+    An index that mixes populations is then walked for entries that cannot join:
+    measured on the same 1,000 chunk rows, chunks alone against chunks plus 9,000
+    document rows, recall 0.858 -> 0.383; and on 6,000 chunk rows with and without
+    6,000 graph-node rows, 0.925 -> 0.812 with the worst query at 0.700 -> 0.300.
+
+    The index predicate names the item table, so the query has to name it as a
+    *literal* or a generic plan cannot prove the predicate and the index is lost --
+    confirmed by EXPLAIN ANALYZE, which drops to the shared per-dimension index
+    (12.2 ms against 1.45 ms) as soon as the clause is bound or absent.
+
+    The store's own table, not a hardcoded ``chunks``: an embedding's ``item_table``
+    is the table its item lives in, so this is the semantically correct restriction
+    for every store that inherits the search, and the one that keeps a document
+    store off an index built for chunks.
+    """
+    sql, params = _search(_capture(store=store))
+    normalized = "".join(sql.split())
+    assert f"e.item_table='{item_table}'" in normalized, (
+        "the item table must be a literal on the embeddings side, or the index "
+        f"predicate cannot be proved:\n{sql}"
+    )
+    assert "item_table" not in params, f"a bound item table proves nothing to the planner: {params}"
+
+
+def test_an_item_table_that_could_break_the_quoting_is_rejected():
+    """The one gate between a store's ``TABLE`` and a SQL string literal.
+
+    It is a class attribute rather than caller data, and the same attribute is
+    already interpolated as an identifier in the ``FROM`` clause -- but the check
+    belongs where the quoting happens, not in a comment about why it is safe.
+    """
+    assert item_table_sql_literal("chunks") == "'chunks'"
+    assert item_table_sql_literal("doc2json_documents") == "'doc2json_documents'"
+    for bad in ["chunks'; DROP TABLE x --", "Chunks", "ai.chunks", "", "chunks chunks", None, 7]:
+        with pytest.raises(ValueError):
+            item_table_sql_literal(bad)
 
 
 # ---------------------------------------------------------------------------
@@ -255,10 +313,22 @@ def test_the_sort_is_priced_out_before_the_search_and_restored_after():
 
 
 def test_the_restore_puts_back_the_value_the_probe_read():
-    """Not a hardcoded ``on``: whatever the transaction had before."""
+    """Not a hardcoded ``on``: whatever the transaction had before.
+
+    The SQL text is asserted as well as the parameters, and that is not
+    belt-and-braces: a restore that stops using the bind and hardcodes ``'on'``
+    still *passes* a parameter assertion, because the bind stays in the dict the
+    caller built. Two mutations hid there -- the hardcoded value, and a restore
+    made session-scoped (``true`` -> ``false``), which leaks the setting into the
+    pool. Both are visible only in the statement.
+    """
     statements = _capture(partial_index=True)
     restore_at = _enable_sort(statements)[1]
     sql, params = statements[restore_at]
+    normalized = "".join(sql.split()).lower()
+    assert "set_config('enable_sort',:prior,true)" in normalized, (
+        f"the restore must bind the value the probe read and stay transaction-local:\n{sql}"
+    )
     assert params.get("prior") == ENABLE_SORT_WAS, (
         f"the restore must bind the value the probe read, not a guess: {sql} {params}"
     )
@@ -275,8 +345,16 @@ def test_the_restore_puts_back_the_value_the_probe_read():
     ],
     ids=["item_ids", "empty-item_ids", "source_ids", "empty-source_ids", "filter_metadata"],
 )
-def test_a_restricted_search_has_the_index_priced_out_not_merely_unforced(restriction):
+@pytest.mark.parametrize("store", [_FakeStore, _FakeDocumentStore], ids=["chunks", "documents"])
+def test_a_restricted_search_has_the_index_priced_out_not_merely_unforced(restriction, store):
     """Every restriction the search accepts, including the empty ones.
+
+    Over every store that inherits this search, not just the chunks one. Making
+    exactness conditional on the item table is a *silent wrong answer* for the
+    document-level stores: a caller who names ``item_ids`` gets a full page from an
+    approximate scan, and by this mechanism's own argument a full page has no
+    signal in it to notice. The gate on the item table belongs on the half that
+    steers *towards* the index, never on the half that makes an answer exact.
 
     Two propositions in one spec, because either alone passes a broken
     implementation: the sort penalty must not be applied, *and* the index must be
@@ -289,7 +367,7 @@ def test_a_restricted_search_has_the_index_priced_out_not_merely_unforced(restri
     -- so keying on ``is not None`` rather than truthiness is load-bearing, and
     pinned here.
     """
-    statements = _capture(partial_index=True, **restriction)
+    statements = _capture(partial_index=True, store=store, **restriction)
     priced_out = _writes(statements, "enable_indexscan")
     assert priced_out, (
         "a restricted search must have the approximate index priced out, not just "
@@ -313,14 +391,26 @@ def test_a_restricted_search_has_the_index_priced_out_not_merely_unforced(restri
     ],
     ids=["item_ids", "source_ids", "filter_metadata"],
 )
-def test_the_exact_search_puts_enable_indexscan_back(restriction):
+@pytest.mark.parametrize("store", [_FakeStore, _FakeDocumentStore], ids=["chunks", "documents"])
+def test_the_exact_search_puts_enable_indexscan_back(restriction, store):
     """``hybrid_search`` runs its keyword leg on this same session afterwards, and
     a keyword ranking wants its index scans. Not a hardcoded ``on`` either:
-    whatever the transaction had."""
-    statements = _capture(partial_index=True, **restriction)
+    whatever the transaction had -- and still transaction-local, or the value
+    follows the connection back into the pool.
+
+    Asserted on the statement and not only on the bound parameters: a restore that
+    stops using the bind leaves the parameter dict untouched, so a params-only
+    assertion passes a hardcoded value and a session-scoped restore alike.
+    """
+    statements = _capture(partial_index=True, store=store, **restriction)
     touched = _writes(statements, "enable_indexscan")
     assert len(touched) == 2, f"expected one set and one restore: {statements}"
-    assert statements[touched[1]][1].get("prior") == ENABLE_INDEXSCAN_WAS, statements[touched[1]]
+    sql, params = statements[touched[1]]
+    normalized = "".join(sql.split()).lower()
+    assert "set_config('enable_indexscan',:prior,true)" in normalized, (
+        f"the restore must bind the value that was read and stay transaction-local:\n{sql}"
+    )
+    assert params.get("prior") == ENABLE_INDEXSCAN_WAS, statements[touched[1]]
     search_at = next(i for i, (sql, _) in enumerate(statements) if "ORDER BY" in sql)
     assert touched[0] < search_at < touched[1], statements
 
@@ -361,11 +451,15 @@ def test_an_empty_metadata_filter_is_not_a_restriction(empty):
 def test_the_gate_is_only_for_the_item_table_it_was_measured_on():
     """``ai.embeddings`` is polymorphic and four stores inherit this search.
 
-    The partial index's predicate and the probe name ``(knowledge_base_id, dims)``
-    only, so a knowledge base whose embeddings are mostly chunks but whose search
-    routes to a document-level store passes the probe and is driven into an HNSW
-    walk of rows that cannot join: measured 2.2 -> 25.9 ms and recall 1.00 -> 0.33
-    on a 40-row table. The other stores keep the planner's own choice.
+    The index is *named* after ``(knowledge_base_id, dims)`` and the probe can only
+    look for a name, so a knowledge base whose search routes to a document-level
+    store passes the probe just the same -- and would be driven into an HNSW walk
+    of an index whose predicate restricts it to another store's rows: measured
+    2.2 -> 25.9 ms and recall 1.00 -> 0.33 on a 40-row table.
+
+    "The other stores keep the planner's own choice" holds for the *unrestricted*
+    search only, which is the one this spec drives. A restricted search from those
+    stores is priced off the index like any other, and that is pinned separately.
     """
     statements = _capture(partial_index=True, store=_FakeDocumentStore)
     assert not _enable_sort(statements), (
@@ -383,11 +477,6 @@ def test_the_chunks_store_is_the_one_that_does_enter_it():
     """
     statements = _capture(partial_index=True, store=_FakeStore)
     assert _enable_sort(statements), statements
-
-
-# ---------------------------------------------------------------------------
-# The re-run, which is what makes the setting safe on a restricted search
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +531,12 @@ def test_ef_search_is_restored_to_the_value_the_probe_read():
     statements = _capture(partial_index=True)
     touched = _writes(statements, "hnsw.ef_search")
     assert len(touched) == 2, f"expected one set and one restore: {statements}"
-    assert statements[touched[1]][1].get("prior") == EF_SEARCH_WAS, statements[touched[1]]
+    sql, params = statements[touched[1]]
+    normalized = "".join(sql.split()).lower()
+    assert "set_config('hnsw.ef_search',:prior,true)" in normalized, (
+        f"the restore must bind the value the probe read and stay transaction-local:\n{sql}"
+    )
+    assert params.get("prior") == EF_SEARCH_WAS, statements[touched[1]]
     search_at = next(i for i, (sql, _) in enumerate(statements) if "ORDER BY" in sql)
     assert touched[0] < search_at < touched[1], statements
 
@@ -459,26 +553,47 @@ def test_ef_search_is_read_in_a_way_that_survives_a_database_without_pgvector():
     assert "current_setting('hnsw.ef_search',true)" in normalized, probe
 
 
-def test_a_database_without_pgvector_sets_no_ef_search():
-    """The NULL above must not become a ``set_config`` of the string "None"."""
-    session = MagicMock()
-    captured: list[tuple[str, dict]] = []
+def test_ef_search_is_raised_even_when_the_probe_read_no_value_at_all():
+    """The branch every pooled connection's *first* search takes.
 
-    def spy_execute(text_obj, params=None):
-        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
-        captured.append((sql, dict(params or {})))
-        if "to_regclass" in sql:
-            return iter([(ENABLE_SORT_WAS, None, True)])
-        if "current_setting('enable_indexscan')" in sql:
-            return _scalar(ENABLE_INDEXSCAN_WAS)
-        return iter([])
+    pgvector registers its GUCs in ``_PG_init``, which runs on the first use of
+    the vector type -- not at ``CREATE EXTENSION``, not at connection start, and
+    ``SET LOCAL hnsw.iterative_scan`` does not trigger it either (a dotted name is
+    accepted as a placeholder). The probe runs before any vector operation, so on
+    a fresh connection it reads NULL. Demonstrated on a live server: ``<NULL>``,
+    then a single distance operation, then ``40``.
 
-    session.execute = spy_execute
-    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
-    asyncio.run(store.vector_search(embedding=[0.0] * 1536, top_k=10))
-    assert not _writes(captured, "hnsw.ef_search"), captured
-    assert _enable_sort(captured), (
-        f"the rest of the gate still applies without pgvector's GUC: {captured}"
+    Gating the raise on that read therefore left the first search of every
+    connection at pgvector's default 40 rather than the value this mechanism
+    measured -- recall 0.915 against 0.973 at 12,000 rows, and about 0.85 several
+    times above the build threshold -- once per connection per pool lifetime, on
+    the search most likely to be cold. So it is set unconditionally, which is safe:
+    a ``set_config`` on an unloaded pgvector GUC creates a placeholder whose value
+    survives ``_PG_init`` and still dies with the transaction.
+    """
+    statements = _capture(partial_index=True, ef_search_was=None)
+    raised = _writes(statements, "hnsw.ef_search")
+    assert raised, (
+        "the probe reads NULL on a fresh connection, which is the common case, not "
+        f"the exotic one -- ef_search must still be raised: {statements}"
+    )
+    sql, params = statements[raised[0]]
+    assert params.get("ef") == str(PER_KB_HNSW_EF_SEARCH), statements[raised[0]]
+    assert "None" not in str(params.values()), (
+        f'the NULL must not become a set_config of the string "None": {params}'
+    )
+    normalized = "".join(sql.split()).lower()
+    assert "set_config('hnsw.ef_search',:ef,true)" in normalized, sql
+    search_at = next(i for i, (s, _) in enumerate(statements) if "ORDER BY" in s)
+    assert raised[0] < search_at, (
+        f"the setting has to be in place before the statement is planned: {statements}"
+    )
+    assert len(raised) == 1, (
+        "with nothing read there is nothing to put back, and a transaction-local "
+        f"placeholder dies with the transaction: {statements}"
+    )
+    assert _enable_sort(statements), (
+        f"the rest of the gate applies on this branch too: {statements}"
     )
 
 
@@ -518,6 +633,82 @@ def test_the_probe_runs_in_a_savepoint():
     assert any("ORDER BY" in sql for sql in captured), (
         f"the search must still run after a failed probe: {captured}"
     )
+
+
+def test_the_exact_searchs_own_setting_runs_in_a_savepoint():
+    """The twin of the spec above, on the other half of the symmetry.
+
+    ``_insisting_on_an_exact_search`` reads a setting and writes one, and either
+    statement can be cancelled like any other. Without a savepoint that failure
+    leaves the caller's transaction aborted, so the search that follows raises
+    ``InFailedSqlTransaction`` while the handler logs that it had merely degraded
+    -- proved live both ways: the probe's failure in the mirrored block warns and
+    the search still answers, this one's failure warned and the search raised.
+
+    Two assertions, because either alone passes something broken: the savepoint has
+    to be taken, *and* the search has to still run after the failure.
+    """
+    session = MagicMock()
+    captured: list[str] = []
+
+    def spy_execute(text_obj, params=None):
+        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
+        captured.append(sql)
+        if "current_setting('enable_indexscan')" in sql:
+            raise RuntimeError("cancelled")
+        return iter([])
+
+    session.execute = spy_execute
+    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
+    items = asyncio.run(
+        store.vector_search(
+            embedding=[0.0] * 1536,
+            top_k=10,
+            source_ids=["3f2504e0-4f89-11d3-9a0c-0305e82c3303"],
+        )
+    )
+    assert items == []
+    assert session.begin_nested.called, (
+        "the setting must be read and written in a savepoint, or its failure "
+        f"aborts the caller's transaction: {captured}"
+    )
+    assert any("ORDER BY" in sql for sql in captured), (
+        f"the search must still run after the setting could not be applied: {captured}"
+    )
+
+
+def test_a_setting_that_could_not_be_applied_is_not_restored_either():
+    """Nothing was changed, so there is nothing to put back.
+
+    A restore on this path would be a second statement inside a transaction the
+    savepoint has just rolled back to -- and it would bind a value read from a
+    statement that raised.
+    """
+    session = MagicMock()
+    captured: list[tuple[str, dict]] = []
+
+    def spy_execute(text_obj, params=None):
+        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
+        captured.append((sql, dict(params or {})))
+        if "set_config('enable_indexscan'" in sql:
+            raise RuntimeError("cancelled")
+        if "current_setting('enable_indexscan')" in sql:
+            return _scalar(ENABLE_INDEXSCAN_WAS)
+        return iter([])
+
+    session.execute = spy_execute
+    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
+    asyncio.run(
+        store.vector_search(
+            embedding=[0.0] * 1536,
+            top_k=10,
+            item_ids=["3f2504e0-4f89-11d3-9a0c-0305e82c3302"],
+        )
+    )
+    assert len(_writes(captured, "enable_indexscan")) == 1, (
+        f"only the attempt that failed; no restore of a setting never made: {captured}"
+    )
+    assert any("ORDER BY" in sql for sql, _ in captured), captured
 
 
 # ---------------------------------------------------------------------------

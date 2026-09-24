@@ -335,11 +335,20 @@ def schema(engine, fixture_schema, monkeypatch):
 @pytest.fixture
 def settings(monkeypatch):
     """Injectable thresholds, read through the real clamping and hysteresis code."""
-    # 10,000 / 5,000 are the registry's intended defaults, so these tests run
-    # the thresholds production runs. On this fixture only KB_BIG (12,000 rows)
-    # is at or above the build threshold; KB_MED, at 8,400, is the knowledge
-    # base those defaults leave without an index, which is what the regression
-    # specs measure.
+    # Deliberately 5x below the registry's shipped defaults of 50,000 / 25,000,
+    # and injected rather than read for that reason: a knowledge base of 50,000
+    # rows at 384 dimensions turns this module's fixture from seconds into
+    # minutes, and nothing here is a claim about the numbers themselves. Every
+    # question below is about the *relation* between a knowledge base's size and
+    # the threshold -- which side of it each one falls on, and what the search
+    # costs on each side -- and that relation is what the injected pair
+    # reproduces at a tenth of the rows. The shipped defaults are pinned where
+    # they cost nothing to pin, in
+    # tests/unit/test_per_kb_vector_index_thresholds.py.
+    #
+    # At 10,000 / 5,000, only KB_BIG (12,000 rows) is at or above the build
+    # threshold; KB_MED, at 8,400, is the knowledge base this pair leaves without
+    # an index, which is what the regression specs measure.
     values = {
         "VECTOR_PER_KB_INDEX_MIN_ROWS": 10_000,
         "VECTOR_PER_KB_INDEX_DROP_ROWS": 5_000,
@@ -352,7 +361,7 @@ def settings(monkeypatch):
     return values
 
 
-def _drop_all_partial_indexes(engine) -> None:
+def _drop_all_partial_indexes(engine, schema: str = SCHEMA) -> None:
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         names = [
             row[0]
@@ -362,11 +371,11 @@ def _drop_all_partial_indexes(engine) -> None:
                     "ON n.oid = c.relnamespace WHERE n.nspname = :s AND c.relkind = 'i' "
                     "AND c.relname LIKE 'hnsw_kb_%'"
                 ),
-                {"s": SCHEMA},
+                {"s": schema},
             ).all()
         ]
         for name in names:
-            conn.execute(text(f'DROP INDEX CONCURRENTLY IF EXISTS "{SCHEMA}".{name}'))
+            conn.execute(text(f'DROP INDEX CONCURRENTLY IF EXISTS "{schema}".{name}'))
 
 
 # ---------------------------------------------------------------------------
@@ -394,11 +403,11 @@ class _RecordingSession:
         return getattr(self._session, name)
 
 
-def _capture_search_sql(engine, kb_id, embedding, **kwargs):
+def _capture_search_sql(engine, kb_id, embedding, *, schema=SCHEMA, **kwargs):
     """The SQL the real store issues, and the parameters it binds."""
     with Session(engine) as session:
         recorder = _RecordingSession(session)
-        store = _ChunkStore(db_session=recorder, knowledge_base_id=kb_id, schema=SCHEMA)
+        store = _ChunkStore(db_session=recorder, knowledge_base_id=kb_id, schema=schema)
         asyncio.run(store.vector_search(embedding=list(embedding), top_k=20, **kwargs))
         session.rollback()
     searches = [pair for pair in recorder.statements if "ORDER BY" in pair[0]]
@@ -459,7 +468,7 @@ def _without_the_embeddings_predicate(sql: str) -> str:
     return "\n".join(kept)
 
 
-def _idx_scans(engine, *names: str) -> dict[str, int]:
+def _idx_scans(engine, *names: str, schema: str = SCHEMA) -> dict[str, int]:
     """How many index scans each index has served, on a connection of its own.
 
     Two things about Postgres' statistics make this fiddly, and both bit:
@@ -478,12 +487,12 @@ def _idx_scans(engine, *names: str) -> dict[str, int]:
                 "SELECT indexrelname, coalesce(idx_scan, 0) FROM pg_stat_all_indexes "
                 "WHERE schemaname = :s AND indexrelname = ANY(:n)"
             ),
-            {"s": SCHEMA, "n": list(names)},
+            {"s": schema, "n": list(names)},
         ).all()
         conn.rollback()
     found = {name: int(count) for name, count in rows}
     missing = [name for name in names if name not in found]
-    assert not missing, f"no such index in {SCHEMA}: {missing}"
+    assert not missing, f"no such index in {schema}: {missing}"
     return {name: found[name] for name in names}
 
 
@@ -1338,6 +1347,294 @@ def test_a_concurrent_build_does_not_block_writes(engine, schema, settings):
 
 
 # ---------------------------------------------------------------------------
+# 6. What the index covers: one population, not four
+#
+# ``ai.embeddings`` holds the vectors of four different item tables, and
+# ``item_table`` is NOT NULL and one of those four values. A knowledge base can
+# therefore hold more than one population at once -- chunks and whole documents,
+# chunks and graph nodes -- and the index this feature builds is named by the
+# knowledge base and the dimension only. So an index built for such a knowledge
+# base spans every population in it, while the search this feature steers onto
+# that index joins ``chunks`` and can only ever return chunk rows.
+#
+# That is not a tidiness point, it is recall. The ordered scan walks the index by
+# distance and the join throws away everything that is not a chunk, so the rows
+# the caller gets are drawn from whatever the scan reached before the limit was
+# filled -- and the deeper the scan has to go, the more of the real top-k it never
+# sees. This fixture is the smallest one that shows it: the same 3,000 chunk
+# rows, the same query vectors, once with 7,000 whole-document embeddings beside
+# them in the same knowledge base and once without.
+#
+# The claim is asserted at the answer, not at the DDL. An index definition that
+# names ``item_table`` is evidence of an intention; recall against an exact scan
+# of the chunk rows is evidence of the outcome, and it is the outcome that moved
+# (measured on this fixture over two runs, mean recall at 20 over six query
+# vectors, both runs through the real store on an index it built itself: 0.53-0.57
+# with the second population in the index against 0.82-0.83 without, and 0.05-0.10
+# at the worst vector against 0.60).
+# Both runs assert the index served every execution, because an exact scan
+# answers with recall 1.00 and a comparison that quietly stopped using the index
+# would read as a pass.
+#
+# The twin knowledge base is what makes the recall number mean something. HNSW
+# recall on this fixture's clustered vectors is well below 1.00 even over one
+# population -- the vectors within a cluster are near-ties -- so an absolute bar
+# would be a fixture constant rather than a claim. The twin holds the chunk
+# population and nothing else, so it measures what this search's recall is
+# *allowed* to be, from the same rows and the same queries.
+#
+# Thresholds of its own, deliberately low: the row count that decides whether to
+# build is the other half of this question (a knowledge base that crosses the
+# threshold on the *sum* over its populations, and would not cross it on chunks
+# alone), and pinning that belongs where the counting is unit-testable. These
+# specs are about what the index covers once there is one, so both knowledge bases
+# here are above the threshold either way and the gate is not the variable.
+# ---------------------------------------------------------------------------
+
+MIXED_SCHEMA = f"{SCHEMA}_populations"
+# Two knowledge bases with the same chunk population, from the same vectors, so
+# the only difference between them is the second population in one of them.
+KB_TWO_POPULATIONS = "9f8b1c2e-0000-4000-8000-0000000000f1"
+KB_ONE_POPULATION = "9f8b1c2e-0000-4000-8000-0000000000f2"
+POPULATION_CHUNK_ROWS = 3_000
+# More rows than the chunk population rather than fewer: a knowledge base indexed
+# at the page or whole-document level alongside its chunks is the ordinary case,
+# not a corner, and the harm scales with how much of the index cannot join.
+POPULATION_OTHER_ROWS = 7_000
+
+
+@pytest.fixture(scope="module")
+def mixed_population_schema(engine):
+    """A second scratch schema: one knowledge base with two populations, one with one."""
+    raw_dsn = engine.url.set(drivername="postgresql").render_as_string(hide_password=False)
+    with psycopg.connect(raw_dsn, autocommit=True) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {MIXED_SCHEMA} CASCADE")
+        conn.execute(f"CREATE SCHEMA {MIXED_SCHEMA}")
+        conn.execute(f"""
+            CREATE TABLE {MIXED_SCHEMA}.chunks (
+                id uuid PRIMARY KEY,
+                knowledge_base_id uuid NOT NULL,
+                source_id uuid NOT NULL,
+                text text NOT NULL,
+                meta jsonb DEFAULT '{{}}'::jsonb
+            )
+        """)
+        conn.execute(f"""
+            CREATE TABLE {MIXED_SCHEMA}.embeddings (
+                id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                item_id uuid NOT NULL,
+                item_table varchar(50) NOT NULL,
+                knowledge_base_id uuid NOT NULL,
+                source_id uuid NOT NULL,
+                embedding_model varchar(255) NOT NULL,
+                dims smallint NOT NULL,
+                embedding vector NOT NULL,
+                CONSTRAINT embeddings_item_id_embedding_model_key UNIQUE (item_id, embedding_model)
+            )
+        """)
+        conn.execute(f"CREATE INDEX ON {MIXED_SCHEMA}.chunks (knowledge_base_id)")
+        conn.execute(f"CREATE INDEX ON {MIXED_SCHEMA}.embeddings (item_id)")
+        conn.execute(f"CREATE INDEX ON {MIXED_SCHEMA}.embeddings (knowledge_base_id)")
+        # Serial builds here too, for the reason the first fixture gives.
+        conn.execute(f"ALTER TABLE {MIXED_SCHEMA}.embeddings SET (parallel_workers = 0)")
+
+        rng = np.random.default_rng(777)
+        chunk_vectors = _vectors(rng, POPULATION_CHUNK_ROWS)
+        other_vectors = _vectors(rng, POPULATION_OTHER_ROWS)
+        chunks = io.StringIO()
+        embeddings = io.StringIO()
+        for kb_id in (KB_TWO_POPULATIONS, KB_ONE_POPULATION):
+            for i in range(POPULATION_CHUNK_ROWS):
+                item_id = str(uuid.uuid4())
+                meta = json.dumps({"tier": "gold", "kb": kb_id})
+                chunks.write(f"{item_id}\t{kb_id}\t{SOURCE}\tpassage {i}\t{meta}\n")
+                embeddings.write(
+                    f"{item_id}\tchunks\t{kb_id}\t{SOURCE}\ttest-embed\t{DIMS}\t"
+                    f"{_literal(chunk_vectors[i])}\n"
+                )
+        # The second population, in one of the two knowledge bases. No rows in any
+        # item table to match them: an embedding of a whole document is not a
+        # chunk, so a chunk search's join drops it however it was reached, which
+        # is the whole point -- these are index entries that cannot answer.
+        for i in range(POPULATION_OTHER_ROWS):
+            embeddings.write(
+                f"{uuid.uuid4()}\tfull_documents\t{KB_TWO_POPULATIONS}\t{SOURCE}\t"
+                f"test-embed\t{DIMS}\t{_literal(other_vectors[i])}\n"
+            )
+        chunks.seek(0)
+        embeddings.seek(0)
+        with conn.cursor() as cur:
+            with cur.copy(
+                f"COPY {MIXED_SCHEMA}.chunks (id, knowledge_base_id, source_id, text, meta) "
+                "FROM STDIN"
+            ) as copy:
+                copy.write(chunks.read())
+            with cur.copy(
+                f"COPY {MIXED_SCHEMA}.embeddings (item_id, item_table, knowledge_base_id, "
+                "source_id, embedding_model, dims, embedding) FROM STDIN"
+            ) as copy:
+                copy.write(embeddings.read())
+        conn.execute(f"VACUUM ANALYZE {MIXED_SCHEMA}.embeddings")
+        conn.execute(f"VACUUM ANALYZE {MIXED_SCHEMA}.chunks")
+    yield MIXED_SCHEMA
+    with psycopg.connect(raw_dsn, autocommit=True) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {MIXED_SCHEMA} CASCADE")
+
+
+@pytest.fixture
+def mixed_population(engine, mixed_population_schema, monkeypatch):
+    """The service pointed at that schema, with thresholds both populations clear."""
+    monkeypatch.setattr(pvi, "AI_SCHEMA", MIXED_SCHEMA)
+    values = {
+        "VECTOR_PER_KB_INDEX_MIN_ROWS": 1_000,
+        "VECTOR_PER_KB_INDEX_DROP_ROWS": 500,
+        "VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB": _MEM_MB,
+    }
+    monkeypatch.setattr(pvi, "get_setting", lambda key: values[key])
+    monkeypatch.setattr(pvi, "read_overrides", lambda conn, *keys: dict(values))
+    _drop_all_partial_indexes(engine, MIXED_SCHEMA)
+    yield MIXED_SCHEMA
+    _drop_all_partial_indexes(engine, MIXED_SCHEMA)
+
+
+def _item_tables_of(engine, kb_id: str, schema: str) -> dict[str, int]:
+    """How many embeddings each item table holds for one knowledge base."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                f"SELECT item_table, count(*) FROM {schema}.embeddings "
+                "WHERE knowledge_base_id = CAST(:kb AS uuid) GROUP BY item_table"
+            ),
+            {"kb": kb_id},
+        ).all()
+        conn.rollback()
+    return {str(table): int(count) for table, count in rows}
+
+
+def _indexed_tuples(engine, name: str, schema: str) -> int:
+    """How many tuples the index holds, from the catalog rather than from its DDL.
+
+    ``pg_class.reltuples`` on the index relation is set by the build, so this is a
+    measurement of what the index covers and not a reading of the predicate that
+    was meant to decide it -- which is the difference the recall numbers above
+    turn on.
+    """
+    with engine.connect() as conn:
+        count = conn.execute(
+            text(
+                "SELECT c.reltuples FROM pg_class c JOIN pg_namespace n "
+                "ON n.oid = c.relnamespace WHERE n.nspname = :s AND c.relname = :n"
+            ),
+            {"s": schema, "n": name},
+        ).scalar()
+        conn.rollback()
+    assert count is not None, f"no such index in {schema}: {name}"
+    return int(count)
+
+
+def _recall_of_the_real_search(engine, kb_id: str, vectors, *, schema: str):
+    """``(scans, mean recall, worst recall)`` for the store's own unrestricted search.
+
+    The expectation is PostgreSQL's own answer to the same statement with index
+    scans off, once per query vector, so nothing about the right answer is written
+    down here.
+    """
+    name = pvi.per_kb_index_name(kb_id, DIMS)
+    exact = _exact_answers(engine, kb_id, vectors, schema=schema)
+    assert all(len(answer) == TOP_K for answer in exact), [len(a) for a in exact]
+    scans, answers = _drive_and_collect(engine, kb_id, vectors, name, schema=schema)
+    hits = [len(set(got) & set(want)) / len(want) for got, want in zip(answers, exact)]
+    return scans[name], sum(hits) / len(hits), min(hits)
+
+
+def test_a_knowledge_base_with_two_item_tables_gets_an_index_of_one_population(
+    engine, mixed_population, query_vectors
+):
+    """The index covers the population the search can join, and the answer shows it.
+
+    Two knowledge bases, the same 3,000 chunk rows built from the same vectors,
+    each given its own index by the real service path. One of them also holds
+    7,000 whole-document embeddings, which no chunk search can ever return.
+
+    Four assertions, and the order is the argument:
+
+    - the fixture really is what it claims -- two populations in one knowledge base
+      and one in the other;
+    - both indexes hold the same number of tuples, which is the chunk population.
+      An index that spans the knowledge base's other populations holds 10,000
+      where its twin holds 3,000;
+    - the index served every execution on both, without which the recall
+      comparison below would be comparing an exact scan against an index scan and
+      would pass for the wrong reason;
+    - and the recall the search gets is the recall the same rows and the same
+      queries give through an index that holds nothing else. Measured with the
+      second population in the index: 0.53-0.57 mean and 0.05-0.10 at the worst
+      vector, against 0.82-0.83 and 0.60.
+
+    The margins are there because the two index builds see their rows in a
+    different heap order and an HNSW graph is built in the order it reads, so the
+    twins are not required to agree to the row; they are required to agree within
+    a few rows of a 20-row page.
+    """
+    two = _item_tables_of(engine, KB_TWO_POPULATIONS, MIXED_SCHEMA)
+    one = _item_tables_of(engine, KB_ONE_POPULATION, MIXED_SCHEMA)
+    assert two == {"chunks": POPULATION_CHUNK_ROWS, "full_documents": POPULATION_OTHER_ROWS}, two
+    assert one == {"chunks": POPULATION_CHUNK_ROWS}, one
+
+    for kb_id in (KB_TWO_POPULATIONS, KB_ONE_POPULATION):
+        outcome = pvi.ensure_per_kb_vector_index(kb_id, engine=engine)
+        assert outcome["built"] == [pvi.per_kb_index_name(kb_id, DIMS)], outcome
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(f"ANALYZE {MIXED_SCHEMA}.embeddings"))
+
+    covered = {
+        kb_id: _indexed_tuples(engine, pvi.per_kb_index_name(kb_id, DIMS), MIXED_SCHEMA)
+        for kb_id in (KB_TWO_POPULATIONS, KB_ONE_POPULATION)
+    }
+    # Everything is measured before anything is asserted, so a failure of the
+    # first claim still reports what it cost at the answer -- which is the half of
+    # this that an index definition cannot tell anyone.
+    scans_two, mean_two, worst_two = _recall_of_the_real_search(
+        engine, KB_TWO_POPULATIONS, query_vectors, schema=MIXED_SCHEMA
+    )
+    scans_one, mean_one, worst_one = _recall_of_the_real_search(
+        engine, KB_ONE_POPULATION, query_vectors, schema=MIXED_SCHEMA
+    )
+    measured = (
+        f"(two populations: {covered[KB_TWO_POPULATIONS]} tuples indexed, recall "
+        f"{mean_two:.3f} mean / {worst_two:.3f} worst over {scans_two} index scans; "
+        f"one population: {covered[KB_ONE_POPULATION]} tuples indexed, recall "
+        f"{mean_one:.3f} mean / {worst_one:.3f} worst over {scans_one} index scans)"
+    )
+
+    assert covered[KB_ONE_POPULATION] == POPULATION_CHUNK_ROWS, (covered, measured)
+    assert covered[KB_TWO_POPULATIONS] == covered[KB_ONE_POPULATION], (
+        f"the index built for a knowledge base with two populations holds "
+        f"{covered[KB_TWO_POPULATIONS]} tuples where the one built for the same chunk "
+        f"population alone holds {covered[KB_ONE_POPULATION]}; the difference is "
+        f"{POPULATION_OTHER_ROWS} entries a chunk search can reach and can never "
+        f"return {measured}"
+    )
+    assert scans_two == len(query_vectors) and scans_one == len(query_vectors), (
+        "both searches have to go through the knowledge base's own index for the "
+        f"recall below to be about the index at all: {scans_two} and {scans_one} of "
+        f"{len(query_vectors)} executions did"
+    )
+    assert mean_two >= mean_one - 0.05, (
+        f"a chunk search on a knowledge base that also holds {POPULATION_OTHER_ROWS} "
+        f"whole-document embeddings returned {mean_two:.3f} of the exact answer, where "
+        f"the same {POPULATION_CHUNK_ROWS} chunk rows and the same queries return "
+        f"{mean_one:.3f} through an index holding only them; the scan is walking "
+        "entries that cannot join"
+    )
+    assert worst_two >= worst_one - 0.20, (
+        f"the worst query vector returned {worst_two:.3f} of the exact answer against "
+        f"{worst_one:.3f} on the single-population twin; the tail is where a scan that "
+        "has to walk past rows it cannot return runs out of budget first"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 7. The generic plan, through the real driver
 #
 # Everything in section 3 above reaches the generic plan through a hand-written
@@ -1669,7 +1966,7 @@ def test_a_partial_index_is_not_used_at_all_for_a_small_share_knowledge_base(
     assert name not in plan, f"the planner is not expected to choose this index:\n{plan}"
 
 
-def test_the_knowledge_base_the_default_threshold_leaves_out_is_the_measured_one(
+def test_the_knowledge_base_the_injected_threshold_leaves_out_is_the_measured_one(
     engine, schema, settings
 ):
     """Pins which side of the threshold each fixture knowledge base falls on.
@@ -1677,8 +1974,15 @@ def test_the_knowledge_base_the_default_threshold_leaves_out_is_the_measured_one
     The row counts, the thresholds and the measurements in the comment above are
     one argument, and it stops being an argument if a later edit moves a row
     count without moving the table. KB_MED at 8,400 rows is the knowledge base
-    the 10,000-row default declines -- the population the threshold decision is
-    about -- and KB_BIG at 12,000 is the one it serves.
+    the fixture's 10,000-row threshold declines -- the population the threshold
+    decision is about -- and KB_BIG at 12,000 is the one it serves.
+
+    The threshold it reads is the one the ``settings`` fixture injects, not the
+    registry's shipped default, and the name says so: this spec pins the fixture's
+    own arithmetic and nothing about what a project gets out of the box. That is
+    ``tests/unit/test_per_kb_vector_index_thresholds.py``, which asserts the
+    shipped pair against ``SETTINGS_REGISTRY`` where no database is needed to do
+    it.
     """
     build_at = settings["VECTOR_PER_KB_INDEX_MIN_ROWS"]
     assert MED_ROWS < build_at <= BIG_ROWS, (MED_ROWS, build_at, BIG_ROWS)
@@ -1871,9 +2175,9 @@ def test_hybrid_search_has_a_vector_leg_that_reaches_the_partial_index(
 # ---------------------------------------------------------------------------
 
 
-def _exact_answers(engine, kb_id, vectors, **kwargs) -> list[list[str]]:
+def _exact_answers(engine, kb_id, vectors, *, schema=SCHEMA, **kwargs) -> list[list[str]]:
     """The exact top-20 for each query vector: the same SQL with no index at all."""
-    sql, params = _capture_search_sql(engine, kb_id, vectors[0], **kwargs)
+    sql, params = _capture_search_sql(engine, kb_id, vectors[0], schema=schema, **kwargs)
     answers = []
     with Session(engine) as session:
         for vector in vectors:
@@ -1885,7 +2189,14 @@ def _exact_answers(engine, kb_id, vectors, **kwargs) -> list[list[str]]:
 
 
 def _drive_and_collect(
-    engine, kb_id, vectors, *counted, plan_cache_mode=None, prepared_out=None, **kwargs
+    engine,
+    kb_id,
+    vectors,
+    *counted,
+    plan_cache_mode=None,
+    prepared_out=None,
+    schema=SCHEMA,
+    **kwargs,
 ):
     """``vector_search`` for real, once per vector, on one connection.
 
@@ -1900,7 +2211,7 @@ def _drive_and_collect(
     needs that as a negative control: a run in which psycopg never prepared
     anything would pass while proving nothing.
     """
-    before = _idx_scans(engine, *counted)
+    before = _idx_scans(engine, *counted, schema=schema)
     probe = create_engine(_dsn())
     connection = probe.connect()
     answers = []
@@ -1908,7 +2219,7 @@ def _drive_and_collect(
         with Session(bind=connection) as session:
             if plan_cache_mode is not None:
                 session.execute(text(f"SET plan_cache_mode = '{plan_cache_mode}'"))
-            store = _ChunkStore(db_session=session, knowledge_base_id=kb_id, schema=SCHEMA)
+            store = _ChunkStore(db_session=session, knowledge_base_id=kb_id, schema=schema)
             for vector in vectors:
                 items = asyncio.run(store.vector_search(embedding=list(vector), top_k=20, **kwargs))
                 answers.append([item.item_id for item in items])
@@ -1924,7 +2235,7 @@ def _drive_and_collect(
     finally:
         connection.close()
         probe.dispose()
-    after = _idx_scans(engine, *counted)
+    after = _idx_scans(engine, *counted, schema=schema)
     return {name: after[name] - before[name] for name in counted}, answers
 
 
@@ -2040,6 +2351,158 @@ def test_a_vector_search_leaves_enable_sort_as_it_found_it(
     assert after == was, (
         f"vector_search left enable_sort at {after!r} in a transaction that had it "
         f"at {was!r}; the next statement in the caller's transaction pays for that"
+    )
+
+
+@pytest.mark.parametrize("was", ["on", "off"])
+def test_a_vector_search_leaves_enable_indexscan_as_it_found_it(
+    engine, schema, settings, query_vectors, was
+):
+    """The twin of the spec above, for the setting the restricted block writes.
+
+    ``_insisting_on_an_exact_search`` prices out every ordered index scan in the
+    statement, and it is the block a *restricted* search gets -- so it is the one
+    ``hybrid_search``'s keyword leg meets when the caller passed a filter. A
+    keyword ranking wants its index scans back, and so does every other statement
+    on that pooled connection.
+
+    Two claims, because the restore can fail in two ways and only one of them is
+    visible inside the search's own transaction:
+
+    - the value the caller had is the value that comes back, which a restore
+      hardcoding ``on`` gets wrong for ``was="off"``;
+    - and it comes back *transaction-locally*, which is what the third argument to
+      ``set_config`` decides. A session-scoped restore reads correctly inside the
+      transaction and then survives the commit, so the next transaction on the
+      same connection -- the next checkout of that pool entry -- starts with the
+      caller's old value instead of the server's. That is the leak this module
+      already found once on ``enable_sort``, so it is read back on the same
+      connection after the commit rather than assumed not to have happened.
+    """
+    _build_big_index(engine, settings)
+    probe = create_engine(_dsn())
+    connection = probe.connect()
+    try:
+        with Session(bind=connection) as session:
+            at_checkout = session.execute(
+                text("SELECT current_setting('enable_indexscan')")
+            ).scalar()
+            session.execute(text(f"SET LOCAL enable_indexscan = {was}"))
+            store = _ChunkStore(db_session=session, knowledge_base_id=KB_BIG, schema=SCHEMA)
+            items = asyncio.run(
+                store.vector_search(
+                    embedding=list(query_vectors[0]),
+                    top_k=20,
+                    filter_metadata=FILTER_ONE_IN_FIVE,
+                )
+            )
+            assert items, "the restricted search under test returned nothing"
+            after = session.execute(text("SELECT current_setting('enable_indexscan')")).scalar()
+            session.commit()
+        with Session(bind=connection) as session:
+            next_checkout = session.execute(
+                text("SELECT current_setting('enable_indexscan')")
+            ).scalar()
+            session.rollback()
+    finally:
+        connection.close()
+        probe.dispose()
+    assert after == was, (
+        f"vector_search left enable_indexscan at {after!r} in a transaction that had "
+        f"it at {was!r}; the keyword leg of a hybrid search runs next on this session"
+    )
+    assert next_checkout == at_checkout, (
+        f"the restore outlived its transaction: this connection was checked out with "
+        f"enable_indexscan={at_checkout!r} and the next transaction on it starts at "
+        f"{next_checkout!r}, so the restore was made session-scoped rather than local"
+    )
+
+
+class _ReadingTheSettingBeforeTheSearch:
+    """A real session that reads a GUC back in the transaction the search runs in.
+
+    The value has to be read there and not afterwards: the settings the two
+    steering blocks write are transaction-local and are put back before
+    ``vector_search`` returns, so a read after the call sees the restore rather
+    than the search.
+    """
+
+    def __init__(self, session, setting: str):
+        self._session = session
+        self._read = f"SELECT current_setting('{setting}', true)"
+        self.readings: list[str | None] = []
+
+    def execute(self, clause, params=None):
+        if "ORDER BY" in clause.text:
+            value = self._session.execute(text(self._read)).scalar()
+            self.readings.append(None if value is None else str(value))
+        return self._session.execute(clause, params)
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+
+def test_the_first_vector_search_on_a_connection_runs_at_the_raised_ef_search(
+    engine, schema, settings, query_vectors
+):
+    """The recall the store asks for is the recall the search gets, read back live.
+
+    pgvector registers its GUCs in ``_PG_init``, and ``_PG_init`` runs on the
+    first *use of the vector type* on a backend -- not at ``CREATE EXTENSION``,
+    and not at connection start, because the library is not preloaded. Until then
+    ``current_setting('hnsw.ef_search', true)`` is NULL. Two things make that the
+    case to pin rather than a curiosity:
+
+    - the store's own first statement, ``SET LOCAL hnsw.iterative_scan``, does
+      **not** load the library -- an unrecognised ``prefix.name`` is accepted as a
+      placeholder -- so it cannot be relied on to have made the GUC real by the
+      time the probe reads it;
+    - NULL is not a value to defer to. ``set_config`` on an unloaded pgvector GUC
+      creates a placeholder and the value survives ``_PG_init``: demonstrated on
+      this server, ``set_config('hnsw.ef_search','123',true)`` before any vector
+      operation and ``current_setting`` reads 123 back after one.
+
+    So a fresh connection is exactly where the raise matters and exactly where it
+    is easiest to skip, and at pgvector's default 40 instead of
+    ``PER_KB_HNSW_EF_SEARCH`` the search is not wrong, it is less complete:
+    measured on real embeddings at 12,000 rows, recall 0.915 against 0.973. One
+    such search per connection per pool lifetime, and the first search on a
+    connection is also the one most likely to be cold.
+
+    The assertion before the search is the control that keeps this spec honest: if
+    the connection has already done vector work by the time the store probes, the
+    NULL path is not the one under test and a green result would say nothing about
+    it. The unit tier cannot stand in for this one -- its capture hands the probe
+    a value, so the NULL branch is the one branch a real fresh connection takes
+    and the one no fake takes.
+    """
+    _build_big_index(engine, settings)
+    probe = create_engine(_dsn())
+    connection = probe.connect()
+    try:
+        with Session(bind=connection) as session:
+            assert (
+                session.execute(text("SELECT current_setting('hnsw.ef_search', true)")).scalar()
+                is None
+            ), (
+                "this connection has already used the vector type, so pgvector's GUCs "
+                "are registered on it and the fresh-connection path this spec is about "
+                "cannot happen here"
+            )
+            watcher = _ReadingTheSettingBeforeTheSearch(session, "hnsw.ef_search")
+            store = _ChunkStore(db_session=watcher, knowledge_base_id=KB_BIG, schema=SCHEMA)
+            items = asyncio.run(store.vector_search(embedding=list(query_vectors[0]), top_k=20))
+            assert items, "the search under test returned nothing"
+            session.commit()
+    finally:
+        connection.close()
+        probe.dispose()
+    assert watcher.readings == [str(bvs.PER_KB_HNSW_EF_SEARCH)], (
+        f"the first vector search on a fresh connection ran at hnsw.ef_search "
+        f"{watcher.readings} instead of {bvs.PER_KB_HNSW_EF_SEARCH}; a NULL reading "
+        "means the raise was skipped because pgvector's GUC was not registered yet, "
+        "which is the state every pooled connection is in before its first vector "
+        "operation"
     )
 
 
