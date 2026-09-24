@@ -429,6 +429,37 @@ class TestReActClientDisconnect:
         assert row[0] == "failed"
         assert row[1] == "Client disconnected during the run"
 
+    def test_a_disconnect_before_the_loop_starts_keeps_the_pre_stream_label(
+        self, client, app, mock_auth, auth_headers, react_agent_id
+    ):
+        # The run row is persisted and ``start`` is yielded before the worker
+        # thread starts; a client that leaves at that yield never reached the
+        # loop, so the pre-stream label is still the true one.
+        with patch("agentic.agent.agent.Agent.run") as fake_run:
+            resp = client.post(
+                f"/api/agents/{react_agent_id}/run/stream",
+                json={"message": "disconnect-before-loop"},
+                headers=auth_headers,
+                buffered=False,
+            )
+            body = b""
+            frames = iter(resp.response)
+            while b'"event": "start"' not in body:
+                body += next(frames)
+            resp.close()  # the client goes away before the loop starts
+
+        assert not fake_run.called
+        with app.app_context():
+            row = db.session.execute(
+                text(
+                    'SELECT status, error FROM "ai".agent_runs WHERE input_messages::text LIKE :q'
+                ),
+                {"q": '%"disconnect-before-loop"%'},
+            ).fetchone()
+        assert row is not None
+        assert row[0] == "failed"
+        assert row[1] == "Client disconnected before LLM streaming started"
+
 
 # ---------------------------------------------------------------------------
 # Chat-style branch tests — issue #274 (delta + reasoning parity with ReAct β)
