@@ -865,6 +865,18 @@ def _create_index(
     indefinitely; it blocks no writes while it waits
     (``ShareUpdateExclusiveLock`` only).
 
+    ``lock_timeout = 0`` for the same trade and the same wait, because
+    ``statement_timeout`` does not cover it. ``CREATE INDEX CONCURRENTLY``'s
+    first phase waits for every transaction that could still write a row the
+    build has not seen, and it waits on that transaction's *virtual transaction
+    id* -- a lock wait, which ``lock_timeout`` bounds and ``statement_timeout``
+    does not. A role-level ``lock_timeout`` is exactly as realistic as a
+    role-level ``statement_timeout``: images in ordinary use ship an application
+    role with both set to a few seconds. Measured against a real server with a
+    role-level ``lock_timeout`` of 2 s and one open write transaction, the build
+    failed in 2.02 s, five attempts out of five, leaving the INVALID index this
+    function then has to count.
+
     A build that runs out of disk leaves an INVALID index behind, and the next
     ensure drops and rebuilds it rather than reporting it as built (see
     ``_repair_invalid`` and its caller). ``estimated_index_mb`` says why there is
@@ -886,6 +898,7 @@ def _create_index(
         mem_mb = maintenance_work_mem_mb()
     try:
         conn.execute(text("SET statement_timeout = 0"))
+        conn.execute(text("SET lock_timeout = 0"))
         conn.execute(text(f"SET maintenance_work_mem = '{mem_mb}MB'"))
         conn.execute(text(per_kb_index_ddl(kb_id, dims)))
     except Exception:
@@ -901,6 +914,7 @@ def _create_index(
             _clear_build_failure_record(conn, kb_id, dims)
     finally:
         _reset_session_setting(conn, "maintenance_work_mem")
+        _reset_session_setting(conn, "lock_timeout")
         _reset_session_setting(conn, "statement_timeout")
 
 
@@ -917,6 +931,17 @@ def _drop_index(conn, kb_id: str, dims: int) -> None:
     2 s role timeout and one open write transaction -- cancelled after 2.02 s,
     leaving exactly that state.
 
+    ``lock_timeout = 0`` because ``statement_timeout`` never bounded that wait in
+    the first place, and is therefore not the setting that has been cancelling
+    these drops. The wait is on the conflicting transaction's *virtual
+    transaction id*, which is a lock wait: ``statement_timeout`` does not cover
+    it and ``lock_timeout`` does. Measured on the same server with a role-level
+    ``lock_timeout`` of 2 s: the drop failed in 2.01 s, five attempts out of
+    five, leaving ``indisvalid = false, indisready = true`` -- and on this
+    function's other caller, a deleted knowledge base's drop, that state is
+    permanent, because the row the index is named after is gone and nothing will
+    reconcile it again.
+
     An ensure finds that state on its next run and repairs it. The deleted
     knowledge base's drop cannot: the row these indexes are named after is gone,
     so neither ``index_action`` nor the start-up sweep will ever look at them
@@ -932,8 +957,10 @@ def _drop_index(conn, kb_id: str, dims: int) -> None:
     """
     try:
         conn.execute(text("SET statement_timeout = 0"))
+        conn.execute(text("SET lock_timeout = 0"))
         conn.execute(text(per_kb_index_drop_ddl(kb_id, dims)))
     finally:
+        _reset_session_setting(conn, "lock_timeout")
         _reset_session_setting(conn, "statement_timeout")
 
 

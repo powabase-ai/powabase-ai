@@ -511,15 +511,30 @@ def _ensure(monkeypatch, conn, kb_id=KB, build_at=10_000, drop_below=5_000, **kw
 # ---------------------------------------------------------------------------
 
 
-def test_a_build_sets_both_session_settings_before_the_ddl_and_resets_both_after(monkeypatch):
+def test_a_build_sets_its_session_settings_before_the_ddl_and_resets_every_one_after(monkeypatch):
     monkeypatch.setattr(pvi, "maintenance_work_mem_mb", lambda: 256)
     conn = _FakeConn()
     pvi._create_index(conn, KB, 1536)
     assert conn.statements == [
         "SET statement_timeout = 0",
+        "SET lock_timeout = 0",
         "SET maintenance_work_mem = '256MB'",
         " ".join(pvi.per_kb_index_ddl(KB, 1536).split()),
         "RESET maintenance_work_mem",
+        "RESET lock_timeout",
+        "RESET statement_timeout",
+    ]
+
+
+def test_a_drop_lifts_both_timeouts_and_puts_both_back(monkeypatch):
+    """The drop waits in the same two ways the build does, so it lifts the same two."""
+    conn = _FakeConn()
+    pvi._drop_index(conn, KB, 1536)
+    assert conn.statements == [
+        "SET statement_timeout = 0",
+        "SET lock_timeout = 0",
+        " ".join(pvi.per_kb_index_drop_ddl(KB, 1536).split()),
+        "RESET lock_timeout",
         "RESET statement_timeout",
     ]
 
@@ -537,8 +552,9 @@ def test_a_failed_second_setting_never_leaves_the_connection_without_a_timeout(m
     conn = _FakeConn(fail_on="SET maintenance_work_mem")
     with pytest.raises(RuntimeError):
         pvi._create_index(conn, KB, 1536)
-    assert conn.issued("SET statement_timeout = 0"), conn.statements
-    assert conn.issued("RESET statement_timeout") or conn.invalidated, conn.statements
+    for setting in ("statement_timeout", "lock_timeout"):
+        assert conn.issued(f"SET {setting} = 0"), conn.statements
+        assert conn.issued(f"RESET {setting}") or conn.invalidated, conn.statements
 
 
 def test_the_build_memory_is_read_before_any_session_setting_is_raised(monkeypatch):
@@ -1189,19 +1205,29 @@ def test_a_transient_drop_failure_is_re_raised_untouched_for_the_retry(caplog):
 
 
 class _TimeoutCancellingConn(_FakeConn):
-    """A server with a statement timeout of its own, as a role or database has.
+    """A server with a timeout of its own, as a role or database has.
 
     ``DROP INDEX CONCURRENTLY`` waits for every transaction whose snapshot could
-    still be using the index, exactly as the build does, so a timeout the drop
-    did not ask for cancels it mid-wait. Here that is modelled where it happens:
-    the DROP raises unless the timeout was lifted on this connection first, and
-    the ``RESET`` puts it back, so a second drop is unprotected again if the
-    lifting is not per-drop.
+    still be using the index, and ``CREATE INDEX CONCURRENTLY`` waits for every
+    transaction that could still write a row it has not seen, so a timeout the
+    DDL did not ask for cancels it mid-wait. Here that is modelled where it
+    happens: the concurrent DDL raises unless ``SETTING`` was lifted on this
+    connection first, and the ``RESET`` puts it back, so a second one is
+    unprotected again if the lifting is not per-statement.
 
     Against a real server the cancelled drop leaves the index ``indisvalid =
     false`` -- maintained on every insert, answering no query -- which the
     deleted knowledge base's path can never come back to.
+
+    ``SETTING`` is the name of the timeout, because there are two and they cover
+    different waits: ``statement_timeout`` does not cover a lock wait at all, and
+    both of these waits are lock waits (on a virtual transaction id). Subclassed
+    rather than parametrized inside ``execute`` so each subclass is a server with
+    exactly one of them set, which is how the bound is proved to be lifted for
+    its own reason and not by the other one's ``SET``.
     """
+
+    SETTING = "statement_timeout"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1210,24 +1236,43 @@ class _TimeoutCancellingConn(_FakeConn):
 
     def execute(self, clause, params=None):
         sql = clause.text if hasattr(clause, "text") else str(clause)
-        if "SET statement_timeout = 0" in sql:
+        if f"SET {self.SETTING} = 0" in sql:
             self.timeout_lifted = True
-        elif "RESET statement_timeout" in sql:
+        elif f"RESET {self.SETTING}" in sql:
             self.timeout_lifted = False
-        elif "DROP INDEX CONCURRENTLY" in sql and not self.timeout_lifted:
+        elif "INDEX CONCURRENTLY" in sql and not self.timeout_lifted:
             self.statements.append(" ".join(sql.split()))
             self.cancelled.append(sql)
-            raise RuntimeError("canceling statement due to statement timeout")
+            raise RuntimeError(f"canceling statement due to {self.SETTING}")
         return super().execute(clause, params)
 
 
-def test_a_deleted_knowledge_bases_drops_are_not_cancelled_by_a_statement_timeout():
+class _LockTimeoutCancellingConn(_TimeoutCancellingConn):
+    """The same server with a role-level ``lock_timeout`` instead.
+
+    ``statement_timeout`` does not bound a lock wait, and both phases these two
+    statements block in are lock waits: ``CREATE INDEX CONCURRENTLY``'s
+    ``WaitForLockers`` and ``DROP INDEX CONCURRENTLY``'s wait for conflicting
+    snapshots both wait on a ``virtualxid`` lock. Measured against a real server
+    with a role-level ``lock_timeout`` of 2 s and one open write transaction:
+    the build failed in 2.02 s, five times out of five, and the drop in 2.01 s,
+    leaving the index ``indisvalid = false, indisready = true``.
+    """
+
+    SETTING = "lock_timeout"
+
+
+_TIMEOUT_SERVERS = [_TimeoutCancellingConn, _LockTimeoutCancellingConn]
+
+
+@pytest.mark.parametrize("cls", _TIMEOUT_SERVERS)
+def test_a_deleted_knowledge_bases_drops_are_not_cancelled_by_a_timeout(cls):
     """This is the path a cancelled drop strands for good.
 
     Both dimensions, because the timeout is lifted per drop: the ``RESET`` after
     the first one leaves the second exposed unless it lifts it again.
     """
-    conn = _drop_conn(dims=(768, 1536), cls=_TimeoutCancellingConn)
+    conn = _drop_conn(dims=(768, 1536), cls=cls)
     outcome = pvi.drop_per_kb_vector_indexes(KB, engine=_FakeEngine(conn))
     assert conn.cancelled == [], conn.statements
     assert outcome == {
@@ -1239,22 +1284,26 @@ def test_a_deleted_knowledge_bases_drops_are_not_cancelled_by_a_statement_timeou
     )
 
 
-def test_a_drop_below_the_threshold_is_not_cancelled_by_a_statement_timeout(monkeypatch):
-    conn = _ensure_conn(
-        existing=[_index_row(KB, 1536)], rows_by_dims={1536: 0}, cls=_TimeoutCancellingConn
-    )
+@pytest.mark.parametrize("cls", _TIMEOUT_SERVERS)
+def test_a_drop_below_the_threshold_is_not_cancelled_by_a_timeout(monkeypatch, cls):
+    conn = _ensure_conn(existing=[_index_row(KB, 1536)], rows_by_dims={1536: 0}, cls=cls)
     outcome = _ensure(monkeypatch, conn)
     assert conn.cancelled == [], conn.statements
     assert outcome["dropped"] == [pvi.per_kb_index_name(KB, 1536)], outcome
     assert not conn.timeout_lifted
 
 
-def test_the_repair_of_an_invalid_index_is_not_cancelled_by_a_statement_timeout(monkeypatch):
-    """A cancelled repair drop is the one that loops: it leaves what it came to clear."""
+@pytest.mark.parametrize("cls", _TIMEOUT_SERVERS)
+def test_the_repair_of_an_invalid_index_is_not_cancelled_by_a_timeout(monkeypatch, cls):
+    """A cancelled repair drop is the one that loops: it leaves what it came to clear.
+
+    The build that follows it is covered by the same run: it waits in
+    ``WaitForLockers`` for the same reason and the fake cancels either statement.
+    """
     conn = _ensure_conn(
         existing=[_index_row(KB, 1536, False)],
         rows_by_dims={1536: 20_000},
-        cls=_TimeoutCancellingConn,
+        cls=cls,
     )
     outcome = _ensure(monkeypatch, conn)
     assert conn.cancelled == [], conn.statements
