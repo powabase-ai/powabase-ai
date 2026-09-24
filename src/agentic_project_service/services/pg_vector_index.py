@@ -103,6 +103,7 @@ and degenerates to a sequential scan. That is deliberately a follow-up.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import uuid
@@ -197,27 +198,56 @@ MAX_PER_KB_INDEXES = 200
 # timeout and reaching for the disk that was full the last time.
 #
 # ``MAX_HNSW_DIMS`` guards the one failure that can be predicted from the
-# catalog. This guards the rest, which can only be learnt by trying.
+# catalog. This bounds the *permanent-looking* ones -- a full disk is the
+# obvious one -- which is the class a retry is not expected to get past.
+# ``MAX_CONSECUTIVE_INTERRUPTED_BUILDS`` bounds the other class. Between them
+# every attempt that can write its own record is counted against something; an
+# earlier version of this comment claimed this constant "guards the rest, which
+# can only be learnt by trying", and it did not -- a build that failed
+# transiently was counted against nothing at all, so the bound was unreachable
+# and the loop it exists to stop ran for ever (see the other constant).
 #
-# Only a failure ``is_transient_db_error`` does *not* recognise is counted. The
-# task that runs these builds already retries a transient one six times, so
-# counting them here would let a single contention episode that outlasts those
-# retries write "3 consecutive failed attempts" and turn the index off until an
-# operator drops it by hand. An earlier version of this comment justified three
-# attempts rather than one with "a lost connection or a server restart mid-build",
-# which has it backwards twice over: those are transient, so they are not counted
-# at all, and they could not have been counted anyway -- the write that records an
-# attempt needs the connection that just died. Three rather than one is instead
-# because a permanent-looking failure may still be a one-off (a disk that was full
-# and has been cleared), and because the only remedy for reaching the bound is a
-# manual ``DROP INDEX``.
+# Three rather than one because a permanent-looking failure may still be a
+# one-off (a disk that was full and has been cleared), and because the only
+# remedy for reaching the bound is a manual ``DROP INDEX``.
 #
-# It also only covers a build that got as far as creating a catalog entry, which
-# is where the count is kept: a ``CREATE INDEX CONCURRENTLY`` that fails before
-# that -- a syntax error, a missing relation, a refused permission -- leaves
-# nothing to write the count on, so those failures are unbounded here and bounded
-# only by the task's own retry policy.
+# It only covers a build that got as far as creating a catalog entry, which is
+# where the count is kept: a ``CREATE INDEX CONCURRENTLY`` that fails before that
+# -- a syntax error, a missing relation, a refused permission -- leaves nothing to
+# write the count on, so those failures are unbounded here and bounded only by the
+# task's own retry policy.
 MAX_CONSECUTIVE_BUILD_FAILURES = 3
+
+# The same bound for a build that failed for a reason ``is_transient_db_error``
+# *does* recognise -- a lock conflict, a deadlock, a cancelled statement, a lost
+# connection. Separate and far larger, rather than not counted at all.
+#
+# Not counted at all was the previous answer, and it made the whole bound
+# unreachable: ``_repair_invalid``'s drop takes the record away with the index it
+# is written on, so a build that failed transiently wrote nothing and the next
+# reconcile started again from zero. Measured before this constant existed --
+# seven consecutive reconciles of an INVALID index whose build fails ``55P03``
+# every time: failure comments written ``[]`` on all seven, recorded failures
+# ``0`` against a bound of ``3``, and ``index_action`` asking for a build again
+# every time. That is a drop-rebuild-fail loop with nothing bounding it, on every
+# source that finishes indexing and every boot.
+#
+# Separate and larger is what keeps the reason the count used to skip these: the
+# task that runs these builds retries a transient failure
+# ``PG_BM25_TASK_MAX_RETRIES`` times, so one contention episode is about seven
+# attempts, and a single episode must not turn the index off until an operator
+# drops it by hand. 25 is more than three such episodes back to back, and still a
+# bound.
+#
+# **What this does not cover:** a build whose backend does not come back -- an OOM
+# kill, a server restart -- cannot write anything, because the write needs the
+# connection that just died, and the record it would have updated was destroyed by
+# the repair drop before the build started. So that one failure mode still resets
+# the count on every reconcile. Closing it needs a record that outlives the index,
+# which a ``pg_class`` comment on the index cannot be; it is not fixed here, and
+# it is the reason ``VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB`` has to be set against
+# the database's real memory rather than to the registry maximum.
+MAX_CONSECUTIVE_INTERRUPTED_BUILDS = 25
 
 # Where that count is kept. There is no builds table -- the logs are the whole
 # of the history -- and an in-process counter would forget on every deploy,
@@ -230,12 +260,36 @@ MAX_CONSECUTIVE_BUILD_FAILURES = 3
 #
 # Nothing in the wording may be ``:word``: ``COMMENT ON`` takes no parameter, so
 # this is interpolated, and ``text()`` would read that as a bind parameter.
-_BUILD_FAILURES_COMMENT = (
-    "{n} consecutive failed attempts to build this partial HNSW index. It is "
-    "INVALID: it answers no query and is maintained on every write. Drop it "
+#
+# Three independent facts share the one comment, so it is composed of sentences
+# and each is read back by a pattern of its own rather than the whole comment
+# being matched at once. The counts keep their fixed order -- failed, then
+# interrupted -- so an operator reads the same shape every time, and the
+# fingerprint comes last because it is the one fact a *valid* index carries.
+_BUILD_FAILURES_SENTENCE = (
+    "{n} consecutive failed attempts to build this partial HNSW index."
+)
+_INTERRUPTED_BUILDS_SENTENCE = (
+    "{n} consecutive builds of this partial HNSW index were interrupted."
+)
+_INVALID_INDEX_PROSE = (
+    "It is INVALID: it answers no query and is maintained on every write. Drop it "
     "once the cause is fixed; the next reconcile then builds it again."
 )
-_BUILD_FAILURES_PATTERN = re.compile(r"^(\d+) consecutive failed attempts")
+_DEFINITION_SENTENCE = "Built from definition {fp}."
+
+# Each pattern matches its own whole sentence, not a prefix of it, because the
+# sentences now sit beside each other and beside prose. The original count
+# pattern was anchored at the start of the comment, which composition makes
+# impossible; a long distinctive phrase is the stricter test anyway -- "a comment
+# is a place anyone may write, and one this module did not write is no evidence".
+_BUILD_FAILURES_PATTERN = re.compile(
+    r"(\d+) consecutive failed attempts to build this partial HNSW index\."
+)
+_INTERRUPTED_BUILDS_PATTERN = re.compile(
+    r"(\d+) consecutive builds of this partial HNSW index were interrupted\."
+)
+_DEFINITION_PATTERN = re.compile(r"Built from definition ([0-9a-f]{12})\.")
 
 # Bounded counts never read more than this many rows past the threshold, so the
 # cost of deciding is bounded by the threshold rather than by the size of the
@@ -547,49 +601,104 @@ def maintenance_work_mem_mb() -> int:
 # ---------------------------------------------------------------------------
 
 
-def existing_per_kb_indexes(conn, knowledge_base_id: Any) -> dict[int, bool]:
-    """``{dims: is_valid}`` for this knowledge base's partial HNSW indexes.
+def parsed_per_kb_index_name(relname: str) -> tuple[str, int] | None:
+    """``(knowledge base id, dims)`` for one of these index names, or None.
+
+    The one parse of the name, shared by all three catalog readers here. They used
+    to disagree: this module's per-knowledge-base reader required the dimension
+    suffix to be digits while the project-wide count matched the prefix alone, so
+    the day the name grows a component the count would still see an index the
+    lifecycle had gone blind to -- consuming a place in ``MAX_PER_KB_INDEXES``
+    that nothing could ever free.
+
+    (A component *cannot* simply be added, which is the other half of that note:
+    ``hnsw_kb_`` + 32 hex + ``_doc2json_documents`` + ``_1536`` is 64 bytes, one
+    over PostgreSQL's identifier limit, so a literal item-table name does not fit
+    and the name would have to change shape rather than grow.)
+    """
+    if not relname.startswith(INDEX_NAME_PREFIX):
+        return None
+    kb_hex, _, dims_part = relname[len(INDEX_NAME_PREFIX) :].rpartition("_")
+    if len(kb_hex) != 32 or not dims_part.isdigit():
+        return None
+    try:
+        return str(uuid.UUID(hex=kb_hex)), int(dims_part)
+    except ValueError:
+        return None
+
+
+# The one catalog read behind every question this module asks about its own
+# indexes: which ones a knowledge base has, whether each is valid, what each was
+# built from and how its builds have gone, and how many the project holds. One
+# statement so the three callers cannot drift apart about what counts as one of
+# these indexes -- they did, and the note on ``parsed_per_kb_index_name`` says
+# what that cost. ``prefix`` is the only difference between them: one knowledge
+# base's indexes, or the whole project's.
+_INDEX_CATALOG_SQL = (
+    "SELECT c.relname, i.indisvalid, obj_description(c.oid, 'pg_class') FROM pg_class c "
+    "JOIN pg_index i ON i.indexrelid = c.oid "
+    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+    r"WHERE n.nspname = :schema AND c.relkind = 'i' "
+    r"AND c.relname LIKE :prefix ESCAPE '\'"
+)
+
+
+def _index_catalog_rows(conn, prefix: str) -> list:
+    """``(relname, indisvalid, comment)`` for every index whose name starts with ``prefix``."""
+    return conn.execute(
+        text(_INDEX_CATALOG_SQL), {"schema": AI_SCHEMA, "prefix": _like_prefix(prefix)}
+    ).all()
+
+
+def per_kb_index_states(conn, knowledge_base_id: Any) -> dict[int, tuple[bool, str | None]]:
+    """``{dims: (is_valid, comment)}`` for this knowledge base's partial HNSW indexes.
 
     Read by name rather than by parsing predicates: the name is derived from
     the KB's UUID and the dimension, so the catalog lookup is a literal prefix
     match on ``pg_class.relname`` -- wildcards escaped, so the underscores in
     the name are underscores -- and cannot mistake another KB's index for this
     one's.
+
+    The comment comes back in the same pass because the name is not enough to say
+    what an index *is*: ``per_kb_index_ddl`` decides the predicate, the expression
+    and the operator class, and none of those are in the name. The comment is where
+    the definition the index was built from is recorded
+    (``per_kb_index_fingerprint``), alongside its build history -- which is why
+    this reads it here rather than making a round trip per dimension, exactly as
+    the boot sweep already does.
     """
     kb_hex = uuid.UUID(_validated_kb_id(knowledge_base_id)).hex
-    prefix = f"{INDEX_NAME_PREFIX}{kb_hex}_"
-    rows = conn.execute(
-        text(
-            "SELECT c.relname, i.indisvalid FROM pg_class c "
-            "JOIN pg_index i ON i.indexrelid = c.oid "
-            "JOIN pg_namespace n ON n.oid = c.relnamespace "
-            r"WHERE n.nspname = :schema AND c.relkind = 'i' "
-            r"AND c.relname LIKE :prefix ESCAPE '\'"
-        ),
-        {"schema": AI_SCHEMA, "prefix": _like_prefix(prefix)},
-    ).all()
-    found: dict[int, bool] = {}
-    for relname, valid in rows:
-        suffix = relname[len(prefix) :]
-        if suffix.isdigit():
-            found[int(suffix)] = bool(valid)
+    rows = _index_catalog_rows(conn, f"{INDEX_NAME_PREFIX}{kb_hex}_")
+    found: dict[int, tuple[bool, str | None]] = {}
+    for relname, valid, comment in rows:
+        parsed = parsed_per_kb_index_name(relname)
+        if parsed is not None:
+            found[parsed[1]] = (bool(valid), comment)
     return found
 
 
+def existing_per_kb_indexes(conn, knowledge_base_id: Any) -> dict[int, bool]:
+    """``{dims: is_valid}`` for this knowledge base's partial HNSW indexes.
+
+    What a caller that only needs to know whether an index is there and usable
+    reads; ``per_kb_index_states`` is the same query with the comment too.
+    """
+    return {
+        dims: valid for dims, (valid, _) in per_kb_index_states(conn, knowledge_base_id).items()
+    }
+
+
 def per_kb_index_count(conn) -> int:
-    """How many of these indexes ``ai.embeddings`` already carries."""
-    return (
-        conn.execute(
-            text(
-                "SELECT count(*) FROM pg_class c "
-                "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                r"WHERE n.nspname = :schema AND c.relkind = 'i' "
-                r"AND c.relname LIKE :prefix ESCAPE '\'"
-            ),
-            {"schema": AI_SCHEMA, "prefix": _like_prefix(INDEX_NAME_PREFIX)},
-        ).scalar()
-        or 0
-    )
+    """How many of these indexes ``ai.embeddings`` already carries.
+
+    Counted through the same name parse the per-knowledge-base reader uses, so the
+    budget and the lifecycle cannot disagree about what one of these indexes is.
+    The names are fetched rather than counted in SQL because the parse is not
+    expressible as a ``LIKE``; ``MAX_PER_KB_INDEXES`` bounds how many rows that
+    can be.
+    """
+    rows = _index_catalog_rows(conn, INDEX_NAME_PREFIX)
+    return sum(1 for row in rows if parsed_per_kb_index_name(row[0]) is not None)
 
 
 def bounded_row_count(conn, knowledge_base_id: Any, dims: Any, cap: int) -> int:
@@ -681,17 +790,30 @@ def index_action(conn, knowledge_base_id: Any) -> str | None:
     Nothing is asked for here that the reconcile would decline, because this runs
     once per source that finishes indexing: a build the width forbids
     (``MAX_HNSW_DIMS``), one the project has no room for
-    (``MAX_PER_KB_INDEXES``), or one that has already failed
-    ``MAX_CONSECUTIVE_BUILD_FAILURES`` times would otherwise be dispatched again
-    by every source, for a task that can only report ``skipped``.
+    (``MAX_PER_KB_INDEXES``), or one that has reached either build bound would
+    otherwise be dispatched again by every source, for a task that can only report
+    ``skipped``. ``ensure_per_kb_vector_index`` makes each of these decisions in the
+    same order, for the same reason -- the two used to disagree about whether the
+    row count or the failure bound came first, and the disagreement stranded a
+    doomed index whose knowledge base had since shrunk: this function asked for the
+    drop and the reconcile never reached the count that would have made it.
     """
     build_at, drop_below = thresholds()
-    existing = existing_per_kb_indexes(conn, knowledge_base_id)
+    states = per_kb_index_states(conn, knowledge_base_id)
     cap = build_at + _COUNT_HEADROOM
     at_index_cap: bool | None = None
-    for dims in sorted(set(candidate_dims(conn, knowledge_base_id, cap)) | set(existing)):
+
+    def room_for_one_more() -> bool:
+        nonlocal at_index_cap
+        if at_index_cap is None:
+            # One extra catalog count, and only for a knowledge base that would
+            # otherwise have a build dispatched for it.
+            at_index_cap = per_kb_index_count(conn) >= MAX_PER_KB_INDEXES
+        return not at_index_cap
+
+    for dims in sorted(set(candidate_dims(conn, knowledge_base_id, cap)) | set(states)):
         rows = bounded_row_count(conn, knowledge_base_id, dims, cap)
-        valid = existing.get(dims)
+        valid, comment = states.get(dims, (None, None))
         if valid is False:
             # An INVALID index cannot be left as it is -- it answers no query and
             # Postgres maintains it on every write -- but *which* way it goes is
@@ -703,23 +825,24 @@ def index_action(conn, knowledge_base_id: Any) -> str | None:
             # decline.
             if rows <= drop_below or dims > MAX_HNSW_DIMS:
                 return "drop"
-            if (
-                recorded_build_failures(conn, knowledge_base_id, dims)
-                >= MAX_CONSECUTIVE_BUILD_FAILURES
-            ):
+            if build_is_given_up(comment):
                 continue
             return "build"
         if valid is True:
             if rows <= drop_below:
                 return "drop"
+            if definition_has_drifted(_validated_kb_id(knowledge_base_id), dims, comment):
+                # Built from a definition this version no longer emits, so it
+                # answers searches at whatever recall its old predicate gives. The
+                # reconcile replaces it -- but only where it would build one from
+                # scratch, because the replacement is a drop and then a build, and
+                # a drop it cannot follow with a build leaves this knowledge base
+                # with nothing where it had a stale-but-usable index.
+                if rows >= build_at and dims <= MAX_HNSW_DIMS and room_for_one_more():
+                    return "build"
             continue
-        if rows >= build_at and dims <= MAX_HNSW_DIMS:
-            if at_index_cap is None:
-                # One extra catalog count, and only for a knowledge base that
-                # would otherwise have a build dispatched for it.
-                at_index_cap = per_kb_index_count(conn) >= MAX_PER_KB_INDEXES
-            if not at_index_cap:
-                return "build"
+        if rows >= build_at and dims <= MAX_HNSW_DIMS and room_for_one_more():
+            return "build"
     return None
 
 
@@ -894,99 +1017,245 @@ def _qualified_index(kb_id: str, dims: int) -> str:
     return f'"{AI_SCHEMA}".{per_kb_index_name(kb_id, dims)}'
 
 
-def recorded_build_failures(conn, kb_id: str, dims: int) -> int:
-    """How many consecutive builds of this index have failed, from the catalog.
+def per_kb_index_fingerprint(knowledge_base_id: Any, dims: Any) -> str:
+    """A short digest of the definition an index of this name would be built from.
 
-    Zero for an index that has never failed, that does not exist, or whose
-    comment says something else: a comment is a place anyone may write, and one
-    this module did not write is no evidence that a build is doomed.
+    The index *name* carries the knowledge base and the dimension and nothing
+    else, while ``per_kb_index_ddl`` also decides the indexed expression, the
+    operator class, the ``::vector(N)`` cast and the predicate -- which now names
+    ``item_table`` as well. So two indexes of the same name can be built from
+    different definitions, and the catalog readers here could not tell them apart:
+    an index built before the ``item_table`` clause existed has the old two-clause
+    predicate, today's query *implies* it, so the planner still matches it, and
+    ``CREATE INDEX CONCURRENTLY IF NOT EXISTS`` no-ops against the name it holds.
+    Measured on a 1,000-chunk / 9,000-``full_documents`` fixture at 1536
+    dimensions, that index answers every chunk search at recall 0.562 where 0.989
+    was available, for ever, with no log line.
 
-    A read that *fails* is not swallowed, unlike the two writes below. It is an
+    This is the fact the name does not carry, written into the index's own
+    ``pg_class`` comment by the build and read back by the reconcile and the boot
+    sweep -- which already reads that column in bulk. The ``pg_bm25_index``
+    sibling has the same problem and the same shape of answer
+    (``indexdef_matches_tokenizer``), for the same reason: its index's identity
+    also depends on something its name does not carry.
+
+    **Deliberately not a comparison against ``pg_get_indexdef``.** What
+    PostgreSQL prints back differs from what is emitted here in at least six ways
+    -- ``((embedding)::vector(N))`` against ``(embedding::vector(N))``,
+    ``'...'::uuid`` against ``'...'``, ``(item_table)::text = 'chunks'::text``
+    against ``item_table = 'chunks'``, and the parenthesisation of the predicate
+    -- so the two are never equal and an equality test would call *every* index
+    stale. That is worse than the hole it closes: the failure record dies with the
+    index a drift drop takes away, so ``MAX_CONSECUTIVE_BUILD_FAILURES`` would
+    never engage and every reconcile of every knowledge base would drop and
+    rebuild. A digest of what this module emits is exact and immune to
+    normalisation.
+
+    An index built by a version of this code that did not write a fingerprint
+    carries none, so it reads as drifted on the first look -- which is correct,
+    because that is exactly the index this exists to find.
+
+    Twelve hex characters: the whole comment is an operator-facing sentence, and
+    48 bits is far more than enough to separate the handful of definitions one
+    deploy of this module can emit. It is not a security boundary -- nothing acts
+    on an attacker-chosen value here -- so a short digest of a string this module
+    generated is the right size.
+    """
+    ddl = per_kb_index_ddl(knowledge_base_id, dims)
+    return hashlib.sha256(ddl.encode("utf-8")).hexdigest()[:12]
+
+
+def per_kb_index_comment(
+    failures: int = 0, interrupted: int = 0, fingerprint: str | None = None
+) -> str | None:
+    """The ``pg_class`` comment recording what is known about one of these indexes.
+
+    ``None`` when there is nothing to record, which is what ``COMMENT ON ... IS
+    NULL`` writes. The prose about an INVALID index is appended only when a count
+    is being recorded, because that is the only time the index is INVALID.
+
+    Composed here, and read back by the three ``_in`` functions below, so the
+    wording lives in one place and a reworded sentence moves both directions at
+    once.
+    """
+    parts: list[str] = []
+    if failures:
+        parts.append(_BUILD_FAILURES_SENTENCE.format(n=int(failures)))
+    if interrupted:
+        parts.append(_INTERRUPTED_BUILDS_SENTENCE.format(n=int(interrupted)))
+    if parts:
+        parts.append(_INVALID_INDEX_PROSE)
+    if fingerprint:
+        parts.append(_DEFINITION_SENTENCE.format(fp=fingerprint))
+    return " ".join(parts) or None
+
+
+def build_failures_in(comment: str | None) -> int:
+    """The consecutive permanent-looking failure count a comment records, or zero.
+
+    Split out from ``recorded_build_history`` because the start-up sweep reads
+    these comments in bulk, as a column of the catalog SELECT it already runs,
+    rather than one round trip per index on the boot path.
+    """
+    match = _BUILD_FAILURES_PATTERN.search(comment or "")
+    return int(match.group(1)) if match else 0
+
+
+def interrupted_builds_in(comment: str | None) -> int:
+    """The consecutive interrupted-build count a comment records, or zero."""
+    match = _INTERRUPTED_BUILDS_PATTERN.search(comment or "")
+    return int(match.group(1)) if match else 0
+
+
+def definition_fingerprint_in(comment: str | None) -> str | None:
+    """The definition fingerprint a comment records, or None if it records none.
+
+    None for an index built before fingerprints were written, for one built or
+    commented by hand, and for one whose comment says something else entirely --
+    all of which are treated as a definition this module cannot vouch for.
+    """
+    match = _DEFINITION_PATTERN.search(comment or "")
+    return match.group(1) if match else None
+
+
+def definition_has_drifted(kb_id: str, dims: int, comment: str | None) -> bool:
+    """Was this index built from a definition ``per_kb_index_ddl`` no longer emits?"""
+    return definition_fingerprint_in(comment) != per_kb_index_fingerprint(kb_id, dims)
+
+
+def build_is_given_up(comment: str | None) -> bool:
+    """Has this index reached either bound, so no further build is attempted?"""
+    return (
+        build_failures_in(comment) >= MAX_CONSECUTIVE_BUILD_FAILURES
+        or interrupted_builds_in(comment) >= MAX_CONSECUTIVE_INTERRUPTED_BUILDS
+    )
+
+
+def index_comment(conn, kb_id: str, dims: int) -> str | None:
+    """This index's ``pg_class`` comment, or None if it has none or does not exist.
+
+    A read that *fails* is not swallowed, unlike the writes below. It is an
     ordinary catalog read on the caller's connection, so a failure here means
     every other read around it would fail too, and swallowing it would hand the
     caller back an aborted transaction while reporting a fact. Both callers
     already handle that: the reconcile lets it fail the run, and the dispatch
     check turns it into "this knowledge base keeps whatever it has".
     """
-    comment = conn.execute(
+    return conn.execute(
         text("SELECT obj_description(to_regclass(:index)::oid, 'pg_class')"),
         {"index": _qualified_index(kb_id, dims)},
     ).scalar()
-    return build_failures_in(comment)
 
 
-def build_failures_in(comment: str | None) -> int:
-    """The consecutive-failure count a ``pg_class`` comment records, or zero.
+def recorded_build_history(conn, kb_id: str, dims: int) -> tuple[int, int]:
+    """``(permanent failures, interrupted builds)`` for this index, from the catalog.
 
-    Split out from ``recorded_build_failures`` because the start-up sweep reads
-    these comments in bulk, as a column of the catalog SELECT it already runs,
-    rather than one round trip per index on the boot path.
+    Zeros for an index that has never failed, that does not exist, or whose
+    comment says something else: a comment is a place anyone may write, and one
+    this module did not write is no evidence that a build is doomed.
     """
-    match = _BUILD_FAILURES_PATTERN.match(comment or "")
-    return int(match.group(1)) if match else 0
+    comment = index_comment(conn, kb_id, dims)
+    return build_failures_in(comment), interrupted_builds_in(comment)
+
+
+def recorded_build_failures(conn, kb_id: str, dims: int) -> int:
+    """How many consecutive builds of this index have failed permanently."""
+    return recorded_build_history(conn, kb_id, dims)[0]
+
+
+def _write_index_comment(
+    conn, kb_id: str, dims: int, failures: int, interrupted: int, fingerprint: str | None
+) -> None:
+    """Record what is known about this index on the index itself. Best effort.
+
+    Deliberately best effort: the failure paths run while a build's exception is
+    on its way up, and losing the record must not replace the error that says why
+    the build failed. A failure so early that no catalog entry exists yet leaves
+    nothing to comment on, and the next reconcile is then exactly as it is today.
+
+    The comment is generated here in full -- the only values from outside are two
+    integers this module counted and a hex digest it computed -- so there is
+    nothing in it to quote.
+    """
+    body = per_kb_index_comment(failures, interrupted, fingerprint)
+    literal = "NULL" if body is None else f"'{body}'"
+    try:
+        conn.execute(text(f"COMMENT ON INDEX {_qualified_index(kb_id, dims)} IS {literal}"))
+    except Exception as exc:
+        logger.warning(
+            "Could not record the build history of %s (%d failed, %d interrupted, "
+            "definition %s) (%s); a later reconcile will count from what it can read, and a "
+            "definition it cannot read is treated as one this module did not build",
+            _qualified_index(kb_id, dims),
+            failures,
+            interrupted,
+            fingerprint or "unknown",
+            first_error_line(exc),
+        )
 
 
 def _record_build_failure(conn, kb_id: str, dims: int, failures: int) -> None:
-    """Write the new consecutive-failure count onto the index a build just left.
+    """Record a permanent-looking failure count, keeping the definition on record.
 
-    Best effort, and deliberately: this runs while a build's exception is on its
-    way up, and losing the record must not replace the error that says why the
-    build failed. A failure so early that no catalog entry exists yet leaves
-    nothing to comment on, and the next reconcile is then exactly as it is today.
-
-    The comment is generated here in full -- the only value from outside is an
-    integer this module counted -- so there is nothing in it to quote.
+    The narrow entry point kept for callers that only have a count to write -- the
+    general form is ``_write_index_comment``, which carries all three facts. It
+    reads the definition back off the index rather than assuming today's, so
+    recording a failure on an index built from an older definition does not quietly
+    relabel it as current.
     """
-    try:
-        conn.execute(
-            text(
-                f"COMMENT ON INDEX {_qualified_index(kb_id, dims)} IS "
-                f"'{_BUILD_FAILURES_COMMENT.format(n=int(failures))}'"
-            )
-        )
-    except Exception as exc:
-        logger.warning(
-            "Could not record that building %s has failed %d time(s) (%s); a later reconcile "
-            "will count from what it can read",
-            _qualified_index(kb_id, dims),
-            failures,
-            first_error_line(exc),
-        )
+    _write_index_comment(
+        conn,
+        kb_id,
+        dims,
+        failures,
+        interrupted_builds_in(index_comment(conn, kb_id, dims)),
+        definition_fingerprint_in(index_comment(conn, kb_id, dims)),
+    )
+
+
+def _record_the_definition_built(conn, kb_id: str, dims: int) -> None:
+    """A build succeeded: record what it was built from, and forget the failures.
+
+    Both in one write, because they are one comment. The count is *consecutive*,
+    so a success clears it; the fingerprint has to be written on every success
+    rather than only after a failure, because it is the only record that this
+    index matches the definition this module now emits.
+    """
+    _write_index_comment(conn, kb_id, dims, 0, 0, per_kb_index_fingerprint(kb_id, dims))
 
 
 def _count_a_failed_attempt(
-    conn, kb_id: str, dims: int, prior_failures: int, exc: BaseException
+    conn,
+    kb_id: str,
+    dims: int,
+    prior_failures: int,
+    prior_interrupted: int,
+    exc: BaseException,
 ) -> None:
-    """Record this attempt against the bound -- unless a retry can get past it.
+    """Record this attempt against whichever of the two bounds it belongs to.
 
-    ``MAX_CONSECUTIVE_BUILD_FAILURES`` is three, and reaching it stops the index
-    being built or dispatched until an operator drops it by hand. The task that
-    runs these builds retries a transient failure six times, so a contention
-    episode that outlasts three of those retries would otherwise spend the whole
-    budget on failures the bound was never meant to count.
+    A failure ``is_transient_db_error`` recognises goes against the larger
+    ``MAX_CONSECUTIVE_INTERRUPTED_BUILDS``, because the task that runs these
+    builds retries such a failure several times and one contention episode must
+    not spend a budget whose only remedy is a manual ``DROP INDEX``. Anything else
+    goes against ``MAX_CONSECUTIVE_BUILD_FAILURES``.
 
-    A transient failure still has to *keep* the count, though: the repair drop
-    that precedes a rebuild takes the record away with the index it is written
-    on, so writing nothing here would hand the whole budget back on every
-    episode. It is rewritten unchanged instead.
+    Both counts are carried in from the caller rather than re-read, because the
+    repair drop that precedes a rebuild takes the record away with the index it is
+    written on -- so the numbers have to survive in memory across it. Writing
+    nothing for a transient failure, which is what this did before, handed the
+    whole budget back on every reconcile and made the bound unreachable.
+
+    The fingerprint of the definition this attempt used is written too: the
+    INVALID index left behind really was created from it.
     """
-    if not is_transient_db_error(exc):
-        _record_build_failure(conn, kb_id, dims, prior_failures + 1)
-    elif prior_failures:
-        _record_build_failure(conn, kb_id, dims, prior_failures)
-
-
-def _clear_build_failure_record(conn, kb_id: str, dims: int) -> None:
-    """Forget the failures once a build has succeeded: the count is consecutive."""
-    try:
-        conn.execute(text(f"COMMENT ON INDEX {_qualified_index(kb_id, dims)} IS NULL"))
-    except Exception as exc:
-        logger.warning(
-            "Could not clear the build history of %s (%s); a later failure would be counted "
-            "from a stale total and could give up early",
-            _qualified_index(kb_id, dims),
-            first_error_line(exc),
-        )
+    if is_transient_db_error(exc):
+        interrupted, failures = prior_interrupted + 1, prior_failures
+    else:
+        interrupted, failures = prior_interrupted, prior_failures + 1
+    _write_index_comment(
+        conn, kb_id, dims, failures, interrupted, per_kb_index_fingerprint(kb_id, dims)
+    )
 
 
 def _build_in_progress(conn, kb_id: str, dims: int) -> bool:
@@ -1024,7 +1293,12 @@ def _build_in_progress(conn, kb_id: str, dims: int) -> bool:
 
 
 def _create_index(
-    conn, kb_id: str, dims: int, mem_mb: int | None = None, prior_failures: int = 0
+    conn,
+    kb_id: str,
+    dims: int,
+    mem_mb: int | None = None,
+    prior_failures: int = 0,
+    prior_interrupted: int = 0,
 ) -> None:
     """Build one index online, with room to do it in memory.
 
@@ -1083,13 +1357,16 @@ def _create_index(
         # Where the loop is bounded: the attempt is counted on the INVALID index
         # the failure just left behind, so the next reconcile -- in another
         # process, after a deploy, whenever -- can see how many times this has
-        # already been tried. ``prior_failures`` is the count read before the
+        # already been tried. Both prior counts are the ones read before the
         # repair drop took the previous record away with the index.
-        _count_a_failed_attempt(conn, kb_id, dims, prior_failures, exc)
+        _count_a_failed_attempt(conn, kb_id, dims, prior_failures, prior_interrupted, exc)
         raise
     else:
-        if prior_failures:
-            _clear_build_failure_record(conn, kb_id, dims)
+        # On every success, not only after a failure: this write is also what
+        # records the definition the index was built from, which is the only way a
+        # later reconcile can tell it apart from one built before the predicate
+        # changed (``per_kb_index_fingerprint``).
+        _record_the_definition_built(conn, kb_id, dims)
     finally:
         _reset_session_setting(conn, "maintenance_work_mem")
         _reset_session_setting(conn, "lock_timeout")
@@ -1142,31 +1419,37 @@ def _drop_index(conn, kb_id: str, dims: int) -> None:
         _reset_session_setting(conn, "statement_timeout")
 
 
-def _repair_invalid(conn, kb_id: str, dims: int, prior_failures: int = 0) -> bool:
+def _repair_invalid(
+    conn, kb_id: str, dims: int, prior_failures: int = 0, prior_interrupted: int = 0
+) -> None:
     """Drop an INVALID index left behind by a failed concurrent build.
 
     ``CREATE INDEX CONCURRENTLY`` that is cancelled, killed or fails leaves the
     index in place and marked invalid: it answers no query, Postgres still
     maintains it on every write, and ``IF NOT EXISTS`` makes a re-run a no-op,
-    so without this the knowledge base would never get a usable index. Skipped
-    while a build of this index is actually running, which is the other reason
-    an index can be invalid -- and a caller that gets ``False`` must *not* go on
-    to build, because ``IF NOT EXISTS`` would no-op against the name the invalid
-    index still holds and report a success that did not happen.
+    so without this the knowledge base would never get a usable index.
 
-    A drop that *raises* is counted against ``MAX_CONSECUTIVE_BUILD_FAILURES``
-    under the same rule the build's own failure is, because it is the same
-    attempt: this is the second way one reconcile of an INVALID index can end
-    without an index, and counting only the first left the bound reachable from
-    one side and not the other. Measured before it was: five consecutive
-    reconciles whose repair drop failed each recorded one failure and each asked
-    for a build again, because the count is written past this point, in the build.
+    **The caller decides whether to call this at all**, because two other things
+    it knows come first. A build of this index still running means the entry must
+    be left alone -- dropping it would pull the ground out from under that build
+    -- so the caller checks ``_build_in_progress`` and reports
+    ``invalid_index_build_in_progress``. That check used to live here and returned
+    ``False``, which put it *after* the caller's failure-bound check: an index
+    that had reached the bound with a live build on it reported
+    ``build_repeatedly_failed`` and suppressed the reschedule, for the one case
+    the reschedule exists for.
+
+    A drop that *raises* is counted against the same bounds the build's own
+    failure is, and by the same rule, because it is the same attempt: this is the
+    second way one reconcile of an INVALID index can end without an index, and
+    counting only the first left the bound reachable from one side and not the
+    other. Measured before it was: five consecutive reconciles whose repair drop
+    failed each recorded one failure and each asked for a build again, because the
+    count is written past this point, in the build.
     """
-    if _build_in_progress(conn, kb_id, dims):
-        return False
     logger.warning(
         "Partial HNSW index %s.%s is INVALID and no build is running on %s.embeddings (an "
-        "earlier CREATE INDEX CONCURRENTLY failed or was cancelled); dropping and rebuilding it",
+        "earlier CREATE INDEX CONCURRENTLY failed or was cancelled); dropping it",
         AI_SCHEMA,
         per_kb_index_name(kb_id, dims),
         AI_SCHEMA,
@@ -1174,9 +1457,39 @@ def _repair_invalid(conn, kb_id: str, dims: int, prior_failures: int = 0) -> boo
     try:
         _drop_index(conn, kb_id, dims)
     except Exception as exc:
-        _count_a_failed_attempt(conn, kb_id, dims, prior_failures, exc)
+        _count_a_failed_attempt(conn, kb_id, dims, prior_failures, prior_interrupted, exc)
         raise
-    return True
+
+
+def _drop_a_drifted_index(conn, kb_id: str, dims: int) -> None:
+    """Drop a *valid* index that was built from a definition this module no longer emits.
+
+    Not ``_repair_invalid``: this drop must **not** be counted against either
+    build bound. The index was working, nothing failed, and the reason it is going
+    away is that this module's own DDL changed -- so counting it would spend a
+    budget whose only remedy is a manual ``DROP INDEX`` on a deploy, and three
+    predicate changes would turn the feature off.
+
+    A drop that raises therefore propagates untouched, exactly as the
+    below-threshold drop beside it does, and the task retries it if it was
+    transient. The index that is still there keeps answering queries at whatever
+    recall its old definition gives, which is the state this started from.
+    """
+    logger.warning(
+        "Rebuilding partial HNSW index %s.%s for knowledge base %s at %d dimensions: it was "
+        "built from a definition this version no longer emits (its %s comment records %s, and "
+        "the current definition is %s), so it covers a population or orders by an expression "
+        "the searches steered onto it no longer match. Dropping and rebuilding it; until the "
+        "rebuild finishes those searches use the shared per-dimension index",
+        AI_SCHEMA,
+        per_kb_index_name(kb_id, dims),
+        kb_id,
+        dims,
+        "pg_class",
+        definition_fingerprint_in(index_comment(conn, kb_id, dims)) or "no definition",
+        per_kb_index_fingerprint(kb_id, dims),
+    )
+    _drop_index(conn, kb_id, dims)
 
 
 def outcome_needs_another_attempt(outcome: dict) -> bool:
@@ -1266,6 +1579,8 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     built: list[str] = []
     dropped: list[str] = []
     repaired: list[str] = []
+    rebuilt: list[str] = []
+    stale_kept: list[str] = []
     blocked: list[str] = []
     doomed: list[int] = []
     reschedule: str | None = None
@@ -1273,7 +1588,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     above_limit: list[int] = []
 
     with _autocommit_connection(engine) as conn:
-        existing = existing_per_kb_indexes(conn, kb_id)
+        existing = per_kb_index_states(conn, kb_id)
         dims_in_play = sorted(set(candidate_dims(conn, kb_id, cap)) | set(existing))
         if not dims_in_play:
             return {"status": "ready", "reason": "no_embeddings", "built": [], "dropped": []}
@@ -1289,45 +1604,45 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
             try:
                 # Re-read under the lock: another caller may have finished
                 # between the survey above and this point.
-                valid = existing_per_kb_indexes(conn, kb_id).get(dims)
-                prior_failures = 0
+                valid, comment = per_kb_index_states(conn, kb_id).get(dims, (None, None))
+                # Before the failure bound, because the bound only decides whether
+                # to *build*, and this decides whether the index should exist at
+                # all. ``index_action`` reads it in the same order, and when the
+                # two disagreed a doomed index whose knowledge base had since
+                # shrunk was dispatched for ever and never dropped: the dispatch
+                # asked for the drop, this loop hit the bound first and skipped,
+                # and only a manual ``DROP INDEX`` could clear it -- which also
+                # left the "giving up on the repair is not giving up on the drop"
+                # path in the sweep's docstring dead.
+                rows = bounded_row_count(conn, kb_id, dims, cap)
+                # The count stops at ``cap``, so at the bound it is a floor and
+                # not the knowledge base's size. Everything that reports it says so.
+                floored = rows >= cap
+                prior_failures = prior_interrupted = 0
+
                 if valid is False:
                     # Read before the repair drop, which takes the record away
                     # with the index it is written on.
-                    prior_failures = recorded_build_failures(conn, kb_id, dims)
-                    if prior_failures >= MAX_CONSECUTIVE_BUILD_FAILURES:
-                        logger.error(
-                            "Giving up on partial HNSW index %s.%s: %d consecutive builds of "
-                            "it have failed, so this one is not attempted again. Until an "
-                            "operator drops it by hand it stays INVALID -- answering no "
-                            "query, and maintained on every write to %s.embeddings -- and "
-                            "knowledge base %s keeps the shared per-dimension index, which "
-                            "is what it had before this index existed. The reason is in the "
-                            "failure of the last attempt (a full disk is the usual one); "
-                            "dropping the index is also what lets a later reconcile try "
-                            "again",
-                            AI_SCHEMA,
-                            name,
-                            prior_failures,
-                            AI_SCHEMA,
-                            kb_id,
-                        )
-                        doomed.append(dims)
-                        continue
-                    if not _repair_invalid(conn, kb_id, dims, prior_failures):
-                        # A build of this index is running, so the invalid entry
-                        # stays. Falling through would reach
-                        # `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, which
-                        # no-ops against the name the invalid index holds -- and
-                        # this would report the index as built while it answers
-                        # no query and is maintained on every write. (The BM25
-                        # path does the same, for the same reason.)
+                    prior_failures = build_failures_in(comment)
+                    prior_interrupted = interrupted_builds_in(comment)
+                    if _build_in_progress(conn, kb_id, dims):
+                        # The invalid entry stays. Dropping it would pull the
+                        # ground out from under that build, and falling through
+                        # would reach `CREATE INDEX CONCURRENTLY IF NOT EXISTS`,
+                        # which no-ops against the name the invalid index holds --
+                        # reporting an index as built while it answers no query and
+                        # is maintained on every write. (The BM25 path does the
+                        # same, for the same reason.)
                         #
                         # We hold this index's build lock, so that build belongs
                         # to no live caller of this module: it is an orphan
                         # backend, most often from a worker that did not survive
                         # its own build. Nothing else comes back to this
-                        # knowledge base, so the outcome asks to be run again.
+                        # knowledge base, so the outcome asks to be run again --
+                        # which is why this is decided before the failure bound
+                        # below: an index that had reached the bound with a live
+                        # build on it used to report ``build_repeatedly_failed``
+                        # and suppress the one reschedule that case exists for.
                         logger.warning(
                             "Partial HNSW index %s.%s is INVALID and a build of it is still "
                             "running, so it has to be left in place: dropping it would pull "
@@ -1344,19 +1659,46 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         blocked.append(name)
                         reschedule = reschedule or name
                         continue
+                    # Given up on building it -- but not on dropping it. An index
+                    # whose knowledge base has since fallen to the drop threshold,
+                    # or whose dimension pgvector will not index at all, is dropped
+                    # here whatever its history: the drop is what re-arms the build,
+                    # and refusing it was what stranded the index for ever.
+                    if (
+                        build_is_given_up(comment)
+                        and rows > drop_below
+                        and dims <= MAX_HNSW_DIMS
+                    ):
+                        logger.error(
+                            "Giving up on partial HNSW index %s.%s: %d consecutive builds of "
+                            "it have failed and %d were interrupted, so this one is not "
+                            "attempted again. Until an operator drops it by hand it stays "
+                            "INVALID -- answering no query, and maintained on every write to "
+                            "%s.embeddings -- and knowledge base %s keeps the shared "
+                            "per-dimension index, which is what it had before this index "
+                            "existed. The reason is in the failure of the last attempt (a "
+                            "full disk is the usual one); dropping the index is also what "
+                            "lets a later reconcile try again",
+                            AI_SCHEMA,
+                            name,
+                            prior_failures,
+                            prior_interrupted,
+                            AI_SCHEMA,
+                            kb_id,
+                        )
+                        doomed.append(dims)
+                        continue
+                    _repair_invalid(conn, kb_id, dims, prior_failures, prior_interrupted)
                     repaired.append(name)
                     valid = None
 
-                rows = bounded_row_count(conn, kb_id, dims, cap)
-                # The count stops at ``cap``, so at the bound it is a floor and
-                # not the knowledge base's size. Everything that reports it says so.
-                floored = rows >= cap
                 if valid is True:
                     if rows <= drop_below:
                         progress("dropping", dims=dims, rows=rows, rows_are_a_floor=floored)
                         logger.info(
                             "Dropping partial HNSW index %s.%s: knowledge base %s now has "
-                            "%d rows at %d dimensions, at or below the drop threshold of %d",
+                            "%d chunk rows at %d dimensions, at or below the drop threshold "
+                            "of %d",
                             AI_SCHEMA,
                             name,
                             kb_id,
@@ -1366,7 +1708,70 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         )
                         _drop_index(conn, kb_id, dims)
                         dropped.append(name)
-                    continue
+                        continue
+                    if not definition_has_drifted(kb_id, dims, comment):
+                        continue
+                    # Built from a definition this version no longer emits. The
+                    # index still answers searches, at whatever recall its old
+                    # definition gives, so it is only replaced where the
+                    # replacement can actually be completed: a drop this loop
+                    # cannot follow with a build leaves the knowledge base with no
+                    # index where it had a stale-but-usable one.
+                    total = per_kb_index_count(conn)
+                    if rows < build_at or dims > MAX_HNSW_DIMS:
+                        # Inside the hysteresis band, or a width pgvector will not
+                        # index: a build would be declined below, so keeping it is
+                        # strictly better than dropping it.
+                        why = (
+                            f"{rows} chunk rows is below the build threshold of {build_at}"
+                            if rows < build_at
+                            else f"{dims} dimensions is above pgvector's HNSW limit of "
+                            f"{MAX_HNSW_DIMS}"
+                        )
+                        logger.warning(
+                            "Partial HNSW index %s.%s was built from a definition this "
+                            "version no longer emits, and is being kept rather than "
+                            "rebuilt, because %s -- so a rebuild would be declined and the "
+                            "drop would leave knowledge base %s with no index of its own. "
+                            "Its searches keep whatever recall the old definition gives",
+                            AI_SCHEMA,
+                            name,
+                            why,
+                            kb_id,
+                        )
+                        stale_kept.append(name)
+                        continue
+                    if total >= MAX_PER_KB_INDEXES:
+                        # The drop would free a place another knowledge base's
+                        # reconcile can take before this one rebuilds, and this
+                        # knowledge base would be left with nothing. A stale index
+                        # answers its searches; no index does not.
+                        logger.warning(
+                            "Partial HNSW index %s.%s was built from a definition this "
+                            "version no longer emits, and is being kept rather than "
+                            "rebuilt, because %s.embeddings already carries %d "
+                            "per-knowledge-base indexes (the cap is %d): the drop would free "
+                            "a place another knowledge base can take before the rebuild, "
+                            "leaving knowledge base %s with no index at all. Its searches "
+                            "keep whatever recall the old definition gives. Lower the number "
+                            "of indexed knowledge bases, or drop this one by hand once there "
+                            "is room",
+                            AI_SCHEMA,
+                            name,
+                            AI_SCHEMA,
+                            total,
+                            MAX_PER_KB_INDEXES,
+                            kb_id,
+                        )
+                        stale_kept.append(name)
+                        cap_reached = total
+                        continue
+                    progress("dropping", dims=dims, rows=rows, rows_are_a_floor=floored)
+                    _drop_a_drifted_index(conn, kb_id, dims)
+                    rebuilt.append(name)
+                    # The definition drop is not a build failure, so neither count
+                    # moves; the index is gone, so the build below is the rebuild.
+                    valid = None
 
                 if rows < build_at:
                     continue
@@ -1424,7 +1829,14 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         else ""
                     ),
                 )
-                _create_index(conn, kb_id, dims, mem_mb, prior_failures=prior_failures)
+                _create_index(
+                    conn,
+                    kb_id,
+                    dims,
+                    mem_mb,
+                    prior_failures=prior_failures,
+                    prior_interrupted=prior_interrupted,
+                )
                 built.append(name)
             finally:
                 _release_lock(conn, lock)
@@ -1432,6 +1844,10 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     outcome: dict = {"status": "ready", "built": built, "dropped": dropped}
     if repaired:
         outcome["repaired_invalid_indexes"] = repaired
+    if rebuilt:
+        outcome["rebuilt_stale_definitions"] = rebuilt
+    if stale_kept:
+        outcome["stale_definitions_kept"] = stale_kept
     if above_limit:
         outcome["dims_above_hnsw_limit"] = above_limit
         outcome.update({"status": "skipped", "reason": "dims_above_hnsw_limit"})
@@ -1613,37 +2029,24 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
     """
     engine = _engine(engine)
     needing: dict[str, None] = {}
+    drifted: dict[str, None] = {}
     given_up: list[str] = []
 
     try:
         with engine.connect() as conn:
             build_at, drop_below = thresholds(read_overrides(conn, *_THRESHOLD_KEYS))
-            rows = conn.execute(
-                text(
-                    "SELECT c.relname, i.indisvalid, obj_description(c.oid, 'pg_class') "
-                    "FROM pg_class c "
-                    "JOIN pg_index i ON i.indexrelid = c.oid "
-                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                    r"WHERE n.nspname = :schema AND c.relkind = 'i' "
-                    r"AND c.relname LIKE :prefix ESCAPE '\'"
-                ),
-                {"schema": AI_SCHEMA, "prefix": _like_prefix(INDEX_NAME_PREFIX)},
-            ).all()
+            rows = _index_catalog_rows(conn, INDEX_NAME_PREFIX)
             indexed: dict[str, list[int]] = {}
             for relname, valid, comment in rows:
-                body = relname[len(INDEX_NAME_PREFIX) :]
-                kb_hex, _, dims_part = body.rpartition("_")
-                if len(kb_hex) != 32 or not dims_part.isdigit():
+                parsed = parsed_per_kb_index_name(relname)
+                if parsed is None:
                     continue
-                try:
-                    kb_id = str(uuid.UUID(hex=kb_hex))
-                except ValueError:
-                    continue
-                indexed.setdefault(kb_id, []).append(int(dims_part))
+                kb_id, dims = parsed
+                indexed.setdefault(kb_id, []).append(dims)
                 if not valid:
-                    if build_failures_in(comment) >= MAX_CONSECUTIVE_BUILD_FAILURES:
+                    if build_is_given_up(comment):
                         # Nothing would come of dispatching this one: the reconcile
-                        # reads the same count and declines. Left in the list it
+                        # reads the same counts and declines. Left in the list it
                         # would take one of ``MAX_SWEEP_DISPATCH`` places -- and the
                         # list is INVALID-first, so that many given-up indexes would
                         # consume the whole start-up budget on every boot while a
@@ -1651,6 +2054,13 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
                         given_up.append(f"{AI_SCHEMA}.{relname}")
                         continue
                     needing[kb_id] = None
+                elif definition_has_drifted(kb_id, dims, comment):
+                    # Built from a definition this version no longer emits: it still
+                    # answers searches, at whatever recall the old definition gives,
+                    # so it is the least urgent of the four cases and is added after
+                    # the others rather than here. A catalog fact, like INVALID, so
+                    # it does not depend on the count below finishing.
+                    drifted[kb_id] = None
             conn.rollback()
     except Exception:
         logger.warning(
@@ -1711,6 +2121,15 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
         for kb_id in indexed:
             if not any(r[0] == kb_id for r in counted):
                 needing[kb_id] = None
+
+    # Last, so a stale-but-usable index only ever spends a place
+    # ``MAX_SWEEP_DISPATCH`` had left over. The other three cases are more urgent:
+    # an INVALID index answers nothing, an index past the drop threshold is charged
+    # to every write, and a knowledge base over the build threshold is what the
+    # feature is for. ``needing`` is a dict so a knowledge base already in it for
+    # another reason does not move.
+    for kb_id in drifted:
+        needing[kb_id] = None
 
     pending = list(needing)
     if len(pending) > MAX_SWEEP_DISPATCH:

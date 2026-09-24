@@ -407,6 +407,12 @@ def test_the_index_cap_is_far_below_where_planning_and_locks_degrade():
 # ---------------------------------------------------------------------------
 
 
+# "whatever definition the service emits today", so a helper's default is an index
+# this version built rather than a drifted one.
+_CURRENT = object()
+
+
+
 class _Result:
     """Just enough of a SQLAlchemy result for the three shapes this module reads."""
 
@@ -487,31 +493,59 @@ def _raiser(exc):
     return boom
 
 
-def _failure_comment(failures: int) -> str:
-    """The comment the service writes, built by the service's own template.
+def _recorded(comment: str | None) -> tuple[int, str | None]:
+    """``(permanent failures, definition fingerprint)`` a written comment records.
 
-    So a test says "two failures are already on record" rather than restating the
-    wording, and a reworded comment the parser still reads keeps these passing.
+    Read back through the service's own parsers rather than by matching the
+    wording, so a reworded comment the parsers still read keeps these passing --
+    and so a spec says "two failures are on record" about what the module can read
+    back, not about a substring.
     """
-    return pvi._BUILD_FAILURES_COMMENT.format(n=failures)
+    return pvi.build_failures_in(comment), pvi.definition_fingerprint_in(comment)
 
 
-# The catalog row shape the ensure survey reads.
-def _index_row(kb_id: str, dims: int, valid: bool = True):
-    return (pvi.per_kb_index_name(kb_id, dims), valid)
+def _current_fingerprint(kb_id: str, dims: int) -> str:
+    return pvi.per_kb_index_fingerprint(kb_id, dims)
 
 
-def _sweep_index_row(kb_id: str, dims: int, valid: bool = True, failures: int = 0):
-    """The boot sweep's catalog row, which carries the index's build history too.
-
-    Read in the same pass as ``indisvalid`` so the sweep can tell an INVALID index
-    worth repairing from one that has already been given up on, with no extra
-    query.
-    """
+# The one catalog row shape: name, validity, and the comment carrying both build
+# counts and the definition the index was built from.
+def _index_row(
+    kb_id: str,
+    dims: int,
+    valid: bool = True,
+    failures: int = 0,
+    interrupted: int = 0,
+    fingerprint=_CURRENT,
+):
+    if fingerprint is _CURRENT:
+        fingerprint = _current_fingerprint(kb_id, dims)
     return (
         pvi.per_kb_index_name(kb_id, dims),
         valid,
-        _failure_comment(failures) if failures else None,
+        pvi.per_kb_index_comment(failures, interrupted, fingerprint),
+    )
+
+
+# The sweep reads the same row; the name is kept because the sweep specs are about
+# what it concludes from the build history, which is the third column.
+_sweep_index_row = _index_row
+
+
+def _with_history(row, failures: int = 0, interrupted: int = 0):
+    """The same catalog row, with a build history written into its comment.
+
+    Keeps whatever definition fingerprint the row already carries, so saying "two
+    failures are on record" does not accidentally also say "built from a definition
+    this version no longer emits".
+    """
+    if not (failures or interrupted):
+        return row
+    relname, valid, comment = row
+    return (
+        relname,
+        valid,
+        pvi.per_kb_index_comment(failures, interrupted, pvi.definition_fingerprint_in(comment)),
     )
 
 
@@ -536,7 +570,7 @@ def test_a_build_sets_its_session_settings_before_the_ddl_and_resets_every_one_a
     monkeypatch.setattr(pvi, "maintenance_work_mem_mb", lambda: 256)
     conn = _FakeConn()
     pvi._create_index(conn, KB, 1536)
-    assert conn.statements == [
+    assert [st for st in conn.statements if not st.startswith(_FAILURE_COMMENT_DDL)] == [
         "SET statement_timeout = 0",
         "SET lock_timeout = 0",
         "SET maintenance_work_mem = '256MB'",
@@ -758,10 +792,14 @@ def test_a_build_does_not_hold_the_settings_session_idle_in_a_transaction(monkey
 _KBS = [str(uuid.UUID(int=n)) for n in range(1, 40)]
 
 _COUNT_QUERY = "GROUP BY 1, 2"
+# One statement answers every question this module asks of ``pg_class`` about its
+# own indexes -- a knowledge base's, the whole project's, the boot sweep's -- and
+# the only thing that tells them apart is the LIKE prefix, which is what tells
+# them apart on the server too. So the fakes answer it from the ``prefix`` bind
+# rather than from three fragments of SQL.
 _CATALOG_QUERY = "i.indisvalid"
-# The sweep reads the index's comment in the same pass, so its catalog SELECT is
-# not the ensure survey's and the fakes answer them separately.
-_SWEEP_CATALOG_QUERY = "obj_description(c.oid, 'pg_class') FROM pg_class"
+_SWEEP_CATALOG_QUERY = _CATALOG_QUERY
+_WHOLE_PROJECT_PREFIX = pvi._like_prefix(pvi.INDEX_NAME_PREFIX)
 
 
 def _sweep(conn):
@@ -980,6 +1018,70 @@ def test_a_given_up_index_whose_knowledge_base_shrank_is_still_dispatched_to_be_
     assert _sweep(conn) == [_KBS[0]]
 
 
+def test_the_reconcile_a_given_up_index_is_dispatched_for_actually_drops_it(monkeypatch):
+    """Which the spec above does not say, and for three rounds nothing did.
+
+    The sweep returning the knowledge base is only half of it. The reconcile used to
+    read the failure bound *before* the row count -- the opposite order to
+    ``index_action`` -- so the dispatch asked for a drop, the reconcile reported
+    ``build_repeatedly_failed``, and the index stayed ``indisvalid=false,
+    indisready=true`` for ever: charged to every insert, answering no query, and
+    reachable only by a manual ``DROP INDEX``. Measured exactly that, against a
+    real server, on a knowledge base shrunk to three chunk rows.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)],
+        rows_by_dims={1536: 3},
+        failures=pvi.MAX_CONSECUTIVE_BUILD_FAILURES,
+    )
+    assert pvi.index_action(conn, KB) == "drop", "the dispatch asks for the drop"
+    outcome = _ensure(monkeypatch, conn)
+    assert conn.issued("DROP INDEX CONCURRENTLY"), conn.statements
+    assert outcome["repaired_invalid_indexes"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert outcome.get("build_repeatedly_failed") is None, (
+        "giving up on the repair is not giving up on the drop"
+    )
+    assert conn.issued("CREATE INDEX") == [], "and it is not rebuilt at a size it no longer is"
+
+
+def test_a_given_up_index_above_the_hnsw_limit_is_dropped_too(monkeypatch):
+    """The other half of the same order: pgvector cannot build it at any row count.
+
+    So the failure bound has nothing left to protect, and the index is pure cost.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, pvi.MAX_HNSW_DIMS + 1, False)],
+        dims_present=(pvi.MAX_HNSW_DIMS + 1,),
+        rows_by_dims={pvi.MAX_HNSW_DIMS + 1: 20_000},
+        failures=pvi.MAX_CONSECUTIVE_BUILD_FAILURES,
+    )
+    assert pvi.index_action(conn, KB) == "drop"
+    _ensure(monkeypatch, conn)
+    assert conn.issued("DROP INDEX CONCURRENTLY"), conn.statements
+
+
+def test_a_given_up_index_with_a_live_build_asks_to_be_run_again(monkeypatch):
+    """``invalid_index_build_in_progress`` is the one reason that reschedules.
+
+    A doomed index with a build still on it used to report
+    ``build_repeatedly_failed`` instead, because the bound was read before
+    ``_build_in_progress`` -- suppressing the reschedule for the single case the
+    reschedule exists for. The build is an orphan backend; nothing else comes back
+    to this knowledge base.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False)],
+        rows_by_dims={1536: 20_000},
+        failures=pvi.MAX_CONSECUTIVE_BUILD_FAILURES,
+    )
+    conn.answers.insert(0, (_BUILD_RUNNING_QUERY, [(1,)]))
+    outcome = _ensure(monkeypatch, conn)
+    assert outcome["status"] == "building", outcome
+    assert outcome["reason"] == "invalid_index_build_in_progress", outcome
+    assert pvi.outcome_needs_another_attempt(outcome) is True, outcome
+    assert conn.issued("DROP INDEX") == [], "dropping it would pull the ground out from under it"
+
+
 def test_the_sweeps_failure_history_comes_from_the_query_it_already_runs():
     """No second round trip per index: one column on the catalog SELECT."""
     conn = _FakeConn()
@@ -996,34 +1098,67 @@ def test_the_sweeps_failure_history_comes_from_the_query_it_already_runs():
 # ---------------------------------------------------------------------------
 
 _LOCK_QUERY = "pg_try_advisory_lock"
-_FAILURE_RECORD_QUERY = "obj_description"
+# The one-index comment read, not the catalog SELECT's ``obj_description`` column:
+# both name that function, and only this one names the index by ``to_regclass``.
+_FAILURE_RECORD_QUERY = "obj_description(to_regclass(:index)"
 _FAILURE_COMMENT_DDL = "COMMENT ON INDEX"
 _ROW_COUNT_QUERY = "LIMIT :cap) s"
-_INDEX_COUNT_QUERY = "count(*) FROM pg_class"
 _BUILD_RUNNING_QUERY = "pg_stat_progress_create_index"
+
+
+def _catalog_answer(own_rows, index_count=None):
+    """Answer the one catalog SELECT the way ``pg_class`` would, from the prefix.
+
+    A per-knowledge-base read gets that knowledge base's rows, and the project-wide
+    read gets the whole project's -- which is those same rows unless a spec is about
+    ``MAX_PER_KB_INDEXES`` and says the project holds ``index_count`` of them, in
+    which case other knowledge bases' indexes make up the difference.
+
+    Read from the bind, unlike ``_PopulationConn``, because here the prefix *is* the
+    bind: one statement asks both questions and the bind is the only thing the
+    server tells them apart by. A reader that stopped restricting itself to one
+    knowledge base is answered with the whole project, exactly as Postgres would
+    answer it.
+    """
+    own = list(own_rows)
+
+    def answer(params):
+        if index_count is None or (params or {}).get("prefix") != _WHOLE_PROJECT_PREFIX:
+            return own
+        filler = [
+            _index_row(str(uuid.UUID(int=1_000 + n)), 1536)
+            for n in range(max(0, int(index_count) - len(own)))
+        ]
+        return own + filler
+
+    return answer
 
 
 def _ensure_conn(
     existing=(),
     dims_present=(1536,),
     rows_by_dims=None,
-    index_count=1,
+    index_count=None,
     cls=None,
     failures=0,
+    interrupted=0,
     **kwargs,
 ):
     """A connection that answers every read ``ensure_per_kb_vector_index`` makes.
 
-    ``failures`` is what the index's own catalog comment already records, which is
-    where a doomed build's history lives.
+    ``failures`` and ``interrupted`` are what this knowledge base's index already
+    records in its own ``pg_class`` comment, which is where a doomed build's history
+    lives -- and the reconcile reads that comment from the catalog SELECT, in the
+    same pass as ``indisvalid``, so they are written onto the rows rather than
+    answered separately.
     """
     rows = dict(rows_by_dims or {})
+    own = [_with_history(row, failures, interrupted) for row in existing]
     return (cls or _FakeConn)(
         answers=[
-            (_FAILURE_RECORD_QUERY, [(_failure_comment(failures),)] if failures else []),
-            (_CATALOG_QUERY, list(existing)),
+            (_FAILURE_RECORD_QUERY, [(own[0][2],)] if own and own[0][2] else []),
+            (_CATALOG_QUERY, _catalog_answer(own, index_count)),
             ("GROUP BY dims", [(d,) for d in dims_present]),
-            (_INDEX_COUNT_QUERY, [(index_count,)]),
             (_ROW_COUNT_QUERY, lambda params: [(rows.get(int(params["dims"]), 0),)]),
             (_LOCK_QUERY, [(True,)]),
         ],
@@ -1091,14 +1226,12 @@ class _PopulationConn(_FakeConn):
         return super().execute(clause, params)
 
 
-def _population_conn(population, existing=(), index_count=1, **kwargs):
+def _population_conn(population, existing=(), index_count=None, **kwargs):
     return _PopulationConn(
         population,
         answers=[
             (_FAILURE_RECORD_QUERY, []),
-            (_SWEEP_CATALOG_QUERY, [_sweep_index_row(KB, d) for d in existing]),
-            (_CATALOG_QUERY, [_index_row(KB, d) for d in existing]),
-            (_INDEX_COUNT_QUERY, [(index_count,)]),
+            (_CATALOG_QUERY, _catalog_answer([_index_row(KB, d) for d in existing], index_count)),
             (_LOCK_QUERY, [(True,)]),
             (
                 _SETTINGS_QUERY,
@@ -1169,6 +1302,284 @@ def test_the_boot_sweep_counts_only_the_population_the_index_covers():
     """
     assert _sweep(_population_conn(_MIXED)) == []
     assert _sweep(_population_conn(_CHUNKS_ONLY)) == [KB]
+
+
+# -- an index whose definition the module no longer emits --------------------
+
+
+def _stale_row(kb_id=KB, dims=1536, **kwargs):
+    """A valid index built from a definition this version no longer emits.
+
+    Which is exactly what an index built by an earlier build of this branch is: the
+    predicate gained ``item_table`` and the name did not change, so the catalog
+    carries the old two-clause predicate under today's name. Measured live: the
+    planner still matches it, because today's query *implies* the old predicate, so
+    every chunk search on that knowledge base ran at recall 0.562 where 0.989 was
+    available -- for ever, with no log line.
+    """
+    return _index_row(kb_id, dims, True, fingerprint=None, **kwargs)
+
+
+def test_an_index_with_no_recorded_definition_has_drifted():
+    """The index this exists to find carries no fingerprint at all.
+
+    It was built by code that did not write one, so there is nothing to compare and
+    "unknown" is not "current". Getting this backwards would leave every existing
+    index unreconciled, which is the state the review found.
+    """
+    assert pvi.definition_has_drifted(KB, 1536, None) is True
+    assert pvi.definition_has_drifted(KB, 1536, "dropping this on Monday, see ticket 41") is True
+
+
+def test_an_index_built_from_todays_definition_has_not_drifted():
+    current = pvi.per_kb_index_comment(0, 0, pvi.per_kb_index_fingerprint(KB, 1536))
+    assert pvi.definition_has_drifted(KB, 1536, current) is False
+
+
+def test_the_fingerprint_changes_with_the_definition_and_not_with_the_name():
+    """Every part of the DDL the name does not carry has to move it.
+
+    The predicate is the one that moved in this PR; the operator class, the cast and
+    any storage parameter are the ones that can move next, and the same hole would
+    swallow them.
+    """
+    kb_a, kb_b = KB, str(uuid.UUID(int=77))
+    assert pvi.per_kb_index_fingerprint(kb_a, 1536) != pvi.per_kb_index_fingerprint(kb_b, 1536)
+    assert pvi.per_kb_index_fingerprint(kb_a, 1536) != pvi.per_kb_index_fingerprint(kb_a, 768)
+    before = pvi.per_kb_index_fingerprint(kb_a, 1536)
+    real_ddl = pvi.per_kb_index_ddl
+    try:
+        pvi.per_kb_index_ddl = lambda kb, d: real_ddl(kb, d).replace(
+            "vector_cosine_ops", "vector_l2_ops"
+        )
+        assert pvi.per_kb_index_fingerprint(kb_a, 1536) != before
+    finally:
+        pvi.per_kb_index_ddl = real_ddl
+
+
+def test_drift_is_decided_without_reading_the_definition_back_from_postgres(monkeypatch):
+    """The dangerous fix, kept out by what the reconcile actually asks the server.
+
+    ``pg_get_indexdef`` normalises what this module emits in at least six ways --
+    ``((embedding)::vector(N))``, ``'...'::uuid``, ``(item_table)::text``, the
+    predicate's parentheses -- so the two strings are never equal. An equality test
+    against it would mark *every* index stale, and because the failure record dies
+    with the index a drift drop takes away, nothing would bound the resulting
+    drop-and-rebuild: every reconcile of every knowledge base, for ever.
+
+    Asserted on the statements rather than on the module's text, so the paragraph
+    above may keep naming the functions it warns about.
+    """
+    conn = _ensure_conn(existing=[_stale_row()], rows_by_dims={1536: 20_000})
+    _ensure(monkeypatch, conn)
+    assert conn.issued("DROP INDEX CONCURRENTLY"), "the drift was found"
+    for reader in ("pg_get_indexdef", "pg_get_expr", "indpred"):
+        assert conn.issued(reader) == [], conn.statements
+
+
+def test_a_stale_index_is_dispatched_dropped_and_rebuilt(monkeypatch):
+    """The whole fix, in the order it happens."""
+    conn = _ensure_conn(existing=[_stale_row()], rows_by_dims={1536: 20_000})
+    _at_ten_thousand(monkeypatch)
+    assert pvi.index_action(conn, KB) == "build", "nothing reconciled it before"
+    outcome = _ensure(monkeypatch, conn)
+    assert conn.issued("DROP INDEX CONCURRENTLY"), conn.statements
+    assert outcome["rebuilt_stale_definitions"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert outcome["dropped"] == [], "a definition drop is not a threshold drop"
+
+
+def test_the_rebuild_records_the_definition_so_it_happens_once(monkeypatch):
+    """Otherwise this is the unbounded drop-and-rebuild loop the review warned about.
+
+    The success path's comment is what makes the *next* reconcile a no-op. Measured
+    live: after the rebuild, ``index_action`` is None and the boot sweep returns
+    nothing.
+    """
+    conn = _CatalogStateConn(
+        answers=[
+            ("GROUP BY dims", [(1536,)]),
+            (_ROW_COUNT_QUERY, [(20_000,)]),
+            (_LOCK_QUERY, [(True,)]),
+        ],
+        comment=None,
+        valid=True,
+    )
+    first = _ensure(monkeypatch, conn)
+    assert first["rebuilt_stale_definitions"], first
+    assert pvi.definition_has_drifted(KB, 1536, conn.comment) is False, conn.comment
+    conn.statements.clear()
+    second = _ensure(monkeypatch, conn)
+    assert second.get("rebuilt_stale_definitions") is None, second
+    assert conn.issued("DROP INDEX") == [], "a second reconcile has nothing to do"
+    assert conn.issued("CREATE INDEX") == []
+
+
+def test_a_definition_drop_is_not_counted_against_the_failure_budget(monkeypatch):
+    """Three predicate changes would otherwise turn the feature off.
+
+    Nothing failed: the index was working and this module's own DDL moved. The
+    repair drop of an INVALID index counts against the bound, and a drift drop must
+    not be confused with it.
+    """
+    conn = _ensure_conn(
+        existing=[_stale_row()], rows_by_dims={1536: 20_000}, fail_on="DROP INDEX"
+    )
+    with pytest.raises(RuntimeError):
+        _ensure(monkeypatch, conn)
+    assert conn.issued(_FAILURE_COMMENT_DDL) == [], conn.statements
+
+
+def test_a_stale_index_is_kept_at_the_index_cap(monkeypatch, caplog):
+    """The drop frees a place another knowledge base's reconcile can take.
+
+    This one would then be left with no index where it had a stale-but-usable one,
+    and could not get one back until an operator made room. A stale index answers
+    its searches; no index does not.
+    """
+    conn = _ensure_conn(
+        existing=[_stale_row()],
+        rows_by_dims={1536: 20_000},
+        index_count=pvi.MAX_PER_KB_INDEXES,
+    )
+    with caplog.at_level(logging.WARNING):
+        outcome = _ensure(monkeypatch, conn)
+    assert conn.issued("DROP INDEX") == [], conn.statements
+    assert conn.issued("CREATE INDEX") == []
+    assert outcome["stale_definitions_kept"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert outcome["reason"] == "index_cap_reached", outcome
+    assert "no index at all" in caplog.text
+    assert pvi.index_action(conn, KB) is None, "and it is not dispatched again either"
+
+
+def test_a_stale_index_inside_the_hysteresis_band_is_kept(monkeypatch, caplog):
+    """A rebuild would be declined below the build threshold, so the drop is a loss.
+
+    The hysteresis exists so an index at this size is kept; dropping it for a
+    definition change and then declining the rebuild would delete it instead.
+    """
+    conn = _ensure_conn(existing=[_stale_row()], rows_by_dims={1536: 7_000})
+    with caplog.at_level(logging.WARNING):
+        outcome = _ensure(monkeypatch, conn)
+    assert conn.issued("DROP INDEX") == [], conn.statements
+    assert outcome["stale_definitions_kept"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert "below the build threshold" in caplog.text
+    assert pvi.index_action(conn, KB) is None
+
+
+def test_a_stale_index_below_the_drop_threshold_is_just_dropped(monkeypatch):
+    """The threshold wins: there is no point rebuilding what is about to go."""
+    conn = _ensure_conn(existing=[_stale_row()], rows_by_dims={1536: 10})
+    _at_ten_thousand(monkeypatch)
+    assert pvi.index_action(conn, KB) == "drop"
+    outcome = _ensure(monkeypatch, conn)
+    assert outcome["dropped"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert outcome.get("rebuilt_stale_definitions") is None, outcome
+    assert conn.issued("CREATE INDEX") == []
+
+
+def test_the_boot_sweep_dispatches_a_stale_index_after_the_urgent_ones():
+    """A catalog fact, like INVALID -- but the least urgent of the four cases.
+
+    An INVALID index answers nothing at all, so it must not lose a place in
+    ``MAX_SWEEP_DISPATCH`` to one that answers at reduced recall.
+    """
+    invalid = [_sweep_index_row(kb, 1536, False) for kb in _KBS[:3]]
+    stale = [_stale_row(kb) for kb in _KBS[3:6]]
+    conn = _FakeConn(answers=[(_SWEEP_CATALOG_QUERY, stale + invalid)], fail_on=_COUNT_QUERY)
+    assert _sweep(conn) == _KBS[:3] + _KBS[3:6]
+
+
+def test_the_boot_sweep_leaves_a_current_index_alone():
+    """The half that would make this a boot-time drop-and-rebuild loop."""
+    build_at, drop_below = pvi.thresholds()
+    settled = (build_at + drop_below) // 2
+    assert drop_below < settled < build_at, "a knowledge base the sweep has no reason to touch"
+    rows = [_index_row(_KBS[0], 1536)]
+    conn = _FakeConn(
+        answers=[(_SWEEP_CATALOG_QUERY, rows), (_COUNT_QUERY, [(_KBS[0], 1536, settled)])]
+    )
+    assert _sweep(conn) == []
+
+
+# -- the comment carries three facts and the parse has to be strict ----------
+
+
+@pytest.mark.parametrize(
+    "failures, interrupted, fingerprint",
+    [
+        (0, 0, None),
+        (2, 0, None),
+        (0, 5, None),
+        (0, 0, "abcdef012345"),
+        (2, 0, "abcdef012345"),
+        (0, 5, "abcdef012345"),
+        (2, 5, "abcdef012345"),
+    ],
+)
+def test_every_combination_of_the_three_facts_survives_a_round_trip(
+    failures, interrupted, fingerprint
+):
+    """Both directions, because the counts and the fingerprint share one comment.
+
+    A parse that reads one of them out of the other's sentence, or that stops
+    finding a count once a fingerprint is beside it, is how a bound stops being
+    reachable or an index stops looking stale.
+    """
+    comment = pvi.per_kb_index_comment(failures, interrupted, fingerprint)
+    assert pvi.build_failures_in(comment) == failures
+    assert pvi.interrupted_builds_in(comment) == interrupted
+    assert pvi.definition_fingerprint_in(comment) == fingerprint
+
+
+def test_nothing_to_record_is_no_comment_at_all():
+    """Which is what ``COMMENT ON ... IS NULL`` writes, and what a clean index has."""
+    assert pvi.per_kb_index_comment(0, 0, None) is None
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    [
+        "dropping this on Monday, see ticket 41",
+        "3 consecutive failures",
+        "Built from definition NOTHEX12345.",
+        "Built from definition abcdef0123456789.",
+        "consecutive failed attempts to build this partial HNSW index.",
+        "",
+    ],
+)
+def test_a_comment_this_module_did_not_write_records_nothing(garbage):
+    """A comment is a place anyone may write, and every reader has to say so.
+
+    Reading a count out of one would give up on a healthy index; reading a
+    fingerprint out of one would leave a stale index in place for ever.
+    """
+    assert pvi.build_failures_in(garbage) == 0
+    assert pvi.interrupted_builds_in(garbage) == 0
+    assert pvi.definition_fingerprint_in(garbage) is None
+    assert pvi.build_is_given_up(garbage) is False
+
+
+def test_a_comment_carrying_only_a_fingerprint_is_not_given_up_on():
+    """Which is every index this version builds successfully."""
+    comment = pvi.per_kb_index_comment(0, 0, pvi.per_kb_index_fingerprint(KB, 1536))
+    assert pvi.build_is_given_up(comment) is False
+
+
+def test_either_bound_on_its_own_is_enough_to_give_up():
+    assert pvi.build_is_given_up(
+        pvi.per_kb_index_comment(pvi.MAX_CONSECUTIVE_BUILD_FAILURES, 0, None)
+    )
+    assert pvi.build_is_given_up(
+        pvi.per_kb_index_comment(0, pvi.MAX_CONSECUTIVE_INTERRUPTED_BUILDS, None)
+    )
+    assert not pvi.build_is_given_up(
+        pvi.per_kb_index_comment(
+            pvi.MAX_CONSECUTIVE_BUILD_FAILURES - 1,
+            pvi.MAX_CONSECUTIVE_INTERRUPTED_BUILDS - 1,
+            None,
+        )
+    )
 
 
 # -- the disk-size log, which is the only free-space signal there can be ------
@@ -1267,7 +1678,7 @@ def test_a_failed_build_counts_itself_on_the_index_it_leaves_behind(monkeypatch)
     written = conn.issued(_FAILURE_COMMENT_DDL)
     assert len(written) == 1, conn.statements
     assert pvi.per_kb_index_name(KB, 1536) in written[0]
-    assert _failure_comment(1) in written[0]
+    assert pvi.build_failures_in(written[0]) == 1, written
 
 
 def test_each_failure_counts_on_from_the_last_one(monkeypatch):
@@ -1284,14 +1695,16 @@ def test_each_failure_counts_on_from_the_last_one(monkeypatch):
     )
     with pytest.raises(RuntimeError):
         _ensure(monkeypatch, conn)
-    assert _failure_comment(2) in conn.issued(_FAILURE_COMMENT_DDL)[0], conn.statements
+    written = conn.issued(_FAILURE_COMMENT_DDL)
+    assert pvi.build_failures_in(written[0]) == 2, written
 
 
 def test_a_build_that_succeeds_forgets_the_failures_before_it(monkeypatch):
     """Consecutive failures are what says a build is doomed, not lifetime ones.
 
     A build lost to a server restart or a killed worker is a failure a retry
-    really does get past.
+    really does get past. The one comment the success writes carries neither
+    count, and carries the definition it was built from instead.
     """
     conn = _ensure_conn(
         existing=[_index_row(KB, 1536, False)], rows_by_dims={1536: 20_000}, failures=2
@@ -1299,7 +1712,25 @@ def test_a_build_that_succeeds_forgets_the_failures_before_it(monkeypatch):
     outcome = _ensure(monkeypatch, conn)
     assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
     cleared = conn.issued(_FAILURE_COMMENT_DDL)
-    assert len(cleared) == 1 and cleared[0].endswith("IS NULL"), conn.statements
+    assert len(cleared) == 1, conn.statements
+    assert "consecutive" not in cleared[0], cleared
+    assert pvi.per_kb_index_fingerprint(KB, 1536) in cleared[0], cleared
+
+
+def test_a_build_that_succeeds_records_the_definition_it_built_from(monkeypatch):
+    """On every success, not only the ones that follow a failure.
+
+    The fingerprint is the only record that this index matches the definition the
+    module now emits; without it on a first, clean build, the very next reconcile
+    would read the index as drifted and drop and rebuild it -- on every reconcile,
+    for ever.
+    """
+    conn = _ensure_conn(rows_by_dims={1536: 20_000})
+    outcome = _ensure(monkeypatch, conn)
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    written = conn.issued(_FAILURE_COMMENT_DDL)
+    assert len(written) == 1, conn.statements
+    assert pvi.per_kb_index_fingerprint(KB, 1536) in written[0], written
 
 
 def test_a_comment_this_module_did_not_write_is_not_a_build_history(monkeypatch):
@@ -1335,15 +1766,24 @@ def _transient_exc(sqlstate: str = "55P03", statement: str = "CREATE INDEX"):
 class _CatalogStateConn(_FakeConn):
     """A connection whose index comment survives the reconcile that wrote it.
 
-    The failure bound lives in the index's own ``pg_class`` comment, so a spec
-    about the bound being *reached* has to read back what the previous attempt
-    wrote. This keeps that one piece of catalog state, which is what lets a
-    sequence of reconciles be driven the way the ones against a real server were.
+    Both build bounds live in the index's own ``pg_class`` comment, so a spec about
+    a bound being *reached* has to read back what the previous attempt wrote. This
+    keeps that one piece of catalog state, which is what lets a sequence of
+    reconciles be driven the way the ones against a real server were -- and it
+    serves the comment through the *catalog row*, in the column the reconcile
+    really reads it from, not only through the single-index read.
+
+    The index is INVALID throughout, which is the state a failed
+    ``CREATE INDEX CONCURRENTLY`` leaves and the state each of these reconciles
+    finds.
     """
 
-    def __init__(self, *args, comment=None, **kwargs):
+    def __init__(self, *args, comment=None, kb_id=KB, dims=1536, valid=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.comment = comment
+        self.kb_id = kb_id
+        self.dims = dims
+        self.valid = valid
 
     def execute(self, clause, params=None):
         sql = clause.text if hasattr(clause, "text") else str(clause)
@@ -1356,6 +1796,12 @@ class _CatalogStateConn(_FakeConn):
             self.statements.append(" ".join(sql.split()))
             self.params.append(params)
             return _Result([(self.comment,)] if self.comment else [])
+        if _CATALOG_QUERY in sql:
+            self.statements.append(" ".join(sql.split()))
+            self.params.append(params)
+            return _Result(
+                [(pvi.per_kb_index_name(self.kb_id, self.dims), self.valid, self.comment)]
+            )
         return super().execute(clause, params)
 
 
@@ -1378,7 +1824,7 @@ def test_a_repair_drop_that_fails_counts_the_attempt_too(monkeypatch):
     assert conn.issued("CREATE INDEX") == [], "the drop failed; nothing was rebuilt"
     written = conn.issued(_FAILURE_COMMENT_DDL)
     assert written, "an uncounted attempt is an unbounded loop"
-    assert _failure_comment(2) in written[0], written
+    assert pvi.build_failures_in(written[0]) == 2, written
 
 
 def test_repair_drops_that_keep_failing_reach_the_give_up_bound(monkeypatch, caplog):
@@ -1391,9 +1837,7 @@ def test_repair_drops_that_keep_failing_reach_the_give_up_bound(monkeypatch, cap
     outcomes = []
     conn = _CatalogStateConn(
         answers=[
-            (_CATALOG_QUERY, [_index_row(KB, 1536, False)]),
             ("GROUP BY dims", [(1536,)]),
-            (_INDEX_COUNT_QUERY, [(1,)]),
             (_ROW_COUNT_QUERY, [(20_000,)]),
             (_LOCK_QUERY, [(True,)]),
         ],
@@ -1409,48 +1853,51 @@ def test_repair_drops_that_keep_failing_reach_the_give_up_bound(monkeypatch, cap
     assert "by hand" in caplog.text
 
 
-def test_a_transient_build_failure_does_not_burn_an_attempt(monkeypatch):
-    """Three failures disable the index until an operator drops it by hand.
+def test_a_transient_build_failure_spends_the_other_bound_not_this_one(monkeypatch):
+    """Three permanent failures disable the index until an operator drops it by hand.
 
-    So the bound has to count only the failures a retry cannot get past. The task
-    that runs this classifies a lock conflict as transient and retries it six
-    times; one contention episode outlasting three of those retries would
-    otherwise write "3 consecutive failed attempts" and turn the index off for
-    good.
+    So a lock conflict may not spend one of them: the task that runs this
+    classifies it as transient and retries it several times, and one contention
+    episode outlasting three of those retries would otherwise write "3 consecutive
+    failed attempts" and turn the index off for good.
+
+    It still has to be counted against *something*, which is what this used to get
+    wrong: writing nothing made the whole bound unreachable, because the repair
+    drop takes the previous record away first.
     """
     conn = _ensure_conn(rows_by_dims={1536: 20_000}, fail_on="CREATE INDEX", exc=_transient_exc())
     with pytest.raises(Exception, match="lock timeout"):
         _ensure(monkeypatch, conn)
-    assert conn.issued(_FAILURE_COMMENT_DDL) == [], conn.statements
+    written = conn.issued(_FAILURE_COMMENT_DDL)
+    assert len(written) == 1, conn.statements
+    assert pvi.build_failures_in(written[0]) == 0, written
+    assert pvi.interrupted_builds_in(written[0]) == 1, written
 
 
 def test_a_transient_build_failure_keeps_the_attempts_already_on_record(monkeypatch):
-    """Not counting it must not un-count the ones before it either.
+    """And does not un-count the permanent ones before it.
 
-    The repair drop takes the record away with the index it is written on, so a
-    transient failure after a repair would otherwise reset the count to zero and
-    hand back the whole budget on every contention episode.
+    The repair drop takes the record away with the index it is written on, so both
+    counts have to be carried across it in memory and written back together.
     """
     conn = _ensure_conn(
         existing=[_index_row(KB, 1536, False)],
         rows_by_dims={1536: 20_000},
         failures=2,
+        interrupted=4,
         fail_on="CREATE INDEX",
         exc=_transient_exc(),
     )
     with pytest.raises(Exception, match="lock timeout"):
         _ensure(monkeypatch, conn)
     written = conn.issued(_FAILURE_COMMENT_DDL)
-    assert written and _failure_comment(2) in written[0], written
+    assert written, "an uncounted attempt is an unbounded loop"
+    assert pvi.build_failures_in(written[0]) == 2, written
+    assert pvi.interrupted_builds_in(written[0]) == 5, written
 
 
-def test_a_transient_repair_drop_failure_does_not_burn_an_attempt(monkeypatch):
-    """The repair drop counts under the same rule, so it does not count this one.
-
-    The count on record may be rewritten -- it is the same number -- but it may
-    not advance: a lock conflict on the repair drop is what the task's own six
-    retries are for.
-    """
+def test_a_transient_repair_drop_failure_spends_the_larger_bound_too(monkeypatch):
+    """The repair drop is classified under the same rule as the build it precedes."""
     conn = _ensure_conn(
         existing=[_index_row(KB, 1536, False)],
         rows_by_dims={1536: 20_000},
@@ -1460,9 +1907,56 @@ def test_a_transient_repair_drop_failure_does_not_burn_an_attempt(monkeypatch):
     )
     with pytest.raises(Exception, match="lock timeout"):
         _ensure(monkeypatch, conn)
-    for written in conn.issued(_FAILURE_COMMENT_DDL):
-        assert _failure_comment(1) in written, written
-        assert _failure_comment(2) not in written, written
+    written = conn.issued(_FAILURE_COMMENT_DDL)
+    assert written, conn.statements
+    for one in written:
+        assert pvi.build_failures_in(one) == 1, one
+        assert pvi.interrupted_builds_in(one) == 1, one
+
+
+def test_a_knowledge_base_whose_builds_only_ever_get_interrupted_is_given_up_on(monkeypatch):
+    """The loop the larger bound exists to stop, driven the way it runs.
+
+    Measured against a real server before there was a bound for these: seven
+    consecutive reconciles of an INVALID index whose build fails ``55P03`` every
+    time wrote no comment at all on any of the seven, ended with 0 recorded
+    failures against a bound of 3, and asked for a build again every time. That is
+    a drop-rebuild-fail loop with nothing bounding it, on every source that
+    finishes indexing and every boot.
+    """
+    conn = _CatalogStateConn(
+        answers=[
+            ("GROUP BY dims", [(1536,)]),
+            (_ROW_COUNT_QUERY, [(20_000,)]),
+            (_LOCK_QUERY, [(True,)]),
+        ],
+        fail_on="CREATE INDEX",
+        exc=_transient_exc(),
+    )
+    for _ in range(pvi.MAX_CONSECUTIVE_INTERRUPTED_BUILDS):
+        with pytest.raises(Exception, match="lock timeout"):
+            _ensure(monkeypatch, conn)
+    assert pvi.interrupted_builds_in(conn.comment) == pvi.MAX_CONSECUTIVE_INTERRUPTED_BUILDS
+    outcome = _ensure(monkeypatch, conn)
+    assert outcome["reason"] == "build_repeatedly_failed", outcome
+    assert pvi.index_action(conn, KB) is None, "and nothing dispatches it again"
+
+
+def test_one_contention_episode_cannot_disable_an_index(monkeypatch):
+    """Which is the whole reason the interrupted bound is a separate, larger one.
+
+    The task retries a transient failure ``PG_BM25_TASK_MAX_RETRIES`` times, so one
+    episode is that many attempts plus the first. The bound has to be comfortably
+    above it, or a single burst of contention turns the index off until an operator
+    drops it by hand.
+    """
+    from agentic_project_service.tasks.indexing import PG_BM25_TASK_MAX_RETRIES
+
+    one_episode = PG_BM25_TASK_MAX_RETRIES + 1
+    assert pvi.MAX_CONSECUTIVE_INTERRUPTED_BUILDS > 2 * one_episode, (
+        "one contention episode must not spend the whole budget"
+    )
+    assert pvi.MAX_CONSECUTIVE_INTERRUPTED_BUILDS > pvi.MAX_CONSECUTIVE_BUILD_FAILURES
 
 
 def test_a_build_that_has_failed_the_limit_is_not_attempted_again(monkeypatch, caplog):
