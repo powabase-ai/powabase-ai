@@ -299,8 +299,12 @@ MAX_CONSECUTIVE_INTERRUPTED_BUILDS = 25
 # different door.
 #
 # So this count is written **before** the drop, on the index about to be replaced,
-# and read straight back (``_count_a_definition_rebuild``). Two different loops are
-# bounded by the two halves of that, and it takes both:
+# and read straight back (``_count_a_definition_rebuild``); it is then carried in
+# memory across the drop and written back by whatever ends the attempt -- the
+# rebuild that succeeds (``_record_the_definition_built``), the build that fails
+# (``_count_a_failed_build``) or the repair drop that fails
+# (``_record_build_failure``). Three different loops are bounded by those two
+# halves, and it takes both:
 #
 # * The read-back is what bounds a comment that does not stick. A write that
 #   quietly does nothing cannot be counted -- the count needs the same write -- so
@@ -316,25 +320,57 @@ MAX_CONSECUTIVE_INTERRUPTED_BUILDS = 25
 #   bounded before: the drop raising leaves the index and this comment in place, so
 #   the next reconcile reads the number and adds to it, and the fourth keeps the
 #   stale index instead. It also catches a comment writer that works sometimes.
+# * Carrying it across the drop is what bounds a **rolling-deploy rebuild war**:
+#   two pod versions computing two different fingerprints, each reading the other's
+#   index as drifted and each rebuilding it. Every rebuild there *lands*, so this
+#   is the one shape where nothing fails and the loop still runs; what makes it
+#   terminate is that the number rides through the successful rebuild instead of
+#   being zeroed by it.
+#
+# **What clears it, and why not a rebuild that lands.** Only a later reconcile that
+# finds the index already built from today's definition
+# (``_settle_a_definition_rebuild``). A rebuild that lands proves a
+# ``CREATE INDEX CONCURRENTLY`` finished and a ``COMMENT`` stuck; it does not prove
+# that the definition being emitted has stopped moving, and in the war above every
+# rebuild lands, so clearing on that alone leaves the count at zero for ever --
+# measured at 8 reconciles, 8 distinct index oids and a count that never left 0.
+# The number is therefore "consecutive rebuilds started and not yet confirmed
+# settled", not "consecutive rebuilds that did not land". Clearing it on *something*
+# is not optional -- the budget is spent one per definition change and its only
+# remedy is an operator clearing the comment -- which is why the boot sweep
+# dispatches an index carrying an unconfirmed count: nothing else brings a reconcile
+# back to a knowledge base whose index is already correct, and without that pass a
+# handful of ordinary definition changes over a project's life would spend the whole
+# bound.
 #
 # 3 rather than 25: unlike an interrupted build there is no retrying task multiplying
 # each episode, and unlike a failed build the outcome of giving up is mild -- the
-# index stays, valid, answering searches at whatever recall its old definition
-# gives, which is the state the whole drift mechanism starts from. Nothing goes
-# INVALID and nothing needs an operator to drop anything by hand.
+# index stays and answers searches at whatever recall its old definition gives, which
+# is the state the whole drift mechanism starts from. Nothing needs an operator to
+# drop anything for the searches to keep working.
 #
-# **What no bound here can fix, and what bites on the next DDL change: a rolling
-# deploy is a rebuild war.** Two pod versions computing two different fingerprints
-# each read the other's index as drifted and each rebuild it. Simulated with two
-# versions differing only by ``WITH (m = 24)``: a new index oid on every
-# alternation, failures 0 against a bound of 3, and this bound would only stop it
-# after three rounds of real builds. *This* change is immune, because the code it
-# replaces records no fingerprint at all, so old pods never see today's index as
-# drifted and never fight back. Every DDL change after this one is not immune, and
-# the answer is sequencing rather than a constant: let the new definition reach
-# every process before any process is allowed to act on the drift it sees -- which
-# is the same shape as the constraint in the module docstring above, for the same
-# reason.
+# **What this still cannot bound, and it is the same limit as the one
+# ``MAX_CONSECUTIVE_INTERRUPTED_BUILDS`` names: a worker that dies between the
+# rebuild and the ``COMMENT`` that records it.** A minutes-long
+# ``CREATE INDEX CONCURRENTLY`` followed by a SIGTERM, an eviction or an OOM kill
+# leaves a new index with no comment at all -- which reads as drifted, so the next
+# reconcile rebuilds it, and so on. Reproduced at 5 reconciles and 5 distinct index
+# oids. Carrying the count does not help here and nothing kept on the index can: the
+# drop destroyed the old record, and the only statement that could put the number on
+# the new index is exactly the one that did not run. Closing it needs a record that
+# outlives the index, which a ``pg_class`` comment on the index cannot be.
+#
+# **And the war's bound is a bound, not a guarantee.** The pass that clears the count
+# is a pass that sees no drift, and in a mixed fleet the version whose fingerprint is
+# currently on the index sees none -- so a reconcile that lands on one of its workers
+# gives the budget back and the war starts again from zero. It advances whenever
+# consecutive passes see drift, and terminates rather than running for ever, but the
+# number of real rebuilds it takes to get there is not 3. The real answer to a war is
+# still sequencing rather than a constant: let the new definition reach every process
+# before any process acts on the drift it sees, which is the same shape as the
+# constraint in the module docstring above, for the same reason. *This* change is
+# immune to all of it, because the code it replaces records no fingerprint at all, so
+# old pods never see today's index as drifted and never fight back.
 MAX_CONSECUTIVE_DEFINITION_REBUILDS = 3
 
 # Where that count is kept. There is no builds table -- the logs are the whole
@@ -1317,10 +1353,14 @@ def definition_rebuilds_in(comment: str | None) -> int:
     """How many consecutive definition rebuilds of this index have not settled, or zero.
 
     A third count, on a *third* bound (``MAX_CONSECUTIVE_DEFINITION_REBUILDS``), and
-    deliberately not part of either build bound: it is written before a drift drop
-    and cleared by the success that records the new definition, so a number here
-    means the drop-and-rebuild the drift detector asks for is not completing. See
-    ``MAX_CONSECUTIVE_DEFINITION_REBUILDS`` for what it bounds and what it cannot.
+    deliberately not part of either build bound: it is written before a drift drop,
+    carried across that drop and written back by whatever ends the attempt, and
+    cleared only by a later pass that finds the index already built from today's
+    definition (``_settle_a_definition_rebuild``). So a number here means rebuilds
+    have been started that nothing has since confirmed -- which is a wider thing than
+    rebuilds that failed, and deliberately: the shape that runs for ever is the one
+    where every rebuild succeeds. See ``MAX_CONSECUTIVE_DEFINITION_REBUILDS`` for
+    what it bounds and what it cannot.
     """
     match = _REBUILDS_PATTERN.search(_module_written(comment))
     return int(match.group(1)) if match else 0
@@ -1483,15 +1523,73 @@ def _record_build_failure(
     )
 
 
-def _record_the_definition_built(conn, kb_id: str, dims: int) -> None:
+def _record_the_definition_built(conn, kb_id: str, dims: int, rebuilds: int = 0) -> None:
     """A build succeeded: record what it was built from, and forget the failures.
 
-    Both in one write, because they are one comment. The count is *consecutive*,
-    so a success clears it; the fingerprint has to be written on every success
-    rather than only after a failure, because it is the only record that this
-    index matches the definition this module now emits.
+    Both in one write, because they are one comment. The two *build* counts are
+    consecutive failures, so a success clears them; the fingerprint has to be
+    written on every success rather than only after a failure, because it is the
+    only record that this index matches the definition this module now emits.
+
+    ``rebuilds`` is the one count a success does **not** clear, and it is carried in
+    from the caller for the reason ``_counted_attempt`` carries the other two: the
+    drop that precedes a rebuild takes the record away with the index it is written
+    on, so the number has to survive in memory across it. Writing it back here is
+    what makes the count durable across a rebuild that lands -- see
+    ``MAX_CONSECUTIVE_DEFINITION_REBUILDS`` for why a landed rebuild is not by itself
+    evidence that anything settled, and ``_settle_a_definition_rebuild`` for what
+    clears it.
     """
-    _write_index_comment(conn, kb_id, dims, 0, 0, per_kb_index_fingerprint(kb_id, dims))
+    _write_index_comment(conn, kb_id, dims, 0, 0, per_kb_index_fingerprint(kb_id, dims), rebuilds)
+
+
+def _settle_a_definition_rebuild(conn, kb_id: str, dims: int, comment: str | None) -> None:
+    """A reconcile found this index built from today's definition: clear the count.
+
+    The only thing that clears ``MAX_CONSECUTIVE_DEFINITION_REBUILDS``, and
+    deliberately not the rebuild itself. A rebuild that lands proves that a
+    ``CREATE INDEX CONCURRENTLY`` completed and that a ``COMMENT`` stuck; it does not
+    prove that the definition this module emits has stopped moving, and in the one
+    shape where it has not -- two deploys emitting two definitions, each reading the
+    other's index as drifted -- every rebuild lands and clearing on that alone leaves
+    the count at zero for ever. What this branch has that the rebuild does not is a
+    *later* pass, by a process that recomputed the fingerprint from scratch, finding
+    the index already current.
+
+    Clearing at all is not optional: the count is spent one per definition change,
+    and its only remedy is an operator clearing the comment by hand, so without this
+    a handful of ordinary DDL changes over a project's life would turn the feature
+    off. This is the event that gives the count back, and a boot is what produces it
+    (``kbs_needing_a_per_kb_index`` dispatches an index carrying an unsettled count
+    so that one of these passes happens at all -- nothing else reconciles a knowledge
+    base whose index is already correct).
+
+    A count that has *reached* the bound is left alone, so giving up stays as
+    permanent as the two build bounds it sits beside: in a rebuild war the losing
+    version's own pass would otherwise clear the number the war put there and start
+    it again. Recovery from there is the ERROR's own instruction -- clear the comment
+    or drop the index -- which is a decision about a deploy and not one this module
+    can make from a single catalog read.
+    """
+    rebuilds = definition_rebuilds_in(comment)
+    if not 0 < rebuilds < MAX_CONSECUTIVE_DEFINITION_REBUILDS:
+        return
+    logger.info(
+        "Partial HNSW index %s.%s is built from the definition this version emits, so the "
+        "%d rebuild(s) on record for it have settled and the count is cleared",
+        AI_SCHEMA,
+        per_kb_index_name(kb_id, dims),
+        rebuilds,
+    )
+    _write_index_comment(
+        conn,
+        kb_id,
+        dims,
+        build_failures_in(comment),
+        interrupted_builds_in(comment),
+        definition_fingerprint_in(comment),
+        0,
+    )
 
 
 def _counted_attempt(
@@ -1526,6 +1624,7 @@ def _count_a_failed_build(
     prior_failures: int,
     prior_interrupted: int,
     exc: BaseException,
+    prior_rebuilds: int = 0,
 ) -> None:
     """Count a ``CREATE INDEX CONCURRENTLY`` that failed, recording today's definition.
 
@@ -1536,10 +1635,26 @@ def _count_a_failed_build(
     A drop that fails is the same attempt and the same two bounds, but not the same
     fact -- see ``_count_a_failed_repair_drop``, where the index on disk is the one
     that was already there.
+
+    ``prior_rebuilds`` is carried through for the same reason the sibling path reads
+    it back: this write is a full comment, so a count left out of it is a count
+    erased. The failing build may *be* a drift rebuild -- the drop happened, the
+    number that bounds it was on the index the drop took away, and it is in the
+    caller's hands -- and dropping it here would hand the whole rebuild budget back
+    on every reconcile whose rebuild fails, which is the shape
+    ``MAX_CONSECUTIVE_INTERRUPTED_BUILDS`` was added for one bound down. It is the
+    same decision ``_record_build_failure`` makes by reading the count off the index,
+    stated here because this path has no index to read it from.
     """
     failures, interrupted = _counted_attempt(prior_failures, prior_interrupted, exc)
     _write_index_comment(
-        conn, kb_id, dims, failures, interrupted, per_kb_index_fingerprint(kb_id, dims)
+        conn,
+        kb_id,
+        dims,
+        failures,
+        interrupted,
+        per_kb_index_fingerprint(kb_id, dims),
+        prior_rebuilds,
     )
 
 
@@ -1614,6 +1729,7 @@ def _create_index(
     mem_mb: int | None = None,
     prior_failures: int = 0,
     prior_interrupted: int = 0,
+    prior_rebuilds: int = 0,
 ) -> None:
     """Build one index online, with room to do it in memory.
 
@@ -1674,14 +1790,18 @@ def _create_index(
         # process, after a deploy, whenever -- can see how many times this has
         # already been tried. Both prior counts are the ones read before the
         # repair drop took the previous record away with the index.
-        _count_a_failed_build(conn, kb_id, dims, prior_failures, prior_interrupted, exc)
+        _count_a_failed_build(
+            conn, kb_id, dims, prior_failures, prior_interrupted, exc, prior_rebuilds
+        )
         raise
     else:
         # On every success, not only after a failure: this write is also what
         # records the definition the index was built from, which is the only way a
         # later reconcile can tell it apart from one built before the predicate
-        # changed (``per_kb_index_fingerprint``).
-        _record_the_definition_built(conn, kb_id, dims)
+        # changed (``per_kb_index_fingerprint``). ``prior_rebuilds`` rides through it
+        # because this write is the whole comment and the drop that preceded this
+        # build took the previous one away.
+        _record_the_definition_built(conn, kb_id, dims, prior_rebuilds)
     finally:
         _reset_session_setting(conn, "maintenance_work_mem")
         _reset_session_setting(conn, "lock_timeout")
@@ -1791,8 +1911,10 @@ def _count_a_definition_rebuild(conn, kb_id: str, dims: int, comment: str | None
     Written before the drop rather than after the rebuild, on the index that is
     about to be replaced, for the reason every count here is written where it is:
     the record has to exist at the moment the work starts, because the work is what
-    may not come back. It is cleared by ``_record_the_definition_built``, so the
-    number is consecutive *unsettled* rebuilds and a rebuild that lands zeroes it.
+    may not come back. The caller then carries the number it wrote across the drop
+    that destroys this comment, because the next statement is that drop -- the
+    reason this count only ever advanced when the drop *failed*, and the reason
+    ``_counted_attempt`` carries the other two the same way.
 
     The read-back is a second catalog round trip, which is free next to a
     ``CREATE INDEX CONCURRENTLY`` that runs for minutes, and it is the only thing
@@ -1821,8 +1943,16 @@ def _drop_a_drifted_index(conn, kb_id: str, dims: int) -> None:
 
     A drop that raises therefore propagates untouched, exactly as the
     below-threshold drop beside it does, and the task retries it if it was
-    transient. The index that is still there keeps answering queries at whatever
-    recall its old definition gives, which is the state this started from.
+    transient. **What it leaves behind is not always an index still answering
+    queries**, which this used to claim. ``DROP INDEX CONCURRENTLY`` marks the index
+    ``indisvalid = false`` and commits that before it waits, so a failure in the
+    wait -- the realistic one, a role-level ``lock_timeout`` against an open
+    transaction, measured five times out of five by ``_drop_index`` -- leaves
+    ``indisvalid = false, indisready = true``: answering no query, maintained on
+    every write, and repaired by the *build* path on the next reconcile rather than
+    by this one. Only a failure before that first commit (a refused permission, a
+    lock this statement never got) leaves the index untouched and answering, which
+    is the case the rebuild bound below then counts.
 
     Untouched by the two *build* bounds, that is. The attempt is on record before
     this is called, against ``MAX_CONSECUTIVE_DEFINITION_REBUILDS``, so a drop that
@@ -1978,16 +2108,21 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                 # The count stops at ``cap``, so at the bound it is a floor and
                 # not the knowledge base's size. Everything that reports it says so.
                 floored = rows >= cap
-                prior_failures = prior_interrupted = 0
+                prior_failures = prior_interrupted = prior_rebuilds = 0
                 # Set by a drift drop, and read by the build's cap gate: this
                 # dimension held a place in ``MAX_PER_KB_INDEXES`` until a moment ago.
                 holds_a_place = False
 
                 if valid is False:
                     # Read before the repair drop, which takes the record away
-                    # with the index it is written on.
+                    # with the index it is written on. All three, because the write
+                    # that lands after the drop composes the whole comment and a
+                    # count left out of it is a count erased -- and an INVALID index
+                    # can be carrying a rebuild count, from a drift rebuild whose
+                    # build failed.
                     prior_failures = build_failures_in(comment)
                     prior_interrupted = interrupted_builds_in(comment)
+                    prior_rebuilds = definition_rebuilds_in(comment)
                     if _build_in_progress(conn, kb_id, dims):
                         # The invalid entry stays. Dropping it would pull the
                         # ground out from under that build, and falling through
@@ -2069,6 +2204,11 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         dropped.append(name)
                         continue
                     if not definition_has_drifted(kb_id, dims, comment):
+                        # A pass that recomputed the fingerprint from scratch and
+                        # found the index already current is the only evidence that a
+                        # rebuild *settled*, as opposed to merely landing, so it is
+                        # where the rebuild count is given back.
+                        _settle_a_definition_rebuild(conn, kb_id, dims, comment)
                         continue
                     # Built from a definition this version no longer emits. The
                     # index still answers searches, at whatever recall its old
@@ -2113,8 +2253,11 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                             "valid and still answering knowledge base %s at whatever recall its "
                             "old definition gives. Either its drop keeps failing, or the "
                             "%s comment recording the new definition is not sticking (check "
-                            "that this role may COMMENT ON the index). Clearing the comment, or "
-                            "dropping the index by hand, starts the rebuild again",
+                            "that this role may COMMENT ON the index), or two deploys are "
+                            "emitting two definitions and rebuilding each other's index -- for "
+                            "which the fix is sequencing the deploy and not this index. "
+                            "Clearing the comment, or dropping the index by hand, starts the "
+                            "rebuild again",
                             AI_SCHEMA,
                             name,
                             definition_rebuilds_in(comment),
@@ -2176,6 +2319,12 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         stale_kept.append(name)
                         unsettled.append(dims)
                         continue
+                    # The number just written, carried across the drop that is about
+                    # to destroy the object it is written on. Everything else in this
+                    # module that survives a drop survives the same way
+                    # (``_counted_attempt``); this count did not, so it only ever
+                    # advanced when the drop *failed*.
+                    prior_rebuilds = definition_rebuilds_in(comment) + 1
                     progress("dropping", dims=dims, rows=rows, rows_are_a_floor=floored)
                     _drop_a_drifted_index(conn, kb_id, dims)
                     rebuilt.append(name)
@@ -2262,6 +2411,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                     mem_mb,
                     prior_failures=prior_failures,
                     prior_interrupted=prior_interrupted,
+                    prior_rebuilds=prior_rebuilds,
                 )
                 built.append(name)
             finally:
@@ -2473,7 +2623,9 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
     engine = _engine(engine)
     needing: dict[str, None] = {}
     drifted: dict[str, None] = {}
+    settling: dict[str, None] = {}
     given_up: list[str] = []
+    given_up_rebuilds: list[str] = []
 
     try:
         with engine.connect() as conn:
@@ -2500,15 +2652,36 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
                         )
                         continue
                     needing[kb_id] = None
-                elif definition_has_drifted(kb_id, dims, comment) and not (
-                    definition_rebuild_is_given_up(comment)
-                ):
-                    # Built from a definition this version no longer emits: it still
-                    # answers searches, at whatever recall the old definition gives,
-                    # so it is the least urgent of the four cases and is added after
-                    # the others rather than here. A catalog fact, like INVALID, so
-                    # it does not depend on the count below finishing.
-                    drifted[kb_id] = None
+                elif definition_has_drifted(kb_id, dims, comment):
+                    if definition_rebuild_is_given_up(comment):
+                        # The drift bound reached: nothing dispatches this index
+                        # again, so this boot is the only place it is ever mentioned
+                        # -- see the warning below.
+                        given_up_rebuilds.append(
+                            f"{AI_SCHEMA}.{relname} "
+                            f"({definition_rebuilds_in(comment)} rebuilds started)"
+                        )
+                    else:
+                        # Built from a definition this version no longer emits: it
+                        # still answers searches, at whatever recall the old
+                        # definition gives, so it is the least urgent of the cases
+                        # and is added after the others rather than here. A catalog
+                        # fact, like INVALID, so it does not depend on the count
+                        # below finishing.
+                        drifted[kb_id] = None
+                elif 0 < definition_rebuilds_in(comment) < MAX_CONSECUTIVE_DEFINITION_REBUILDS:
+                    # Correct, and carrying rebuilds that nothing has confirmed. A
+                    # boot is the event that confirms them: this process recomputed
+                    # the fingerprint from its own DDL and the index already matches
+                    # it, which is the only evidence ``_settle_a_definition_rebuild``
+                    # accepts. Nothing else brings a reconcile back to a knowledge
+                    # base whose index is already right -- ``index_action`` returns
+                    # None for it and none of the cases above fires -- so without
+                    # this dispatch the count would never be given back and a handful
+                    # of ordinary definition changes over a project's life would
+                    # spend the whole bound. Least urgent of all, and it happens
+                    # once: the pass it asks for clears the count.
+                    settling[kb_id] = None
             conn.rollback()
     except Exception:
         logger.warning(
@@ -2537,6 +2710,33 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
             if len(given_up) > MAX_SWEEP_DISPATCH
             else "",
             AI_SCHEMA,
+        )
+
+    if given_up_rebuilds:
+        # The one permanent state in this module that nothing else ever says a word
+        # about. An index past either *build* bound is INVALID, so it is in the list
+        # above and in the reconcile's own give-up ERROR; an index past the *drift*
+        # bound is valid, answers every search from a definition this version no
+        # longer emits, and is skipped by ``index_action`` and by the dispatch above
+        # -- so the reconcile that would log about it is never run, and fixing
+        # whatever caused it does not re-arm anything. Without this line the whole
+        # state is invisible, across restarts, for as long as the index exists.
+        logger.warning(
+            "%d partial HNSW index(es) are valid but built from a definition this version no "
+            "longer emits, and have reached the rebuild bound (%d consecutive rebuilds "
+            "started, none confirmed settled), so no more are started and this start-up does "
+            "not reconcile them: %s%s. Each answers its knowledge base at whatever recall its "
+            "old definition gives, and keeps doing so until an operator clears the %s comment "
+            "or drops the index by hand. Either its drop keeps failing, or the comment "
+            "recording the new definition is not sticking, or two deploys are emitting two "
+            "definitions and rebuilding each other's index",
+            len(given_up_rebuilds),
+            MAX_CONSECUTIVE_DEFINITION_REBUILDS,
+            ", ".join(given_up_rebuilds[:MAX_SWEEP_DISPATCH]),
+            f" (and {len(given_up_rebuilds) - MAX_SWEEP_DISPATCH} more)"
+            if len(given_up_rebuilds) > MAX_SWEEP_DISPATCH
+            else "",
+            "pg_class",
         )
 
     counted_ok = True
@@ -2585,6 +2785,10 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
     # feature is for. ``needing`` is a dict so a knowledge base already in it for
     # another reason does not move.
     for kb_id in drifted:
+        needing[kb_id] = None
+    # After the drifted ones, because this one starts no build and drops nothing: it
+    # asks a reconcile to read a comment and write a shorter one.
+    for kb_id in settling:
         needing[kb_id] = None
 
     pending = list(needing)
