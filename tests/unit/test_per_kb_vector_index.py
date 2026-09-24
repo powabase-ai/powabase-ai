@@ -1883,6 +1883,7 @@ def test_the_boot_sweep_leaves_a_current_index_alone():
 # -- the comment carries three facts and the parse has to be strict ----------
 
 
+@pytest.mark.parametrize("rebuilds", [0, 4])
 @pytest.mark.parametrize(
     "failures, interrupted, fingerprint",
     [
@@ -1895,19 +1896,23 @@ def test_the_boot_sweep_leaves_a_current_index_alone():
         (2, 5, "abcdef012345"),
     ],
 )
-def test_every_combination_of_the_three_facts_survives_a_round_trip(
-    failures, interrupted, fingerprint
+def test_every_combination_of_the_four_facts_survives_a_round_trip(
+    failures, interrupted, fingerprint, rebuilds
 ):
-    """Both directions, because the counts and the fingerprint share one comment.
+    """Both directions, because all four facts share one comment.
 
-    A parse that reads one of them out of the other's sentence, or that stops
+    A parse that reads one of them out of another's sentence, or that stops
     finding a count once a fingerprint is beside it, is how a bound stops being
-    reachable or an index stops looking stale.
+    reachable or an index stops looking stale. Three of the four are now "N
+    consecutive <something> of this partial HNSW index", and each drives a different
+    decision, so a pattern matching a prefix of its neighbour would spend the wrong
+    budget.
     """
-    comment = pvi.per_kb_index_comment(failures, interrupted, fingerprint)
+    comment = pvi.per_kb_index_comment(failures, interrupted, fingerprint, rebuilds)
     assert pvi.build_failures_in(comment) == failures
     assert pvi.interrupted_builds_in(comment) == interrupted
     assert pvi.definition_fingerprint_in(comment) == fingerprint
+    assert pvi.definition_rebuilds_in(comment) == rebuilds
 
 
 def test_nothing_to_record_is_no_comment_at_all():
@@ -1955,7 +1960,9 @@ def test_a_comment_this_module_did_not_write_records_nothing(garbage):
     assert pvi.build_failures_in(garbage) == 0
     assert pvi.interrupted_builds_in(garbage) == 0
     assert pvi.definition_fingerprint_in(garbage) is None
+    assert pvi.definition_rebuilds_in(garbage) == 0
     assert pvi.build_is_given_up(garbage) is False
+    assert pvi.definition_rebuild_is_given_up(garbage) is False
 
 
 def test_a_comment_carrying_only_a_fingerprint_is_not_given_up_on():
