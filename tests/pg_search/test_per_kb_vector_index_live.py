@@ -335,11 +335,20 @@ def schema(engine, fixture_schema, monkeypatch):
 @pytest.fixture
 def settings(monkeypatch):
     """Injectable thresholds, read through the real clamping and hysteresis code."""
-    # 10,000 / 5,000 are the registry's intended defaults, so these tests run
-    # the thresholds production runs. On this fixture only KB_BIG (12,000 rows)
-    # is at or above the build threshold; KB_MED, at 8,400, is the knowledge
-    # base those defaults leave without an index, which is what the regression
-    # specs measure.
+    # Deliberately 5x below the registry's shipped defaults of 50,000 / 25,000,
+    # and injected rather than read for that reason: a knowledge base of 50,000
+    # rows at 384 dimensions turns this module's fixture from seconds into
+    # minutes, and nothing here is a claim about the numbers themselves. Every
+    # question below is about the *relation* between a knowledge base's size and
+    # the threshold -- which side of it each one falls on, and what the search
+    # costs on each side -- and that relation is what the injected pair
+    # reproduces at a tenth of the rows. The shipped defaults are pinned where
+    # they cost nothing to pin, in
+    # tests/unit/test_per_kb_vector_index_thresholds.py.
+    #
+    # At 10,000 / 5,000, only KB_BIG (12,000 rows) is at or above the build
+    # threshold; KB_MED, at 8,400, is the knowledge base this pair leaves without
+    # an index, which is what the regression specs measure.
     values = {
         "VECTOR_PER_KB_INDEX_MIN_ROWS": 10_000,
         "VECTOR_PER_KB_INDEX_DROP_ROWS": 5_000,
@@ -1957,7 +1966,7 @@ def test_a_partial_index_is_not_used_at_all_for_a_small_share_knowledge_base(
     assert name not in plan, f"the planner is not expected to choose this index:\n{plan}"
 
 
-def test_the_knowledge_base_the_default_threshold_leaves_out_is_the_measured_one(
+def test_the_knowledge_base_the_injected_threshold_leaves_out_is_the_measured_one(
     engine, schema, settings
 ):
     """Pins which side of the threshold each fixture knowledge base falls on.
@@ -1965,8 +1974,15 @@ def test_the_knowledge_base_the_default_threshold_leaves_out_is_the_measured_one
     The row counts, the thresholds and the measurements in the comment above are
     one argument, and it stops being an argument if a later edit moves a row
     count without moving the table. KB_MED at 8,400 rows is the knowledge base
-    the 10,000-row default declines -- the population the threshold decision is
-    about -- and KB_BIG at 12,000 is the one it serves.
+    the fixture's 10,000-row threshold declines -- the population the threshold
+    decision is about -- and KB_BIG at 12,000 is the one it serves.
+
+    The threshold it reads is the one the ``settings`` fixture injects, not the
+    registry's shipped default, and the name says so: this spec pins the fixture's
+    own arithmetic and nothing about what a project gets out of the box. That is
+    ``tests/unit/test_per_kb_vector_index_thresholds.py``, which asserts the
+    shipped pair against ``SETTINGS_REGISTRY`` where no database is needed to do
+    it.
     """
     build_at = settings["VECTOR_PER_KB_INDEX_MIN_ROWS"]
     assert MED_ROWS < build_at <= BIG_ROWS, (MED_ROWS, build_at, BIG_ROWS)
