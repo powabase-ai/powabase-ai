@@ -878,24 +878,47 @@ class BasePgVectorStore:
             )
             yield
             return
-        if prior_ef_search is not None:
-            try:
-                self.session.execute(
-                    text("SELECT set_config('hnsw.ef_search', :ef, true)"),
-                    {"ef": str(PER_KB_HNSW_EF_SEARCH)},
-                )
-            except Exception as e:  # pragma: no cover - depends on pgvector version
-                # The search still runs, on the index, at pgvector's default
-                # ef_search -- lower recall than intended, not a wrong answer, so
-                # the block goes ahead rather than giving the index up.
-                logger.warning(
-                    "Could not raise hnsw.ef_search to %d for KB %s: %s; this vector "
-                    "search will run at pgvector's default recall",
-                    PER_KB_HNSW_EF_SEARCH,
-                    self.kb_id,
-                    e,
-                )
-                prior_ef_search = None
+        # Set unconditionally, and NOT gated on the probe having read a value.
+        # pgvector registers its GUCs in ``_PG_init``, which runs on the first
+        # *use of the vector type* -- not at ``CREATE EXTENSION`` and not at
+        # connection start, because the library is not preloaded. So on a fresh
+        # pooled connection the probe above reads NULL, and gating the raise on
+        # that read left the first search of every connection at pgvector's
+        # default 40 instead of this value: recall 0.915 rather than 0.973 at
+        # 12,000 rows, projecting to about 0.85 several times above the build
+        # threshold. One such search per connection per pool lifetime, and the
+        # first search on a connection is also the one most likely to be cold.
+        # ``SET LOCAL hnsw.iterative_scan`` earlier in the search does not load
+        # the library either -- a dotted name is accepted as a placeholder.
+        #
+        # Setting it anyway is safe, and was measured rather than assumed: a
+        # ``set_config`` on an unloaded pgvector GUC creates a placeholder, the
+        # value survives ``_PG_init`` (read back as 120 after the first distance
+        # operation in the same transaction), and it is still transaction-local,
+        # so the next transaction on the connection sees pgvector's own default
+        # again. On a database where the extension is not installed at all it is
+        # accepted the same way, so this adds no new failure path.
+        #
+        # The *restore* below stays gated, and correctly so: with nothing read
+        # there is no value to put back, and a placeholder set with the third
+        # argument dies with the transaction regardless.
+        try:
+            self.session.execute(
+                text("SELECT set_config('hnsw.ef_search', :ef, true)"),
+                {"ef": str(PER_KB_HNSW_EF_SEARCH)},
+            )
+        except Exception as e:  # pragma: no cover - depends on pgvector version
+            # The search still runs, on the index, at pgvector's default
+            # ef_search -- lower recall than intended, not a wrong answer, so
+            # the block goes ahead rather than giving the index up.
+            logger.warning(
+                "Could not raise hnsw.ef_search to %d for KB %s: %s; this vector "
+                "search will run at pgvector's default recall",
+                PER_KB_HNSW_EF_SEARCH,
+                self.kb_id,
+                e,
+            )
+            prior_ef_search = None
         try:
             yield
         finally:
