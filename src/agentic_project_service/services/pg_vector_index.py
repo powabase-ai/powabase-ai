@@ -303,8 +303,9 @@ MAX_CONSECUTIVE_INTERRUPTED_BUILDS = 25
 # memory across the drop and written back by whatever ends the attempt -- the
 # rebuild that succeeds (``_record_the_definition_built``), the build that fails
 # (``_count_a_failed_build``) or the repair drop that fails
-# (``_record_build_failure``). Three different loops are bounded by those two
-# halves, and it takes both:
+# (``_record_build_failure``). Three different loops are bounded between the
+# read-back, the number that survives a drop which fails, and the number carried
+# across a drop which does not -- and it takes all three:
 #
 # * The read-back is what bounds a comment that does not stick. A write that
 #   quietly does nothing cannot be counted -- the count needs the same write -- so
@@ -1947,12 +1948,13 @@ def _drop_a_drifted_index(conn, kb_id: str, dims: int) -> None:
     queries**, which this used to claim. ``DROP INDEX CONCURRENTLY`` marks the index
     ``indisvalid = false`` and commits that before it waits, so a failure in the
     wait -- the realistic one, a role-level ``lock_timeout`` against an open
-    transaction, measured five times out of five by ``_drop_index`` -- leaves
-    ``indisvalid = false, indisready = true``: answering no query, maintained on
-    every write, and repaired by the *build* path on the next reconcile rather than
-    by this one. Only a failure before that first commit (a refused permission, a
-    lock this statement never got) leaves the index untouched and answering, which
-    is the case the rebuild bound below then counts.
+    transaction, five attempts out of five in the measurement ``_drop_index``
+    records -- leaves ``indisvalid = false, indisready = true``: answering no query,
+    maintained on every write, and repaired by the *build* path on the next
+    reconcile rather than by this one. Only a failure before that first commit (a
+    refused permission, a lock this statement never got) leaves the index untouched
+    and answering, which is the case ``MAX_CONSECUTIVE_DEFINITION_REBUILDS`` then
+    counts to a stop.
 
     Untouched by the two *build* bounds, that is. The attempt is on record before
     this is called, against ``MAX_CONSECUTIVE_DEFINITION_REBUILDS``, so a drop that
@@ -2590,6 +2592,18 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
     covers, and this query and that one have to agree about which rows those are or
     the boot dispatches builds the reconcile then declines.
 
+    Two more come from the same catalog read and neither needs the count: an index
+    built from a definition this version no longer emits, and -- last of all -- one
+    that is correct but still carries rebuilds nothing has confirmed. The second
+    exists because a boot is the only event that can confirm them: this process
+    recomputed the fingerprint from its own DDL and the index already matches it,
+    which is what ``_settle_a_definition_rebuild`` accepts and what gives the rebuild
+    budget back. Nothing else ever brings a reconcile back to a knowledge base whose
+    index is already right, so without it the count written by one definition change
+    would outlive the index and a handful of changes would spend the whole bound. The
+    reconcile it asks for reads a comment and writes a shorter one; it starts no
+    build and drops nothing.
+
     An ``INVALID`` index that has already reached
     ``MAX_CONSECUTIVE_BUILD_FAILURES`` is not one of them: the reconcile would
     read the same count and decline, so dispatching it only spends one of
@@ -2599,6 +2613,12 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
     is still dispatched for the other two reasons: giving up on the *repair* is not
     giving up on the *drop*, and a knowledge base that has since fallen below the
     drop threshold wants the index gone -- which is also what re-arms the build.
+
+    An index past ``MAX_CONSECUTIVE_DEFINITION_REBUILDS`` is left out for the same
+    reason and is the one state in this module nothing else would ever mention: it is
+    *valid*, so ``index_action`` skips it and no reconcile runs to log the give-up
+    ERROR, and fixing the cause does not re-arm it. It gets a warning of its own
+    here, which is the only place it is ever named.
 
     An abandoned count is not evidence about any knowledge base, so when it
     fails nothing is concluded from it -- only the ``INVALID`` indexes are
