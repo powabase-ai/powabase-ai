@@ -607,29 +607,67 @@ def test_a_reset_that_fails_discards_the_connection():
 class _DiscardedConnectionConn(_FakeConn):
     """A connection that behaves as a real one does after ``invalidate()``.
 
-    Measured against a real server on the AUTOCOMMIT connection this loop runs
-    on: after ``invalidate()`` the next statement raises ``PendingRollbackError``
-    ("Can't reconnect until invalid transaction is rolled back"), and it goes on
-    raising until the connection is rolled back. ``PendingRollbackError`` is not
-    classified as a transient database error either, so a connection lost
-    mid-loop would fail the run without the retry that exists for exactly that.
+    Two server rules, both measured against a real server on the AUTOCOMMIT
+    connection this loop runs on, both modelled here because a fake that only
+    records the calls cannot tell a fixed discard from a broken one.
+
+    **The rollback is what lets the handle reconnect.** After ``invalidate()``
+    the next statement raises ``PendingRollbackError`` ("Can't reconnect until
+    invalid transaction is rolled back"), and it goes on raising until the
+    connection is rolled back. ``PendingRollbackError`` is not classified as a
+    transient database error either, so a connection lost mid-loop would fail the
+    run without the retry that exists for exactly that.
+
+    **Reconnecting loses the AUTOCOMMIT execution option.** It is held against
+    the DBAPI connection the handle had, and SQLAlchemy does not carry it onto
+    the new one, so a reconnected handle is inside an implicit transaction until
+    the option is applied again -- and ``CREATE INDEX CONCURRENTLY`` and
+    ``DROP INDEX CONCURRENTLY`` both refuse a transaction block, with
+    ``25001``. Measured live on the scenario ``_discard_connection``'s own
+    docstring gives: drop at 4 dimensions, connection lost at
+    ``pg_advisory_unlock``, build at 8 -- the drop succeeded, the loop reached the
+    next dimension, and the build raised
+    ``ActiveSqlTransaction: CREATE INDEX CONCURRENTLY cannot run inside a
+    transaction block``, which ``is_transient_db_error`` does not recognise.
+
+    So the rule is read off the *statement* -- CONCURRENTLY or not -- against the
+    connection's own transaction state, the way the server reads it, rather than
+    from whether some method was called. That is what makes a missing
+    re-application of the option fail a spec here.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.discarded = False
+        # An opened connection is put into AUTOCOMMIT by ``_autocommit_connection``;
+        # these fakes are handed straight to the code under test, so they start
+        # there too.
+        self.autocommit = True
 
     def invalidate(self):
         super().invalidate()
         self.discarded = True
+        # A new backend, and the execution option did not come with it.
+        self.autocommit = False
 
     def rollback(self):
         super().rollback()
         self.discarded = False
 
+    def execution_options(self, **kwargs):
+        if kwargs.get("isolation_level") == "AUTOCOMMIT":
+            self.autocommit = True
+        return self
+
     def execute(self, clause, params=None):
         if self.discarded:
             raise RuntimeError("Can't reconnect until invalid transaction is rolled back")
+        sql = clause.text if hasattr(clause, "text") else str(clause)
+        if "CONCURRENTLY" in sql and not self.autocommit:
+            raise RuntimeError(
+                "ActiveSqlTransaction: CREATE INDEX CONCURRENTLY cannot run inside a "
+                "transaction block"
+            )
         return super().execute(clause, params)
 
 
@@ -653,6 +691,48 @@ def test_a_discarded_loop_connection_is_given_back_so_the_rest_of_the_loop_runs(
         pvi.per_kb_index_name(KB, 768),
         pvi.per_kb_index_name(KB, 1536),
     ], outcome
+
+
+def test_a_discarded_connection_can_still_run_concurrently_ddl(monkeypatch):
+    """The scenario ``_discard_connection`` exists for, end to end.
+
+    A knowledge base that has changed embedding model: an index to drop at the old
+    dimension, one to build at the new one, and the connection lost at the
+    ``pg_advisory_unlock`` in between. Reconnecting gets a new backend without the
+    AUTOCOMMIT execution option, and both ``DROP INDEX CONCURRENTLY`` and
+    ``CREATE INDEX CONCURRENTLY`` refuse a transaction block -- so the dimension
+    after the discard has to find the handle back in AUTOCOMMIT, not merely usable.
+
+    Measured live before the option was re-applied: the 768 drop succeeded, the
+    loop reached 1536, and the build raised ``25001``, which
+    ``is_transient_db_error`` does not recognise -- so the one retry this whole
+    function exists to preserve was lost.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 768)],
+        dims_present=(768, 1536),
+        rows_by_dims={768: 0, 1536: 10_001},
+        cls=_DiscardedConnectionConn,
+        fail_on="pg_advisory_unlock",
+    )
+    outcome = _ensure(monkeypatch, conn)
+    assert conn.invalidated, "the harness has to actually lose the backend"
+    assert outcome["dropped"] == [pvi.per_kb_index_name(KB, 768)], outcome
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+
+
+def test_the_discard_puts_the_handle_back_into_autocommit_itself(monkeypatch):
+    """Not only via a caller that happens to re-open the connection.
+
+    ``_discard_connection`` is reached from three places -- a lock release that
+    failed, a session ``RESET`` that failed, and either of those inside a build's
+    ``finally`` -- and in all three the caller goes on using the same handle. So
+    the option is applied here rather than being left to whoever notices.
+    """
+    conn = _DiscardedConnectionConn()
+    pvi._discard_connection(conn)
+    assert conn.autocommit, "CREATE INDEX CONCURRENTLY cannot run on it otherwise"
+    assert conn.rollbacks >= 1, "and the rollback is what lets it reconnect at all"
 
 
 def test_a_build_does_not_hold_the_settings_session_idle_in_a_transaction(monkeypatch):

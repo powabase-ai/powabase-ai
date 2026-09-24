@@ -746,9 +746,16 @@ def estimated_index_mb(rows: int, dims: int) -> int:
     return max(1, rows * dims * _INDEX_BYTES_PER_DIMENSION // (1024 * 1024))
 
 
+# The execution option that keeps a connection outside a transaction block, so
+# ``CREATE INDEX CONCURRENTLY`` can run on it. Named once because it has to be
+# applied in two places: when the connection is opened, and again whenever
+# ``_discard_connection`` reconnects the handle.
+_AUTOCOMMIT = {"isolation_level": "AUTOCOMMIT"}
+
+
 def _autocommit_connection(engine):
     """A connection outside any transaction: CONCURRENTLY refuses one."""
-    return engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+    return engine.connect().execution_options(**_AUTOCOMMIT)
 
 
 def _engine(engine=None):
@@ -779,6 +786,19 @@ def _discard_connection(conn) -> None:
 
     The rollback is what lets the handle reconnect; it rolls nothing back that the
     caller wanted, because the backend it belonged to is already gone.
+
+    **The AUTOCOMMIT option has to be re-applied.** It is an *execution* option,
+    held against the DBAPI connection the handle had, and reconnecting gets a new
+    one that SQLAlchemy does not carry it onto -- so without this line everything
+    after a discard runs in an implicit transaction, and the next
+    ``CREATE INDEX CONCURRENTLY`` fails with ``25001 CREATE INDEX CONCURRENTLY
+    cannot run inside a transaction block``. Measured on exactly the scenario
+    above -- drop at 4 dimensions, connection lost at ``pg_advisory_unlock``,
+    build at 8 -- the drop succeeded, the loop reached the next dimension, and the
+    build then raised ``25001``, which ``is_transient_db_error`` does *not*
+    recognise: the one retry this function exists to preserve was lost, and every
+    later ``RESET`` in the same ``finally`` failed with "current transaction is
+    aborted", so the warnings described the wrong cause too.
     """
     try:
         conn.invalidate()
@@ -788,6 +808,19 @@ def _discard_connection(conn) -> None:
         conn.rollback()
     except Exception:
         logger.debug("Could not give the invalidated connection back", exc_info=True)
+    try:
+        conn.execution_options(**_AUTOCOMMIT)
+    except Exception:
+        # Nothing here can run without it -- every statement the callers issue
+        # after this point is either DDL that refuses a transaction block or a
+        # read that has to see the DDL's effect -- so a handle that cannot be put
+        # back into AUTOCOMMIT is worth the warning even though the caller's own
+        # error may be on its way up.
+        logger.warning(
+            "Could not put the reconnected connection back into AUTOCOMMIT; "
+            "CREATE INDEX CONCURRENTLY cannot run on it",
+            exc_info=True,
+        )
 
 
 def _release_lock(conn, relation: str) -> None:
