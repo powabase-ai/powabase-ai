@@ -1028,6 +1028,30 @@ def test_the_boot_sweep_leaves_out_an_index_at_the_failure_bound(caplog):
     )
 
 
+def test_the_boot_sweeps_give_up_warning_names_the_bound_that_was_reached(caplog):
+    """The gate is failures **or** interrupted, and the line used to name only the first.
+
+    An index with 0 failed builds and 25 interrupted ones was reported as "3
+    consecutive failed builds" -- a full disk when the cause was contention, in the
+    first log read after a restart, and the interrupted branch is new enough to be
+    the likely one for a while. Both bounds in the headline, and each index's own two
+    numbers beside its name.
+    """
+    rows = [
+        _sweep_index_row(_KBS[0], 1536, False, interrupted=pvi.MAX_CONSECUTIVE_INTERRUPTED_BUILDS)
+    ]
+    conn = _FakeConn(answers=[(_SWEEP_CATALOG_QUERY, rows)], fail_on=_COUNT_QUERY)
+    with caplog.at_level(logging.WARNING):
+        assert _sweep(conn) == []
+    assert f"0 failed, {pvi.MAX_CONSECUTIVE_INTERRUPTED_BUILDS} interrupted" in caplog.text, (
+        caplog.text
+    )
+    assert str(pvi.MAX_CONSECUTIVE_INTERRUPTED_BUILDS) in caplog.text
+    assert "consecutive failed builds, or" in caplog.text, (
+        "naming one bound for a gate that is either of two sends the operator to the wrong remedy"
+    )
+
+
 def test_an_index_one_attempt_short_of_the_bound_is_still_dispatched():
     """The positive control: the bound is the bound, not a fear of failure."""
     rows = [_sweep_index_row(_KBS[0], 1536, False, failures=pvi.MAX_CONSECUTIVE_BUILD_FAILURES - 1)]
@@ -2058,6 +2082,11 @@ def test_a_failed_build_counts_itself_on_the_index_it_leaves_behind(monkeypatch)
     assert len(written) == 1, conn.statements
     assert pvi.per_kb_index_name(KB, 1536) in written[0]
     assert pvi.build_failures_in(written[0]) == 1, written
+    # The permanent direction, which nothing pinned: making the non-transient branch
+    # increment ``interrupted`` too passed every tier. The two counts are reported side
+    # by side in the give-up ERROR, so an operator told "1 was interrupted" about a full
+    # disk reaches for contention.
+    assert pvi.interrupted_builds_in(written[0]) == 0, written
 
 
 def test_each_failure_counts_on_from_the_last_one(monkeypatch):
@@ -2238,6 +2267,13 @@ def test_repair_drops_that_keep_failing_reach_the_give_up_bound(monkeypatch, cap
     assert outcomes[-1]["reason"] == "build_repeatedly_failed", outcomes
     assert pvi.index_action(conn, KB) is None, "and nothing dispatches it again"
     assert "by hand" in caplog.text
+    # Both numbers in the give-up ERROR, which were asserted nowhere. These drops
+    # failed permanently, so the line has to say so: "3 ... failed and 0 were
+    # interrupted" points at a full disk, and swapping them points at contention.
+    assert (
+        f"{pvi.MAX_CONSECUTIVE_BUILD_FAILURES} consecutive builds of it have failed and 0 "
+        "were interrupted" in caplog.text
+    ), caplog.text
 
 
 def test_a_transient_build_failure_spends_the_other_bound_not_this_one(monkeypatch):

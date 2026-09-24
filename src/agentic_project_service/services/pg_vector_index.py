@@ -102,11 +102,26 @@ count over ``ai.embeddings`` on every boot, bounded by ``SWEEP_TIMEOUT_MS``,
 even when it then dispatches nothing.
 
 Nothing here touches the shared per-dimension index. Replacing it with a
-residual one (``WHERE dims = N AND knowledge_base_id NOT IN (...)``) is what
-turns the transitional write cost of maintaining two graphs into a large write
-*gain*, but it may only be done once the query change is deployed everywhere:
-with a residual index in place the old query shape matches no HNSW index at all
-and degenerates to a sequential scan. That is deliberately a follow-up.
+residual one is what turns the transitional write cost of maintaining two graphs
+into a large write *gain*, and it is deliberately a follow-up (**#88**). Two
+things about it belong here, on the build side, because they are facts about the
+index this module builds:
+
+* **The residual predicate has to exclude the population, not the knowledge
+  base**: ``AND NOT (knowledge_base_id IN (...) AND item_table = 'chunks')``, never
+  ``AND knowledge_base_id NOT IN (...)``. The index built here holds ``chunks``
+  alone (``PER_KB_INDEX_ITEM_TABLE``), so the weaker form excludes a covered
+  knowledge base's other three populations from both indexes at once and every
+  document-store vector search on it sequential-scans the table.
+* **It cannot land while any process still issues the older query shape**, which
+  is a stronger condition than the query change having been deployed: a rolling
+  deploy runs both shapes side by side, and against a residual index the old shape
+  matches no HNSW index at all. "Deployed everywhere" is the weaker statement and
+  not the constraint.
+
+``base_vector_store.ensure_embedding_index`` owns the sequencing and states it in
+its strict form -- read it there rather than from here, which describes only what
+this module's own index covers.
 """
 
 from __future__ import annotations
@@ -902,12 +917,20 @@ def index_action(conn, knowledge_base_id: Any) -> str | None:
     Cheap enough for the indexing path to call once per source, but not free, and
     the number matters at the shipped threshold: one catalog lookup plus two
     bounded reads per dimension in play, each stopping at ``build_at + 1``. At the
-    50,000-row default that is a cap of 50,001 twice over, so **up to about 100,000
-    index rows read per dispatch** -- the dimension survey and then the count --
-    and once more per further dimension. Both are index-only reads of one knowledge
-    base's slice, which is why this is still the cheap side of dispatching a build
-    that would read the whole slice; a project that lowers the threshold lowers
-    this with it. Never raises for a knowledge base that has no embeddings at all.
+    50,000-row default that is a cap of 50,001 twice over -- the dimension survey and
+    then the count -- and once more per further dimension.
+
+    **Neither is an index-only read, and the cap bounds what each one returns rather
+    than what it reads**, which an earlier version of this docstring had backwards:
+    see ``bounded_row_count``, where it is measured as a ``Seq Scan`` with all three
+    predicates as heap filters. So a knowledge base with a large *other* population
+    reads past it to find ``cap`` rows of this one, and the honest figure is bounded
+    by the table's slice rather than by 2 x ``cap``. It is still the cheap side of
+    dispatching a build that reads the whole slice and writes a graph over it, and a
+    project that lowers the threshold lowers this with it; the btree
+    ``bounded_row_count`` names is what would make both index-only.
+
+    Never raises for a knowledge base that has no embeddings at all.
 
     Nothing is asked for here that the reconcile would decline, because this runs
     once per source that finishes indexing: a build the width forbids
@@ -2422,7 +2445,10 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
                         # list is INVALID-first, so that many given-up indexes would
                         # consume the whole start-up budget on every boot while a
                         # repairable one was never reached.
-                        given_up.append(f"{AI_SCHEMA}.{relname}")
+                        given_up.append(
+                            f"{AI_SCHEMA}.{relname} ({build_failures_in(comment)} failed, "
+                            f"{interrupted_builds_in(comment)} interrupted)"
+                        )
                         continue
                     needing[kb_id] = None
                 elif definition_has_drifted(kb_id, dims, comment) and not (
@@ -2442,13 +2468,21 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
         return []
 
     if given_up:
+        # Both numbers, per index, because the gate is either bound: naming only
+        # ``MAX_CONSECUTIVE_BUILD_FAILURES`` reported an index with 0 failures and 25
+        # interrupted builds as "3 consecutive failed builds", which sends the first
+        # log read after a restart looking for a full disk when the cause was
+        # contention -- and the interrupted count is new, so that is the likely branch
+        # for a while.
         logger.warning(
-            "%d partial HNSW index(es) are INVALID after %d consecutive failed builds, so this "
-            "start-up does not reconcile them: %s%s. Each answers no query and is maintained on "
+            "%d partial HNSW index(es) are INVALID and have reached one of the two build "
+            "bounds (%d consecutive failed builds, or %d interrupted), so this start-up does "
+            "not reconcile them: %s%s. Each answers no query and is maintained on "
             "every write to %s.embeddings until an operator drops it by hand, which is also what "
             "lets a later reconcile try again",
             len(given_up),
             MAX_CONSECUTIVE_BUILD_FAILURES,
+            MAX_CONSECUTIVE_INTERRUPTED_BUILDS,
             ", ".join(given_up[:MAX_SWEEP_DISPATCH]),
             f" (and {len(given_up) - MAX_SWEEP_DISPATCH} more)"
             if len(given_up) > MAX_SWEEP_DISPATCH
