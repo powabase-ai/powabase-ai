@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.11.0](https://github.com/powabase-ai/powabase-ai/compare/v0.10.1...v0.11.0) (2026-09-24)
+
+
+### Features
+
+* **search:** scope vector search to the knowledge base and give big ones their own index ([#79](https://github.com/powabase-ai/powabase-ai/issues/79)) ([0c95b6f](https://github.com/powabase-ai/powabase-ai/commit/0c95b6fb9671deb8208624b535f185284b689314))
+
+
+### Bug Fixes
+
+* bind the whole metadata filter instead of interpolating its keys ([#81](https://github.com/powabase-ai/powabase-ai/issues/81)) ([a4f1406](https://github.com/powabase-ai/powabase-ai/commit/a4f14068d4a1748d0b77e47bc71a2445cc44f2fc))
+* **search:** stop a progress hook from costing us a BM25 index ([#87](https://github.com/powabase-ai/powabase-ai/issues/87)) ([ac9a3ce](https://github.com/powabase-ai/powabase-ai/commit/ac9a3cecc2f4eaf58279a29064d38d89a0a37114))
+
 ## [0.10.1](https://github.com/powabase-ai/powabase-ai/compare/v0.10.0...v0.10.1) (2026-09-24)
 
 
