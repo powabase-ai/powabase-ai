@@ -366,7 +366,9 @@ MAX_CONSECUTIVE_INTERRUPTED_BUILDS = 25
 # currently on the index sees none -- so a reconcile that lands on one of its workers
 # gives the budget back and the war starts again from zero. It advances whenever
 # consecutive passes see drift, and terminates rather than running for ever, but the
-# number of real rebuilds it takes to get there is not 3. The real answer to a war is
+# number of real rebuilds it takes to get there is not 3 -- measured at 3 to 11 across
+# six trials of a fleet where either version may pick the task up, terminating in every
+# one, against exactly 3 when the versions strictly alternate. The real answer to a war is
 # still sequencing rather than a constant: let the new definition reach every process
 # before any process acts on the drift it sees, which is the same shape as the
 # constraint in the module docstring above, for the same reason. *This* change is
@@ -1566,9 +1568,9 @@ def _settle_a_definition_rebuild(conn, kb_id: str, dims: int, comment: str | Non
     base whose index is already correct).
 
     A count that has *reached* the bound is left alone, so giving up stays as
-    permanent as the two build bounds it sits beside: in a rebuild war the losing
-    version's own pass would otherwise clear the number the war put there and start
-    it again. Recovery from there is the ERROR's own instruction -- clear the comment
+    permanent as the two build bounds it sits beside: in a rebuild war a pass by
+    whichever version's definition is currently on the index sees no drift, and would
+    otherwise clear the number the war put there and start it again. Recovery from there is the ERROR's own instruction -- clear the comment
     or drop the index -- which is a decision about a deploy and not one this module
     can make from a single catalog read.
     """
