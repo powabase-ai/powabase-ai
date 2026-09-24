@@ -2856,11 +2856,13 @@ def run_agent_stream(agent_id: str):
             yield f"data: {complete_payload}\n\n"
 
         except GeneratorExit:
-            # Client disconnected before streaming started.
+            # Client disconnected outside the chat-style stream loop: before
+            # streaming started, or (ReAct) while the loop ran on its worker.
             abort_event.set()
             logger.info(
-                "Client disconnected (pre-stream) for run %s, run_persisted=%s",
+                "Client disconnected for run %s (%s), run_persisted=%s",
                 run_id,
+                "during the ReAct loop" if react_started else "pre-stream",
                 run_persisted,
             )
             if llm_gen is not None:
