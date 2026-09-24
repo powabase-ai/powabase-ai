@@ -959,10 +959,22 @@ class BasePgVectorStore:
         ``_fetch_with_timeout`` restores its budget and
         ``_insisting_on_an_exact_search`` restores ``enable_indexscan``.
 
+        One exception, and it is deliberate: when the probe read no ``ef_search``
+        at all -- which is what a fresh pooled connection always reports, because
+        pgvector has not registered the GUC yet -- there is no value to put back,
+        so the raise is not restored. It is a transaction-local placeholder that
+        dies at the end of the transaction, and nothing between here and there
+        reads it: the keyword leg's ranking is a sort, not an ANN scan.
+
         A failure on any side degrades latency, never the answer, so all of them
         are logged rather than raised -- and the restore is expected to fail when
         the search itself did, because the transaction is then aborted and the
-        settings die with it anyway.
+        settings die with it anyway. The two ``set_config`` calls are not
+        themselves savepointed, unlike the probe: if one of them fails the
+        transaction is aborted and the *search* raises. That is the right
+        direction to fail in -- an error the caller sees rather than a quietly
+        worse plan -- and it is the reason this block's warnings say what they
+        would do, not what they did.
 
         The probe runs in a savepoint. Without one, a probe that errors -- a
         catalog lookup can be cancelled like anything else -- would leave the
