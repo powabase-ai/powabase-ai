@@ -1133,6 +1133,119 @@ def _build_registry() -> dict[str, SettingDef]:
                 "like this setting it is trusted, not verified."
             ),
         ),
+        SettingDef(
+            key="VECTOR_PER_KB_INDEX_MIN_ROWS",
+            category=cat,
+            label="Per-KB Vector Index Threshold (rows)",
+            type="int",
+            default=50000,
+            min=1000,
+            max=10000000,
+            advanced=True,
+            description=(
+                "A knowledge base with at least this many embeddings gets a vector "
+                "index of its own, built in the background without blocking writes, "
+                "instead of sharing the project-wide one. Its searches then rank "
+                "over only its own vectors: measured on a 73,290-embedding knowledge "
+                "base, 182 ms to 1.4 ms warm and 824 ms to 225 ms cold, and a top-k "
+                "drawn from the right population rather than from the whole project. "
+                "A knowledge base BELOW this threshold keeps the project-wide index. "
+                "Whether that is slower than before this feature existed depends on "
+                "the table: one fixture measured 3.6 ms to 80 ms where a knowledge "
+                "base was 21% of the embeddings table, while another measured the new "
+                "shape 3.6x FASTER at the same recall, so treat that regression as "
+                "fixture-dependent rather than a property of the change. What the "
+                "scoped search does buy everywhere is a top-k drawn from the right "
+                "population: searching the project-wide index and discarding other "
+                "knowledge bases' hits returned only 0.65 to 0.70 of the right "
+                "top-k on one measurement and 0.93 to 0.96 on real embeddings, "
+                "against an exact scan's 1.00. An index of a knowledge base's own "
+                "is itself approximate — recall 0.915 at 30% of the table and 0.933 "
+                "at 21% on real embeddings, 0.973 at the ef_search this service sets "
+                "— so crossing this threshold trades an exact answer for a much "
+                "faster approximate one. "
+                "THE SHAPE TO LOOK FOR is a knowledge base of roughly 10,000 to 25,000 "
+                "embeddings that is a small fraction of a much larger table. On one "
+                "150,000-embedding fixture at 1536 dimensions, such a knowledge base "
+                "went 6.2 ms to 50.4 ms at 10,000 rows and 4.4 ms to 132.5 ms at "
+                "20,000 — exact either way, where the old answers were recall 0.61 and "
+                "0.58 — while the same 10,000-row knowledge base WITH an index of its "
+                "own answered in 1.8 ms at recall 1.000, paying 27x for nothing. "
+                "Treat that as a shape to look for rather than a range to trust: "
+                "neither edge of it was measured (30,000 was unchanged, nothing below "
+                "10,000 was tried), and whether the window exists at all depends on "
+                "the table, because which plan wins is a cost race decided by table "
+                "shape rather than by embedding width — one independently built fixture "
+                "measured the new query shape FASTER at the same recall, with no window "
+                "anywhere. So: if a project has a knowledge base in that size range and "
+                "its searches feel slow, lowering this setting for that project is the "
+                "fix, following the procedure below — and confirming afterwards that "
+                "the new index is actually being scanned is what tells you the window "
+                "was real for that project. "
+                "The default is deliberately conservative, and the reason is not the "
+                "disk. In some storage layouts the planner can prefer the "
+                "project-wide index even for a knowledge base that has its own, which "
+                "would mean an index built, maintained on every write, and never "
+                "scanned. That has been measured in one layout and could not be "
+                "reproduced in another, so it is an open question rather than a known "
+                "defect — and this default keeps the exposure to it near zero while "
+                "still covering the knowledge bases big enough to be the problem in "
+                "the first place. To lower it, lower it on one project, then confirm "
+                "with pg_stat_all_indexes that the new index is actually being "
+                "scanned before lowering it anywhere else. "
+                "The cost of each index is disk and write throughput: roughly 9.5 MB "
+                "per 1,000 embeddings at 1536 dimensions (573 MB measured at 60,000, "
+                "so about 475 MB at this threshold), multiplied by up to the 200 "
+                "per-knowledge-base indexes a project may hold, and writes to an "
+                "indexed knowledge base pay for one more index until the "
+                "project-wide one is retired."
+            ),
+        ),
+        SettingDef(
+            key="VECTOR_PER_KB_INDEX_DROP_ROWS",
+            category=cat,
+            label="Per-KB Vector Index Drop Threshold (rows)",
+            type="int",
+            default=25000,
+            min=1,
+            max=10000000,
+            advanced=True,
+            description=(
+                "A knowledge base that falls below this many embeddings — sources "
+                "deleted, or reindexed with a different embedding model — has its own "
+                "vector index dropped again. Deliberately well below the build "
+                "threshold: with one threshold, a knowledge base sitting on it would "
+                "have its index built and thrown away over and over, and each build "
+                "is a full index build. A value at or above the build threshold is "
+                "ignored in favour of half of it. It cannot be 0: a knowledge base "
+                "goes back to the project-wide index once it is at or below this many "
+                "embeddings, so 0 would hold its own index open until the very last "
+                "embedding was gone — an index of nothing in particular, still "
+                "evaluated on every write to the embeddings table."
+            ),
+        ),
+        SettingDef(
+            key="VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB",
+            category=cat,
+            label="Vector Index Build Memory (MB)",
+            type="int",
+            default=128,
+            min=64,
+            max=4096,
+            advanced=True,
+            description=(
+                "maintenance_work_mem for a per-knowledge-base vector index build, "
+                "set in the builder's own session only. A build that does not fit "
+                "spills and gets much slower: measured 3.3x slower at 64 MB than at "
+                "1 GB for a 73,290-vector, 1536-dimension index (50.6 s against "
+                "15.3 s), which needs roughly 500 MB to stay in memory. The range "
+                "here is a sanity limit, not a safety bound: nothing can see how "
+                "much memory the database actually has, so raising this is your "
+                "judgement against the database's own memory. It is taken on top of "
+                "shared_buffers, and the smallest project databases have 512 MiB in "
+                "total — for those the default is already about the limit."
+            ),
+        ),
     ]
 
     # =========================================================================

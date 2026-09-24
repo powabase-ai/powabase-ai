@@ -1030,16 +1030,20 @@ def delete_source(source_id: str):
     except StorageError as e:
         logger.warning(f"Failed to delete files: {e}")
 
-    # Check for dependent indexed sources before deleting
+    # Check for dependent indexed sources before deleting. The knowledge base
+    # ids come back too: the delete CASCADEs this source's embeddings out of
+    # every one of them, which can take a knowledge base below the threshold its
+    # own vector index is kept for.
     deps_result = db.session.execute(
         text(f"""
-            SELECT kb.name FROM "{AI_SCHEMA}".indexed_sources idx
+            SELECT kb.id, kb.name FROM "{AI_SCHEMA}".indexed_sources idx
             JOIN "{AI_SCHEMA}".knowledge_bases kb ON idx.knowledge_base_id = kb.id
             WHERE idx.source_id = :source_id
         """),
         {"source_id": source_id},
     )
-    dep_names = [row[0] for row in deps_result]
+    deps = [(str(row[0]), row[1]) for row in deps_result]
+    dep_names = [name for _kb_id, name in deps]
 
     # Delete from database
     db.session.execute(
@@ -1047,6 +1051,28 @@ def delete_source(source_id: str):
         {"id": source_id},
     )
     db.session.commit()
+
+    # Nothing else comes back to those knowledge bases: only an indexing run
+    # reconciles a per-knowledge-base vector index, and a delete never starts
+    # one. Without this, a knowledge base that has just lost most of its
+    # embeddings keeps an index it no longer qualifies for -- paid for on every
+    # write to the embeddings table -- until a pod wins the start-up lock. After
+    # the commit, so the bounded row count each dispatch reads is the true one.
+    if deps:
+        from ..tasks.indexing import dispatch_per_kb_vector_index
+
+        for kb_id in dict.fromkeys(kb_id for kb_id, _name in deps):
+            try:
+                dispatch_per_kb_vector_index(kb_id)
+            except Exception:
+                logger.warning(
+                    "Failed to dispatch the per-knowledge-base vector index reconcile for "
+                    "KB %s after deleting source %s; it keeps whatever index it has until "
+                    "the next indexing run or start-up",
+                    kb_id,
+                    source_id,
+                    exc_info=True,
+                )
 
     response = {"message": "Source deleted"}
     if dep_names:

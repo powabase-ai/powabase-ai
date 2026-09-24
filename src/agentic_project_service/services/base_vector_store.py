@@ -8,6 +8,9 @@ attributes and add their own storage methods.
 import json
 import logging
 import time
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from agentic.knowledge.model_config import HYBRID_DEFAULT_VECTOR_WEIGHT
@@ -18,7 +21,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from ..db import AI_SCHEMA
-from . import pg_bm25_index
+from . import pg_bm25_index, pg_vector_index
 from .kb_search_config import HNSW_ITERATIVE_SCAN_MODE
 from .settings_registry import SETTINGS_REGISTRY, get_setting
 
@@ -63,6 +66,230 @@ VALID_TS_LANGUAGES = frozenset(
 )
 
 
+# Upper bound on ``top_k``, which the vector query interpolates rather than
+# binds (see ``kb_sql_literal``). Nothing upstream range-checks it -- the search
+# route takes it straight from the request body -- so this is where it is
+# checked. Generous: the per-source candidate pool is capped at 200 and hybrid
+# search doubles the caller's value, so nothing legitimate comes near.
+#
+# That doubling also means this is not the ceiling a caller sees on every route:
+# hybrid search fetches twice the caller's ``top_k`` from each leg, so the largest
+# ``top_k`` it accepts is half of this. It checks that itself, against the value
+# the caller sent, so the error names a limit the caller can act on rather than
+# the doubled one the vector leg would have reported.
+MAX_TOP_K = 10_000
+
+
+# The one item table whose searches may be steered onto a knowledge base's own
+# partial HNSW index (see ``_preferring_this_kbs_partial_index``).
+#
+# ``ai.embeddings`` is polymorphic -- ``item_table`` is a column on it, and four
+# stores inherit ``vector_search`` -- while the index is named after
+# ``(knowledge_base_id, dims)`` and so is the catalog probe that looks for it. The
+# predicate is narrower than the name (it restricts ``item_table`` too), but the
+# probe cannot see a predicate, only a name: so a knowledge base whose search
+# routes to one of the document-level stores passes the probe just the same, and
+# without this constant would be driven at an index holding none of its rows.
+# Measured at 1536 dimensions on a document-level store of 40 rows at
+# ``top_k=5``: 2.2 -> 25.9 ms, recall 1.00 -> 0.33, against a plan the planner
+# would have sorted in 2 ms.
+#
+# The index predicate now names ``item_table`` as well, so the index holds one
+# population (see ``vector_search``, and ``item_table_sql_literal`` for what it
+# costs). This constant is what keeps a document-level store from being *steered*
+# at an index built for chunks, which is a separate question from what the index
+# contains: the steering was measured to help only this store.
+#
+# What the other three stores get is not "the plan the planner chooses for them",
+# and that wording was wrong. ``vector_search`` tests ``restricted`` *before* it
+# tests the store, so a search from any of them that carries ``item_ids``,
+# ``source_ids`` or a metadata filter has the approximate index priced out like
+# any other restricted search -- deliberately, because that is the half that makes
+# an answer exact and exactness is not a chunks-only concern. It is only the
+# *unrestricted* search from those stores that is left on the planner's own plan.
+#
+# The string itself is ``pg_vector_index``'s, because that module builds the index
+# whose predicate names it: the literal in this module's query and the literal in
+# that module's predicate have to be the same one, or the planner cannot prove the
+# predicate and the index is never used at all -- measured as 1.44 ms on the
+# knowledge base's own index against 12.0 ms on the project-wide one. Imported
+# rather than restated for exactly that reason.
+PER_KB_INDEX_ITEM_TABLE = pg_vector_index.PER_KB_INDEX_ITEM_TABLE
+
+
+# ``hnsw.ef_search`` for a search that is using a knowledge base's own partial
+# index. pgvector's default is 40, and recall degrades with the *absolute* size
+# of the index rather than with the knowledge base's share of the table: measured
+# on real embeddings, 0.997 at 400 rows, 0.982 at 2,000, 0.933 at 8,400 and 0.915
+# at 12,000. A knowledge base that crosses the build threshold can be several
+# times its size, where the trend projects about 0.85 -- too low to ship as the
+# answer to a search that used to be exact. 120 measured 0.973 at 12,000 rows for
+# 2.96 ms, still 12x faster than the exact scan it replaces.
+#
+# **The supported band is 80-400, and the upper bound is a planner cliff rather
+# than taste.** pgvector's HNSW cost estimate scales with this setting, and past
+# roughly 600-800 a knowledge base's own partial index prices *above* the shared
+# per-dimension index, so the planner flips to the shared one and the whole
+# mechanism inverts -- reproduced at **12,000 rows**, where ``ef_search`` 600
+# kept the partial index at 6.9 ms and 800 took the shared index at 18.8 ms with
+# *lower* recall. The size matters: that cliff is a small-index property. At
+# 10,000 rows ``ef_search`` 800 cost 235.61 ms, and at 50,000 rows there was no
+# flip at all. So 80-400 is a band the measured sizes were comfortable inside,
+# not a threshold that holds at every size. 120 is deliberately well inside it.
+#
+# **The upper edge is not a measured-safe edge: 120 is safe by margin, not by
+# guard.** Read this before raising the value. On a further fixture the flip to
+# the shared per-dimension index had already happened at ``ef_search`` **400** --
+# the band's own upper bound -- so the bound is a convention that 120 sits well
+# below rather than a value shown to be safe in itself, and which side of it a
+# given knowledge base is on depends on the shape of its table. Nothing detects
+# the flip: the forcing beside this setting is a penalty on sorts, which cannot
+# choose between two index plans (see
+# ``BasePgVectorStore._preferring_this_kbs_partial_index``), and no statement
+# reads back which index the plan used. Safe *by guard* would need exactly that
+# missing read -- confirming that the index the plan reached is this knowledge
+# base's own, and reporting or standing down when it is not -- and this change
+# does not have it. Until it does, a raise is a per-shape measurement of plan
+# choice as well as of recall, on the sizes that are actually in the table.
+#
+# **Not orthogonal to the forcing beside it**, and the earlier claim that it was
+# is withdrawn. It does decide how accurate an index scan is once the planner is
+# on an index -- but because pgvector's cost estimate scales with it, it is also a
+# dominant input to *which* plan the planner picks, which is the cliff described
+# eight lines up. Measured on one query and one fixture with both indexes present:
+# 40 chose an exact sort, 50 the shared per-dimension index, 60 this knowledge
+# base's partial index, and 800 the shared one again. The shipped 120 sits inside
+# that fixture's plateau, and the plateau is *not* why the value is 120: the
+# recall band twelve lines up is, and this measurement came afterwards. Another
+# fixture's plateau runs from 40 to 600, which does not distinguish 120 from
+# pgvector's own default. What the plateau does establish is the consequence -- a
+# change to this value is a change to plan choice and not only to recall, so it
+# belongs with a fresh measurement of both.
+#
+# It is still set only when the probe has found an index to be on, because that is
+# where it has anything to decide.
+PER_KB_HNSW_EF_SEARCH = 120
+
+
+def kb_sql_literal(knowledge_base_id: Any) -> str:
+    """A knowledge base id as a quoted SQL literal, or ValueError.
+
+    The embeddings-side ``knowledge_base_id`` predicate is interpolated rather
+    than bound, and this is the one gate between a caller's value and the SQL.
+    ``uuid.UUID`` accepts nothing that could carry a quote or a statement
+    separator, and the result is the *canonical* form, so braces, a ``urn:``
+    prefix and surrounding whitespace are all normalised away. A value that is
+    not a UUID cannot match ``ai.embeddings.knowledge_base_id`` anyway (the
+    column is ``uuid``, so before this it reached the server and failed there).
+
+    Interpolated because a bound parameter cannot prove the partial index's
+    predicate. PostgreSQL uses a partial index only when the query's own
+    restriction clauses *prove* the index predicate, and the per-knowledge-base
+    index names one KB id and one ``dims`` value as literals. A plan built
+    without knowing a parameter's value proves neither -- which matters because
+    psycopg prepares a statement after ``prepare_threshold`` executions on a
+    connection, and from the sixth execution of the prepared statement
+    PostgreSQL starts weighing its generic plan against the custom ones.
+
+    ``knowledge_base_id`` is not sufficient on its own, and that was measured
+    rather than assumed. Under ``plan_cache_mode = force_generic_plan``, on a
+    12,000-embedding fixture at 1536 dimensions with both indexes present:
+
+    | query shape | generic plan reaches |
+    |---|---|
+    | kb literal, ``dims`` and ``LIMIT`` bound | no HNSW index: Sort, cost 999 |
+    | kb literal, ``dims`` literal, ``LIMIT`` bound | no HNSW index: Sort, cost 999 |
+    | kb literal, ``dims`` bound, ``LIMIT`` literal | no HNSW index: Sort, cost 845 |
+    | **kb, ``dims`` and ``LIMIT`` all literal** | **the partial index**, cost 369 |
+    | kb bound, ``dims`` and ``LIMIT`` literal | the *shared* index, cost 533 |
+
+    So ``vector_search`` interpolates all three, on both sides of the join for
+    the KB id. ``dims`` is range-checked and already interpolated into the
+    distance cast, and ``top_k`` is checked against ``MAX_TOP_K``; the last row
+    is why the KB id has to be one of them.
+
+    **What this guarantees, and what it does not.** The guarantee is for the
+    *unfiltered* search: every value in the index's predicate, and the LIMIT, is
+    a literal, so a generic plan can prove the predicate and keep the ordered
+    index scan. A ``filter_metadata`` search has a fourth value the planner does
+    not know, and it cannot be made a literal -- it is caller data, bound as
+    jsonb. A generic plan has no selectivity estimate for ``meta @>`` at all, so
+    it prices the ordered index scan out and the partial index is lost.
+
+    **That is accepted rather than worked around, and the earlier claim that a
+    filtered search reaches the index is withdrawn.** A restriction the caller
+    wrote down -- a metadata filter, ``item_ids`` or ``source_ids`` -- has to be
+    answered exactly, and an approximate scan cannot promise that however well it
+    is planned. Such a search is therefore steered *away* from the index rather
+    than towards it: see ``BasePgVectorStore._insisting_on_an_exact_search``. The
+    guarantee above is for the unfiltered search, which is the one this whole
+    mechanism exists for.
+    """
+    try:
+        return f"'{uuid.UUID(str(knowledge_base_id))}'"
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"knowledge_base_id is not a UUID: {knowledge_base_id!r}") from exc
+
+
+def item_table_sql_literal(item_table: str) -> str:
+    """A store's item table as a quoted SQL literal, or ValueError.
+
+    ``ai.embeddings`` is polymorphic: ``item_table`` is a NOT NULL column naming
+    which table the embedded item lives in, and four stores inherit
+    ``vector_search``. A knowledge base crosses the per-knowledge-base build
+    threshold on the *sum* over those tables, so without this restriction one
+    index can hold several populations and a search from one store walks entries
+    that cannot join. Measured on the same 1,000 chunk rows, an index over chunks
+    alone against chunks plus 9,000 document rows: recall 0.858 -> 0.383; and on
+    6,000 chunk rows with and without 6,000 graph-node rows, 0.925 -> 0.812 with
+    the worst query falling 0.700 -> 0.300.
+
+    Interpolated rather than bound for the same reason the knowledge base id and
+    ``dims`` are (see ``kb_sql_literal``): the index predicate names it, and a
+    generic plan can only match a partial index whose predicate it can *prove*.
+    A bound parameter proves nothing, so the third clause has to be a literal too
+    or a prepared statement loses the index it was built to reach.
+
+    Validated even though the value is a class attribute rather than caller data,
+    and even though the same attribute is already interpolated as an identifier in
+    the ``FROM`` clause: a value that could close the quote here would break that
+    clause too, but the gate is one line and it puts the check where the quoting
+    happens.
+    """
+    if not (isinstance(item_table, str) and item_table.isidentifier() and item_table.islower()):
+        raise ValueError(f"item_table is not a bare lowercase identifier: {item_table!r}")
+    return f"'{item_table}'"
+
+
+def validated_top_k(top_k: Any) -> int:
+    """A row limit safe to interpolate into ``LIMIT``, or ValueError.
+
+    ``LIMIT`` is interpolated so a prepared statement's generic plan can still
+    reach the partial HNSW index (see ``kb_sql_literal``): with an unknown limit
+    the planner assumes it will be asked for a large fraction of the rows, which
+    prices an ordered index scan out and leaves an exact sort. Zero is allowed
+    because that is what a bound ``LIMIT 0`` did -- an empty answer, not an
+    error.
+
+    ``int()`` coerces rather than rejects, so ``True`` becomes 1 and ``1.9``
+    becomes 1: surprising to read, safe to emit, and unreachable from the routes,
+    which parse ``top_k`` out of JSON as an int.
+
+    ``OverflowError`` is in the handler for one reachable input: Python's JSON
+    parser accepts bare ``Infinity`` and ``NaN``, so a request body of
+    ``{"top_k": Infinity}`` arrives as a float, and ``int(float('inf'))`` raises
+    ``OverflowError`` rather than ``ValueError``. Without it that body is a 500
+    where every other unusable ``top_k`` is a 400.
+    """
+    try:
+        value = int(top_k)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"top_k is not an integer: {top_k!r}") from exc
+    if not (0 <= value <= MAX_TOP_K):
+        raise ValueError(f"top_k must be between 0 and {MAX_TOP_K}, got {value}")
+    return value
+
+
 def ensure_embedding_index(session: Session, schema: str, dims: int) -> None:
     """Create partial hnsw index for this embedding dimension if it doesn't exist.
 
@@ -72,6 +299,37 @@ def ensure_embedding_index(session: Session, schema: str, dims: int) -> None:
     already holds from INSERTing. Under concurrent workers this routinely
     deadlocks. The pg_indexes read takes only AccessShareLock on system
     catalogs and never contends with user-table DML.
+
+    **This index is load-bearing for every knowledge base without a partial one,
+    and narrowing it is sequenced.** It is the index a KB-scoped vector search
+    falls back to, so it must keep covering every row of its dimension until the
+    last process still issuing the *older* query shape is gone. "Once the
+    embeddings-side ``knowledge_base_id`` predicate (see ``kb_sql_literal``) has
+    deployed everywhere" is the weaker statement and not the constraint: a rolling
+    deploy runs both shapes side by side, and the old shape matches no HNSW index
+    at all against a residual one and sequential-scans ``ai.embeddings`` for as
+    long as it lives.
+
+    Replacing this index with a residual one that excludes the knowledge bases
+    holding their own partial index is the planned follow-up, tracked as **#88**,
+    which carries that constraint in its strict form. Its predicate has to exclude
+    the *population* a per-knowledge-base index covers rather than the whole
+    knowledge base -- ``AND NOT (knowledge_base_id IN (...) AND item_table =
+    'chunks')``, not ``AND knowledge_base_id NOT IN (...)`` -- because that index
+    holds ``chunks`` alone (see ``PER_KB_INDEX_ITEM_TABLE``). Written the weaker
+    way, a covered knowledge base's ``full_documents``, ``graph_index_nodes`` and
+    ``doc2json_documents`` embeddings are excluded from the per-KB index by
+    ``item_table`` and from the residual one by ``knowledge_base_id``, so they end
+    up with no HNSW index at all and every document-store vector search on that
+    knowledge base sequential-scans the table.
+
+    **The two paragraphs above are the constraint in full, and this docstring is
+    where it is kept** -- next to the index it constrains, which is the one created
+    here. ``pg_vector_index`` builds the per-knowledge-base index and is the place
+    to read for *that* index's predicate and the population it covers; it names the
+    same follow-up, but from the build side, where the shared index is not the
+    subject. So do not read the sequencing or the residual predicate's shape from
+    there: read them here, or from #88's own deploy note.
     """
     dims = int(dims)
     if not (1 <= dims <= 8192):
@@ -121,14 +379,25 @@ def metadata_filter_clause(filter_metadata: dict | None) -> tuple[str, dict[str,
     the left, so ``meta @> '{"a": 1, "b": 2}'`` matches exactly the rows
     ``meta @> '{"a": 1}' AND meta @> '{"b": 2}'`` matches.
 
-    Returns ``("", {})`` for an empty or absent filter, so the caller appends
-    nothing and binds nothing. A filter that is present but not an object is
-    rejected rather than bound: ``jsonb @> <array|string|number|boolean>`` does
+    Returns ``("", {})`` for an absent filter and for an empty object, so the
+    caller appends nothing and binds nothing. Anything else that is not an object
+    is rejected rather than bound: ``jsonb @> <array|string|number|boolean>`` does
     not error, it is simply false, so binding one would turn a malformed filter
     into an empty result with nothing logged — indistinguishable, on the agent
     path, from "nothing relevant". A ``ValueError`` reaches the search route's
-    400 instead. The order matters: the falsy short-circuit comes first, so the
-    set of inputs that add no clause is exactly what it has always been.
+    400 instead.
+
+    **The type check comes before the falsy one, and the order is the fix.** With
+    the falsy check first, a truthy non-object (``["a"]``, ``"gold"``, ``1``) was
+    a 400 while a *falsy* one (``[]``, ``""``, ``0``, ``False``) silently added no
+    clause at all — so the malformed filter a caller most likely typed by mistake
+    was the one that answered with the whole knowledge base instead of an error.
+    Widening a search is the worse of the two failures, and it was the quiet one.
+
+    ``json.dumps`` is wrapped because it raises ``TypeError`` for a value it
+    cannot serialise — a ``set``, a ``datetime``, anything with no encoder — and
+    this function's contract, and the route that turns it into a 400, is
+    ``ValueError``.
 
     Two conventions the caller has to match: the filtered item table is aliased
     ``c``, and the bound parameter is named ``filter_metadata``.
@@ -138,15 +407,21 @@ def metadata_filter_clause(filter_metadata: dict | None) -> tuple[str, dict[str,
     leg does not come through here: it filters in Python with ``==`` on each
     key, which is stricter, and the two have never agreed on nested values.
     """
-    if not filter_metadata:
+    if filter_metadata is None:
         return "", {}
     if not isinstance(filter_metadata, dict):
         raise ValueError(
             f"filter_metadata must be a JSON object, got {type(filter_metadata).__name__}"
         )
+    if not filter_metadata:
+        return "", {}
+    try:
+        encoded = json.dumps(filter_metadata)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"filter_metadata is not valid JSON: {exc}") from exc
     return (
         f" AND c.meta @> CAST(:{METADATA_FILTER_PARAM} AS jsonb)",
-        {METADATA_FILTER_PARAM: json.dumps(filter_metadata)},
+        {METADATA_FILTER_PARAM: encoded},
     )
 
 
@@ -356,11 +631,17 @@ class BasePgVectorStore:
     def _apply_iterative_scan(self) -> None:
         """Enable pgvector HNSW iterative scan for this transaction.
 
-        The HNSW index on ai.embeddings is global (spans all KBs) and the
-        vector query filters `knowledge_base_id` AFTER the approximate scan.
-        Without iterative scanning, pgvector emits only ~ef_search global
-        candidates before that filter, starving KB-scoped queries (often 0
-        rows). SET LOCAL keeps this scoped to the current transaction so it
+        The per-dimension HNSW index on ai.embeddings spans every KB, and for a
+        KB without a partial index of its own the vector query filters
+        `knowledge_base_id` AFTER the approximate scan. Without iterative
+        scanning, pgvector emits only ~ef_search global candidates before that
+        filter, starving KB-scoped queries (often 0 rows). A KB that has its own
+        partial index (`pg_vector_index`) does not need this -- its index holds
+        only its own rows, so nothing is filtered away after the scan -- but it
+        costs that KB nothing either, so the GUC is set unconditionally rather
+        than made to depend on a catalog lookup per search.
+
+        SET LOCAL keeps this scoped to the current transaction so it
         can't leak across pooled connections. The mode is a validated constant,
         safe to interpolate. No-op (and logged) if pgvector is too old to know
         the GUC — search still works, just without the fix.
@@ -377,6 +658,648 @@ class BasePgVectorStore:
                 mode,
                 e,
             )
+
+    @contextmanager
+    def _insisting_on_an_exact_search(self) -> Iterator[None]:
+        """Price the approximate index out, for a search the caller restricted.
+
+        The mirror of ``_preferring_this_kbs_partial_index``, and the reason the
+        pair is symmetric: an unrestricted search wants the index and cannot be
+        starved by anything, a restricted one must be exact and an ordered ANN
+        scan cannot promise that.
+
+        **Why not simply leave the planner alone.** Because the planner's own
+        choice is a cost race, and on some shapes of the table it comes out for the
+        approximate index: it takes the partial index for a restricted search
+        unaided and returns a *full* page of ``top_k`` rows in which 12 to 17 of 20
+        are not the nearest matching ones. A full page is the failure mode with no
+        signal in it: nothing is short, so nothing can notice.
+
+        **Which shapes those are is decided by the table, not by the vector width,
+        and the earlier claim that 1536 dimensions is already exact is withdrawn.**
+        Measured on a 4,000-row knowledge base with its own partial index, varying
+        only how many rows other knowledge bases hold, for a ``source_ids`` search:
+
+        | the knowledge base's share | 1536 d, planner unaided | 384 d, planner unaided |
+        |---|---|---|
+        | 4,000 of 4,000 rows (100 %) | **the partial index**, cost 159.08 | **the partial index**, cost 531.79 |
+        | 4,000 of 10,000 (40 %) | **the partial index**, cost 400.28 | **the partial index**, cost 668.04 |
+        | 4,000 of 24,000 (17 %) | an exact plan, cost 614.51 | **the partial index**, cost 1047.07 |
+        | 4,000 of 44,000 (9 %) | an exact plan, cost 1677.33 | **the partial index**, cost 1665.59 |
+
+        This block produced an exact plan on all eight. So at 1536 dimensions it is
+        load-bearing on two of those four shapes and inert on the other two, and at
+        384 dimensions it is load-bearing on all four -- while on a different
+        384-dimension fixture the planner was already exact on all four restricted
+        *shapes* and the block was a pure regression there, 36.3 -> 123.8 ms on
+        ``source_ids`` and 1.6 -> 37.7 ms on ``item_ids`` (3.4x and 23x). The width
+        makes the race close; the number of rows the rest of the table holds
+        decides it. **There is no shape on which this block makes an answer less
+        exact**, which is the property it is here for, and the price of it is
+        anything from nothing to the 23x above.
+
+        **What it costs where the planner was already exact.** Measured at 1536
+        dimensions on a 12,000-row knowledge base with its partial index built and
+        valid, median of six query vectors, against a seq-scan-and-sort ground
+        truth -- one of the shapes where the plan does not change:
+
+        | restricted search | planner unaided | this block |
+        |---|---|---|
+        | ``source_ids`` covering ~80 % of the KB | exact, 44.8 ms, recall 1.00 | exact, **42.7 ms**, recall 1.00 |
+        | ``source_ids`` covering ~1 % of the KB | exact, 3.6 ms, recall 1.00 | exact, **1.6 ms**, recall 1.00 |
+        | ``item_ids``, 200 named (10x ``top_k``) | exact, 3.0 ms, recall 1.00 | exact, **2.1 ms**, recall 1.00 |
+        | ``filter_metadata``, one row in five | exact, 14.1 ms, recall 1.00 | exact, **13.8 ms**, recall 1.00 |
+
+        The large restricted search is the one worth checking rather than assuming,
+        because it is the case with the most rows to sort, and it matches: 42.7
+        against 44.8 ms. For comparison, the same four shapes with the index forced
+        *in* cost 1.6/22.0/18.0/4.2 ms at recall 0.07/0.58/0.63/0.13 -- which is
+        what the symmetry exists to make impossible.
+
+        **``enable_indexscan`` is broader than "no ANN scan", and the fallback was
+        checked rather than assumed.** PostgreSQL has no GUC that prices one index
+        out, so this prices out every ordered index scan in the statement. What
+        replaces them is usually a *bitmap* index scan on the same indexes. Read
+        off ``EXPLAIN ANALYZE`` at 1536 dimensions for all three restricted
+        shapes: the item-table predicate went from ``Index Scan using
+        chunks_knowledge_base_id_idx`` to a ``BitmapAnd`` of the same index, and
+        the embeddings side from ``Index Scan using
+        embeddings_knowledge_base_id_idx`` to a ``Bitmap Index Scan`` on it. The
+        thin ``source_ids`` case is faster because the bitmap path picks
+        ``chunks_source_id_idx`` and drives a nested loop where the unaided plan
+        hashed the whole knowledge base's embeddings.
+
+        **"No plan contains a ``Seq Scan``" was true only at 1536 dimensions, and
+        that claim is withdrawn.** Where a knowledge base is a large share of the
+        shared ``embeddings`` table the planner reads the whole relation instead.
+        Measured at 384 dimensions, a knowledge base holding 12,000 of 36,500
+        embeddings, two of the four restricted shapes:
+
+        ```
+        Seq Scan on embeddings e  (actual rows=12000)   Rows Removed by Filter: 24500
+        ```
+
+        So on those shapes the work tracks the *table's* size and not the number
+        of matching rows -- 36,500 rows read to emit 12,000 -- exactly where this
+        block is load-bearing. It is still the exact answer, which is what the
+        block is for, but the cost is not bounded by the knowledge base.
+
+        ``set_config(..., true)`` so the previous value can be bound and dies with
+        the transaction; restored before returning, because ``hybrid_search`` runs
+        its keyword leg on this same session and a keyword ranking wants its index
+        scans back. A failure on either side degrades latency or exactness rather
+        than erroring, so both are logged, not raised -- and the read and the set
+        run in a savepoint, without which "degrades rather than errors" would be
+        false: an aborted transaction makes the search itself raise. Rolling back
+        to the savepoint is what lets the warning describe the plan the search
+        actually gets.
+
+        **What it costs, split honestly.** Three statements -- read the prior, set
+        it, put it back -- and the plan they produce. Measured separately, 18
+        executions on one pooled connection so the statement is prepared:
+
+        | restricted search | the plan | the three round trips |
+        |---|---|---|
+        | ``source_ids`` ~80 % of the KB | 49.1 -> **42.0 ms** | +1.5 ms |
+        | ``source_ids`` ~1 % of the KB | 3.2 -> **2.0 ms** | +1.3 ms |
+        | ``item_ids``, 200 named | 2.5 -> **2.3 ms** | +1.1 ms |
+        | ``filter_metadata`` | 14.8 -> 15.3 ms | +1.4 ms |
+
+        **On that fixture the block changes no plan**, so what the table above
+        measures is three round trips against a plan that was already going to be
+        chosen. It is not the fixture to generalise from in either direction: the
+        sweep further up finds the same width choosing the index unaided once the
+        knowledge base is 40 % of the table or more. On a fixture where the plan
+        *does* change, at **384 dimensions**, it is not free. Same fixture as the
+        ``Seq Scan`` reading above, median of six query vectors, eight executions
+        each, recall against a ground truth computed with every scan priced out:
+
+        | restricted search | planner unaided | this block | |
+        |---|---|---|---|
+        | ``source_ids`` covering the KB | 0.97 ms, recall **0.600** | 15.30 ms, recall 1.000 | 15.8x, +14.3 ms |
+        | ``filter_metadata``, one row in five | 1.27 ms, recall **0.517** | 10.45 ms, recall 1.000 | 8.2x, +9.2 ms |
+        | ``item_ids``, 200 named | 1.79 ms, recall 1.000 | 1.76 ms, recall 1.000 | 1.0x, -0.03 ms |
+        | ``filter_metadata`` matching nothing | 2.00 ms | 1.93 ms | 1.0x, -0.08 ms |
+
+        Rows one and two are the whole case for the block: unaided, the planner
+        takes the approximate index and returns a *full page* of ``top_k`` rows of
+        which two in five are not among the nearest matching ones. There is no
+        signal in a full page. The block buys that back for an order of magnitude
+        of latency on a millisecond-scale query.
+
+        And on another 384-dimension fixture none of the four restricted shapes
+        went to the index unaided, so there was nothing to buy back and the block
+        was a pure regression -- 3.4x on ``source_ids`` and 23x on ``item_ids``.
+        Both readings are real and neither is *the* behaviour: a merger should read
+        this block as an unconditional insurance premium whose size depends on the
+        table it is paid on, not as a measured win.
+
+        **The earlier claim that the plan is a *saving* on three of four shapes
+        did not reproduce and is withdrawn.** On the shapes where the block
+        changes the plan it is 8-16x slower; on the shapes where it changes
+        nothing the difference is within noise. It is a price paid for a right
+        answer, not a free win, and a merger reading this should price it that way.
+
+        It could be two statements rather than three by reading
+        the prior and setting it in one, which needs a ``MATERIALIZED`` CTE to make
+        the evaluation order safe; that was left undone deliberately, because this
+        block reads the same way as the one beside it and a construct that depends
+        on evaluation order is the kind of thing this file already warns about.
+
+        **One caller-visible restriction this cannot make exact:
+        ``similarity_threshold``.** It is not a clause -- callers pass it to the
+        search layer, which drops rows below it in Python *after* these rows are
+        off the cursor -- so no predicate the planner sees mentions it, and an
+        unrestricted search with a threshold still goes to the index. A row the
+        approximate scan missed cannot be recovered by a filter applied to what it
+        returned, so a caller who sets a threshold and passes no other restriction
+        gets an approximate answer filtered exactly, not an exact answer. That is
+        the one place the "exact by construction" claim in this file does not
+        reach, and it is here rather than left implicit.
+
+        **The plan cache is not a hole here, which was checked rather than
+        assumed.** A planner GUC does not rebuild a cached generic plan, so a
+        setting that arrives after one is built does nothing -- the defect this
+        file has met before. It does not apply because the setting is made *before*
+        the statement on every execution, so whichever execution PostgreSQL chooses
+        to build the generic plan on, it builds it with the index priced out.
+        Verified through the real store, 14 executions of each restricted shape on
+        one pooled connection, counters read from ``pg_stat_all_indexes``: 0 of 14
+        on the partial index and 0 on the shared one, under ``plan_cache_mode``
+        ``auto`` *and* under ``force_generic_plan``. The unrestricted search on the
+        same connection was 14 of 14 on the partial index, which is what makes that
+        a result rather than an absence.
+        """
+        prior: str | None = None
+        try:
+            # In a savepoint, the same way the mirrored block's probe is, and for
+            # the same reason: either of these statements can be cancelled like
+            # any other, and without a savepoint that failure leaves the caller's
+            # transaction aborted -- so the search below would raise
+            # ``InFailedSqlTransaction`` while this line claimed it had merely
+            # degraded. Rolling back to the savepoint is what makes the warning
+            # true. Verified on a live server all three ways: a released savepoint
+            # keeps a transaction-local ``set_config`` in force, a rolled-back one
+            # undoes it and leaves the transaction usable, and without one the next
+            # statement in the transaction is refused.
+            with self.session.begin_nested():
+                prior = str(
+                    self.session.execute(
+                        text("SELECT current_setting('enable_indexscan')")
+                    ).scalar()
+                )
+                self.session.execute(text("SELECT set_config('enable_indexscan', 'off', true)"))
+        except Exception as e:  # pragma: no cover - needs a live server
+            # What actually happens now: the setting is back where it was, the
+            # transaction is usable, and the search runs on the plan the planner
+            # picks for itself. Whether that plan is the exact one depends on the
+            # shape of the table rather than on the vector width -- see the sweep
+            # in the docstring -- so the honest statement is that this search may
+            # come back with a full page of rows that are not the nearest ones
+            # among those the caller named.
+            logger.warning(
+                "Could not price the approximate index out for KB %s: %s; this "
+                "restricted vector search will run on the planner's own plan, which "
+                "on some tables is an approximate index scan returning a full page "
+                "of rows that are not the nearest matching ones",
+                self.kb_id,
+                e,
+            )
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                # Savepointed like the two above, and for the caller's sake rather
+                # than this block's: the rows are already off the cursor when this
+                # runs, so a bare failure here would hand back a search that
+                # answered and a transaction that no longer works, and the error
+                # would surface on whatever the caller did next. When the
+                # transaction is already aborted -- the usual reason to be here at
+                # all -- the savepoint cannot be taken either and this logs exactly
+                # as it did before.
+                with self.session.begin_nested():
+                    self.session.execute(
+                        text("SELECT set_config('enable_indexscan', :prior, true)"),
+                        {"prior": prior},
+                    )
+            except Exception as e:
+                logger.debug(
+                    "Could not restore enable_indexscan=%s after a vector search on KB %s: %s",
+                    prior,
+                    self.kb_id,
+                    e,
+                )
+
+    _PARTIAL_INDEX_PROBE = """
+        SELECT
+            current_setting('enable_sort') AS prior_sort,
+            current_setting('hnsw.ef_search', true) AS prior_ef_search,
+            EXISTS (
+                SELECT 1 FROM pg_index
+                WHERE indexrelid = to_regclass(:index) AND indisvalid
+            ) AS usable
+    """
+
+    @contextmanager
+    def _preferring_this_kbs_partial_index(self, dims: int) -> Iterator[None]:
+        """Price an exact sort out of the search, when there is an index to fall on.
+
+        Everything else in this class makes the partial HNSW index *reachable*.
+        This is what makes the planner *take* it, and it is needed because at
+        1536 dimensions -- the width most embedding models here produce -- the
+        planner's arithmetic comes out the wrong way round.
+
+        A 1536-value vector does not fit in a heap tuple, so it is stored out of
+        line: the heap stays small (656 pages for 40,000 rows) while the HNSW
+        index holds about one tuple per page (12,001 pages for 12,000 tuples).
+        PostgreSQL then prices an exact scan as 656 pages plus a sort of narrow
+        tuples, and prices detoasting -- 12,000 out-of-line reads and 12,000
+        1536-value distance computations -- at nothing at all. So the exact scan
+        is systematically underpriced and the ordered index scan overpriced. That
+        is why the race is close at this width; it is not why either side of it
+        wins.
+
+        **Which side wins is decided by the shape of the table, and the earlier
+        claim that 1536 dimensions is the width at which "the planner declines the
+        index" is withdrawn.** It declined on the fixture this block was developed
+        against -- 20 knowledge bases, 39,995 rows, every share of the table from
+        21 % to 70 % -- and on others at the same width it takes the index unaided.
+        Measured on a 4,000-row knowledge base at 1536 dimensions with its own
+        partial index built and valid, the only thing changing between rows being
+        how many rows *other* knowledge bases hold:
+
+        | the knowledge base's share | planner unaided | with this block |
+        |---|---|---|
+        | 4,000 of 4,000 rows (100 %) | **the partial index**, cost 159.06 | the same plan at the same cost |
+        | 4,000 of 10,000 (40 %) | **the partial index**, cost 400.22 | the same plan at the same cost |
+        | 4,000 of 24,000 (17 %) | an exact plan, cost 609.51 | the partial index, cost 1009.06 |
+        | 4,000 of 44,000 (9 %) | an exact plan, cost 1672.36 | the partial index, cost 3122.14 |
+
+        A third fixture at this width takes the index unaided at every
+        ``ef_search`` from 40 to 600 (cost 846.66 against an exact scan's
+        1918.58). The same sweep at 384 dimensions, where a vector is inline, took
+        the index unaided on all four shapes.
+
+        **So this block is insurance, and on some shapes it buys a round trip and
+        two session settings for the plan the planner had already picked.** Nothing
+        here can tell those shapes apart at search time: the probe answers whether
+        the index exists, not whether the planner needed persuading. That is a
+        deliberate trade rather than an omission -- being wrong in this direction
+        costs the +0.3 ms the probe measures below, and being wrong in the other
+        costs the 50.5 -> 5.2 ms row in the table that follows. What it is not is a
+        property of the vector width, so a later measurement that finds the index
+        chosen unaided at 1536 dimensions is reproducing the table above rather
+        than contradicting it.
+
+        Measured through ``vector_search`` itself, 12 executions on one pooled
+        connection under ``force_generic_plan``, ``top_k`` 20, on that fixture,
+        with the knowledge base's partial index built and valid:
+
+        | knowledge base | search | before | with this |
+        |---|---|---|---|
+        | 30 % of the table | unfiltered | 0/12 on the index, 50.5 ms | 12/12, 5.2 ms |
+        | 30 % | one metadata key | 0/12, 15.2 ms | 12/12, 8.5 ms |
+        | 30 % | two metadata keys | 0/12, 15.0 ms | 12/12, 7.4 ms |
+        | 21 % of the table | unfiltered | 0/12, 38.0 ms | 12/12, 4.7 ms |
+
+        The filtered rows in that table are history: a filtered search no longer
+        comes here at all (see below). They are worth keeping only for what they
+        showed about the *estimate*, which is that a filter whose key is the
+        knowledge base is multiplied by the knowledge-base predicate as though the
+        two were independent. Measured at 384 dimensions on the live fixture:
+        ``{"tier": "gold"}`` estimates 722 rows of 2,400 real and keeps the
+        index, and filtering on the knowledge base alone estimates 1,076 of
+        12,000 and keeps it -- but the two together estimate **217 of the same
+        2,400** and lose it, an ordered index scan at 5,060 against a sort at
+        3,837. So it is an 11x-low correlated estimate rather than a key count:
+        two uncorrelated keys are likely fine. The estimate is wrong, not the
+        clause, so the fix belongs here rather than in how the filter is
+        compiled.
+
+        **Only with an index of this knowledge base's own.** This is a cost
+        penalty on every sort in the statement, not an instruction to use a
+        particular index, so with no partial index it drives the query onto the
+        *shared* per-dimension index, which spans every knowledge base and
+        post-filters. Measured on the same fixture with no partial index built,
+        median of six query vectors:
+
+        | knowledge base | planner's own choice | this, ungated |
+        |---|---|---|
+        | 21 %, 8,400 rows | exact scan, 34.4 ms, recall 1.00 | shared index, 6.3 ms |
+        | 5 %, 2,000 rows | exact scan, 9.4 ms, recall 1.00 | shared index, 31.3 ms |
+        | 1 %, 400 rows | exact scan, 1.8 ms, recall 1.00 | shared index, 39.8 ms |
+
+        Mostly *slower*, and with a bad tail on the small knowledge bases. The
+        recall figures this table used to carry (0.08 at 21 %, 0.04 at 5 %) are
+        an artifact of the fixture rather than a property of the shared index:
+        measured again on real embeddings the same shapes give 0.927 and 0.964.
+        What does survive on real data is the latency inversion -- the shared
+        index gets slower as the knowledge base gets smaller, because the
+        post-filter discards more, 7.40 ms at 1 % against an exact scan's 1.66 --
+        and the tail, where 1 % is the one cell in the whole real-embedding run
+        with a minimum recall below 0.5.
+
+        That is what the catalog probe buys: a knowledge base below the build
+        threshold, one whose index is INVALID, and one whose index is still being
+        built all keep the plan they have today -- measured, 0 of 12 executions on
+        the index and recall 1.00 in each case. The probe costs a round trip,
+        which for a knowledge base that has no index is the whole of what this
+        adds: +0.3 ms, measured over 120 searches each at 400, 2,000 and 8,400
+        rows.
+
+        **What the probe cannot buy, and this is a standing limitation rather than
+        a fixed bug: a sort penalty cannot break a tie between two index plans, so
+        where the shared index is cheaper the gate hands the search to it.**
+        ``enable_sort = off`` adds a penalty to every sort path and to nothing
+        else; it does not price one index above another. So it can move a search
+        off an exact plan -- the case the tables above measure, and the case it is
+        here for -- but between this knowledge base's partial index and the shared
+        per-dimension one it changes no ordering at all. That leaves three
+        outcomes, and the probe distinguishes none of them: where the planner had
+        already chosen the partial index the block is inert; where the exact sort
+        was winning it is load-bearing; and where the shared index prices below the
+        partial one it is *worse* than doing nothing, because it takes away the
+        exact plan and what the search lands on is the index spanning every other
+        knowledge base. The probe answers "does this knowledge base have a valid
+        partial index", and nothing here reads back which index the plan actually
+        used.
+
+        Stated as a property rather than with a window of ``ef_search`` values,
+        deliberately: the crossover moves with the fixture, and three successive
+        measured windows each turned out to be a fact about one fixture rather than
+        about the mechanism. The mechanism is the sentence in bold, which follows
+        from what the GUC prices rather than from any fixture. Shipped knowingly:
+        the case it was measured on is real and common, and the remedy is not a
+        cost penalty (see ``PER_KB_HNSW_EF_SEARCH`` for what a guard would have to
+        read).
+
+        **Only for an unrestricted search, and that is the other half of the
+        gate.** The probe answers "does this knowledge base have a valid partial
+        index", which is not the same proposition as "is this search better off
+        on it". Any extra predicate turns the ordered scan into a walk of the
+        index for rows the join or the restriction then throws away, and every
+        restricted shape measured at 1536 dimensions through ``vector_search``
+        came out both slower and less accurate:
+
+        | search | planner's choice | on the index |
+        |---|---|---|
+        | unfiltered | 46.0 ms, recall 1.00 | **15.3 ms** |
+        | ``source_ids``, one source of six | 22.7 ms, recall 1.00 | 28.5 ms, recall 0.49 |
+        | ``item_ids``, 200 named | 11.0 ms, recall 1.00 | 37.8 ms, recall 0.80 |
+        | ``filter_metadata`` matching no row | 3.0 ms | 38.3 ms |
+        | ``source_ids`` matching no row | 2.4 ms | 36.7 ms |
+
+        Row one is the whole of what this mechanism is for. So a search carrying
+        ``item_ids``, ``source_ids`` or a metadata filter does not enter this block
+        at all -- it gets ``_insisting_on_an_exact_search`` instead, which prices
+        the index out rather than merely declining to force it in.
+
+        **Not forcing is not enough, and that is worth stating because it was the
+        first fix tried.** The planner's own choice is the same cost race, and on
+        the shapes where it comes out for the index a *restricted* search gets an
+        approximate answer unaided: a full page of ``top_k`` rows of which 12 to 17
+        of 20 were not the nearest matching ones, on the 384-dimension fixture
+        where that was counted. Which shapes those are is again a question about
+        the table rather than about the width -- the same sweep, read for a
+        restricted search in ``_insisting_on_an_exact_search``'s docstring, took
+        the index unaided at 384 dimensions on every share from 9 % to 100 %, and
+        at 1536 dimensions on the two shapes where the knowledge base held 40 % of
+        the table or more. There is no signal in a full page. Nor can a re-run
+        repair it: where the planner already prefers the index, the re-run replays
+        the same approximate scan. So the restricted case is made exact by
+        construction, on both sides of the race.
+
+        The cost of a restricted search that did get here anyway is bounded
+        rather than proportional: pgvector stops an iterative scan at
+        ``hnsw.max_scan_tuples``, 20,000 by default, so this is a ceiling and not
+        something that grows with the knowledge base.
+
+        Recall is the trade even when the index is there, and it is a real trade
+        rather than the collapse this docstring used to imply. On real embeddings
+        -- 39,995 passages, 300 held-out queries encoded asymmetrically -- an
+        unfiltered search on the index returns 0.915 at 30 % of the table and
+        0.933 at 21 %, with the worst of 300 queries at 0.70 and nothing below
+        half. The 0.22/0.28 this fixture gives at the same selectivities is a
+        generator artifact: clustered random noise in 1536 dimensions puts almost
+        every pair about equally far apart, so there is barely a nearest
+        neighbour to find. Neither number is a production figure; the first is the
+        one to reason from.
+
+        Because that trade grows with the *absolute* size of the index, this block
+        also raises ``hnsw.ef_search`` to ``PER_KB_HNSW_EF_SEARCH`` -- see that
+        constant for the measurement, and for why the supported band has an upper
+        bound. It is set here rather than globally for the same reason
+        ``enable_sort`` is: it is only the right value while the search is on a
+        knowledge base's own index, and the two are otherwise independent.
+
+        ``set_config(..., true)`` rather than ``SET LOCAL`` so the previous values
+        can be bound; the third argument is what makes them transaction-local.
+        Transaction-local is not enough on its own here, and that is why every
+        setting this store touches is now restored rather than left to the
+        transaction: ``hybrid_search`` runs its keyword leg on the same session
+        immediately after the vector leg, and a keyword ranking is a sort. So the
+        previous values go back on before this returns, the same way
+        ``_fetch_with_timeout`` restores its budget and
+        ``_insisting_on_an_exact_search`` restores ``enable_indexscan``.
+
+        One case is deliberately *not* restored, and it is the common one rather
+        than an edge: when the probe read no ``ef_search`` at all. That is what a
+        fresh pooled connection always reports, because pgvector registers the GUC
+        on the first use of the vector type and the probe runs before any -- so
+        there is no prior value to bind, and the guard on the restore is kept
+        rather than made to invent one.
+
+        What that leaves is the raised value in force for the rest of *this*
+        transaction. The bound is the transaction and nothing wider: the third
+        argument to ``set_config`` makes it transaction-local, so it dies at
+        commit or rollback and cannot follow the connection back into the pool --
+        checked on a live server, where the next transaction on the same
+        connection read pgvector's own default again. Nothing between here and
+        that point reads it either; the keyword leg ``hybrid_search`` runs on this
+        session ranks with a sort, not an ANN scan. So this is a choice, not an
+        omission, and no spec asserts anything about the value after the search
+        because there is nothing about it worth pinning.
+
+        **All three statements run in a savepoint, and until they did, two of the
+        three handlers below said the opposite of what happened.** A failure
+        anywhere here is meant to degrade latency or recall and never the answer,
+        which is why every one of them is logged rather than raised. That is only
+        true of a statement inside a savepoint: a server-side error outside one
+        aborts the caller's transaction, so the search that follows raises
+        ``InFailedSqlTransaction`` while the handler logs that it had merely
+        degraded. Measured by injecting a server-side failure at each of the three
+        statements in turn -- a shadow ``set_config``/``to_regclass`` ahead of
+        ``pg_catalog`` on the ``search_path``, raising for one named GUC and
+        delegating for the rest, so exactly one statement fails and the others are
+        untouched:
+
+        | failure injected at | probe savepointed only | all three savepointed |
+        |---|---|---|
+        | the catalog probe | search runs | search runs |
+        | ``set_config('enable_sort', 'off')`` | **search raises** | search runs |
+        | ``set_config('hnsw.ef_search', 120)`` | **search raises** | search runs |
+
+        The two ``set_config`` calls take a savepoint each rather than sharing
+        one, because a failure has to undo its own statement and nothing else: a
+        released savepoint keeps a transaction-local ``set_config`` in force, so
+        ``enable_sort = off`` survives a rolled-back ``ef_search`` and the search
+        still reaches the index at pgvector's default recall -- which is what that
+        handler says happens.
+
+        **The restores are savepointed too, and they had to be.** Eight statements
+        issue from the two blocks, not five: three of them are restores, and a
+        failure there is worse than it looks rather than harmless. The rows are
+        already off the cursor by then, so a bare failure hands the caller a search
+        that *answered* and a transaction that no longer works, and the error
+        surfaces on whatever the request does next -- resolving the items,
+        reranking, a write. Injected at each restore on its own, before:
+
+        | failure injected at | restores bare | restores savepointed |
+        |---|---|---|
+        | ``set_config('enable_indexscan', prior)`` | answers, then the **caller's transaction is aborted** | answers, transaction usable |
+        | ``set_config('enable_sort', prior)`` | answers, then the **caller's transaction is aborted** | answers, transaction usable |
+        | ``set_config('hnsw.ef_search', prior)`` | not reached on a fresh connection (the probe read NULL) | same |
+
+        This cannot make the common case worse: the failure a restore usually meets
+        is a transaction the search itself aborted, and there the savepoint cannot
+        be taken either, so the handler logs exactly what it logged before.
+        """
+        # Not inside the try below: both arguments have already been validated by
+        # the caller, so a failure here is a programming error and should not be
+        # logged as a missing index.
+        index = f'"{self.schema}".{pg_vector_index.per_kb_index_name(self.kb_id, dims)}'
+        prior: str | None = None
+        prior_ef_search: str | None = None
+        try:
+            with self.session.begin_nested():
+                rows = list(self.session.execute(text(self._PARTIAL_INDEX_PROBE), {"index": index}))
+            if rows and rows[0][2]:
+                prior = str(rows[0][0])
+                prior_ef_search = None if rows[0][1] is None else str(rows[0][1])
+        except Exception as e:  # pragma: no cover - needs a live catalog
+            logger.warning(
+                "Could not check for KB %s's partial HNSW index at %d dimensions: %s; "
+                "this vector search may fall back to an exact scan",
+                self.kb_id,
+                dims,
+                e,
+            )
+        if prior is None:
+            yield
+            return
+        try:
+            # In a savepoint, like the probe above and for the same reason: a
+            # ``set_config`` can be cancelled like any other statement, and a
+            # failure outside a savepoint leaves the caller's transaction aborted
+            # -- so the search below would raise ``InFailedSqlTransaction`` while
+            # this handler claimed the search had merely lost the index. Rolling
+            # back to the savepoint is what makes the warning true. Measured with
+            # a server-side failure injected at exactly this statement: without
+            # the savepoint the search raises ``InternalError``, with it the
+            # search runs.
+            with self.session.begin_nested():
+                self.session.execute(text("SELECT set_config('enable_sort', 'off', true)"))
+        except Exception as e:  # pragma: no cover - needs a live server
+            # What actually happens now: nothing was changed, the transaction is
+            # usable, and the search runs on the planner's own plan. On the shapes
+            # where that plan is the exact scan this block exists to price out, the
+            # answer is right and the latency is what it was before the feature; on
+            # the shapes where the planner takes the index unaided it is the plan
+            # this block wanted anyway.
+            logger.warning(
+                "Could not price the exact sort out for KB %s: %s; this vector search "
+                "runs on the planner's own plan and so may miss the knowledge base's "
+                "partial HNSW index",
+                self.kb_id,
+                e,
+            )
+            yield
+            return
+        # Set unconditionally, and NOT gated on the probe having read a value.
+        # pgvector registers its GUCs in ``_PG_init``, which runs on the first
+        # *use of the vector type* -- not at ``CREATE EXTENSION`` and not at
+        # connection start, because the library is not preloaded. So on a fresh
+        # pooled connection the probe above reads NULL, and gating the raise on
+        # that read left the first search of every connection at pgvector's
+        # default 40 instead of this value: recall 0.915 rather than 0.973 at
+        # 12,000 rows, projecting to about 0.85 several times above the build
+        # threshold. One such search per connection per pool lifetime, and the
+        # first search on a connection is also the one most likely to be cold.
+        # ``SET LOCAL hnsw.iterative_scan`` earlier in the search does not load
+        # the library either -- a dotted name is accepted as a placeholder.
+        #
+        # Setting it anyway is safe, and was measured rather than assumed: a
+        # ``set_config`` on an unloaded pgvector GUC creates a placeholder, the
+        # value survives ``_PG_init`` (read back as 120 after the first distance
+        # operation in the same transaction), and it is still transaction-local,
+        # so the next transaction on the connection sees pgvector's own default
+        # again. On a database where the extension is not installed at all it is
+        # accepted the same way, so this adds no new failure path.
+        #
+        # The *restore* below stays gated, and correctly so: with nothing read
+        # there is no value to put back, and a placeholder set with the third
+        # argument dies with the transaction regardless.
+        try:
+            # Its own savepoint, not the one above: a failure here must undo this
+            # statement and nothing else, so that ``enable_sort = off`` -- already
+            # released, and released means kept -- stays in force and the search
+            # still reaches the index, which is what the handler below says
+            # happens. Verified with a server-side failure injected at exactly
+            # this statement.
+            with self.session.begin_nested():
+                self.session.execute(
+                    text("SELECT set_config('hnsw.ef_search', :ef, true)"),
+                    {"ef": str(PER_KB_HNSW_EF_SEARCH)},
+                )
+        except Exception as e:  # pragma: no cover - depends on pgvector version
+            # The search still runs, on the index, at pgvector's default
+            # ef_search -- lower recall than intended, not a wrong answer, so
+            # the block goes ahead rather than giving the index up. That is true
+            # because this statement had a savepoint of its own: rolling it back
+            # leaves ``enable_sort = off`` in force and the transaction usable.
+            logger.warning(
+                "Could not raise hnsw.ef_search to %d for KB %s: %s; this vector "
+                "search will run at pgvector's default recall",
+                PER_KB_HNSW_EF_SEARCH,
+                self.kb_id,
+                e,
+            )
+            prior_ef_search = None
+        try:
+            yield
+        finally:
+            # One statement per setting, each naming its own GUC, so the restore
+            # is as readable in a captured statement list as the set was.
+            if prior_ef_search is not None:
+                try:
+                    # In a savepoint for the caller's sake: see the note on the
+                    # restore in ``_insisting_on_an_exact_search``.
+                    with self.session.begin_nested():
+                        self.session.execute(
+                            text("SELECT set_config('hnsw.ef_search', :prior, true)"),
+                            {"prior": prior_ef_search},
+                        )
+                except Exception as e:
+                    logger.debug(
+                        "Could not restore hnsw.ef_search=%s after a vector search on KB %s: %s",
+                        prior_ef_search,
+                        self.kb_id,
+                        e,
+                    )
+            try:
+                with self.session.begin_nested():
+                    self.session.execute(
+                        text("SELECT set_config('enable_sort', :prior, true)"), {"prior": prior}
+                    )
+            except Exception as e:
+                logger.debug(
+                    "Could not restore enable_sort=%s after a vector search on KB %s: %s",
+                    prior,
+                    self.kb_id,
+                    e,
+                )
 
     def _fetch_with_timeout(
         self, sql: str, params: dict[str, Any], timeout_ms: int, *, query: str
@@ -477,9 +1400,166 @@ class BasePgVectorStore:
         # to use it, our distance expression must contain that exact cast.
         # dims is interpolated into SQL (not bound) because PostgreSQL does not
         # allow type modifiers to come from a parameter; range-check guards it.
+        # int() truncates rather than rejects, so a float 1536.9 would search as
+        # 1536 -- surprising, safe to emit, and not reachable from a caller that
+        # takes the value off a stored embedding.
         if not (1 <= effective_dims <= 8192):
             raise ValueError(f"dims must be between 1 and 8192, got {effective_dims}")
+        effective_top_k = validated_top_k(top_k)
 
+        # The embeddings-side knowledge_base_id predicate is what lets the
+        # planner use this KB's partial HNSW index, if it has one: a partial
+        # index is only matched from a restriction clause on the relation it is
+        # on, and the planner does not reason through `e.item_id = c.id` to
+        # reach `c.knowledge_base_id`. Without it the plan picks the shared
+        # per-dimension index and post-filters -- verified by EXPLAIN with the
+        # partial index present.
+        #
+        # The item-table filter stays, and not for the reason this comment used
+        # to give. It is not a correctness guard: an embedding whose item no
+        # longer exists is dropped by the inner join, not by this clause, and
+        # nothing in this service ever moves an item between knowledge bases --
+        # both rows are written from one value in the same transaction and no
+        # statement anywhere updates either column -- so the two columns cannot
+        # disagree. It stays because it is the item table's *partition key*: the
+        # item tables are partitioned BY LIST (knowledge_base_id), and the join
+        # alone would read every partition, as `_iter_items_for_kb_bm25` says for
+        # the same reason. Measured at 1536 dimensions on a 20-knowledge-base
+        # fixture whose item table was partitioned exactly as deployed, dropping
+        # it cost 5.1 -> 9.8 ms at 1% of the table and 18.0 -> 26.9 ms at 5%,
+        # and the shape of that cost is a factor of the partition count: on the
+        # sequential path one scan per partition instead of one -- 21 on that
+        # fixture -- and on the indexed path one primary-key probe per partition
+        # for every row returned. Nothing in this module bounds the partition
+        # count; it grows with the number of knowledge bases the BM25 builder has
+        # touched, so it is a number to measure per deployment rather than one to
+        # write down here.
+        #
+        # "Prunes to ONE partition" would be too strong, and the difference
+        # matters for exactly the population this feature exists for. A partition
+        # per knowledge base is created only by `ensure_bm25_index`, which returns
+        # early unless the knowledge base's `retrieval_method` is `hybrid` or
+        # `full_text`. A pure-*vector* knowledge base has no partition of its own,
+        # so this clause prunes to DEFAULT -- still one relation instead of all of
+        # them, which is the saving above, but not a partition of its own.
+        #
+        # It is not free either, and the cost is a row estimate rather than a
+        # correctness risk. `c.knowledge_base_id = K` and `e.knowledge_base_id =
+        # K` are perfectly correlated, and the planner multiplies them as
+        # independent: the join estimate becomes
+        # `rows(c matching K) * rows(e matching K) / n_distinct(e.item_id)`,
+        # which is the true count times the knowledge base's share of the table.
+        # Measured on the fixture above, each shape against 12,000, 8,400, 2,000
+        # and 400 real rows:
+        #
+        # | shape                            | 30 %   | 21 %  | 5 %   | 1 %  |
+        # |---|---|---|---|---|
+        # | `c.knowledge_base_id = K` alone  | 12,074 | 8,339 | 2,028 | 393  |
+        # | `e.knowledge_base_id = K` alone  | 12,076 | 8,394 | 2,002 | 396  |
+        # | both, i.e. this statement        |  3,646 | 1,750 |   102 |   4  |
+        #
+        # So a 1 % knowledge base is estimated 100x low, and that underestimate
+        # is part of what `_preferring_this_kbs_partial_index` has to overcome.
+        # Dropping the clause corrects the estimate exactly, and the reason not to
+        # is the pruning above and nothing else: one relation read instead of
+        # every partition, or one primary-key probe per returned row instead of
+        # one per partition.
+        #
+        # What this paragraph used to also claim -- that with the estimate
+        # corrected the planner still declines the index, so correcting it is not
+        # an alternative to the gate -- is a fixture result and was written as a
+        # property. One fixture put the crossover at 30 % of the table, a second
+        # at 21 %, and a third had the planner take the index unaided at all four
+        # shares measured. Three fixtures, three answers; the clause is defended
+        # on pruning, which is a structural fact about the schema, and the gate is
+        # defended by its own measurements rather than by this one.
+        #
+        # For the record, so nobody re-proposes it: extended statistics cannot fix
+        # the estimate. `CREATE STATISTICS` is single-relation in PG 15 and 16 --
+        # the cross-table form is rejected outright, "only a single relation is
+        # allowed in CREATE STATISTICS" -- and the correlation here is between two
+        # tables.
+        #
+        # The KB id is interpolated on BOTH sides, and the second one was
+        # measured rather than reasoned about. The embeddings-side literal is
+        # what makes the index *matchable*; it is not what makes the planner
+        # choose it. With `c.knowledge_base_id` still bound, a generic plan has
+        # no row estimate for the item side of the join, so it prices a hash
+        # join plus an exact sort below the ordered index scan the index would
+        # drive -- the index is matchable and not chosen. Measured through the
+        # real driver on one pooled connection, on a table where the KB is a
+        # small fraction of the rows (the regime this feature exists for):
+        # ~0.98 ms while the custom plan held, ~135 ms from the execution the
+        # generic plan was adopted on, and for the life of that connection.
+        # Both literals come from the same validated gate, so the second costs
+        # no new injection surface.
+        #
+        # `e.item_table` is the third literal in the predicate, and it is here
+        # because the index is single-population by construction: `ai.embeddings`
+        # is polymorphic, a knowledge base crosses the build threshold on the SUM
+        # over its item tables, and an index mixing populations is walked for
+        # entries that cannot join. Measured on the same 1,000 chunk rows, an
+        # index over chunks alone against chunks plus 9,000 document rows: recall
+        # 0.858 -> 0.383; and on 6,000 chunk rows with and without 6,000
+        # graph-node rows, 0.925 -> 0.812 with the worst query at 0.700 -> 0.300.
+        # The index predicate names it, so the query has to name it as a literal
+        # for a generic plan to prove the predicate -- the same reason the KB id
+        # and `dims` are literals.
+        #
+        # It returns no different rows, and that is a property rather than a
+        # hope: an embedding's `item_table` is the table its item lives in, both
+        # columns are written from one value in the same statement, and the join
+        # already restricts to this table's rows. So it is a redundant clause
+        # whose only job is to be provable -- and, incidentally, the one thing
+        # that would stop an `item_id` collision across two item tables joining
+        # the wrong row. Verified rather than argued: on a fixture whose
+        # embeddings table holds all three populations for every knowledge base,
+        # 144 comparisons (2 stores x 3 knowledge base sizes x 4 restriction
+        # shapes x 6 query vectors, every scan priced out on both sides so the
+        # answers are exact), the row sets with and without the clause were
+        # identical in every one.
+        #
+        # Without it the restricted index predicate cannot be *proved*, which is
+        # the whole point: with `item_table = 'chunks'` in the index predicate and
+        # this clause absent, EXPLAIN ANALYZE takes the shared per-dimension index
+        # instead -- 12.2 ms against the partial index's 1.45 ms -- under
+        # `plan_cache_mode` `auto` and `force_generic_plan` alike. The two halves
+        # only work together.
+        #
+        # What it costs is another correlated clause on the same estimate. It
+        # multiplies the underestimate below by the item table's *global*
+        # frequency, which on the same fixture is 0.789 for chunks:
+        #
+        # | shape                                | BIG    | MED   | THIN |
+        # |---|---|---|---|
+        # | real chunk rows                      | 12,000 | 8,400 |  400 |
+        # | `c.knowledge_base_id = K` alone      | 12,000 | 8,400 |  400 |
+        # | `e.knowledge_base_id = K` alone      | 12,580 | 7,420 |  554 |
+        # | both                                 |  5,242 | 2,164 |    8 |
+        # | **both + `e.item_table`**            |  4,136 | 1,708 |    6 |
+        #
+        # So about 1.27x worse on the join estimate, on top of an error the gate
+        # below already has to overcome. The scan estimate on the embeddings side
+        # moves the other way and gets *better*, because that is the side the
+        # clause actually restricts: 15,943 -> 12,581 against 12,000 real rows.
+        # Correctness settles it either way -- an index mixing populations is
+        # walked for rows that cannot join -- but the number is here rather than
+        # left to be discovered.
+        #
+        # So five values decide whether a prepared statement keeps the index:
+        # the KB id on each side, `item_table`, `dims`, and the LIMIT. All five
+        # are interpolated -- a generic plan can only match the index's predicate
+        # when it can prove all of it, and the planner's estimate for an unknown
+        # LIMIT prices the ordered index scan out. kb_sql_literal has the
+        # measured table; all of them are validated above.
+        #
+        # What cannot be a literal is the metadata filter below: it is caller
+        # data, so it is bound as jsonb, and a generic plan has no selectivity
+        # estimate for `@>` at all. That is why a filtered search asks for a
+        # bound as jsonb -- and a search carrying one is made exact instead of
+        # approximate, see _insisting_on_an_exact_search.
+        kb_literal = kb_sql_literal(self.kb_id)
+        item_table_literal = item_table_sql_literal(self.TABLE)
         query = f"""
             SELECT
                 c.id,
@@ -489,14 +1569,14 @@ class BasePgVectorStore:
                 c.meta
             FROM "{self.schema}".{self.TABLE} c
             JOIN "{self.schema}".embeddings e ON e.item_id = c.id
-            WHERE c.knowledge_base_id = :kb_id
-              AND e.dims = :dims
+            WHERE c.knowledge_base_id = {kb_literal}
+              AND e.knowledge_base_id = {kb_literal}
+              AND e.item_table = {item_table_literal}
+              AND e.dims = {effective_dims}
         """
 
         params: dict[str, Any] = {
             "embedding": embedding_str,
-            "kb_id": self.kb_id,
-            "dims": effective_dims,
         }
 
         if item_ids is not None:
@@ -513,25 +1593,70 @@ class BasePgVectorStore:
 
         query += f"""
             ORDER BY (e.embedding::vector({effective_dims})) <=> CAST(:embedding AS vector({effective_dims}))
-            LIMIT :top_k
+            LIMIT {effective_top_k}
         """
-        params["top_k"] = top_k
+
+        def run_the_search() -> list[RetrievedItem]:
+            result = self.session.execute(text(query), params)
+            return [
+                RetrievedItem(
+                    item_id=str(row[0]),
+                    text=row[1],
+                    score=float(row[2]) if row[2] is not None else 0.0,
+                    source_id=str(row[3]) if row[3] else None,
+                    knowledge_base_id=self.kb_id,
+                    meta=row[4] or {},
+                )
+                for row in result
+            ]
+
+        # Which of the two blocks below this search gets, and it is deliberately
+        # symmetric: a search the caller restricted must be exact, and one it did
+        # not restrict should use the index if there is one.
+        #
+        # Keyed on the arguments, not on the clauses built above: how a restriction
+        # is compiled may change, the reason a restricted search must be exact does
+        # not. ``is not None`` rather than truthiness for the two id sets, so it
+        # matches exactly the condition under which a clause was added -- an empty
+        # set narrows the search to nothing, which is the most starved restriction
+        # there is.
+        #
+        # There is no safety net after the fact any more, and that is the point.
+        # The old one re-ran a short answer with the sort available, which cannot
+        # repair the case that matters: a restriction with more matching rows than
+        # ``top_k`` comes back with a *full* page of the wrong rows, so there is
+        # nothing short to trigger on -- and where the planner's own preferred plan
+        # is also the index, the re-run replays the same approximate scan and
+        # returns the same answer. Exactness is structural here instead.
+        restricted = item_ids is not None or source_ids is not None or bool(filter_metadata)
 
         try:
             self._apply_iterative_scan()
-            result = self.session.execute(text(query), params)
-            items = []
-            for row in result:
-                items.append(
-                    RetrievedItem(
-                        item_id=str(row[0]),
-                        text=row[1],
-                        score=float(row[2]) if row[2] is not None else 0.0,
-                        source_id=str(row[3]) if row[3] else None,
-                        knowledge_base_id=self.kb_id,
-                        meta=row[4] or {},
-                    )
-                )
+            # Both blocks wrap the execution rather than preceding it, because a
+            # setting must not be put back until the rows are off the cursor. The
+            # plan is fixed when the statement executes, so this is belt and
+            # braces -- but the belt is free and the alternative depends on how
+            # the driver buffers.
+            if restricted:
+                with self._insisting_on_an_exact_search():
+                    items = run_the_search()
+            elif self.TABLE == PER_KB_INDEX_ITEM_TABLE:
+                with self._preferring_this_kbs_partial_index(effective_dims):
+                    items = run_the_search()
+            else:
+                # An unrestricted search from one of the other item tables. The
+                # index is named after the knowledge base and the dimension, so
+                # the probe would find it, but its predicate restricts
+                # ``item_table`` to the chunks store -- it holds none of this
+                # store's rows, and steering at it would walk entries that cannot
+                # join. Measured at 1536 dimensions on a 40-row document-level
+                # store, before the predicate was restricted at all: 2.2 -> 25.9
+                # ms, recall 1.00 -> 0.33.
+                #
+                # This is the ONLY branch left on the planner's own plan. A
+                # restricted search from this same store took the branch above it,
+                # because exactness is not a chunks-only concern.
+                items = run_the_search()
             return self._resolve_results(items) if _resolve else items
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
@@ -557,6 +1682,43 @@ class BasePgVectorStore:
         ``source_cap`` most-relevant *matched* sources are kept, to bound cost;
         the threshold is applied before that cap so a below-threshold source
         cannot consume a slot.
+
+        **This path deliberately keeps the planner's own plan**, where
+        ``vector_search`` steers it: no partial-index gate, no custom plan, and
+        no raised ``ef_search``. It is not an oversight and it is not the
+        inconsistency it looks like from the KB literal it does carry. The query
+        has no ``LIMIT`` on the distance order -- it scores every row of the
+        knowledge base by design, then ranks within each source -- so there is no
+        ordered-index-scan-against-sort race for the gate to win. Measured at 1536
+        dimensions on a 12,000-row knowledge base with its partial index built and
+        valid: the plan reaches no HNSW index in any configuration, it contains
+        six sort nodes that no setting can remove, ``enable_sort = off`` makes it
+        **4.8x slower** (50.5 -> 244.7 ms) while changing nothing about which index
+        it uses, and ``ef_search`` is inert (48.3 ms, within noise). The gate would
+        be a pure regression here.
+
+        The remaining parameters stay bound for the same reason: with no ordered
+        index scan there is no unknown row estimate to price one out, so a generic
+        plan costs nothing and one shared statement text serves every knowledge
+        base.
+
+        **A ``LIMIT`` on the distance order would make this ``vector_search``'s
+        shape -- and this query cannot reach the partial index even then, because
+        it does not carry ``e.item_table``.** The index's predicate names one
+        population (see ``PER_KB_INDEX_ITEM_TABLE``), and PostgreSQL matches a
+        partial index only from restriction clauses that *prove* the predicate, so
+        without that literal there is no plan in which this statement uses the
+        index -- the measurement above is right today for a reason it does not
+        mention. Measured by taking ``vector_search``'s own statement, which does
+        reach the index (cost 1,681.79), and deleting only that one clause: the
+        planner reaches no HNSW index at all, and ``enable_sort = off`` does not
+        recover it -- it adds the disable penalty to the same exact plan
+        (5,084.26 -> 10,000,005,084.26). With the shared per-dimension index still
+        in place the statement would land on that instead, which is the plan this
+        query has today anyway. Anyone adding the ``LIMIT`` has to add the ``item_table`` literal
+        and the gate with it, or the change lands as a query that has given up the
+        sort it was built on and gained no index in exchange. That is three
+        statements, not one, which is why none of them is here.
         """
         embedding_str = f"[{','.join(str(x) for x in embedding)}]"
         effective_dims = int(dims or len(embedding))
@@ -567,7 +1729,6 @@ class BasePgVectorStore:
         params: dict[str, Any] = {
             "embedding": embedding_str,
             "kb_id": self.kb_id,
-            "dims": effective_dims,
             "per_source_k": per_source_k,
             "source_cap": source_cap,
             "threshold": similarity_threshold,
@@ -580,6 +1741,21 @@ class BasePgVectorStore:
             f"(e.embedding::vector({effective_dims})) "
             f"<=> CAST(:embedding AS vector({effective_dims}))"
         )
+        # This leg already carried the embeddings-side knowledge_base_id
+        # predicate; it and `dims` are literals here for the same reason
+        # vector_search's are (see kb_sql_literal), so a prepared statement's
+        # generic plan can prove the partial index's whole predicate. Unlike
+        # vector_search this query has no outer LIMIT on the distance order -- it
+        # scores the whole knowledge base by design, so no HNSW index is used
+        # either way, and the remaining parameters stay bound.
+        #
+        # That is also why the item-table id below is still bound, where
+        # vector_search interpolates it on both sides: there is no ordered index
+        # scan here for an unknown row estimate to price out, so the bind costs
+        # nothing -- and it keeps one statement text shared across knowledge
+        # bases instead of one per knowledge base in the driver's
+        # prepared-statement cache. A LIMIT on the distance order would make this
+        # query vector_search's shape and the bind would then matter.
         query = f"""
             WITH scored AS (
                 SELECT
@@ -591,8 +1767,8 @@ class BasePgVectorStore:
                 FROM "{self.schema}".{self.TABLE} c
                 JOIN "{self.schema}".embeddings e ON e.item_id = c.id
                 WHERE c.knowledge_base_id = :kb_id
-                  AND e.knowledge_base_id = :kb_id
-                  AND e.dims = :dims
+                  AND e.knowledge_base_id = {kb_sql_literal(self.kb_id)}
+                  AND e.dims = {effective_dims}
                   {source_filter}
             ),
             ranked AS (
@@ -1169,6 +2345,15 @@ class BasePgVectorStore:
         """Combine vector and full-text search using Reciprocal Rank Fusion."""
         from agentic.knowledge.retrieval.fusion import reciprocal_rank_fusion
 
+        # Checked here, against the caller's own value, because the vector leg
+        # below is handed ``top_k * 2`` -- so left to that leg the error message
+        # would name a number the caller never sent, and a ceiling reported as
+        # twice what it is cannot be acted on.
+        if validated_top_k(top_k) * 2 > MAX_TOP_K:
+            raise ValueError(
+                f"top_k must be between 0 and {MAX_TOP_K // 2} for hybrid search, "
+                f"which fetches twice it from each leg, got {top_k}"
+            )
         fetch_count = top_k * 2
         vector_results = await self.vector_search(
             embedding,

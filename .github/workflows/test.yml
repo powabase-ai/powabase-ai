@@ -53,8 +53,34 @@ jobs:
 
       # --no-sync: the step above already resolved and materialized the venv;
       # this stops uv re-resolving mid-suite.
+      #
+      # The guard the `store` and `pg_search` jobs have, for the same reason:
+      # everything this tier can skip is gated on TEST_REDIS_URL, which this job
+      # sets, so a skip here means the gate stopped matching the environment and
+      # those tests silently stopped running. Measured on this configuration --
+      # the service above, TEST_REDIS_URL set -- the tier reports none of the
+      # four.
+      #
+      # Four words rather than one, because a skip is only the way pytest is
+      # asked *inside* a test not to run it. `-k`, `--deselect` and a `deselect`
+      # in the ini file report `deselected`, an `xfail` marker reports `xfailed`
+      # or `xpassed`, and every one of those is a test this job claims to have
+      # run and did not. Measured: an injected skip failed the job as intended,
+      # while `-k "not <test>"` reported `2286 passed, 1 deselected` and the
+      # one-word guard stayed quiet.
+      #
+      # What it cannot see, and no grep on a log can: a test that was never
+      # collected at all -- renamed, `--ignore`d, or dropped by a
+      # `collect_ignore` -- because pytest reports nothing about a test it never
+      # found. Only the counts moving says that happened.
       - name: Run unit tests
-        run: uv run --no-sync pytest tests/unit -q
+        run: |
+          set -o pipefail
+          uv run --no-sync pytest tests/unit -q -rs | tee pytest-unit.log
+          if grep -Eq "[0-9]+ (skipped|deselected|xfailed|xpassed)" pytest-unit.log; then
+            echo "::error::the unit tier did not run every test; this job must run all of them"
+            exit 1
+          fi
 
   # SQL that no gate executes is SQL nobody finds out about: a cast or column
   # change would make the graph_index document outline silently disappear from
@@ -124,8 +150,8 @@ jobs:
             tests/test_index_source_retry.py \
             tests/test_run_usage_cache_creation_store.py \
             -q -rs | tee pytest-store.log
-          if grep -Eq "[0-9]+ skipped" pytest-store.log; then
-            echo "::error::the store tier skipped tests; this job must run all of them"
+          if grep -Eq "[0-9]+ (skipped|deselected|xfailed|xpassed)" pytest-store.log; then
+            echo "::error::the store tier did not run every test; this job must run all of them"
             exit 1
           fi
 
@@ -136,8 +162,9 @@ jobs:
   # available, which the store job's image does not have.
   #
   # PG_SEARCH_REQUIRED=1 turns every "pg_search is unavailable" skip into a
-  # failure, and the run step also fails on any skip at all: a job whose only
-  # purpose is this extension must not go green by skipping it.
+  # failure, and the run step also fails on any test it did not run -- skipped,
+  # deselected or xfailed: a job whose only purpose is this extension must not go
+  # green by leaving it out.
   #
   # The server is NOT the stock paradedb/paradedb:0.25.9-pg15 image. Stock
   # pg_search 0.25.9 on Postgres 15 and 16 fails a bm25 CREATE INDEX
@@ -269,8 +296,8 @@ jobs:
         run: |
           set -o pipefail
           uv run --no-sync pytest tests/pg_search -q -rs | tee pytest-pg-search.log
-          if grep -Eq "[0-9]+ skipped" pytest-pg-search.log; then
-            echo "::error::tests/pg_search skipped tests; this job must run all of them"
+          if grep -Eq "[0-9]+ (skipped|deselected|xfailed|xpassed)" pytest-pg-search.log; then
+            echo "::error::tests/pg_search did not run every test; this job must run all of them"
             exit 1
           fi
 

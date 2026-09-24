@@ -29,7 +29,7 @@ from ..services.knowledge_store import PgVectorKnowledgeStore
 from ..services.doc2json_store import Doc2JSONStore
 from ..services.full_document_store import FullDocumentStore
 from ..services.graph_index_store import GraphIndexStore
-from ..services import pg_bm25_index
+from ..services import pg_bm25_index, pg_vector_index
 from ..services.bm25_build_outcome import record_bm25_build_outcome
 from ..services.page_index_store import PageIndexStore
 from ..services.storage import StorageError, SupabaseStorage, get_storage
@@ -1913,6 +1913,21 @@ def _run_index_body(
         #     before the new ones land. Both now happen only for the owner and
         #     only after the commit, so no sparse entry can point at a chunk
         #     that was rolled back.
+        # (3) this KB's own partial HNSW index, if the rows it just committed
+        #     took it over the threshold (or the ones it removed took it under).
+        #     Dispatched rather than built here for the same reason as (1) the
+        #     other way round: CREATE INDEX CONCURRENTLY cannot run in a
+        #     transaction at all, and it takes tens of seconds on a large
+        #     knowledge base.
+        #
+        #     Deliberately NOT gated on this run having produced embeddings: a
+        #     re-index to a strategy that stores none deletes every embedding
+        #     this knowledge base had, which is precisely when its index has to
+        #     be dropped. The dispatch decides for itself with a row count
+        #     bounded at the threshold, so the cost of asking is the same
+        #     either way.
+        dispatch_per_kb_vector_index(knowledge_base_id)
+
         if _should_build_bm25_now(knowledge_base_id):
             sparse_store = SparseIndexStore(knowledge_base_id=knowledge_base_id)
             if chunk_ids_to_remove:
@@ -3088,4 +3103,338 @@ def drop_pg_bm25_index(self, kb_id: str, drop_partitions: bool = True) -> dict:
         countdown = _pg_bm25_retry_countdown(self.request.retries)
         retry = self.retry(exc=exc, countdown=countdown, throw=False)
         logger.info("Retrying the BM25 index drop for KB %s in %d s: %s", kb_id, countdown, reason)
+        raise retry from exc
+
+
+# ---------------------------------------------------------------------------
+# Per-knowledge-base vector indexes
+# ---------------------------------------------------------------------------
+
+
+def _per_kb_vector_index_action(kb_id: str) -> str | None:
+    """ "build", "drop" or None for this KB, read through the request session.
+
+    Cheap by construction -- one catalog lookup and one row count bounded at
+    the build threshold -- because it runs once per source that finishes
+    indexing. Never raises: a knowledge base whose state cannot be read keeps
+    the index it has, and the start-up sweep comes back to it.
+    """
+    try:
+        action = pg_vector_index.index_action(db.session.connection(), kb_id)
+        db.session.rollback()
+        return action
+    except Exception as exc:
+        db.session.rollback()
+        logger.warning(
+            "Could not tell whether KB %s needs a vector index of its own (%s); it keeps "
+            "whatever it has until the next source or start-up",
+            kb_id,
+            pg_vector_index.first_error_line(exc),
+        )
+        return None
+
+
+def dispatch_per_kb_vector_index(kb_id: str) -> bool:
+    """Ask a worker to reconcile this KB's own vector index, if anything has changed.
+
+    Called after a source finishes indexing, which is the only moment a
+    knowledge base's embedding count moves far enough to cross a threshold. The
+    row count is checked here rather than in the task so a project whose
+    knowledge bases are all small dispatches nothing at all. Never fatal:
+    indexing has already committed, and the start-up sweep is the backstop.
+    """
+    action = _per_kb_vector_index_action(kb_id)
+    if action is None:
+        return False
+    try:
+        ensure_per_kb_vector_index.delay(kb_id)
+    except Exception:
+        logger.warning(
+            "Failed to dispatch the per-knowledge-base vector index %s for KB %s; its "
+            "searches keep the project-wide index until this is retried",
+            action,
+            kb_id,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+def dispatch_per_kb_vector_indexes_at_start(engine) -> list[str]:
+    """Start-up: dispatch a reconcile for every KB whose own vector index is out of step.
+
+    The counterpart of ``dispatch_partition_completion_at_start``, at the same
+    point in start-up and with the same contract: idempotent, bounded, and it
+    never raises. It is what gives an existing large knowledge base an index --
+    nothing else looks at a knowledge base that is not being indexed right now
+    -- and what clears an INVALID index left by a build the worker did not
+    survive. Returns the knowledge base ids dispatched.
+    """
+    try:
+        pending = pg_vector_index.kbs_needing_a_per_kb_index(engine)
+    except Exception:
+        logger.warning(
+            "Could not look for knowledge bases needing their own vector index at start-up",
+            exc_info=True,
+        )
+        return []
+    dispatched: list[str] = []
+    for kb_id in pending:
+        try:
+            ensure_per_kb_vector_index.delay(kb_id)
+        except Exception:
+            logger.warning(
+                "Could not dispatch the vector index reconcile of KB %s at start-up",
+                kb_id,
+                exc_info=True,
+            )
+            continue
+        dispatched.append(kb_id)
+    if dispatched:
+        logger.info(
+            "Dispatched per-knowledge-base vector index reconciles at start-up: %s", dispatched
+        )
+    return dispatched
+
+
+def _vector_index_log_fields(fields: dict) -> str:
+    """Render ``key=value`` pairs for one of the log lines below.
+
+    Sorted so the fields are in the same order on every line, lists joined, and
+    a value containing a space quoted -- otherwise a failure reason would run
+    into the next field and nothing downstream could split the line.
+    """
+    rendered = []
+    for key in sorted(fields):
+        value = fields[key]
+        if isinstance(value, (list, tuple, set)):
+            value = ",".join(str(v) for v in sorted(value)) or "none"
+        value = str(value)
+        rendered.append(f' {key}="{value}"' if " " in value else f" {key}={value}")
+    return "".join(rendered)
+
+
+def _vector_index_dims(*name_lists) -> str:
+    """The dimensions an ensure touched, read out of the index names it reports.
+
+    The names are ``hnsw_kb_<hex>_<dims>``, so this is the one place the run's
+    dimensions can be recovered without the service handing them over.
+    """
+    dims = set()
+    for names in name_lists:
+        for name in names or ():
+            tail = str(name).rpartition("_")[2]
+            if tail.isdigit():
+                dims.add(int(tail))
+    return ",".join(str(d) for d in sorted(dims)) or "none"
+
+
+@celery_app.task(bind=True, max_retries=PG_BM25_TASK_MAX_RETRIES)
+@billing.no_billing_context
+def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
+    """Build, repair or drop this knowledge base's own partial HNSW index.
+
+    Idempotent, and a no-op for a knowledge base that is between the two
+    thresholds or already has a valid index. Dispatched after a source finishes
+    indexing (only when a bounded row count says something has changed) and at
+    start-up for the knowledge bases the sweep finds out of step.
+
+    Retries with the same jittered backoff as the BM25 index tasks on a
+    transient database failure -- a lost connection, a cancelled statement, a
+    lock conflict. Anything else fails the run at ERROR; nothing is left
+    half-built, because a failed ``CREATE INDEX CONCURRENTLY`` leaves only an
+    INVALID index, which the next run drops and rebuilds.
+
+    It also reschedules itself, without an exception, for the one outcome that
+    nothing else comes back to: an INVALID index left in place because a build of
+    it was still running (``outcome_needs_another_attempt``). Finding this
+    index's build lock held by another caller is **not** that case and does not
+    retry -- that caller is doing this index's work.
+
+    Every run leaves two kinds of ``per_kb_vector_index`` line: one per state the
+    service enters, as it enters it, and one summary with the outcome and how
+    long it took. The first is why the service's ``on_progress`` hook is passed
+    at all -- a build that the worker does not survive is otherwise invisible,
+    and answering "does this knowledge base have an index, and if not why"
+    otherwise means deriving the index name by hand and reading the catalog.
+    There is deliberately no builds table and no status field on the knowledge
+    base yet; these lines are the whole of it.
+    """
+    import time
+
+    started = time.monotonic()
+    attempt = self.request.retries + 1
+    events: list[str] = []
+    progress_fields: dict = {}
+
+    def record(status: str, **fields) -> None:
+        """The service's ``on_progress`` hook.
+
+        Logged as it happens rather than accumulated, so a build killed
+        mid-flight still leaves the evidence that it was attempted. Takes
+        keyword details so the service can hand over what only it knows (the
+        dimensions and row count of the build it is starting) without this
+        having to change again.
+        """
+        events.append(status)
+        progress_fields.update(fields)
+        logger.info(
+            "per_kb_vector_index kb=%s attempt=%d event=%s%s",
+            kb_id,
+            attempt,
+            status,
+            _vector_index_log_fields(fields),
+        )
+
+    def summarise(outcome: str, **fields) -> None:
+        logger.info(
+            "per_kb_vector_index kb=%s attempt=%d outcome=%s duration_ms=%d events=%s%s",
+            kb_id,
+            attempt,
+            outcome,
+            (time.monotonic() - started) * 1000,
+            ",".join(events) or "none",
+            _vector_index_log_fields({**progress_fields, **fields}),
+        )
+
+    try:
+        outcome = pg_vector_index.ensure_per_kb_vector_index(kb_id, on_progress=record)
+    except Exception as exc:
+        summarise("failed", reason=pg_vector_index.first_error_line(exc))
+        if not pg_vector_index.is_transient_db_error(exc):
+            logger.error(
+                "The per-knowledge-base vector index build for KB %s failed", kb_id, exc_info=exc
+            )
+            raise
+        reason = pg_vector_index.first_error_line(exc)
+        if self.request.retries >= self.max_retries:
+            logger.error(
+                "Giving up on the vector index build for KB %s after %d attempts: %s",
+                kb_id,
+                self.request.retries + 1,
+                reason,
+            )
+            raise
+        countdown = _pg_bm25_retry_countdown(self.request.retries)
+        retry = self.retry(exc=exc, countdown=countdown, throw=False)
+        logger.info(
+            "Retrying the vector index build for KB %s in %d s (attempt %d of %d): %s",
+            kb_id,
+            countdown,
+            self.request.retries + 2,
+            self.max_retries + 1,
+            reason,
+        )
+        raise retry from exc
+
+    built = outcome.get("built") or []
+    dropped = outcome.get("dropped") or []
+    repaired = outcome.get("repaired_invalid_indexes") or []
+    # An index whose stored definition no longer matches what this version emits is
+    # either rebuilt or deliberately kept, and the kept case is the one an operator
+    # has to find later: a knowledge base searching an index built from an older
+    # definition, correctly but at whatever recall that definition gives. It had
+    # only a WARNING, which is not something you can count.
+    rebuilt_stale = outcome.get("rebuilt_stale_definitions") or []
+    stale_kept = outcome.get("stale_definitions_kept") or []
+    summarise(
+        outcome.get("status", "unknown"),
+        dims=_vector_index_dims(built, dropped, repaired),
+        built=built,
+        dropped=dropped,
+        repaired=repaired,
+        **({"rebuilt_stale": rebuilt_stale} if rebuilt_stale else {}),
+        **({"stale_kept": stale_kept} if stale_kept else {}),
+        **({"reason": outcome["reason"]} if outcome.get("reason") else {}),
+    )
+
+    # An INVALID index the ensure had to leave alone, because a build of it was
+    # still running, is the one outcome nothing comes back to: the index answers
+    # no query and is maintained on every write, and the running build is a
+    # backend from a worker that may already be dead. So this is the caller that
+    # has to come back -- ordinary lock contention deliberately does not, because
+    # whoever holds the lock is doing the work right now.
+    if pg_vector_index.outcome_needs_another_attempt(outcome):
+        if self.request.retries >= self.max_retries:
+            logger.error(
+                "Giving up on repairing KB %s's INVALID vector index after %d attempts: a "
+                "build of it was still running each time. It answers no query and is "
+                "maintained on every write to the embeddings table until the next indexing "
+                "run or start-up reconciles it: %s",
+                kb_id,
+                attempt,
+                outcome.get("index") or outcome.get("indexes") or "(index unnamed)",
+            )
+            return outcome
+        countdown = _pg_bm25_retry_countdown(self.request.retries)
+        retry = self.retry(countdown=countdown, throw=False)
+        logger.info(
+            "Rescheduling KB %s's vector index reconcile in %d s (attempt %d of %d): %s",
+            kb_id,
+            countdown,
+            attempt + 1,
+            self.max_retries + 1,
+            outcome.get("reason") or "another attempt is needed",
+        )
+        raise retry
+
+    return outcome
+
+
+def _orphaned_vector_index_names(kb_id: str) -> list[str]:
+    """This KB's surviving partial HNSW index names, for a give-up log line. Never raises."""
+    try:
+        with db.engine.connect() as conn:
+            names = [
+                f"{pg_vector_index.AI_SCHEMA}.{pg_vector_index.per_kb_index_name(kb_id, dims)}"
+                for dims in sorted(pg_vector_index.existing_per_kb_indexes(conn, kb_id))
+            ]
+            conn.rollback()
+            return names
+    except Exception:
+        logger.debug("Could not list KB %s's vector indexes for the log", kb_id, exc_info=True)
+        return []
+
+
+@celery_app.task(bind=True, max_retries=PG_BM25_TASK_MAX_RETRIES)
+@billing.no_billing_context
+def drop_per_kb_vector_index(self, kb_id: str) -> dict:
+    """Drop every partial HNSW index a deleted knowledge base owned.
+
+    KB delete dispatches this: the row is gone, so nothing will reconcile the
+    index again, and Postgres would keep maintaining an index named after a
+    knowledge base that no longer exists on every write to ai.embeddings.
+    Retries on contention so an index is not orphaned by a build that happened
+    to be running.
+    """
+    try:
+        return pg_vector_index.drop_per_kb_vector_indexes(kb_id)
+    except Exception as exc:
+        if not (
+            isinstance(exc, pg_vector_index.PerKbVectorIndexBuildInProgress)
+            or pg_vector_index.is_transient_db_error(exc)
+        ):
+            raise
+        reason = pg_vector_index.first_error_line(exc)
+        if self.request.retries >= self.max_retries:
+            # Nothing comes back to this: the knowledge base row is already gone,
+            # so neither the indexing dispatch nor the start-up sweep will ever
+            # see it again. Name the indexes so an operator can drop them by
+            # hand, the way the route's dispatch-failure warning does.
+            logger.error(
+                "Giving up on dropping the vector index(es) of KB %s after %d attempts: %s. "
+                "They are now orphaned — named after a knowledge base that no longer exists, "
+                "and maintained on every write to the embeddings table — and have to be "
+                "dropped by hand: %s",
+                kb_id,
+                self.request.retries + 1,
+                reason,
+                ", ".join(_orphaned_vector_index_names(kb_id)) or "(names unavailable)",
+            )
+            raise
+        countdown = _pg_bm25_retry_countdown(self.request.retries)
+        retry = self.retry(exc=exc, countdown=countdown, throw=False)
+        logger.info(
+            "Retrying the vector index drop for KB %s in %d s: %s", kb_id, countdown, reason
+        )
         raise retry from exc
