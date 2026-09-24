@@ -412,6 +412,10 @@ def test_the_index_cap_is_far_below_where_planning_and_locks_degrade():
 # this version built rather than a drifted one.
 _CURRENT = object()
 
+# "no ``COMMENT ON INDEX`` has been issued against this fake yet", which is a
+# different state from "the comment was written as NULL".
+_UNWRITTEN = object()
+
 
 class _Result:
     """Just enough of a SQLAlchemy result for the three shapes this module reads."""
@@ -437,6 +441,14 @@ class _FakeConn:
     everything else comes back empty. ``fail_on`` is the fragment whose
     statement raises, which is how the lifecycle specs put a failure exactly
     where it hurts.
+
+    A ``COMMENT ON INDEX`` that succeeds **sticks**, and the single-index comment
+    read then serves it rather than whatever ``answers`` said. That is what a server
+    does, and the drift path depends on it: it reads its own write back before
+    dropping anything, so a fake that accepts the write and then keeps answering
+    with the old comment is a fake where no drift rebuild can ever start. A write
+    that ``fail_on`` makes raise does not stick, which is the other case -- and the
+    one the drift path has to refuse.
     """
 
     def __init__(self, answers=(), fail_on=None, exc=None):
@@ -445,6 +457,7 @@ class _FakeConn:
         self.params: list[dict | None] = []
         self.invalidated = False
         self.rollbacks = 0
+        self.written_comment = _UNWRITTEN
         self._fail_on = fail_on
         self._exc = exc if exc is not None else RuntimeError("statement failed")
 
@@ -454,6 +467,11 @@ class _FakeConn:
         self.params.append(params)
         if self._fail_on is not None and self._fail_on in sql:
             raise self._exc
+        if _FAILURE_COMMENT_DDL in sql:
+            self.written_comment = None if sql.rstrip().endswith("IS NULL") else sql.split("'")[-2]
+            return _Result([])
+        if _FAILURE_RECORD_QUERY in sql and self.written_comment is not _UNWRITTEN:
+            return _Result([(self.written_comment,)] if self.written_comment else [])
         for fragment, rows in self.answers:
             if fragment in sql:
                 return _Result(rows(params) if callable(rows) else rows)
@@ -800,6 +818,22 @@ _COUNT_QUERY = "GROUP BY 1, 2"
 _CATALOG_QUERY = "i.indisvalid"
 _SWEEP_CATALOG_QUERY = _CATALOG_QUERY
 _WHOLE_PROJECT_PREFIX = pvi._like_prefix(pvi.INDEX_NAME_PREFIX)
+
+
+def _settled_row_count() -> int:
+    """A row count the sweep has no *threshold* reason to touch, at the real defaults.
+
+    Between the drop threshold and the build threshold, so a knowledge base that has
+    an index keeps it and one that has none is not given one. Any spec about the
+    sweep noticing something else -- an INVALID index, a drifted definition -- has to
+    use this, or the count alone dispatches the knowledge base and the spec passes
+    with the thing it is about switched off. The sweep reads no stubbed settings, so
+    this comes from the real ones.
+    """
+    build_at, drop_below = pvi.thresholds()
+    settled = (build_at + drop_below) // 2
+    assert drop_below < settled < build_at, (drop_below, settled, build_at)
+    return settled
 
 
 def _sweep(conn):
@@ -1445,7 +1479,7 @@ def test_an_index_recording_a_different_definition_is_dispatched_and_rebuilt(mon
     sweep = _FakeConn(
         answers=[
             (_SWEEP_CATALOG_QUERY, [_older_definition_row()]),
-            (_COUNT_QUERY, [(KB, 1536, 20_000)]),
+            (_COUNT_QUERY, [(KB, 1536, _settled_row_count())]),
         ]
     )
     assert _sweep(sweep) == [KB], "and the start-up sweep has to see it too"
@@ -1530,17 +1564,185 @@ def test_the_rebuild_records_the_definition_so_it_happens_once(monkeypatch):
     assert conn.issued("CREATE INDEX") == []
 
 
-def test_a_definition_drop_is_not_counted_against_the_failure_budget(monkeypatch):
+def test_a_definition_drop_is_not_counted_against_either_build_budget(monkeypatch):
     """Three predicate changes would otherwise turn the feature off.
 
     Nothing failed: the index was working and this module's own DDL moved. The
-    repair drop of an INVALID index counts against the bound, and a drift drop must
-    not be confused with it.
+    repair drop of an INVALID index counts against the two build bounds, and a drift
+    drop must not be confused with it -- spending a budget whose only remedy is a
+    manual ``DROP INDEX`` on a deploy.
+
+    Asserted on what the comments this reconcile writes *record*, not on there being
+    none: the drift path does write one, against a bound of its own
+    (``MAX_CONSECUTIVE_DEFINITION_REBUILDS``), and "no build count on any of them"
+    is the property this spec is about.
     """
     conn = _ensure_conn(existing=[_stale_row()], rows_by_dims={1536: 20_000}, fail_on="DROP INDEX")
     with pytest.raises(RuntimeError):
         _ensure(monkeypatch, conn)
-    assert conn.issued(_FAILURE_COMMENT_DDL) == [], conn.statements
+    written = conn.issued(_FAILURE_COMMENT_DDL)
+    assert written, "the attempt is on record, or nothing bounds the next one"
+    for one in written:
+        assert pvi.build_failures_in(one) == 0, one
+        assert pvi.interrupted_builds_in(one) == 0, one
+    assert pvi.build_is_given_up(written[-1]) is False, written
+
+
+# -- the drift path has a bound of its own ------------------------------------
+
+
+def _drift_conn(comment=None, **kwargs):
+    """A connection whose valid, drifted index carries ``comment``, reconcile to reconcile.
+
+    ``_CatalogStateConn`` because these specs are about a *sequence* of reconciles
+    reading back what the one before wrote, which is how the loop they bound runs.
+    """
+    return _CatalogStateConn(
+        answers=[
+            ("GROUP BY dims", [(1536,)]),
+            (_ROW_COUNT_QUERY, [(20_000,)]),
+            (_LOCK_QUERY, [(True,)]),
+        ],
+        comment=comment,
+        valid=True,
+        **kwargs,
+    )
+
+
+def test_a_rebuild_that_lands_leaves_no_unsettled_rebuild_on_record(monkeypatch):
+    """The negative control, and the case that must not spend the bound at all.
+
+    The counter is written before the drop and cleared by the success that records
+    the new definition, so one ordinary definition change leaves nothing behind. If
+    it did not clear, three DDL changes over the life of a project would stop the
+    third from being applied.
+    """
+    conn = _drift_conn()
+    outcome = _ensure(monkeypatch, conn)
+    assert outcome["rebuilt_stale_definitions"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert pvi.definition_rebuilds_in(conn.comment) == 0, conn.comment
+    assert pvi.definition_rebuild_is_given_up(conn.comment) is False, conn.comment
+    assert pvi.definition_has_drifted(KB, 1536, conn.comment) is False, conn.comment
+
+
+def test_a_comment_that_does_not_stick_stops_the_rebuild_before_the_drop(monkeypatch, caplog):
+    """The reviewer's first reproduction: ``_write_index_comment`` no-op'd.
+
+    Measured before this bound existed: 6 reconciles, 6 distinct index oids, failures
+    0 against a bound of 3, each iteration a real ``DROP`` plus
+    ``CREATE INDEX CONCURRENTLY`` with both timeouts lifted and up to 4 GB of
+    ``maintenance_work_mem``. The fingerprint that write records is the only thing
+    that makes the next reconcile a no-op, and the write is best effort, so an
+    attempt that cannot be put on record must not be started: the stale index answers
+    its searches, and a knowledge base with no index does not.
+    """
+    monkeypatch.setattr(pvi, "_write_index_comment", lambda *a, **k: None)
+    conn = _drift_conn()
+    with caplog.at_level(logging.ERROR):
+        for _ in range(6):
+            outcome = _ensure(monkeypatch, conn)
+    assert conn.issued("DROP INDEX") == [], conn.statements
+    assert conn.issued("CREATE INDEX") == []
+    assert outcome["stale_definitions_kept"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert outcome["reason"] == "definition_rebuild_not_settling", outcome
+    assert outcome["definition_rebuilds_not_settling"] == [1536], outcome
+    assert "does not read back" in caplog.text, caplog.text
+
+
+def test_a_comment_refused_by_the_server_stops_the_rebuild_too(monkeypatch, caplog):
+    """The reviewer's second reproduction: ``COMMENT`` refused server-side.
+
+    4 consecutive rebuilds with ``status`` staying ``ready`` throughout. The write
+    raises here rather than silently doing nothing, and ``_write_index_comment``
+    swallows that on purpose -- so the read-back is what tells the two apart, and
+    neither may start a drop.
+
+    What is bounded is the *work*, not the dispatch. ``index_action`` reads the same
+    unwritable comment, so it keeps saying "build" and every source that finishes
+    indexing keeps asking for a reconcile -- each one now a catalog read, a bounded
+    count, a refused ``COMMENT`` and a read-back, and **no DDL at all**. That is the
+    honest limit of a record kept on the object: a database where this module cannot
+    comment is a database where it has no memory, and the only sound answer is to
+    stop doing the destructive half. Pinned here so the difference is not mistaken
+    for the bound failing.
+    """
+    conn = _drift_conn(fail_on=_FAILURE_COMMENT_DDL)
+    with caplog.at_level(logging.ERROR):
+        for _ in range(4):
+            outcome = _ensure(monkeypatch, conn)
+    assert conn.issued("DROP INDEX") == [], conn.statements
+    assert conn.issued("CREATE INDEX") == []
+    assert outcome["reason"] == "definition_rebuild_not_settling", outcome
+    assert pvi.index_action(conn, KB) == "build", "the dispatch cannot see what it cannot read"
+
+
+def test_drift_drops_that_keep_failing_reach_the_rebuild_bound(monkeypatch, caplog):
+    """The loop nothing bounded: a drift drop is charged to neither build bound.
+
+    "Counted against neither build bound" had been left to mean "counted by nothing",
+    so a drop that kept raising was retried by every source that finished indexing
+    and every boot. The count is written before the drop, so a drop that fails leaves
+    it in place for the next reconcile to read and add to.
+    """
+    conn = _drift_conn(fail_on="DROP INDEX")
+    for n in range(1, pvi.MAX_CONSECUTIVE_DEFINITION_REBUILDS + 1):
+        with pytest.raises(RuntimeError):
+            _ensure(monkeypatch, conn)
+        assert pvi.definition_rebuilds_in(conn.comment) == n, conn.comment
+    with caplog.at_level(logging.ERROR):
+        outcome = _ensure(monkeypatch, conn)
+    assert outcome["reason"] == "definition_rebuild_not_settling", outcome
+    assert outcome["stale_definitions_kept"] == [pvi.per_kb_index_name(KB, 1536)], outcome
+    assert conn.issued("CREATE INDEX") == [], "and it never went INVALID"
+    assert f"{pvi.MAX_CONSECUTIVE_DEFINITION_REBUILDS} consecutive rebuilds" in caplog.text
+    assert pvi.index_action(conn, KB) is None, "nor is it dispatched again"
+
+
+def test_the_boot_sweep_stops_dispatching_a_rebuild_it_has_given_up_on():
+    """Or ``MAX_SWEEP_DISPATCH`` is spent on reconciles that decline, on every boot.
+
+    The same argument as the INVALID indexes past their build bound, and the drifted
+    ones are added last, so these would be the places left over.
+    """
+    given_up = pvi.per_kb_index_comment(
+        0, 0, _OLDER_DEFINITION, pvi.MAX_CONSECUTIVE_DEFINITION_REBUILDS
+    )
+    rows = [(pvi.per_kb_index_name(KB, 1536), True, given_up)]
+    conn = _FakeConn(
+        answers=[
+            (_SWEEP_CATALOG_QUERY, rows),
+            (_COUNT_QUERY, [(KB, 1536, _settled_row_count())]),
+        ]
+    )
+    assert _sweep(conn) == []
+
+
+def test_the_rebuild_bound_is_not_the_build_bound(monkeypatch):
+    """The three counts have to stay separable, in both directions.
+
+    A spent rebuild budget must not suppress the build a knowledge base with no
+    index at all still needs, and a spent build budget must not be reported as a
+    rebuild that is not settling. Reaching this bound leaves a *valid* index in
+    place, which is not true of either of the others.
+    """
+    spent = pvi.per_kb_index_comment(
+        0, 0, _OLDER_DEFINITION, pvi.MAX_CONSECUTIVE_DEFINITION_REBUILDS
+    )
+    assert pvi.definition_rebuild_is_given_up(spent) is True
+    assert pvi.build_is_given_up(spent) is False, spent
+
+    doomed = pvi.per_kb_index_comment(pvi.MAX_CONSECUTIVE_BUILD_FAILURES, 0, None)
+    assert pvi.build_is_given_up(doomed) is True
+    assert pvi.definition_rebuild_is_given_up(doomed) is False, doomed
+
+    # An index with a spent rebuild budget that has since gone INVALID is still built.
+    conn = _ensure_conn(
+        existing=[(pvi.per_kb_index_name(KB, 1536), False, spent)],
+        rows_by_dims={1536: 20_000},
+    )
+    outcome = _ensure(monkeypatch, conn)
+    assert outcome["built"] == [pvi.per_kb_index_name(KB, 1536)], outcome
 
 
 def test_a_stale_index_is_kept_at_the_index_cap(monkeypatch, caplog):
@@ -1563,6 +1765,45 @@ def test_a_stale_index_is_kept_at_the_index_cap(monkeypatch, caplog):
     assert outcome["reason"] == "index_cap_reached", outcome
     assert "no index at all" in caplog.text
     assert pvi.index_action(conn, KB) is None, "and it is not dispatched again either"
+
+
+def test_a_rebuild_is_not_declined_by_the_place_its_own_drop_just_freed(monkeypatch, caplog):
+    """The drop-to-rebuild window, which used to lose the index outright.
+
+    The cap was counted once before the drop and again before the build, so another
+    knowledge base's reconcile taking the freed place in between made the rebuild
+    declined -- and this knowledge base was left with *nothing* where it had a
+    stale-but-usable index, reported as ``rebuilt_stale_definitions: [name]`` with
+    ``built: []``. Worse than either outcome the cap is allowed to choose between,
+    and an index that was inside the bound a moment ago is not one the cap has a
+    reason to refuse.
+    """
+    name = pvi.per_kb_index_name(KB, 1536)
+    conn = _FakeConn()
+    own = [_stale_row()]
+
+    def catalog(params):
+        if (params or {}).get("prefix") != _WHOLE_PROJECT_PREFIX:
+            return own
+        # One short of the cap until the drop happens; full immediately after, because
+        # another knowledge base's reconcile took the place this one just freed.
+        total = pvi.MAX_PER_KB_INDEXES - (0 if conn.issued("DROP INDEX") else 1)
+        others = [_index_row(str(uuid.UUID(int=2_000 + n)), 1536) for n in range(total - len(own))]
+        return own + others
+
+    conn.answers = [
+        (_CATALOG_QUERY, catalog),
+        ("GROUP BY dims", [(1536,)]),
+        (_ROW_COUNT_QUERY, [(20_000,)]),
+        (_LOCK_QUERY, [(True,)]),
+    ]
+    with caplog.at_level(logging.WARNING):
+        outcome = _ensure(monkeypatch, conn)
+    assert conn.issued("DROP INDEX CONCURRENTLY"), conn.statements
+    assert outcome["rebuilt_stale_definitions"] == [name], outcome
+    assert outcome["built"] == [name], "the index its own drop freed a place for"
+    assert outcome.get("reason") != "index_cap_reached", outcome
+    assert "keeps the shared index" not in caplog.text, caplog.text
 
 
 def test_a_stale_index_inside_the_hysteresis_band_is_kept(monkeypatch, caplog):
@@ -1925,6 +2166,14 @@ class _CatalogStateConn(_FakeConn):
 
     def execute(self, clause, params=None):
         sql = clause.text if hasattr(clause, "text") else str(clause)
+        if self._fail_on is not None and self._fail_on in sql:
+            # Honoured before the branches below, because it used to be honoured only
+            # by the statements this class does *not* handle -- so a spec asking for
+            # the ``COMMENT`` write to be refused got one that succeeded, which is the
+            # false green the drift bound exists to catch.
+            self.statements.append(" ".join(sql.split()))
+            self.params.append(params)
+            raise self._exc
         if _FAILURE_COMMENT_DDL in sql:
             self.statements.append(" ".join(sql.split()))
             self.params.append(params)

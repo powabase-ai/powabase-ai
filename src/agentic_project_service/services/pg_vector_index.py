@@ -264,6 +264,64 @@ MAX_CONSECUTIVE_BUILD_FAILURES = 3
 # the database's real memory rather than to the registry maximum.
 MAX_CONSECUTIVE_INTERRUPTED_BUILDS = 25
 
+# The drift path's own bound, and the **third** of these -- deliberately neither of
+# the other two, and it counts something neither of them counts.
+#
+# A drift drop is charged to neither build bound, correctly: nothing failed, the
+# index was working, and the reason it is going away is that this module's own DDL
+# changed, so spending a budget whose only remedy is a manual ``DROP INDEX`` would
+# let three predicate changes turn the feature off (``_drop_a_drifted_index``). The
+# consequence is that the *only* thing stopping the next reconcile calling the same
+# index stale again is the fingerprint the rebuild records -- and that write is
+# ``_write_index_comment``, which is deliberately best effort. Reproduced two ways:
+# with that write no-op'd, 6 reconciles produced 6 distinct index oids, failures 0
+# against a bound of 3; with ``COMMENT`` refused server-side, 4 consecutive
+# rebuilds with ``status`` staying ``ready`` throughout. Each iteration is a real
+# ``DROP`` plus ``CREATE INDEX CONCURRENTLY`` with ``statement_timeout = 0``,
+# ``lock_timeout = 0`` and up to 4 GB of ``maintenance_work_mem``. That is the
+# unbounded drop-and-rebuild property whose absence was the whole reason for
+# choosing a fingerprint over comparing ``pg_get_indexdef``, arriving through a
+# different door.
+#
+# So this count is written **before** the drop, on the index about to be replaced,
+# and read straight back (``_count_a_definition_rebuild``). Two different loops are
+# bounded by the two halves of that, and it takes both:
+#
+# * The read-back is what bounds a comment that does not stick. A write that
+#   quietly does nothing cannot be counted -- the count needs the same write -- so
+#   the only sound answer is not to start work whose termination depends on a
+#   record this module has just failed to make. Both reproductions above end at
+#   *zero* rebuilds with the read-back in place. What it bounds is the destructive
+#   work and not the dispatch: ``index_action`` reads the same unwritable comment,
+#   so a source that finishes indexing still asks for a reconcile, which now costs
+#   a catalog read, a bounded count and a refused write rather than a drop and a
+#   rebuild. A database where this module cannot comment is one where it has no
+#   memory at all, so that is the most any record kept on the object can do.
+# * The count is what bounds a drift *drop* that keeps failing, which nothing
+#   bounded before: the drop raising leaves the index and this comment in place, so
+#   the next reconcile reads the number and adds to it, and the fourth keeps the
+#   stale index instead. It also catches a comment writer that works sometimes.
+#
+# 3 rather than 25: unlike an interrupted build there is no retrying task multiplying
+# each episode, and unlike a failed build the outcome of giving up is mild -- the
+# index stays, valid, answering searches at whatever recall its old definition
+# gives, which is the state the whole drift mechanism starts from. Nothing goes
+# INVALID and nothing needs an operator to drop anything by hand.
+#
+# **What no bound here can fix, and what bites on the next DDL change: a rolling
+# deploy is a rebuild war.** Two pod versions computing two different fingerprints
+# each read the other's index as drifted and each rebuild it. Simulated with two
+# versions differing only by ``WITH (m = 24)``: a new index oid on every
+# alternation, failures 0 against a bound of 3, and this bound would only stop it
+# after three rounds of real builds. *This* change is immune, because the code it
+# replaces records no fingerprint at all, so old pods never see today's index as
+# drifted and never fight back. Every DDL change after this one is not immune, and
+# the answer is sequencing rather than a constant: let the new definition reach
+# every process before any process is allowed to act on the drift it sees -- which
+# is the same shape as the constraint in the module docstring above, for the same
+# reason.
+MAX_CONSECUTIVE_DEFINITION_REBUILDS = 3
+
 # Where that count is kept. There is no builds table -- the logs are the whole
 # of the history -- and an in-process counter would forget on every deploy,
 # every worker restart and every other worker, which is exactly the population
@@ -902,7 +960,12 @@ def index_action(conn, knowledge_base_id: Any) -> str | None:
                 # scratch, because the replacement is a drop and then a build, and
                 # a drop it cannot follow with a build leaves this knowledge base
                 # with nothing where it had a stale-but-usable index.
-                if rows >= build_at and dims <= MAX_HNSW_DIMS and room_for_one_more():
+                if (
+                    rows >= build_at
+                    and dims <= MAX_HNSW_DIMS
+                    and not definition_rebuild_is_given_up(comment)
+                    and room_for_one_more()
+                ):
                     return "build"
             continue
         if rows >= build_at and dims <= MAX_HNSW_DIMS and room_for_one_more():
@@ -1208,11 +1271,28 @@ def definition_has_drifted(kb_id: str, dims: int, comment: str | None) -> bool:
 
 
 def build_is_given_up(comment: str | None) -> bool:
-    """Has this index reached either bound, so no further build is attempted?"""
+    """Has this index reached either *build* bound, so no further build is attempted?
+
+    Deliberately not also the drift bound. These two say "do not build this index",
+    and the index they say it about is INVALID; ``definition_rebuild_is_given_up``
+    says "do not *replace* this index", about one that is valid and answering
+    searches. Folding the third in would make a spent rebuild budget suppress the
+    build that a knowledge base with no index at all still needs.
+    """
     return (
         build_failures_in(comment) >= MAX_CONSECUTIVE_BUILD_FAILURES
         or interrupted_builds_in(comment) >= MAX_CONSECUTIVE_INTERRUPTED_BUILDS
     )
+
+
+def definition_rebuild_is_given_up(comment: str | None) -> bool:
+    """Have this index's definition rebuilds stopped settling, so no more are started?
+
+    The drift path's bound, and nothing to do with the two above: reaching it leaves
+    a *valid* index in place, still answering searches at whatever recall its old
+    definition gives. See ``MAX_CONSECUTIVE_DEFINITION_REBUILDS``.
+    """
+    return definition_rebuilds_in(comment) >= MAX_CONSECUTIVE_DEFINITION_REBUILDS
 
 
 def index_comment(conn, kb_id: str, dims: int) -> str | None:
@@ -1629,6 +1709,35 @@ def _repair_invalid(
         raise
 
 
+def _count_a_definition_rebuild(conn, kb_id: str, dims: int, comment: str | None) -> bool:
+    """Record that a rebuild for a definition change is starting, and read it back.
+
+    ``True`` when the record is readable off the index afterwards, which is the drift
+    path's precondition for dropping anything -- see
+    ``MAX_CONSECUTIVE_DEFINITION_REBUILDS`` for what each half of that bounds.
+
+    Written before the drop rather than after the rebuild, on the index that is
+    about to be replaced, for the reason every count here is written where it is:
+    the record has to exist at the moment the work starts, because the work is what
+    may not come back. It is cleared by ``_record_the_definition_built``, so the
+    number is consecutive *unsettled* rebuilds and a rebuild that lands zeroes it.
+
+    The read-back is a second catalog round trip, which is free next to a
+    ``CREATE INDEX CONCURRENTLY`` that runs for minutes, and it is the only thing
+    that can tell a write that worked from ``_write_index_comment`` swallowing a
+    failure -- which it must, on the failure paths, and therefore does here too.
+
+    The recorded *definition* is the index's own, never today's: the index on disk is
+    still the pre-existing one at this point. ``_count_a_failed_repair_drop``
+    carries the same rule and says what stamping today's costs. The two build
+    counts are written back as zero because this branch runs only on a valid index,
+    whose counts a successful build cleared.
+    """
+    rebuilds = definition_rebuilds_in(comment) + 1
+    _write_index_comment(conn, kb_id, dims, 0, 0, definition_fingerprint_in(comment), rebuilds)
+    return definition_rebuilds_in(index_comment(conn, kb_id, dims)) >= rebuilds
+
+
 def _drop_a_drifted_index(conn, kb_id: str, dims: int) -> None:
     """Drop a *valid* index that was built from a definition this module no longer emits.
 
@@ -1642,6 +1751,11 @@ def _drop_a_drifted_index(conn, kb_id: str, dims: int) -> None:
     below-threshold drop beside it does, and the task retries it if it was
     transient. The index that is still there keeps answering queries at whatever
     recall its old definition gives, which is the state this started from.
+
+    Untouched by the two *build* bounds, that is. The attempt is on record before
+    this is called, against ``MAX_CONSECUTIVE_DEFINITION_REBUILDS``, so a drop that
+    keeps raising does not retry for ever -- which it did, because "counted against
+    neither build bound" had been left to mean "counted by nothing at all".
     """
     logger.warning(
         "Rebuilding partial HNSW index %s.%s for knowledge base %s at %d dimensions: it was "
@@ -1709,8 +1823,13 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
       the work) from ``invalid_index_build_in_progress``, which also sets
       ``reschedule`` -- see ``outcome_needs_another_attempt``.
     * ``skipped`` with a ``reason`` of ``index_cap_reached``,
-      ``dims_above_hnsw_limit`` or ``build_repeatedly_failed`` -- a build this
-      project, this embedding width or this database cannot have.
+      ``dims_above_hnsw_limit``, ``definition_rebuild_not_settling`` or
+      ``build_repeatedly_failed`` -- a build this project, this embedding width or
+      this database cannot have. ``definition_rebuild_not_settling`` is the mildest
+      of them and the only one where the knowledge base still has a working index:
+      the rebuild its definition change asks for is not completing, so it keeps the
+      index it has (``MAX_CONSECUTIVE_DEFINITION_REBUILDS``), and the dimensions are
+      listed in ``definition_rebuilds_not_settling``.
       ``build_repeatedly_failed`` lists the dimensions given up on in
       ``build_repeatedly_failed``, and is the one that needs an operator: the
       INVALID index stays until it is dropped by hand, which is also what lets a
@@ -1751,6 +1870,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     stale_kept: list[str] = []
     blocked: list[str] = []
     doomed: list[int] = []
+    unsettled: list[int] = []
     reschedule: str | None = None
     cap_reached: int | None = None
     above_limit: list[int] = []
@@ -1787,6 +1907,9 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                 # not the knowledge base's size. Everything that reports it says so.
                 floored = rows >= cap
                 prior_failures = prior_interrupted = 0
+                # Set by a drift drop, and read by the build's cap gate: this
+                # dimension held a place in ``MAX_PER_KB_INDEXES`` until a moment ago.
+                holds_a_place = False
 
                 if valid is False:
                     # Read before the repair drop, which takes the record away
@@ -1904,7 +2027,32 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         )
                         stale_kept.append(name)
                         continue
-                    # Only now, because the two cheap gates above decide it more
+                    if definition_rebuild_is_given_up(comment):
+                        # The drift path's own bound, reached. Free to read, so it
+                        # comes before the catalog count -- but after the two gates
+                        # above, because where a rebuild would be declined anyway
+                        # this bound has nothing to say and its log line would send
+                        # an operator after the wrong thing.
+                        logger.error(
+                            "Not rebuilding partial HNSW index %s.%s for its definition "
+                            "change: %d consecutive rebuilds of it have been started and none "
+                            "has settled, so no more are started and it is kept as it is. This "
+                            "is not the build bound and nothing here is INVALID -- the index is "
+                            "valid and still answering knowledge base %s at whatever recall its "
+                            "old definition gives. Either its drop keeps failing, or the "
+                            "%s comment recording the new definition is not sticking (check "
+                            "that this role may COMMENT ON the index). Clearing the comment, or "
+                            "dropping the index by hand, starts the rebuild again",
+                            AI_SCHEMA,
+                            name,
+                            definition_rebuilds_in(comment),
+                            kb_id,
+                            "pg_class",
+                        )
+                        stale_kept.append(name)
+                        unsettled.append(dims)
+                        continue
+                    # Only now, because the three cheap gates above decide it more
                     # often and this is a catalog count.
                     total = per_kb_index_count(conn)
                     if total >= MAX_PER_KB_INDEXES:
@@ -1932,11 +2080,37 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         stale_kept.append(name)
                         cap_reached = total
                         continue
+                    if not _count_a_definition_rebuild(conn, kb_id, dims, comment):
+                        # The attempt could not be put on record, so the bound above
+                        # cannot advance and nothing would stop the next reconcile
+                        # doing this again -- a real DROP and CREATE INDEX
+                        # CONCURRENTLY per reconcile, with both timeouts lifted and
+                        # its own maintenance_work_mem, for ever. Not starting is the
+                        # only sound answer: the stale index answers its searches.
+                        logger.error(
+                            "Not rebuilding partial HNSW index %s.%s for its definition "
+                            "change: the attempt could not be recorded on the index (the "
+                            "%s comment does not read back), so nothing would stop the next "
+                            "reconcile dropping and rebuilding it again, and the one after "
+                            "that. Keeping it instead -- knowledge base %s keeps whatever "
+                            "recall its old definition gives, which is what it had. Check that "
+                            "this role may COMMENT ON the index; the warning just above says "
+                            "why the write failed",
+                            AI_SCHEMA,
+                            name,
+                            "pg_class",
+                            kb_id,
+                        )
+                        stale_kept.append(name)
+                        unsettled.append(dims)
+                        continue
                     progress("dropping", dims=dims, rows=rows, rows_are_a_floor=floored)
                     _drop_a_drifted_index(conn, kb_id, dims)
                     rebuilt.append(name)
-                    # The definition drop is not a build failure, so neither count
-                    # moves; the index is gone, so the build below is the rebuild.
+                    # The definition drop is not a build failure, so neither build
+                    # count moves; the index is gone, so the build below is the
+                    # rebuild, and the cap may not decline it (``holds_a_place``).
+                    holds_a_place = True
                     valid = None
 
                 if rows < build_at:
@@ -1957,21 +2131,35 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                     )
                     above_limit.append(dims)
                     continue
-                total = per_kb_index_count(conn)
-                if total >= MAX_PER_KB_INDEXES:
-                    logger.warning(
-                        "Not building partial HNSW index %s.%s: %s.embeddings already carries "
-                        "%d per-knowledge-base indexes (the cap is %d), and every index on a "
-                        "relation is opened and locked while planning any query on it. This "
-                        "knowledge base keeps the shared index",
-                        AI_SCHEMA,
-                        name,
-                        AI_SCHEMA,
-                        total,
-                        MAX_PER_KB_INDEXES,
-                    )
-                    cap_reached = total
-                    continue
+                # The cap is not counted again when the drift drop a moment ago freed
+                # this index's own place. It used to be, and the window between the
+                # two counts lost the index: another knowledge base's reconcile taking
+                # the freed place in between made this rebuild declined, leaving this
+                # knowledge base with *nothing* where it had a stale-but-usable index
+                # -- reported as ``rebuilt_stale_definitions: [name]`` with
+                # ``built: []``. That outcome is worse than either of the two the cap
+                # is allowed to choose between (keep the stale one, or replace it), and
+                # the cap's purpose -- bound how many indexes one relation carries
+                # while any query on it is planned -- is not served by refusing to put
+                # back an index that was inside the bound a moment ago. The gate before
+                # the drop is where the cap decides this knowledge base's case, and it
+                # decides it once.
+                if not holds_a_place:
+                    total = per_kb_index_count(conn)
+                    if total >= MAX_PER_KB_INDEXES:
+                        logger.warning(
+                            "Not building partial HNSW index %s.%s: %s.embeddings already "
+                            "carries %d per-knowledge-base indexes (the cap is %d), and every "
+                            "index on a relation is opened and locked while planning any query "
+                            "on it. This knowledge base keeps the shared index",
+                            AI_SCHEMA,
+                            name,
+                            AI_SCHEMA,
+                            total,
+                            MAX_PER_KB_INDEXES,
+                        )
+                        cap_reached = total
+                        continue
                 progress("building", dims=dims, rows=rows, rows_are_a_floor=floored)
                 floor = "at least " if floored else ""
                 logger.info(
@@ -2021,6 +2209,13 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
         outcome.update(
             {"status": "skipped", "reason": "index_cap_reached", "index_count": cap_reached}
         )
+    if unsettled:
+        # Reported before the build bound and after the cap, in the same order the
+        # loop decides: a knowledge base with no index at all is the worse state, and
+        # this one has a working index. Its own reason so an operator is not told
+        # "build_repeatedly_failed" about an index that is valid and answering.
+        outcome["definition_rebuilds_not_settling"] = unsettled
+        outcome.update({"status": "skipped", "reason": "definition_rebuild_not_settling"})
     if doomed:
         # Reported after the other skips: a build that has failed every time is
         # the one an operator has to act on, so its reason is the one that
@@ -2230,7 +2425,9 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
                         given_up.append(f"{AI_SCHEMA}.{relname}")
                         continue
                     needing[kb_id] = None
-                elif definition_has_drifted(kb_id, dims, comment):
+                elif definition_has_drifted(kb_id, dims, comment) and not (
+                    definition_rebuild_is_given_up(comment)
+                ):
                     # Built from a definition this version no longer emits: it still
                     # answers searches, at whatever recall the old definition gives,
                     # so it is the least urgent of the four cases and is added after
