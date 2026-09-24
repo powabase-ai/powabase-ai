@@ -17,6 +17,7 @@ import re
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy import text
 
 from agentic_project_service.services.base_vector_store import (
     PER_KB_HNSW_EF_SEARCH,
@@ -25,6 +26,7 @@ from agentic_project_service.services.base_vector_store import (
 )
 
 _KB_ID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+_SOURCE_ID = "3f2504e0-4f89-11d3-9a0c-0305e82c3303"
 
 # Deliberately not the defaults ("on" and "40"): a restore that hardcodes what
 # the setting usually is would pass against a fixture whose prior value *was* that.
@@ -664,10 +666,16 @@ class _SavepointModellingSession:
         self,
         *,
         fail_at: str,
+        occurrence: int = 1,
         partial_index: bool = True,
         ef_search_was: str | None = EF_SEARCH_WAS,
     ):
         self.fail_at = fail_at
+        # Which execution of the matching statement fails. The sets and the
+        # restores are the same statement text, so nothing but a count can tell a
+        # spec about the restore apart from a spec about the set.
+        self.occurrence = occurrence
+        self._seen = 0
         self.partial_index = partial_index
         self.ef_search_was = ef_search_was
         self.statements: list[tuple[str, dict]] = []
@@ -687,6 +695,14 @@ class _SavepointModellingSession:
         return _Savepoint(self)
 
     def _enter_savepoint(self) -> None:
+        # ``SAVEPOINT`` is itself refused inside an aborted transaction, and the
+        # transaction stays aborted -- confirmed on a live server, where it answers
+        # "current transaction is aborted, commands ignored until end of
+        # transaction block" like any other statement. Without this the model lets
+        # a later savepoint *clear* an abort an earlier bare statement caused, and
+        # a dedent of the restore that runs first then goes unnoticed.
+        if self._aborted:
+            raise _AbortedTransaction("current transaction is aborted; SAVEPOINT refused")
         self._levels.append([])
 
     def _leave_savepoint(self, *, failed: bool) -> None:
@@ -710,9 +726,11 @@ class _SavepointModellingSession:
                 f"transaction block; refused: {flat[:60]}"
             )
         if self.fail_at and self.fail_at in flat:
-            self.failed_at.append(flat)
-            self._aborted = True
-            raise _InjectedServerError(f"injected server-side failure at {flat[:60]}")
+            self._seen += 1
+            if self._seen == self.occurrence:
+                self.failed_at.append(flat)
+                self._aborted = True
+                raise _InjectedServerError(f"injected server-side failure at {flat[:60]}")
         self._record_a_setting(flat, params or {})
         if "ORDER BY" in sql:
             self.settings_at_the_search = dict(self.settings)
@@ -821,6 +839,38 @@ def test_the_exact_searchs_own_setting_runs_in_a_savepoint(fail_at):
     assert any("ORDER BY" in sql for sql, _ in statements), (
         f"the search must still run after the setting could not be applied: {statements}"
     )
+
+
+@pytest.mark.parametrize(
+    ("fail_at", "restriction"),
+    [
+        ("set_config('enable_indexscan'", {"source_ids": [_SOURCE_ID]}),
+        ("set_config('enable_sort'", {}),
+        ("set_config('hnsw.ef_search'", {}),
+    ],
+)
+def test_a_restore_that_fails_does_not_hand_back_a_broken_transaction(fail_at, restriction):
+    """The restores are the other three of the eight statements, and they matter more.
+
+    A restore runs after the rows are off the cursor, so a bare failure there gives
+    the caller a search that *answered* and a transaction that no longer works --
+    and the error surfaces on whatever the request does next, which is a failure
+    attributed to the wrong statement. Measured with a server-side failure injected
+    at each restore on its own: the search returned its rows and the caller's
+    transaction was aborted.
+
+    ``occurrence=2`` because a restore is the same statement text as the set it puts
+    back, so nothing but a count can tell a spec about one from a spec about the
+    other.
+
+    This costs nothing in the case a restore usually fails in -- a transaction the
+    search itself aborted -- because there the savepoint cannot be taken either and
+    the handler logs what it logged before.
+    """
+    session = _SavepointModellingSession(fail_at=fail_at, occurrence=2)
+    statements = _run_a_search(session, **restriction)
+    assert session.failed_at, f"the injection missed the restore: {statements}"
+    session.execute(text("SELECT 1"))
 
 
 def test_a_setting_that_could_not_be_applied_is_not_restored_either():
