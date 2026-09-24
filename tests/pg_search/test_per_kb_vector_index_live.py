@@ -94,6 +94,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import threading
 import time
@@ -1263,25 +1264,64 @@ def test_a_build_held_by_another_caller_is_reported_not_duplicated(engine, schem
         holder.close()
 
 
-def test_the_build_leaves_no_session_settings_behind(engine, schema, settings):
-    """maintenance_work_mem and statement_timeout must not ride a pooled connection out.
+# Role-level values for the three settings the build lifts, each different from
+# what the build sets it to. Without them this spec cannot see a leak in two of
+# the three: the build lifts ``statement_timeout`` and ``lock_timeout`` to 0, a
+# stock server's own default for both is already 0, and ``setting = reset_val``
+# then holds whether the reset ran or not. Measured -- with both ``lock_timeout``
+# resets deleted, the version of this spec that only named the setting passed.
+#
+# A role-level value is also the realistic one rather than a contrivance:
+# ``reset_val`` is what a connection comes out of the pool holding, and a
+# deployment that bounds statements or lock waits bounds them there.
+_HYGIENE_ROLE_VALUES = {
+    "maintenance_work_mem": "32MB",
+    "statement_timeout": "7s",
+    "lock_timeout": "2s",
+}
 
-    The build raises both on its own session, because CREATE INDEX CONCURRENTLY
-    cannot run in a transaction and so SET LOCAL would do nothing.
+
+def test_the_build_leaves_no_session_settings_behind(engine, schema, settings):
+    """None of the three settings the build lifts may ride a pooled connection out.
+
+    The build raises all three on its own session, because CREATE INDEX
+    CONCURRENTLY cannot run in a transaction and so SET LOCAL would do nothing.
+
+    ``lock_timeout`` is the one that has to be named here rather than left to the
+    unit tier. It is lifted to ``0`` -- wait for a lock for ever -- and this is
+    the only spec anywhere that reads a *real* pooled connection back after a real
+    non-transactional build, so it is the only one that can say the next statement
+    to check that connection out does not inherit an unbounded lock wait.
+
+    A pool of exactly one connection, so the connection read back is the
+    connection the build ran on rather than probably it.
     """
-    _build_big_index(engine, settings)
-    # The build's own connection is back in the pool by now, so this may well be
-    # it. reset_val is what the session would hold with nothing set on it.
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT name, setting, reset_val FROM pg_settings "
-                "WHERE name IN ('maintenance_work_mem', 'statement_timeout')"
-            )
-        ).all()
-    assert len(rows) == 2, rows
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        role = conn.execute(text("SELECT quote_ident(current_user)")).scalar()
+        for name, value in _HYGIENE_ROLE_VALUES.items():
+            conn.execute(text(f"ALTER ROLE {role} SET {name} = '{value}'"))
+    probe = create_engine(_dsn(), pool_size=1, max_overflow=0, pool_timeout=10)
+    try:
+        outcome = pvi.ensure_per_kb_vector_index(KB_BIG, engine=probe)
+        assert outcome["built"] == [pvi.per_kb_index_name(KB_BIG, DIMS)], outcome
+        # reset_val is the value this connection came out of the pool with, which
+        # is the role-level one set above.
+        with probe.connect() as conn:
+            rows = conn.execute(
+                text("SELECT name, setting, reset_val FROM pg_settings WHERE name = ANY(:names)"),
+                {"names": sorted(_HYGIENE_ROLE_VALUES)},
+            ).all()
+    finally:
+        probe.dispose()
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            for name in _HYGIENE_ROLE_VALUES:
+                conn.execute(text(f"ALTER ROLE {role} RESET {name}"))
+    assert len(rows) == len(_HYGIENE_ROLE_VALUES), rows
     for name, setting, reset_val in rows:
-        assert setting == reset_val, (name, setting, reset_val)
+        assert setting == reset_val, (
+            f"the build left {name} at {setting!r} on a connection whose own value is "
+            f"{reset_val!r}; every later statement on that pooled connection pays for it"
+        )
 
 
 def test_a_concurrent_build_does_not_block_writes(engine, schema, settings):
@@ -2764,3 +2804,420 @@ def test_a_restriction_above_top_k_answers_exactly(
             )
 
     _assert_the_unrestricted_search_still_reaches_the_index(engine, query_vectors, name, shared)
+
+
+# ---------------------------------------------------------------------------
+# 10. What the two GUC blocks may do to the search when a statement of theirs
+#     fails on the server
+# ---------------------------------------------------------------------------
+
+GUC_INJECTION_SCHEMA = "vector_guc_failure_injection"
+
+# Why the failure has to come from the server, and how it is aimed at one
+# statement.
+#
+# Both blocks promise the same thing in their handlers -- the search still runs,
+# on a worse plan, and the warning says which. What decides whether that promise
+# holds is not the handler but the *transaction*: a statement that errors on the
+# server leaves the caller's transaction aborted, so the search that follows
+# raises ``InFailedSqlTransaction`` no matter what the handler logged. A savepoint
+# around the statement is what makes the promise true, and a fake connection that
+# raises in the client cannot tell the two apart: nothing is aborted, so the
+# search after it runs either way. That is why the existing guarding spec asserts
+# ``begin_nested.called`` on a mock, and why mutations that take a statement back
+# out of the savepoint survive every tier.
+#
+# ``pg_catalog`` is searched ahead of everything only while it is not named in
+# ``search_path``; naming it second puts the two functions below -- same names,
+# same argument types -- ahead of the built-ins. Each raises for exactly one
+# setting name, the one armed in a placeholder GUC, and hands every other call
+# to the built-in, so one of the five statements fails and the other four run
+# untouched. Nothing is armed until a test arms it: comparing a name against an
+# unset placeholder yields NULL, which is not true.
+#
+# An event trigger was the other candidate and does not fit: these five
+# statements are ``SELECT``s, and an event trigger only fires on DDL.
+#
+# No ``%`` anywhere in these bodies: the driver reads one as a placeholder in any
+# statement it is given parameters for, so the setting's name goes in DETAIL.
+_GUC_INJECTION_DDL = (
+    f"""
+    CREATE OR REPLACE FUNCTION {GUC_INJECTION_SCHEMA}.set_config(
+        setting_name text, new_value text, is_local boolean
+    ) RETURNS text LANGUAGE plpgsql AS $fn$
+    BEGIN
+        IF setting_name = pg_catalog.current_setting(
+            '{GUC_INJECTION_SCHEMA}.fail_set_config', true
+        ) THEN
+            RAISE EXCEPTION 'injected server-side failure'
+                USING DETAIL = 'set_config(' || setting_name || ')';
+        END IF;
+        RETURN pg_catalog.set_config(setting_name, new_value, is_local);
+    END;
+    $fn$
+    """,
+    f"""
+    CREATE OR REPLACE FUNCTION {GUC_INJECTION_SCHEMA}.current_setting(setting_name text)
+    RETURNS text LANGUAGE plpgsql AS $fn$
+    BEGIN
+        IF setting_name = pg_catalog.current_setting(
+            '{GUC_INJECTION_SCHEMA}.fail_current_setting', true
+        ) THEN
+            RAISE EXCEPTION 'injected server-side failure'
+                USING DETAIL = 'current_setting(' || setting_name || ')';
+        END IF;
+        RETURN pg_catalog.current_setting(setting_name);
+    END;
+    $fn$
+    """,
+    f"""
+    CREATE OR REPLACE FUNCTION {GUC_INJECTION_SCHEMA}.current_setting(
+        setting_name text, missing_ok boolean
+    ) RETURNS text LANGUAGE plpgsql AS $fn$
+    BEGIN
+        IF setting_name = pg_catalog.current_setting(
+            '{GUC_INJECTION_SCHEMA}.fail_current_setting', true
+        ) THEN
+            RAISE EXCEPTION 'injected server-side failure'
+                USING DETAIL = 'current_setting(' || setting_name || ')';
+        END IF;
+        RETURN pg_catalog.current_setting(setting_name, missing_ok);
+    END;
+    $fn$
+    """,
+)
+
+# The five statements the two blocks issue, each with the fragment that shows it
+# was issued at all. ``restricted`` is which of the two blocks a search gets:
+# a restriction takes the exact block, no restriction takes the partial-index one.
+_GUC_STATEMENTS = (
+    ("partial-index block: the catalog probe", "current_setting", "enable_sort", False),
+    ("partial-index block: set_config('enable_sort')", "set_config", "enable_sort", False),
+    (
+        "partial-index block: set_config('hnsw.ef_search')",
+        "set_config",
+        "hnsw.ef_search",
+        False,
+    ),
+    (
+        "exact block: current_setting('enable_indexscan')",
+        "current_setting",
+        "enable_indexscan",
+        True,
+    ),
+    ("exact block: set_config('enable_indexscan')", "set_config", "enable_indexscan", True),
+)
+
+# Fragments that say each of the five was issued, so a refactor that stops
+# issuing one cannot leave this spec passing on four.
+_GUC_STATEMENT_FRAGMENTS = (
+    "current_setting('enable_sort') AS prior_sort",
+    "set_config('enable_sort', 'off', true)",
+    "set_config('hnsw.ef_search', :ef, true)",
+    "current_setting('enable_indexscan')",
+    "set_config('enable_indexscan', 'off', true)",
+)
+
+
+@pytest.fixture(scope="module")
+def guc_failure_injection(engine):
+    """A schema holding one shadow per built-in the two blocks call."""
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {GUC_INJECTION_SCHEMA} CASCADE")
+        conn.exec_driver_sql(f"CREATE SCHEMA {GUC_INJECTION_SCHEMA}")
+        for ddl in _GUC_INJECTION_DDL:
+            conn.exec_driver_sql(ddl)
+    yield GUC_INJECTION_SCHEMA
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {GUC_INJECTION_SCHEMA} CASCADE")
+
+
+def _search_with_one_statement_failing(
+    kb_id, vector, *, shadow=None, setting=None, restricted=False, statements=None
+):
+    """``"ran"`` or ``"raised <Exception>/<sqlstate>"`` for one real search.
+
+    A connection of its own each time, and the search runs on the session the
+    injection is armed on: a search that raises leaves the transaction aborted,
+    and what this spec is about is whether the *caller's* search survived.
+    """
+    probe = create_engine(_dsn())
+    connection = probe.connect()
+    try:
+        with Session(bind=connection) as session:
+            session.execute(text(f"SET search_path = {GUC_INJECTION_SCHEMA}, pg_catalog, public"))
+            if shadow is not None:
+                session.execute(
+                    text("SELECT pg_catalog.set_config(:guc, :setting, false)"),
+                    {"guc": f"{GUC_INJECTION_SCHEMA}.fail_{shadow}", "setting": setting},
+                )
+            # Committed, so the search below meets the injection in a transaction
+            # of its own -- the shape a pooled connection is checked out in.
+            session.commit()
+            recorder = _RecordingSession(session)
+            store = _ChunkStore(db_session=recorder, knowledge_base_id=kb_id, schema=SCHEMA)
+            restriction = {"filter_metadata": FILTER_ONE_IN_FIVE} if restricted else {}
+            try:
+                items = asyncio.run(
+                    store.vector_search(embedding=list(vector), top_k=TOP_K, **restriction)
+                )
+                return f"ran, {len(items)} rows"
+            except Exception as exc:
+                sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+                return f"raised {type(exc).__name__}/{sqlstate}"
+            finally:
+                if statements is not None:
+                    statements.extend(sql for sql, _ in recorder.statements)
+                session.rollback()
+    finally:
+        connection.close()
+        probe.dispose()
+
+
+def test_neither_guc_block_may_turn_a_failed_setting_into_a_failed_search(
+    engine, schema, settings, guc_failure_injection, query_vectors, caplog
+):
+    """One harness over both blocks: five statements, five server-side failures.
+
+    Every handler in the pair says the same thing -- the search still runs, on a
+    worse plan, and here is which -- and the module docstring says it of all of
+    them: "degrades latency, never the answer, so all of them are logged rather
+    than raised". A statement that fails outside a savepoint makes that false,
+    because the aborted transaction takes the search with it, and the log line
+    then describes a plan no search ever got.
+
+    So each of the five is failed on the server in turn, one at a time, and the
+    search is asked for its verdict: it must come back with rows, and it must
+    have said in the log what it came back with instead. The control run, with
+    nothing armed, is what says all five statements are issued at all -- a
+    refactor that stops issuing one must not leave four green.
+    """
+    _build_big_index(engine, settings)
+
+    issued: list[str] = []
+    controls = {
+        restricted: _search_with_one_statement_failing(
+            KB_BIG, query_vectors[0], restricted=restricted, statements=issued
+        )
+        for restricted in (False, True)
+    }
+    assert all(verdict.startswith("ran") for verdict in controls.values()), controls
+    for fragment in _GUC_STATEMENT_FRAGMENTS:
+        assert any(fragment in sql for sql in issued), (
+            f"no search issued {fragment!r}, so the injection aimed at it would prove nothing"
+        )
+
+    verdicts = []
+    for label, shadow, setting, restricted in _GUC_STATEMENTS:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=bvs.__name__):
+            verdict = _search_with_one_statement_failing(
+                KB_BIG,
+                query_vectors[0],
+                shadow=shadow,
+                setting=setting,
+                restricted=restricted,
+            )
+        warned = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING and record.name == bvs.__name__
+        ]
+        verdicts.append((label, verdict, bool(warned)))
+
+    table = "\n".join(
+        f"    {label:<50} -> {verdict}{'' if warned else '   [and nothing was logged]'}"
+        for label, verdict, warned in verdicts
+    )
+    broken = [row for row in verdicts if not row[1].startswith("ran") or not row[2]]
+    assert not broken, (
+        "a failure at any one of the five statements the two GUC blocks issue must "
+        "leave the search running and say so in the log; these did not:\n" + table
+    )
+
+
+# ---------------------------------------------------------------------------
+# 11. A connection lost between two dimensions of the same knowledge base
+# ---------------------------------------------------------------------------
+
+MODEL_CHANGE_SCHEMA = f"{SCHEMA}_model_change"
+KB_MODEL_CHANGE = "9f8b1c2e-0000-4000-8000-0000000000e1"
+
+# The scenario `_discard_connection`'s own docstring gives as its reason: a
+# knowledge base that changed embedding model, with an index to drop at the old
+# width and one to build at the new one. Tiny widths and tiny row counts, with
+# thresholds to match, because nothing here is about either number -- what is
+# under test is whether the connection the loop carries from one dimension to the
+# next can still run `CREATE INDEX CONCURRENTLY` after it has been discarded.
+# The build threshold is the registry's own minimum rather than something
+# smaller: `thresholds` clamps to the registry bounds, so a smaller one is
+# silently raised to 1,000 and the second dimension is never dispatched at all.
+DIMS_BEFORE, DIMS_AFTER = 4, 8
+ROWS_BEFORE, ROWS_AFTER = 400, 1_200
+MODEL_CHANGE_BUILD_AT, MODEL_CHANGE_DROP_BELOW = 1_000, 500
+
+
+@pytest.fixture(scope="module")
+def model_change_schema(engine):
+    """An ``embeddings`` table with rows at two widths, and nothing else.
+
+    A schema of its own rather than the module fixture's, because the fixture's
+    row counts and its ``n_distinct(knowledge_base_id)`` are chosen against the
+    planner (see the module docstring) and a knowledge base added to it moves
+    both. Only ``embeddings``: the reconcile loop reads and indexes that table
+    and never joins the item table.
+    """
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {MODEL_CHANGE_SCHEMA} CASCADE")
+        conn.exec_driver_sql(f"CREATE SCHEMA {MODEL_CHANGE_SCHEMA}")
+        conn.exec_driver_sql(f"""
+            CREATE TABLE {MODEL_CHANGE_SCHEMA}.embeddings (
+                id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                item_id uuid NOT NULL,
+                item_table varchar(50) NOT NULL,
+                knowledge_base_id uuid NOT NULL,
+                source_id uuid NOT NULL,
+                embedding_model varchar(255) NOT NULL,
+                dims smallint NOT NULL,
+                embedding vector NOT NULL
+            )
+        """)
+        conn.exec_driver_sql(
+            f"ALTER TABLE {MODEL_CHANGE_SCHEMA}.embeddings SET (parallel_workers = 0)"
+        )
+        for dims, rows in ((DIMS_BEFORE, ROWS_BEFORE), (DIMS_AFTER, ROWS_AFTER)):
+            conn.exec_driver_sql(f"""
+                INSERT INTO {MODEL_CHANGE_SCHEMA}.embeddings (
+                    item_id, item_table, knowledge_base_id, source_id,
+                    embedding_model, dims, embedding
+                )
+                SELECT gen_random_uuid(), '{pvi.PER_KB_INDEX_ITEM_TABLE}',
+                       '{KB_MODEL_CHANGE}'::uuid, '{SOURCE}'::uuid,
+                       'test-embed-{dims}', {dims},
+                       ('[' || array_to_string(
+                           array_fill(g::float8, ARRAY[{dims}]), ',') || ']')::vector
+                FROM generate_series(1, {rows}) AS g
+            """)
+    yield MODEL_CHANGE_SCHEMA
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.exec_driver_sql(f"DROP SCHEMA IF EXISTS {MODEL_CHANGE_SCHEMA} CASCADE")
+
+
+@pytest.fixture
+def model_change(engine, model_change_schema, monkeypatch):
+    """Point the service at that schema, with thresholds its row counts straddle."""
+    monkeypatch.setattr(pvi, "AI_SCHEMA", MODEL_CHANGE_SCHEMA)
+    values = {
+        "VECTOR_PER_KB_INDEX_MIN_ROWS": MODEL_CHANGE_BUILD_AT,
+        "VECTOR_PER_KB_INDEX_DROP_ROWS": MODEL_CHANGE_DROP_BELOW,
+        "VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB": _MEM_MB,
+    }
+    monkeypatch.setattr(pvi, "get_setting", lambda key: values[key])
+    monkeypatch.setattr(pvi, "read_overrides", lambda conn, *keys: dict(values))
+    _drop_all_partial_indexes(engine, MODEL_CHANGE_SCHEMA)
+    yield MODEL_CHANGE_SCHEMA
+    _drop_all_partial_indexes(engine, MODEL_CHANGE_SCHEMA)
+
+
+def test_a_discarded_connection_can_still_build_the_next_dimensions_index(
+    engine, model_change, monkeypatch
+):
+    """The live twin of the fake-connection spec: the handle has to still *work*.
+
+    ``_discard_connection`` exists so that one lost connection does not take the
+    other dimensions of the same knowledge base with it, and the existing spec
+    for it drives a fake connection -- which pins that the loop *reaches* the
+    next dimension and nothing about whether the statement there can run. The
+    part a fake cannot carry is that ``CREATE INDEX CONCURRENTLY`` refuses a
+    transaction block, so the reconnected handle has to come back outside one.
+
+    Four moves: an index at the old width to drop, an unlock that ends its own
+    backend the way a lost connection does, and then the assertion that is the
+    whole point -- the build at the new width happened.
+    """
+    before = pvi.per_kb_index_name(KB_MODEL_CHANGE, DIMS_BEFORE)
+    after = pvi.per_kb_index_name(KB_MODEL_CHANGE, DIMS_AFTER)
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(pvi.per_kb_index_ddl(KB_MODEL_CHANGE, DIMS_BEFORE)))
+
+    unlocks: list[None] = []
+    real_unlock_sql = pvi.partition_build_unlock_sql()
+
+    def unlock_sql() -> str:
+        unlocks.append(None)
+        # Only the first dimension's unlock: the loop's connection is lost
+        # between two dimensions, which is the case the function is for.
+        if len(unlocks) == 1:
+            return "SELECT pg_terminate_backend(pg_backend_pid())"
+        return real_unlock_sql
+
+    monkeypatch.setattr(pvi, "partition_build_unlock_sql", unlock_sql)
+    try:
+        outcome = pvi.ensure_per_kb_vector_index(KB_MODEL_CHANGE, engine=engine)
+    except Exception as exc:
+        pytest.fail(
+            f"the reconcile raised {type(exc).__name__} "
+            f"[{getattr(getattr(exc, 'orig', None), 'sqlstate', None)}] at the dimension "
+            f"after the one whose connection was discarded: "
+            f"{str(exc).splitlines()[0]}"
+        )
+
+    assert outcome["dropped"] == [before], outcome
+    assert outcome["built"] == [after], (
+        f"the loop survived the discarded connection but the build after it did not: {outcome}"
+    )
+    with engine.connect() as conn:
+        assert pvi.existing_per_kb_indexes(conn, KB_MODEL_CHANGE) == {DIMS_AFTER: True}
+
+
+def test_a_given_up_index_on_a_shrunken_knowledge_base_is_really_dropped(
+    engine, schema, settings, monkeypatch
+):
+    """Giving up on the repair is not giving up on the drop -- as an outcome.
+
+    An INVALID index that has failed its bound is not rebuilt, and the module
+    says so in three places; what it also says is that a knowledge base which has
+    since fallen below the drop threshold still wants that index *gone*, "which is
+    also what re-arms the build". Both dispatch paths agree that something is owed
+    here -- the start-up sweep returns the knowledge base and ``index_action``
+    answers ``drop`` -- so the only question left is whether the reconcile they
+    dispatch does it.
+
+    The existing spec for this stops at the dispatch, which is the false green:
+    it would pass unchanged against a reconcile that does nothing at all. This one
+    asserts the index is not there any more.
+    """
+    name = _build_big_index(engine, settings)
+    _invalidate(engine, name)
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        # Through the module's own writer, so the comment this reads back is in
+        # the format the module writes rather than one spelled out here.
+        pvi._record_build_failure(conn, KB_BIG, DIMS, pvi.MAX_CONSECUTIVE_BUILD_FAILURES)
+        assert (
+            pvi.recorded_build_failures(conn, KB_BIG, DIMS) == pvi.MAX_CONSECUTIVE_BUILD_FAILURES
+        ), "the failure history this spec is about was not recorded"
+
+    # Above BIG_ROWS on both sides: the knowledge base has shrunk under a build
+    # that kept failing, and is now below the drop threshold.
+    shrunk = {
+        "VECTOR_PER_KB_INDEX_MIN_ROWS": 20_000,
+        "VECTOR_PER_KB_INDEX_DROP_ROWS": 15_000,
+        "VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB": _MEM_MB,
+    }
+    monkeypatch.setattr(pvi, "get_setting", lambda key: shrunk[key])
+    monkeypatch.setattr(pvi, "read_overrides", lambda conn, *keys: dict(shrunk))
+
+    with engine.connect() as conn:
+        assert pvi.index_action(conn, KB_BIG) == "drop", "the dispatch gate asks for the drop"
+    assert KB_BIG in pvi.kbs_needing_a_per_kb_index(engine=engine), (
+        "the start-up sweep dispatches this knowledge base"
+    )
+
+    outcome = pvi.ensure_per_kb_vector_index(KB_BIG, engine=engine)
+    with engine.connect() as conn:
+        assert pvi.existing_per_kb_indexes(conn, KB_BIG) == {}, (
+            f"both dispatch paths asked for this index to be dropped and it is still "
+            f"there, so nothing will ever drop it and nothing re-arms the build: "
+            f"{outcome}"
+        )
+    assert outcome["dropped"] == [name], outcome
