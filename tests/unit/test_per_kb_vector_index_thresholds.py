@@ -3,9 +3,12 @@
 Scoping a vector search to its knowledge base can make a knowledge base with no
 partial index of its own slower -- it can no longer stop at the project-wide
 index's first ``ef_search`` candidates. One fixture measured 3.6 ms to 80 ms at
-21% of the embeddings table (12.6k rows) and 129 ms at 30% (18k rows); a second,
-independently built, measured the new shape 3.6x *faster* at the same recall. So
-that regression is fixture-dependent, and a default chosen to sit below it would
+21% of the embeddings table (12.6k rows) and 129 ms at 30% (18k rows); a later
+150,000-embedding one measured 6.2 ms to 50.4 ms at 10k and 4.4 ms to 132.5 ms at
+20k; and a third, independently built, measured the new shape 3.6x *faster* at the
+same recall with no window at all. So the window is a property of the fixture --
+its existence included, because which plan wins is a cost race decided by table
+shape rather than by embedding width -- and a default chosen to sit below it would
 be chasing a number that does not reproduce.
 
 What decided these defaults is the other side: an index can be built, maintained
@@ -27,9 +30,12 @@ import re
 
 from agentic_project_service.services.settings_registry import SETTINGS_REGISTRY
 
-# The two knowledge bases measured as regressing, in rows.
-SMALLEST_MEASURED_REGRESSION = 12_600
-LARGEST_MEASURED_REGRESSION = 18_000
+# The knowledge-base sizes measured as regressing, in rows, across two fixtures:
+# 12.6k and 18k on the first, 10k and 20k on a later 150,000-embedding one. The
+# largest is what this module asserts against, so it has to move when a bigger one
+# is measured -- otherwise the assertion below quietly stops meaning anything.
+SMALLEST_MEASURED_REGRESSION = 10_000
+LARGEST_MEASURED_REGRESSION = 20_000
 
 # The shapes the copy has to carry, whatever the numbers turn out to be and
 # however they are worded: a latency, a recall fraction, and an index size.

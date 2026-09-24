@@ -520,6 +520,49 @@ def test_every_run_ends_in_one_structured_line(monkeypatch, caplog):
     assert "attempt=1" in line
 
 
+def test_an_index_kept_on_an_older_definition_is_countable(monkeypatch, caplog):
+    """A kept stale index is the outcome an operator has to find later.
+
+    It answers correctly, at whatever recall the definition it was built from
+    gives, and nothing comes back to it — so of the two stale outcomes this is the
+    one that needs to be greppable rather than merely logged as a warning.
+    """
+    import logging
+
+    def fake_ensure(kb_id, engine=None, on_progress=None):
+        return {
+            "status": "ready",
+            "built": [],
+            "dropped": [],
+            "stale_definitions_kept": [f"hnsw_kb_{KB.replace('-', '')}_768"],
+            "reason": "index_cap_reached",
+        }
+
+    monkeypatch.setattr(pvi, "ensure_per_kb_vector_index", fake_ensure)
+    with caplog.at_level(logging.INFO):
+        idx.ensure_per_kb_vector_index.run(KB)
+
+    line = next(x for x in _ensure_log(caplog).splitlines() if "outcome=" in x)
+    assert "stale_kept=hnsw_kb_" in line, line
+    assert "reason=index_cap_reached" in line, line
+
+
+def test_a_run_that_kept_nothing_stale_says_nothing_about_it(monkeypatch, caplog):
+    """The fields are absent rather than empty, so a grep for them means something."""
+    import logging
+
+    def fake_ensure(kb_id, engine=None, on_progress=None):
+        return {"status": "ready", "built": [], "dropped": []}
+
+    monkeypatch.setattr(pvi, "ensure_per_kb_vector_index", fake_ensure)
+    with caplog.at_level(logging.INFO):
+        idx.ensure_per_kb_vector_index.run(KB)
+
+    line = next(x for x in _ensure_log(caplog).splitlines() if "outcome=" in x)
+    assert "stale_kept" not in line, line
+    assert "rebuilt_stale" not in line, line
+
+
 def test_a_failed_build_is_recorded_before_it_is_raised(monkeypatch, caplog):
     """A permanently failing build is exactly the case an operator has to find."""
     import logging

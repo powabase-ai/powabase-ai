@@ -3330,12 +3330,21 @@ def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
     built = outcome.get("built") or []
     dropped = outcome.get("dropped") or []
     repaired = outcome.get("repaired_invalid_indexes") or []
+    # An index whose stored definition no longer matches what this version emits is
+    # either rebuilt or deliberately kept, and the kept case is the one an operator
+    # has to find later: a knowledge base searching an index built from an older
+    # definition, correctly but at whatever recall that definition gives. It had
+    # only a WARNING, which is not something you can count.
+    rebuilt_stale = outcome.get("rebuilt_stale_definitions") or []
+    stale_kept = outcome.get("stale_definitions_kept") or []
     summarise(
         outcome.get("status", "unknown"),
         dims=_vector_index_dims(built, dropped, repaired),
         built=built,
         dropped=dropped,
         repaired=repaired,
+        **({"rebuilt_stale": rebuilt_stale} if rebuilt_stale else {}),
+        **({"stale_kept": stale_kept} if stale_kept else {}),
         **({"reason": outcome["reason"]} if outcome.get("reason") else {}),
     )
 
