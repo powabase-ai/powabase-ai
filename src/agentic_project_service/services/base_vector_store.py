@@ -183,6 +183,36 @@ def kb_sql_literal(knowledge_base_id: Any) -> str:
         raise ValueError(f"knowledge_base_id is not a UUID: {knowledge_base_id!r}") from exc
 
 
+def item_table_sql_literal(item_table: str) -> str:
+    """A store's item table as a quoted SQL literal, or ValueError.
+
+    ``ai.embeddings`` is polymorphic: ``item_table`` is a NOT NULL column naming
+    which table the embedded item lives in, and four stores inherit
+    ``vector_search``. A knowledge base crosses the per-knowledge-base build
+    threshold on the *sum* over those tables, so without this restriction one
+    index can hold several populations and a search from one store walks entries
+    that cannot join. Measured on the same 1,000 chunk rows, an index over chunks
+    alone against chunks plus 9,000 document rows: recall 0.858 -> 0.383; and on
+    6,000 chunk rows with and without 6,000 graph-node rows, 0.925 -> 0.812 with
+    the worst query falling 0.700 -> 0.300.
+
+    Interpolated rather than bound for the same reason the knowledge base id and
+    ``dims`` are (see ``kb_sql_literal``): the index predicate names it, and a
+    generic plan can only match a partial index whose predicate it can *prove*.
+    A bound parameter proves nothing, so the third clause has to be a literal too
+    or a prepared statement loses the index it was built to reach.
+
+    Validated even though the value is a class attribute rather than caller data,
+    and even though the same attribute is already interpolated as an identifier in
+    the ``FROM`` clause: a value that could close the quote here would break that
+    clause too, but the gate is one line and it puts the check where the quoting
+    happens.
+    """
+    if not (isinstance(item_table, str) and item_table.isidentifier() and item_table.islower()):
+        raise ValueError(f"item_table is not a bare lowercase identifier: {item_table!r}")
+    return f"'{item_table}'"
+
+
 def validated_top_k(top_k: Any) -> int:
     """A row limit safe to interpolate into ``LIMIT``, or ValueError.
 
@@ -1141,9 +1171,61 @@ class BasePgVectorStore:
         # Both literals come from the same validated gate, so the second costs
         # no new injection surface.
         #
-        # So four values decide whether a prepared statement keeps the index:
-        # the KB id on each side, `dims`, and the LIMIT. All four are
-        # interpolated -- a generic plan can only match the index's predicate
+        # `e.item_table` is the third literal in the predicate, and it is here
+        # because the index is single-population by construction: `ai.embeddings`
+        # is polymorphic, a knowledge base crosses the build threshold on the SUM
+        # over its item tables, and an index mixing populations is walked for
+        # entries that cannot join. Measured on the same 1,000 chunk rows, an
+        # index over chunks alone against chunks plus 9,000 document rows: recall
+        # 0.858 -> 0.383; and on 6,000 chunk rows with and without 6,000
+        # graph-node rows, 0.925 -> 0.812 with the worst query at 0.700 -> 0.300.
+        # The index predicate names it, so the query has to name it as a literal
+        # for a generic plan to prove the predicate -- the same reason the KB id
+        # and `dims` are literals.
+        #
+        # It returns no different rows, and that is a property rather than a
+        # hope: an embedding's `item_table` is the table its item lives in, both
+        # columns are written from one value in the same statement, and the join
+        # already restricts to this table's rows. So it is a redundant clause
+        # whose only job is to be provable -- and, incidentally, the one thing
+        # that would stop an `item_id` collision across two item tables joining
+        # the wrong row. Verified rather than argued: on a fixture whose
+        # embeddings table holds all three populations for every knowledge base,
+        # 144 comparisons (2 stores x 3 knowledge base sizes x 4 restriction
+        # shapes x 6 query vectors, every scan priced out on both sides so the
+        # answers are exact), the row sets with and without the clause were
+        # identical in every one.
+        #
+        # Without it the restricted index predicate cannot be *proved*, which is
+        # the whole point: with `item_table = 'chunks'` in the index predicate and
+        # this clause absent, EXPLAIN ANALYZE takes the shared per-dimension index
+        # instead -- 12.2 ms against the partial index's 1.45 ms -- under
+        # `plan_cache_mode` `auto` and `force_generic_plan` alike. The two halves
+        # only work together.
+        #
+        # What it costs is another correlated clause on the same estimate. It
+        # multiplies the underestimate below by the item table's *global*
+        # frequency, which on the same fixture is 0.789 for chunks:
+        #
+        # | shape                                | BIG    | MED   | THIN |
+        # |---|---|---|---|
+        # | real chunk rows                      | 12,000 | 8,400 |  400 |
+        # | `c.knowledge_base_id = K` alone      | 12,000 | 8,400 |  400 |
+        # | `e.knowledge_base_id = K` alone      | 12,580 | 7,420 |  554 |
+        # | both                                 |  5,242 | 2,164 |    8 |
+        # | **both + `e.item_table`**            |  4,136 | 1,708 |    6 |
+        #
+        # So about 1.27x worse on the join estimate, on top of an error the gate
+        # below already has to overcome. The scan estimate on the embeddings side
+        # moves the other way and gets *better*, because that is the side the
+        # clause actually restricts: 15,943 -> 12,581 against 12,000 real rows.
+        # Correctness settles it either way -- an index mixing populations is
+        # walked for rows that cannot join -- but the number is here rather than
+        # left to be discovered.
+        #
+        # So five values decide whether a prepared statement keeps the index:
+        # the KB id on each side, `item_table`, `dims`, and the LIMIT. All five
+        # are interpolated -- a generic plan can only match the index's predicate
         # when it can prove all of it, and the planner's estimate for an unknown
         # LIMIT prices the ordered index scan out. kb_sql_literal has the
         # measured table; all of them are validated above.
@@ -1154,6 +1236,7 @@ class BasePgVectorStore:
         # bound as jsonb -- and a search carrying one is made exact instead of
         # approximate, see _insisting_on_an_exact_search.
         kb_literal = kb_sql_literal(self.kb_id)
+        item_table_literal = item_table_sql_literal(self.TABLE)
         query = f"""
             SELECT
                 c.id,
@@ -1165,6 +1248,7 @@ class BasePgVectorStore:
             JOIN "{self.schema}".embeddings e ON e.item_id = c.id
             WHERE c.knowledge_base_id = {kb_literal}
               AND e.knowledge_base_id = {kb_literal}
+              AND e.item_table = {item_table_literal}
               AND e.dims = {effective_dims}
         """
 

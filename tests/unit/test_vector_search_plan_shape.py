@@ -20,6 +20,7 @@ import pytest
 from agentic_project_service.services.base_vector_store import (
     PER_KB_HNSW_EF_SEARCH,
     BasePgVectorStore,
+    item_table_sql_literal,
 )
 
 _KB_ID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
@@ -167,6 +168,55 @@ def test_a_bad_knowledge_base_id_is_rejected_on_both_sides():
         assert "knowledge_base_id" in str(exc), exc
     else:
         raise AssertionError("a non-UUID knowledge base id must raise")
+
+
+@pytest.mark.parametrize(
+    ("store", "item_table"),
+    [(_FakeStore, "chunks"), (_FakeDocumentStore, "full_documents")],
+    ids=["chunks", "documents"],
+)
+def test_the_item_table_reaches_sql_as_a_literal_too(store, item_table):
+    """``ai.embeddings`` is polymorphic, so the index is one population by predicate.
+
+    A knowledge base crosses the build threshold on the *sum* over its item tables.
+    An index that mixes populations is then walked for entries that cannot join:
+    measured on the same 1,000 chunk rows, chunks alone against chunks plus 9,000
+    document rows, recall 0.858 -> 0.383; and on 6,000 chunk rows with and without
+    6,000 graph-node rows, 0.925 -> 0.812 with the worst query at 0.700 -> 0.300.
+
+    The index predicate names the item table, so the query has to name it as a
+    *literal* or a generic plan cannot prove the predicate and the index is lost --
+    confirmed by EXPLAIN ANALYZE, which drops to the shared per-dimension index
+    (12.2 ms against 1.45 ms) as soon as the clause is bound or absent.
+
+    The store's own table, not a hardcoded ``chunks``: an embedding's ``item_table``
+    is the table its item lives in, so this is the semantically correct restriction
+    for every store that inherits the search, and the one that keeps a document
+    store off an index built for chunks.
+    """
+    sql, params = _search(_capture(store=store))
+    normalized = "".join(sql.split())
+    assert f"e.item_table='{item_table}'" in normalized, (
+        "the item table must be a literal on the embeddings side, or the index "
+        f"predicate cannot be proved:\n{sql}"
+    )
+    assert "item_table" not in params, (
+        f"a bound item table proves nothing to the planner: {params}"
+    )
+
+
+def test_an_item_table_that_could_break_the_quoting_is_rejected():
+    """The one gate between a store's ``TABLE`` and a SQL string literal.
+
+    It is a class attribute rather than caller data, and the same attribute is
+    already interpolated as an identifier in the ``FROM`` clause -- but the check
+    belongs where the quoting happens, not in a comment about why it is safe.
+    """
+    assert item_table_sql_literal("chunks") == "'chunks'"
+    assert item_table_sql_literal("doc2json_documents") == "'doc2json_documents'"
+    for bad in ["chunks'; DROP TABLE x --", "Chunks", "ai.chunks", "", "chunks chunks", None, 7]:
+        with pytest.raises(ValueError):
+            item_table_sql_literal(bad)
 
 
 # ---------------------------------------------------------------------------
