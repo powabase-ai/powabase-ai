@@ -1,14 +1,24 @@
-"""The default thresholds have to cover the window where the query change costs time.
+"""The default thresholds encode a decision, so they are pinned where it is written.
 
-Scoping a vector search to its knowledge base makes a knowledge base that has no
-partial index of its own SLOWER: it can no longer stop at the project-wide
-index's first ``ef_search`` candidates. Measured 3.6 ms to 80 ms where the
-knowledge base held 21% of the embeddings table (12.6k rows) and 129 ms at 30%
-(18k rows). A build threshold above those row counts leaves precisely the
-knowledge bases that regressed with no way out of it, on a project that will
-never look big enough to anyone reading the setting.
+Scoping a vector search to its knowledge base can make a knowledge base with no
+partial index of its own slower -- it can no longer stop at the project-wide
+index's first ``ef_search`` candidates. One fixture measured 3.6 ms to 80 ms at
+21% of the embeddings table (12.6k rows) and 129 ms at 30% (18k rows); a second,
+independently built, measured the new shape 3.6x *faster* at the same recall. So
+that regression is fixture-dependent, and a default chosen to sit below it would
+be chasing a number that does not reproduce.
 
-So the defaults are pinned against the measurement, not against each other.
+What decided these defaults is the other side: an index can be built, maintained
+on every write, and never scanned, because in some storage layouts the planner
+prefers the project-wide index even for a knowledge base that owns one. That was
+measured in one layout and could not be reproduced in another, so it is an open
+question -- and until it is settled the default stays high enough that almost
+nothing crosses it by accident. Lowering it is a per-project setting change, to be
+made after confirming with ``pg_stat_all_indexes`` that the index is really
+scanned.
+
+The literals are therefore pinned here, with the reasoning, so that moving them is
+a deliberate edit against a new measurement rather than a quiet retune.
 """
 
 from __future__ import annotations
@@ -28,26 +38,35 @@ _RECALL_FIGURE = re.compile(r"0\.\d+")
 _DISK_FIGURE = re.compile(r"\d[\d,.]* ?(?:MB|GB)\b")
 
 
-def test_the_defaults_are_the_pair_the_measurement_chose():
+def test_the_defaults_are_the_pair_that_was_decided():
     """The literal numbers, pinned once, here.
 
     Everything else about these two settings is asserted as a relation -- the
     hysteresis, the range -- which is right for properties that hold whatever the
-    numbers are. But the numbers themselves are the fix: 50,000 and 25,000 left
-    every measured regression below the threshold with no index and no way to
-    earn one. A change back needs a new measurement and a deliberate edit here.
+    numbers are. These numbers are a judgement call instead: high enough that a
+    project does not start building per-knowledge-base indexes on its first boot
+    while it is still unknown whether the planner will scan them. Changing them
+    needs the measurement named in the module docstring, and a deliberate edit
+    here.
     """
-    assert SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"].default == 10_000
-    assert SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_DROP_ROWS"].default == 5_000
+    assert SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"].default == 50_000
+    assert SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_DROP_ROWS"].default == 25_000
 
 
-def test_the_build_default_is_at_or_below_the_measured_regression_window():
+def test_the_build_default_leaves_the_measured_regression_window_unindexed():
+    """The cost of the conservative default, asserted so it cannot be forgotten.
+
+    A knowledge base in the measured window keeps the project-wide index and earns
+    no index of its own. That is the accepted trade, not an oversight -- and it is
+    the thing to revisit first if the open plan-choice question closes, because
+    lowering the threshold is then the whole fix.
+    """
     build = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"]
-    assert build.default <= SMALLEST_MEASURED_REGRESSION, (
-        "a knowledge base that got slower must be able to reach the threshold: "
-        f"default {build.default} leaves the measured "
-        f"{SMALLEST_MEASURED_REGRESSION}- and {LARGEST_MEASURED_REGRESSION}-row "
-        "knowledge bases on the project-wide index for good"
+    assert build.default > LARGEST_MEASURED_REGRESSION, (
+        "this default is meant to sit above the measured window; if it has been "
+        f"lowered to {build.default} on purpose, the module docstring and the "
+        "setting's description both need to say why, and this spec should be the "
+        "one that made you read them"
     )
 
 

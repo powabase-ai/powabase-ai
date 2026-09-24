@@ -1138,7 +1138,7 @@ def _build_registry() -> dict[str, SettingDef]:
             category=cat,
             label="Per-KB Vector Index Threshold (rows)",
             type="int",
-            default=10000,
+            default=50000,
             min=1000,
             max=10000000,
             advanced=True,
@@ -1149,26 +1149,38 @@ def _build_registry() -> dict[str, SettingDef]:
                 "over only its own vectors: measured on a 73,290-embedding knowledge "
                 "base, 182 ms to 1.4 ms warm and 824 ms to 225 ms cold, and a top-k "
                 "drawn from the right population rather than from the whole project. "
-                "A knowledge base BELOW this threshold keeps the project-wide index "
-                "and is slower than it was before this feature existed: measured "
-                "3.6 ms to 80 ms where its own rows are 21% of the embeddings table, "
-                "and 129 ms at 30%. What it buys there is a correct answer instead of "
-                "a fast wrong one — searching the project-wide index and discarding "
-                "other knowledge bases' hits returned, measured against an exact "
-                "scan, only 0.65 to 0.70 of the right top-k, and the scoped search "
-                "returns all of it. So the default sits at the low end of that "
-                "regression window rather than above it: a knowledge base that is "
-                "slow because it is a small fraction of a large table is exactly the "
-                "one an index of its own fixes. (That index is itself approximate — "
-                "measured recall 0.90 — because it is an HNSW index, just one over "
-                "the right population.) The cost is disk and write throughput: "
-                "roughly 9.5 MB of index per 1,000 embeddings at 1536 dimensions "
-                "(573 MB measured at 60,000), multiplied by up to the 200 "
+                "A knowledge base BELOW this threshold keeps the project-wide index. "
+                "Whether that is slower than before this feature existed depends on "
+                "the table: one fixture measured 3.6 ms to 80 ms where a knowledge "
+                "base was 21% of the embeddings table, while another measured the new "
+                "shape 3.6x FASTER at the same recall, so treat that regression as "
+                "fixture-dependent rather than a property of the change. What the "
+                "scoped search does buy everywhere is a top-k drawn from the right "
+                "population: searching the project-wide index and discarding other "
+                "knowledge bases\' hits returned only 0.65 to 0.70 of the right "
+                "top-k on one measurement and 0.93 to 0.96 on real embeddings, "
+                "against an exact scan\'s 1.00. An index of a knowledge base\'s own "
+                "is itself approximate — recall 0.915 at 30% of the table and 0.933 "
+                "at 21% on real embeddings, 0.973 at the ef_search this service sets "
+                "— so crossing this threshold trades an exact answer for a much "
+                "faster approximate one. "
+                "The default is deliberately conservative, and the reason is not the "
+                "disk. In some storage layouts the planner can prefer the "
+                "project-wide index even for a knowledge base that has its own, which "
+                "would mean an index built, maintained on every write, and never "
+                "scanned. That has been measured in one layout and could not be "
+                "reproduced in another, so it is an open question rather than a known "
+                "defect — and this default keeps the exposure to it near zero while "
+                "still covering the knowledge bases big enough to be the problem in "
+                "the first place. To lower it, lower it on one project, then confirm "
+                "with pg_stat_all_indexes that the new index is actually being "
+                "scanned before lowering it anywhere else. "
+                "The cost of each index is disk and write throughput: roughly 9.5 MB "
+                "per 1,000 embeddings at 1536 dimensions (573 MB measured at 60,000, "
+                "so about 475 MB at this threshold), multiplied by up to the 200 "
                 "per-knowledge-base indexes a project may hold, and writes to an "
                 "indexed knowledge base pay for one more index until the "
-                "project-wide one is retired. Raising this leaves a mid-sized "
-                "knowledge base in the regression window; lowering it spends disk on "
-                "knowledge bases too small to be slow in the first place."
+                "project-wide one is retired."
             ),
         ),
         SettingDef(
@@ -1176,7 +1188,7 @@ def _build_registry() -> dict[str, SettingDef]:
             category=cat,
             label="Per-KB Vector Index Drop Threshold (rows)",
             type="int",
-            default=5000,
+            default=25000,
             min=1,
             max=10000000,
             advanced=True,

@@ -73,10 +73,15 @@ replaces was fast and quietly wrong. Measured against an exact scan over the
 same knowledge base, the old shape returned recall 0.65-0.70 -- it stopped as
 soon as the join had produced ``top_k`` rows of the wanted knowledge base --
 where the new one returns 1.0. So the trade in that window is lossy-fast for
-exact-slow, and the build threshold has to sit *below* the knowledge bases that
-land in it, which is what the 10,000-row default is for: the two knowledge bases
-where this was measured held 12.6k and 18k rows, and a 50,000-row threshold left
-both of them regressed with no index ever built.
+exact-slow. Whether it is a regression at all is fixture-dependent -- the two
+knowledge bases where it was measured held 12.6k and 18k rows, and a second
+fixture built independently measured the new shape 3.6x *faster* at the same
+recall -- and the 50,000-row default deliberately leaves that window unindexed.
+The reason is the other side of the trade: an index can be built, maintained on
+every write and never scanned, because in some storage layouts the planner
+prefers the project-wide index even for a knowledge base that owns one. Until
+that is settled, the default keeps almost nothing crossing it; lowering it is a
+per-project setting change, made after confirming the index is really scanned.
 
 (The partial index is itself approximate, at recall 0.90 on that fixture. The
 exactness above is a property of the transitional plan, not of the destination.)

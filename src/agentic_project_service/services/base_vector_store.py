@@ -104,8 +104,8 @@ PER_KB_INDEX_ITEM_TABLE = "chunks"
 # index. pgvector's default is 40, and recall degrades with the *absolute* size
 # of the index rather than with the knowledge base's share of the table: measured
 # on real embeddings, 0.997 at 400 rows, 0.982 at 2,000, 0.933 at 8,400 and 0.915
-# at 12,000. The build threshold is 10,000 and a knowledge base can be several
-# times that, where the trend projects about 0.85 -- too low to ship as the
+# at 12,000. A knowledge base that crosses the build threshold can be several
+# times its size, where the trend projects about 0.85 -- too low to ship as the
 # answer to a search that used to be exact. 120 measured 0.973 at 12,000 rows for
 # 2.96 ms, still 12x faster than the exact scan it replaces.
 #

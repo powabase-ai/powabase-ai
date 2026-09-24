@@ -16,6 +16,7 @@ import pytest
 from agentic_project_service.services import base_vector_store as bvs
 from agentic_project_service.services import pg_bm25_index as pgb
 from agentic_project_service.services import pg_vector_index as pvi
+from agentic_project_service.services.settings_registry import SETTINGS_REGISTRY
 from agentic_project_service.tasks import indexing as idx
 
 KB = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
@@ -259,7 +260,12 @@ def test_the_sweep_reads_its_settings_without_touching_the_shared_session(monkey
         raise AssertionError(f"the start-up sweep read {key} through db.session")
 
     monkeypatch.setattr(pvi, "get_setting", forbidden)
-    engine = _SweepEngine(catalog=[], counted=[(KB, 1536, 40_000)])
+    # Above the registry's own build threshold, read from the registry rather
+    # than written down: what this spec is about is where the settings are read
+    # from, and a literal here silently stops testing that the day the default
+    # moves past it.
+    over_threshold = SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"].default * 2
+    engine = _SweepEngine(catalog=[], counted=[(KB, 1536, over_threshold)])
 
     assert pvi.kbs_needing_a_per_kb_index(engine) == [KB]
     assert all(c.rolled_back for c in engine.connections), (
