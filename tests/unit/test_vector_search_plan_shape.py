@@ -13,6 +13,7 @@ before the live suite has to catch it with a scan counter.
 """
 
 import asyncio
+import re
 from unittest.mock import MagicMock
 
 import pytest
@@ -598,8 +599,145 @@ def test_ef_search_is_raised_even_when_the_probe_read_no_value_at_all():
 
 
 # ---------------------------------------------------------------------------
-# The probe's own failure, which must not take the caller's transaction with it
+# A statement that fails must not take the caller's transaction with it
 # ---------------------------------------------------------------------------
+
+
+class _InjectedServerError(Exception):
+    """What the server raises at the one statement a spec picked out."""
+
+
+class _AbortedTransaction(Exception):
+    """``InFailedSqlTransaction``: every statement after an unprotected failure."""
+
+
+class _Savepoint:
+    """What ``Session.begin_nested`` hands back: a savepoint as a context manager.
+
+    On the way out with an exception it rolls back to the savepoint, which is the
+    whole of what this models -- and then re-raises, the way SQLAlchemy's does.
+    """
+
+    def __init__(self, session: "_SavepointModellingSession"):
+        self._session = session
+
+    def __enter__(self):
+        self._session._enter_savepoint()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._session._leave_savepoint(failed=exc_type is not None)
+        return False
+
+
+class _SavepointModellingSession:
+    """A session that fails one *statement* and then behaves the way PostgreSQL does.
+
+    Two things this has that a ``MagicMock`` does not, and both are why the
+    assertion this replaces could not fail:
+
+    * it picks its victim by reading the **statement**, not a bound parameter or a
+      call count -- the shape that caught the mutation the ``item_table`` work was
+      most afraid of (``_PopulationConn._restricted_to`` in ``tests/pg_search``),
+      because a statement is what a dedent moves and a bind is not;
+    * it models the consequence. A failure with no savepoint around it leaves the
+      transaction **aborted**, so every later statement -- the search included --
+      raises. A failure inside one is undone by the rollback the savepoint does on
+      its way out, and the transaction is usable again. That is the difference
+      between the two versions of this code, and a mock has no way to express it.
+
+    It is a model, and it is one on purpose: the pinned proposition is "this
+    statement is inside a savepoint", which is a property of the module and not of
+    any server. The model's fidelity was checked against a real server rather than
+    reasoned about -- a released savepoint keeps a transaction-local
+    ``set_config`` in force, a rolled-back one undoes it and leaves the
+    transaction usable, and without one the next statement is refused -- and the
+    same defects were reproduced end to end by injecting a real server-side error
+    at each statement in turn (a shadow ``set_config`` ahead of ``pg_catalog`` on
+    the ``search_path``). The live tier is where that injection belongs; this is
+    where a dedent gets caught in seconds.
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_at: str,
+        partial_index: bool = True,
+        ef_search_was: str | None = EF_SEARCH_WAS,
+    ):
+        self.fail_at = fail_at
+        self.partial_index = partial_index
+        self.ef_search_was = ef_search_was
+        self.statements: list[tuple[str, dict]] = []
+        self.settings: dict[str, str | None] = {}
+        # What was in force when the search itself was planned, which is the only
+        # moment any of these settings matters. Read after the fact, a restore that
+        # puts a setting back to the value it was set *to* is indistinguishable
+        # from the set surviving -- and that is exactly the difference a shared
+        # savepoint erases.
+        self.settings_at_the_search: dict[str, str | None] = {}
+        self.failed_at: list[str] = []
+        self._levels: list[list[str]] = []
+        self._aborted = False
+
+    # -- the savepoint half -------------------------------------------------
+    def begin_nested(self) -> _Savepoint:
+        return _Savepoint(self)
+
+    def _enter_savepoint(self) -> None:
+        self._levels.append([])
+
+    def _leave_savepoint(self, *, failed: bool) -> None:
+        written = self._levels.pop()
+        if not failed:
+            return
+        # ROLLBACK TO SAVEPOINT: the subtransaction's writes are undone and the
+        # transaction is usable again.
+        for guc in written:
+            self.settings.pop(guc, None)
+        self._aborted = False
+
+    # -- the statement half -------------------------------------------------
+    def execute(self, clause, params=None):
+        sql = clause.text if hasattr(clause, "text") else str(clause)
+        self.statements.append((sql, dict(params or {})))
+        flat = "".join(sql.split())
+        if self._aborted:
+            raise _AbortedTransaction(
+                "current transaction is aborted, commands ignored until end of "
+                f"transaction block; refused: {flat[:60]}"
+            )
+        if self.fail_at and self.fail_at in flat:
+            self.failed_at.append(flat)
+            self._aborted = True
+            raise _InjectedServerError(f"injected server-side failure at {flat[:60]}")
+        self._record_a_setting(flat, params or {})
+        if "ORDER BY" in sql:
+            self.settings_at_the_search = dict(self.settings)
+        if "to_regclass" in sql:
+            return iter([(ENABLE_SORT_WAS, self.ef_search_was, self.partial_index)])
+        if "current_setting('enable_indexscan')" in sql:
+            return _scalar(ENABLE_INDEXSCAN_WAS)
+        return iter([])
+
+    def _record_a_setting(self, flat: str, params: dict) -> None:
+        match = re.search(r"set_config\('([^']+)',(:?\w+|'[^']*')", flat)
+        if not match:
+            return
+        guc, raw = match.group(1), match.group(2)
+        self.settings[guc] = params.get(raw[1:]) if raw.startswith(":") else raw.strip("'")
+        if self._levels:
+            self._levels[-1].append(guc)
+
+
+def _run_a_search(session, **kwargs):
+    """``vector_search`` against a modelling session; the statements it got through."""
+    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
+    kwargs.setdefault("embedding", [0.0] * 1536)
+    kwargs.setdefault("top_k", 10)
+    items = asyncio.run(store.vector_search(**kwargs))
+    assert items == [], items
+    return session.statements
 
 
 def test_the_probe_runs_in_a_savepoint():
@@ -610,70 +748,76 @@ def test_the_probe_runs_in_a_savepoint():
     follows fails with ``InFailedSqlTransaction`` and the caller gets an error
     about a statement it never wrote.
     """
-    session = MagicMock()
-    nested = MagicMock()
-    session.begin_nested.return_value = nested
-    captured: list[str] = []
-
-    def spy_execute(text_obj, params=None):
-        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
-        captured.append(sql)
-        if "to_regclass" in sql:
-            raise RuntimeError("catalog read cancelled")
-        return iter([])
-
-    session.execute = spy_execute
-    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
-    items = asyncio.run(store.vector_search(embedding=[0.0] * 1536, top_k=10))
-    assert items == []
-    assert session.begin_nested.called, (
-        "the probe must run in a savepoint, or its failure aborts the caller's "
-        f"transaction: {captured}"
+    session = _SavepointModellingSession(fail_at="to_regclass")
+    statements = _run_a_search(session)
+    assert session.failed_at, f"the injection missed the probe: {statements}"
+    assert any("ORDER BY" in sql for sql, _ in statements), (
+        f"the search must still run after a failed probe: {statements}"
     )
-    assert any("ORDER BY" in sql for sql in captured), (
-        f"the search must still run after a failed probe: {captured}"
+    assert not _writes(statements, "enable_sort"), (
+        f"with no answer from the probe there is no index to steer at: {statements}"
     )
 
 
-def test_the_exact_searchs_own_setting_runs_in_a_savepoint():
-    """The twin of the spec above, on the other half of the symmetry.
+@pytest.mark.parametrize(
+    ("fail_at", "still_applied"),
+    [
+        ("set_config('enable_sort'", None),
+        ("set_config('hnsw.ef_search'", "enable_sort"),
+    ],
+)
+def test_each_setting_the_partial_index_gate_makes_runs_in_a_savepoint(fail_at, still_applied):
+    """Not only the probe: both of this block's own settings, which is where it bit.
+
+    The probe was savepointed and the two ``set_config`` calls beside it were not,
+    so a failure at either aborted the caller's transaction and the search raised
+    ``InternalError`` -- while the handler logged that the search "may miss the
+    knowledge base's partial HNSW index" or "will run at pgvector's default
+    recall". Both sentences were false, and the block round 3 held up as the
+    correct one was the block they were in.
+
+    ``still_applied`` is the second half, and it is why the two statements take a
+    savepoint each rather than sharing one: a rolled-back ``ef_search`` must leave
+    ``enable_sort = off`` alone, or the handler's "runs at pgvector's default
+    recall" turns into a search that is not on the index at all.
+    """
+    session = _SavepointModellingSession(fail_at=fail_at)
+    statements = _run_a_search(session)
+    assert session.failed_at, f"the injection missed its statement: {statements}"
+    assert any("ORDER BY" in sql for sql, _ in statements), (
+        f"a failed session setting must not make the search itself raise: {statements}"
+    )
+    if still_applied:
+        assert session.settings_at_the_search.get(still_applied) == "off", (
+            "one savepoint per statement: rolling this one back must not undo the "
+            "setting that was already released, which has to still be in force when "
+            f"the search is planned: {session.settings_at_the_search}"
+        )
+
+
+@pytest.mark.parametrize(
+    "fail_at",
+    ["current_setting('enable_indexscan')", "set_config('enable_indexscan'"],
+)
+def test_the_exact_searchs_own_setting_runs_in_a_savepoint(fail_at):
+    """The twin of the specs above, on the other half of the symmetry.
 
     ``_insisting_on_an_exact_search`` reads a setting and writes one, and either
     statement can be cancelled like any other. Without a savepoint that failure
     leaves the caller's transaction aborted, so the search that follows raises
     ``InFailedSqlTransaction`` while the handler logs that it had merely degraded
-    -- proved live both ways: the probe's failure in the mirrored block warns and
-    the search still answers, this one's failure warned and the search raised.
+    -- proved live both ways with a server-side failure injected at each
+    statement, before and after.
 
-    Two assertions, because either alone passes something broken: the savepoint has
-    to be taken, *and* the search has to still run after the failure.
+    Parametrized over both statements because the version of this spec that only
+    injected at the *read* was green with the write dedented back out of the
+    savepoint: the failing statement has to be the one the spec picks out.
     """
-    session = MagicMock()
-    captured: list[str] = []
-
-    def spy_execute(text_obj, params=None):
-        sql = text_obj.text if hasattr(text_obj, "text") else str(text_obj)
-        captured.append(sql)
-        if "current_setting('enable_indexscan')" in sql:
-            raise RuntimeError("cancelled")
-        return iter([])
-
-    session.execute = spy_execute
-    store = _FakeStore(db_session=session, knowledge_base_id=_KB_ID)
-    items = asyncio.run(
-        store.vector_search(
-            embedding=[0.0] * 1536,
-            top_k=10,
-            source_ids=["3f2504e0-4f89-11d3-9a0c-0305e82c3303"],
-        )
-    )
-    assert items == []
-    assert session.begin_nested.called, (
-        "the setting must be read and written in a savepoint, or its failure "
-        f"aborts the caller's transaction: {captured}"
-    )
-    assert any("ORDER BY" in sql for sql in captured), (
-        f"the search must still run after the setting could not be applied: {captured}"
+    session = _SavepointModellingSession(fail_at=fail_at)
+    statements = _run_a_search(session, source_ids=["3f2504e0-4f89-11d3-9a0c-0305e82c3303"])
+    assert session.failed_at, f"the injection missed its statement: {statements}"
+    assert any("ORDER BY" in sql for sql, _ in statements), (
+        f"the search must still run after the setting could not be applied: {statements}"
     )
 
 

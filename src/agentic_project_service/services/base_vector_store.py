@@ -984,21 +984,41 @@ class BasePgVectorStore:
         omission, and no spec asserts anything about the value after the search
         because there is nothing about it worth pinning.
 
-        A failure on any side degrades latency, never the answer, so all of them
-        are logged rather than raised -- and the restore is expected to fail when
-        the search itself did, because the transaction is then aborted and the
-        settings die with it anyway. The two ``set_config`` calls are not
-        themselves savepointed, unlike the probe: if one of them fails the
-        transaction is aborted and the *search* raises. That is the right
-        direction to fail in -- an error the caller sees rather than a quietly
-        worse plan -- and it is the reason this block's warnings say what they
-        would do, not what they did.
+        **All three statements run in a savepoint, and until they did, two of the
+        three handlers below said the opposite of what happened.** A failure
+        anywhere here is meant to degrade latency or recall and never the answer,
+        which is why every one of them is logged rather than raised. That is only
+        true of a statement inside a savepoint: a server-side error outside one
+        aborts the caller's transaction, so the search that follows raises
+        ``InFailedSqlTransaction`` while the handler logs that it had merely
+        degraded. Measured by injecting a server-side failure at each of the three
+        statements in turn -- a shadow ``set_config``/``to_regclass`` ahead of
+        ``pg_catalog`` on the ``search_path``, raising for one named GUC and
+        delegating for the rest, so exactly one statement fails and the others are
+        untouched:
 
-        The probe runs in a savepoint. Without one, a probe that errors -- a
-        catalog lookup can be cancelled like anything else -- would leave the
-        caller's transaction aborted, so the search that follows would fail with
-        an unrelated error while this warned that it "may fall back to an exact
-        scan". Rolling back to the savepoint makes the warning true.
+        | failure injected at | probe savepointed only | all three savepointed |
+        |---|---|---|
+        | the catalog probe | search runs | search runs |
+        | ``set_config('enable_sort', 'off')`` | **search raises** | search runs |
+        | ``set_config('hnsw.ef_search', 120)`` | **search raises** | search runs |
+
+        The two ``set_config`` calls take a savepoint each rather than sharing
+        one, because a failure has to undo its own statement and nothing else: a
+        released savepoint keeps a transaction-local ``set_config`` in force, so
+        ``enable_sort = off`` survives a rolled-back ``ef_search`` and the search
+        still reaches the index at pgvector's default recall -- which is what that
+        handler says happens.
+
+        The *restores* are not savepointed, and that is a smaller gap left
+        deliberately rather than an oversight. The failure they actually meet is a
+        transaction the search already aborted, where a savepoint cannot be taken
+        either and the settings die with the transaction anyway. A restore that
+        fails on an otherwise healthy transaction does leave the caller's
+        transaction aborted after this block has returned -- injected at the
+        restore alone and confirmed -- but that is a statement the search's answer
+        does not depend on, and the caller's own ``rollback`` is what follows a
+        failed request.
         """
         # Not inside the try below: both arguments have already been validated by
         # the caller, so a failure here is a programming error and should not be
@@ -1024,11 +1044,27 @@ class BasePgVectorStore:
             yield
             return
         try:
-            self.session.execute(text("SELECT set_config('enable_sort', 'off', true)"))
+            # In a savepoint, like the probe above and for the same reason: a
+            # ``set_config`` can be cancelled like any other statement, and a
+            # failure outside a savepoint leaves the caller's transaction aborted
+            # -- so the search below would raise ``InFailedSqlTransaction`` while
+            # this handler claimed the search had merely lost the index. Rolling
+            # back to the savepoint is what makes the warning true. Measured with
+            # a server-side failure injected at exactly this statement: without
+            # the savepoint the search raises ``InternalError``, with it the
+            # search runs.
+            with self.session.begin_nested():
+                self.session.execute(text("SELECT set_config('enable_sort', 'off', true)"))
         except Exception as e:  # pragma: no cover - needs a live server
+            # What actually happens now: nothing was changed, the transaction is
+            # usable, and the search runs on the planner's own plan -- which at
+            # the width production runs is the exact scan this block exists to
+            # price out, so the answer is right and the latency is what it was
+            # before the feature.
             logger.warning(
                 "Could not price the exact sort out for KB %s: %s; this vector search "
-                "may miss the knowledge base's partial HNSW index",
+                "runs on the planner's own plan and so may miss the knowledge base's "
+                "partial HNSW index",
                 self.kb_id,
                 e,
             )
@@ -1059,14 +1095,23 @@ class BasePgVectorStore:
         # there is no value to put back, and a placeholder set with the third
         # argument dies with the transaction regardless.
         try:
-            self.session.execute(
-                text("SELECT set_config('hnsw.ef_search', :ef, true)"),
-                {"ef": str(PER_KB_HNSW_EF_SEARCH)},
-            )
+            # Its own savepoint, not the one above: a failure here must undo this
+            # statement and nothing else, so that ``enable_sort = off`` -- already
+            # released, and released means kept -- stays in force and the search
+            # still reaches the index, which is what the handler below says
+            # happens. Verified with a server-side failure injected at exactly
+            # this statement.
+            with self.session.begin_nested():
+                self.session.execute(
+                    text("SELECT set_config('hnsw.ef_search', :ef, true)"),
+                    {"ef": str(PER_KB_HNSW_EF_SEARCH)},
+                )
         except Exception as e:  # pragma: no cover - depends on pgvector version
             # The search still runs, on the index, at pgvector's default
             # ef_search -- lower recall than intended, not a wrong answer, so
-            # the block goes ahead rather than giving the index up.
+            # the block goes ahead rather than giving the index up. That is true
+            # because this statement had a savepoint of its own: rolling it back
+            # leaves ``enable_sort = off`` in force and the transaction usable.
             logger.warning(
                 "Could not raise hnsw.ef_search to %d for KB %s: %s; this vector "
                 "search will run at pgvector's default recall",
