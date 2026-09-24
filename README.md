@@ -1,6 +1,10 @@
 # powabase-ai
 
-The AI backend service of the [Powabase](https://github.com/powabase-ai) OSS
+> **Powabase** — The AI-Native Supabase Alternative — RAG and Agents built-in. Powabase is the Postgres backend for AI apps. Every project gets its own database, auth, storage, and dedicated compute, with documents that index on upload and agents that call tools over HTTP or MCP — all behind one REST API.
+>
+> [Website](https://powabase.ai) · [Docs](https://docs.powabase.ai) · [Compare with Supabase](https://powabase.ai/supabase-alternative/)
+
+This repo is the AI backend service of the [Powabase](https://github.com/powabase-ai) OSS
 edition — the per-project service for AI features: sources, knowledge bases,
 agents, workflows, and background task processing. It is published as the
 container image `ghcr.io/powabase-ai/powabase-ai` and builds on the
