@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.1](https://github.com/powabase-ai/powabase-ai/compare/v0.10.0...v0.10.1) (2026-09-24)
+
+
+### Bug Fixes
+
+* **agents:** label a ReAct client disconnect by the phase it hit ([#86](https://github.com/powabase-ai/powabase-ai/issues/86)) ([678b288](https://github.com/powabase-ai/powabase-ai/commit/678b2886b160a8e13abe8a4e52da822e22911ec0))
+* **deps:** bump powabase-agentic from 0.5.1 to 0.5.3 ([#90](https://github.com/powabase-ai/powabase-ai/issues/90)) ([a354e51](https://github.com/powabase-ai/powabase-ai/commit/a354e512280cf1acce81b40bc6cf303ac4a26ff2))
+
 ## [0.10.0](https://github.com/powabase-ai/powabase-ai/compare/v0.9.2...v0.10.0) (2026-09-23)
 
 
