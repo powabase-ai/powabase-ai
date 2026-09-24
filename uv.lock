@@ -12,7 +12,7 @@ resolution-markers = [
 
 [[package]]
 name = "agentic-project-service"
-version = "0.10.0"
+version = "0.10.1"
 source = { editable = "." }
 dependencies = [
     { name = "anyascii" },
@@ -2313,7 +2313,7 @@ wheels = [
 
 [[package]]
 name = "powabase-agentic"
-version = "0.5.1"
+version = "0.5.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -2338,9 +2338,9 @@ dependencies = [
     { name = "seaborn" },
     { name = "tiktoken" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/dc/5b/fa4c401a9f3a56c738352ac24852a7dfb39cb5689623013791a9ef55d133/powabase_agentic-0.5.1.tar.gz", hash = "sha256:0cb9a3e30c025fea2930df207473b486e320d2439cbb4542e307ee81e49ba9e1", size = 566089, upload-time = "2026-09-23T04:54:15.707Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/03/63e6794f1d0fabe8b8ae46015e7507432829daa1d4351e3617a2dfa7fa75/powabase_agentic-0.5.3.tar.gz", hash = "sha256:2d46df2692fe50acd52b36ffaf113d3dcac9443a1c7b11325ac481d912f7a3be", size = 574322, upload-time = "2026-09-24T07:22:11.173Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3d/dd/9718b4cfcc01e2f27ef539d289aaff3e27c475b09cc736e4d48f2de9a0b8/powabase_agentic-0.5.1-py3-none-any.whl", hash = "sha256:00e65975378f9c2ccdca4b5527d6e3a8bcc29b2c337fb2c63c1f58a165af93e3", size = 280210, upload-time = "2026-09-23T04:54:13.892Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/c1/e001dfca2680f5f032ace92ddf8c867eb283ccc1ea567a367223629e18df/powabase_agentic-0.5.3-py3-none-any.whl", hash = "sha256:85931c6831905ac18feef7774b157ea2a636b90f3be2adead5c0045982e4809f", size = 283076, upload-time = "2026-09-24T07:22:09.426Z" },
 ]
 
 [package.optional-dependencies]

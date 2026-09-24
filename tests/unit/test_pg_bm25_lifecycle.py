@@ -1517,6 +1517,10 @@ def test_a_progress_hook_that_raises_does_not_cost_us_the_index(caplog):
     assert [s for s in _ddl(conn) if "USING bm25" in s]
     record = next(r for r in caplog.records if "progress hook failed" in r.getMessage())
     assert "could not record the build" in record.getMessage()
+    # A traceback, like the lock-release failure logged beside it: the message
+    # names the recorder's complaint, but only the traceback says where it came
+    # from, and a recorder that writes a row can fail in several places.
+    assert record.exc_info is not None
 
 
 def test_ensure_reports_building_for_an_attached_partition_that_has_no_index_yet():
