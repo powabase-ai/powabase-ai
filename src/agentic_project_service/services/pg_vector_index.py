@@ -1256,13 +1256,14 @@ def _record_build_failure(conn, kb_id: str, dims: int, failures: int) -> None:
     recording a failure on an index built from an older definition does not quietly
     relabel it as current.
     """
+    comment = index_comment(conn, kb_id, dims)
     _write_index_comment(
         conn,
         kb_id,
         dims,
         failures,
-        interrupted_builds_in(index_comment(conn, kb_id, dims)),
-        definition_fingerprint_in(index_comment(conn, kb_id, dims)),
+        interrupted_builds_in(comment),
+        definition_fingerprint_in(comment),
     )
 
 
@@ -1766,7 +1767,6 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                     # replacement can actually be completed: a drop this loop
                     # cannot follow with a build leaves the knowledge base with no
                     # index where it had a stale-but-usable one.
-                    total = per_kb_index_count(conn)
                     if rows < build_at or dims > MAX_HNSW_DIMS:
                         # Inside the hysteresis band, or a width pgvector will not
                         # index: a build would be declined below, so keeping it is
@@ -1790,6 +1790,9 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         )
                         stale_kept.append(name)
                         continue
+                    # Only now, because the two cheap gates above decide it more
+                    # often and this is a catalog count.
+                    total = per_kb_index_count(conn)
                     if total >= MAX_PER_KB_INDEXES:
                         # The drop would free a place another knowledge base's
                         # reconcile can take before this one rebuilds, and this
