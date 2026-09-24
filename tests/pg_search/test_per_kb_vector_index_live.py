@@ -394,11 +394,11 @@ class _RecordingSession:
         return getattr(self._session, name)
 
 
-def _capture_search_sql(engine, kb_id, embedding, **kwargs):
+def _capture_search_sql(engine, kb_id, embedding, *, schema=SCHEMA, **kwargs):
     """The SQL the real store issues, and the parameters it binds."""
     with Session(engine) as session:
         recorder = _RecordingSession(session)
-        store = _ChunkStore(db_session=recorder, knowledge_base_id=kb_id, schema=SCHEMA)
+        store = _ChunkStore(db_session=recorder, knowledge_base_id=kb_id, schema=schema)
         asyncio.run(store.vector_search(embedding=list(embedding), top_k=20, **kwargs))
         session.rollback()
     searches = [pair for pair in recorder.statements if "ORDER BY" in pair[0]]
@@ -459,7 +459,7 @@ def _without_the_embeddings_predicate(sql: str) -> str:
     return "\n".join(kept)
 
 
-def _idx_scans(engine, *names: str) -> dict[str, int]:
+def _idx_scans(engine, *names: str, schema: str = SCHEMA) -> dict[str, int]:
     """How many index scans each index has served, on a connection of its own.
 
     Two things about Postgres' statistics make this fiddly, and both bit:
@@ -478,12 +478,12 @@ def _idx_scans(engine, *names: str) -> dict[str, int]:
                 "SELECT indexrelname, coalesce(idx_scan, 0) FROM pg_stat_all_indexes "
                 "WHERE schemaname = :s AND indexrelname = ANY(:n)"
             ),
-            {"s": SCHEMA, "n": list(names)},
+            {"s": schema, "n": list(names)},
         ).all()
         conn.rollback()
     found = {name: int(count) for name, count in rows}
     missing = [name for name in names if name not in found]
-    assert not missing, f"no such index in {SCHEMA}: {missing}"
+    assert not missing, f"no such index in {schema}: {missing}"
     return {name: found[name] for name in names}
 
 
@@ -1871,9 +1871,9 @@ def test_hybrid_search_has_a_vector_leg_that_reaches_the_partial_index(
 # ---------------------------------------------------------------------------
 
 
-def _exact_answers(engine, kb_id, vectors, **kwargs) -> list[list[str]]:
+def _exact_answers(engine, kb_id, vectors, *, schema=SCHEMA, **kwargs) -> list[list[str]]:
     """The exact top-20 for each query vector: the same SQL with no index at all."""
-    sql, params = _capture_search_sql(engine, kb_id, vectors[0], **kwargs)
+    sql, params = _capture_search_sql(engine, kb_id, vectors[0], schema=schema, **kwargs)
     answers = []
     with Session(engine) as session:
         for vector in vectors:
@@ -1885,7 +1885,14 @@ def _exact_answers(engine, kb_id, vectors, **kwargs) -> list[list[str]]:
 
 
 def _drive_and_collect(
-    engine, kb_id, vectors, *counted, plan_cache_mode=None, prepared_out=None, **kwargs
+    engine,
+    kb_id,
+    vectors,
+    *counted,
+    plan_cache_mode=None,
+    prepared_out=None,
+    schema=SCHEMA,
+    **kwargs,
 ):
     """``vector_search`` for real, once per vector, on one connection.
 
@@ -1900,7 +1907,7 @@ def _drive_and_collect(
     needs that as a negative control: a run in which psycopg never prepared
     anything would pass while proving nothing.
     """
-    before = _idx_scans(engine, *counted)
+    before = _idx_scans(engine, *counted, schema=schema)
     probe = create_engine(_dsn())
     connection = probe.connect()
     answers = []
@@ -1908,7 +1915,7 @@ def _drive_and_collect(
         with Session(bind=connection) as session:
             if plan_cache_mode is not None:
                 session.execute(text(f"SET plan_cache_mode = '{plan_cache_mode}'"))
-            store = _ChunkStore(db_session=session, knowledge_base_id=kb_id, schema=SCHEMA)
+            store = _ChunkStore(db_session=session, knowledge_base_id=kb_id, schema=schema)
             for vector in vectors:
                 items = asyncio.run(store.vector_search(embedding=list(vector), top_k=20, **kwargs))
                 answers.append([item.item_id for item in items])
@@ -1924,7 +1931,7 @@ def _drive_and_collect(
     finally:
         connection.close()
         probe.dispose()
-    after = _idx_scans(engine, *counted)
+    after = _idx_scans(engine, *counted, schema=schema)
     return {name: after[name] - before[name] for name in counted}, answers
 
 
@@ -2040,6 +2047,158 @@ def test_a_vector_search_leaves_enable_sort_as_it_found_it(
     assert after == was, (
         f"vector_search left enable_sort at {after!r} in a transaction that had it "
         f"at {was!r}; the next statement in the caller's transaction pays for that"
+    )
+
+
+@pytest.mark.parametrize("was", ["on", "off"])
+def test_a_vector_search_leaves_enable_indexscan_as_it_found_it(
+    engine, schema, settings, query_vectors, was
+):
+    """The twin of the spec above, for the setting the restricted block writes.
+
+    ``_insisting_on_an_exact_search`` prices out every ordered index scan in the
+    statement, and it is the block a *restricted* search gets -- so it is the one
+    ``hybrid_search``'s keyword leg meets when the caller passed a filter. A
+    keyword ranking wants its index scans back, and so does every other statement
+    on that pooled connection.
+
+    Two claims, because the restore can fail in two ways and only one of them is
+    visible inside the search's own transaction:
+
+    - the value the caller had is the value that comes back, which a restore
+      hardcoding ``on`` gets wrong for ``was="off"``;
+    - and it comes back *transaction-locally*, which is what the third argument to
+      ``set_config`` decides. A session-scoped restore reads correctly inside the
+      transaction and then survives the commit, so the next transaction on the
+      same connection -- the next checkout of that pool entry -- starts with the
+      caller's old value instead of the server's. That is the leak this module
+      already found once on ``enable_sort``, so it is read back on the same
+      connection after the commit rather than assumed not to have happened.
+    """
+    _build_big_index(engine, settings)
+    probe = create_engine(_dsn())
+    connection = probe.connect()
+    try:
+        with Session(bind=connection) as session:
+            at_checkout = session.execute(
+                text("SELECT current_setting('enable_indexscan')")
+            ).scalar()
+            session.execute(text(f"SET LOCAL enable_indexscan = {was}"))
+            store = _ChunkStore(db_session=session, knowledge_base_id=KB_BIG, schema=SCHEMA)
+            items = asyncio.run(
+                store.vector_search(
+                    embedding=list(query_vectors[0]),
+                    top_k=20,
+                    filter_metadata=FILTER_ONE_IN_FIVE,
+                )
+            )
+            assert items, "the restricted search under test returned nothing"
+            after = session.execute(text("SELECT current_setting('enable_indexscan')")).scalar()
+            session.commit()
+        with Session(bind=connection) as session:
+            next_checkout = session.execute(
+                text("SELECT current_setting('enable_indexscan')")
+            ).scalar()
+            session.rollback()
+    finally:
+        connection.close()
+        probe.dispose()
+    assert after == was, (
+        f"vector_search left enable_indexscan at {after!r} in a transaction that had "
+        f"it at {was!r}; the keyword leg of a hybrid search runs next on this session"
+    )
+    assert next_checkout == at_checkout, (
+        f"the restore outlived its transaction: this connection was checked out with "
+        f"enable_indexscan={at_checkout!r} and the next transaction on it starts at "
+        f"{next_checkout!r}, so the restore was made session-scoped rather than local"
+    )
+
+
+class _ReadingTheSettingBeforeTheSearch:
+    """A real session that reads a GUC back in the transaction the search runs in.
+
+    The value has to be read there and not afterwards: the settings the two
+    steering blocks write are transaction-local and are put back before
+    ``vector_search`` returns, so a read after the call sees the restore rather
+    than the search.
+    """
+
+    def __init__(self, session, setting: str):
+        self._session = session
+        self._read = f"SELECT current_setting('{setting}', true)"
+        self.readings: list[str | None] = []
+
+    def execute(self, clause, params=None):
+        if "ORDER BY" in clause.text:
+            value = self._session.execute(text(self._read)).scalar()
+            self.readings.append(None if value is None else str(value))
+        return self._session.execute(clause, params)
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+
+def test_the_first_vector_search_on_a_connection_runs_at_the_raised_ef_search(
+    engine, schema, settings, query_vectors
+):
+    """The recall the store asks for is the recall the search gets, read back live.
+
+    pgvector registers its GUCs in ``_PG_init``, and ``_PG_init`` runs on the
+    first *use of the vector type* on a backend -- not at ``CREATE EXTENSION``,
+    and not at connection start, because the library is not preloaded. Until then
+    ``current_setting('hnsw.ef_search', true)`` is NULL. Two things make that the
+    case to pin rather than a curiosity:
+
+    - the store's own first statement, ``SET LOCAL hnsw.iterative_scan``, does
+      **not** load the library -- an unrecognised ``prefix.name`` is accepted as a
+      placeholder -- so it cannot be relied on to have made the GUC real by the
+      time the probe reads it;
+    - NULL is not a value to defer to. ``set_config`` on an unloaded pgvector GUC
+      creates a placeholder and the value survives ``_PG_init``: demonstrated on
+      this server, ``set_config('hnsw.ef_search','123',true)`` before any vector
+      operation and ``current_setting`` reads 123 back after one.
+
+    So a fresh connection is exactly where the raise matters and exactly where it
+    is easiest to skip, and at pgvector's default 40 instead of
+    ``PER_KB_HNSW_EF_SEARCH`` the search is not wrong, it is less complete:
+    measured on real embeddings at 12,000 rows, recall 0.915 against 0.973. One
+    such search per connection per pool lifetime, and the first search on a
+    connection is also the one most likely to be cold.
+
+    The assertion before the search is the control that keeps this spec honest: if
+    the connection has already done vector work by the time the store probes, the
+    NULL path is not the one under test and a green result would say nothing about
+    it. The unit tier cannot stand in for this one -- its capture hands the probe
+    a value, so the NULL branch is the one branch a real fresh connection takes
+    and the one no fake takes.
+    """
+    _build_big_index(engine, settings)
+    probe = create_engine(_dsn())
+    connection = probe.connect()
+    try:
+        with Session(bind=connection) as session:
+            assert (
+                session.execute(text("SELECT current_setting('hnsw.ef_search', true)")).scalar()
+                is None
+            ), (
+                "this connection has already used the vector type, so pgvector's GUCs "
+                "are registered on it and the fresh-connection path this spec is about "
+                "cannot happen here"
+            )
+            watcher = _ReadingTheSettingBeforeTheSearch(session, "hnsw.ef_search")
+            store = _ChunkStore(db_session=watcher, knowledge_base_id=KB_BIG, schema=SCHEMA)
+            items = asyncio.run(store.vector_search(embedding=list(query_vectors[0]), top_k=20))
+            assert items, "the search under test returned nothing"
+            session.commit()
+    finally:
+        connection.close()
+        probe.dispose()
+    assert watcher.readings == [str(bvs.PER_KB_HNSW_EF_SEARCH)], (
+        f"the first vector search on a fresh connection ran at hnsw.ef_search "
+        f"{watcher.readings} instead of {bvs.PER_KB_HNSW_EF_SEARCH}; a NULL reading "
+        "means the raise was skipped because pgvector's GUC was not registered yet, "
+        "which is the state every pooled connection is in before its first vector "
+        "operation"
     )
 
 
