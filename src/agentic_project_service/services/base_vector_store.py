@@ -107,7 +107,14 @@ MAX_TOP_K = 10_000
 # any other restricted search -- deliberately, because that is the half that makes
 # an answer exact and exactness is not a chunks-only concern. It is only the
 # *unrestricted* search from those stores that is left on the planner's own plan.
-PER_KB_INDEX_ITEM_TABLE = "chunks"
+#
+# The string itself is ``pg_vector_index``'s, because that module builds the index
+# whose predicate names it: the literal in this module's query and the literal in
+# that module's predicate have to be the same one, or the planner cannot prove the
+# predicate and the index is never used at all -- measured as 1.44 ms on the
+# knowledge base's own index against 12.0 ms on the project-wide one. Imported
+# rather than restated for exactly that reason.
+PER_KB_INDEX_ITEM_TABLE = pg_vector_index.PER_KB_INDEX_ITEM_TABLE
 
 
 # ``hnsw.ef_search`` for a search that is using a knowledge base's own partial
