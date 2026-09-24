@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from unittest.mock import MagicMock
 
@@ -1370,6 +1371,31 @@ def _stale_row(kb_id=KB, dims=1536, **kwargs):
     return _index_row(kb_id, dims, True, fingerprint=None, **kwargs)
 
 
+# A fingerprint of exactly the shape ``_DEFINITION_PATTERN`` accepts -- twelve hex
+# digits -- that no definition this module emits produces. "An older definition",
+# which is a different thing from "no definition at all": the first is what every
+# index carries once ``per_kb_index_ddl`` has changed twice, and the whole point of
+# recording a fingerprint rather than nothing.
+_OLDER_DEFINITION = "0123456789ab"
+
+
+def _older_definition_row(kb_id=KB, dims=1536, **kwargs):
+    """A valid index whose comment records a *different* definition, not none.
+
+    ``_stale_row`` is the other half of the same case and the only one the suite
+    used to carry: an index built before fingerprints were written, so
+    ``definition_fingerprint_in`` returns None. Nothing pinned the case where a
+    fingerprint is present and wrong, so ``definition_has_drifted`` could be
+    replaced by ``definition_fingerprint_in(comment) is None`` -- drift seen only
+    when *nothing* is recorded -- and the whole suite stayed green. That mutation
+    keeps today's behaviour exactly (every pre-existing index has no comment at all)
+    and diverges the next time the DDL changes, leaving every index this version
+    built at reduced recall for ever.
+    """
+    assert _OLDER_DEFINITION != _current_fingerprint(kb_id, dims), "not an older definition"
+    return _index_row(kb_id, dims, True, fingerprint=_OLDER_DEFINITION, **kwargs)
+
+
 def test_an_index_with_no_recorded_definition_has_drifted():
     """The index this exists to find carries no fingerprint at all.
 
@@ -1384,6 +1410,45 @@ def test_an_index_with_no_recorded_definition_has_drifted():
 def test_an_index_built_from_todays_definition_has_not_drifted():
     current = pvi.per_kb_index_comment(0, 0, pvi.per_kb_index_fingerprint(KB, 1536))
     assert pvi.definition_has_drifted(KB, 1536, current) is False
+
+
+def test_an_index_recording_a_different_definition_has_drifted():
+    """The half the suite did not have: a fingerprint that is present and wrong.
+
+    ``definition_has_drifted`` has to act on the *difference*, not merely on the
+    absence. There was a spec pinning that the digest function discriminates and
+    none pinning that this reader does anything with the discrimination, which is
+    what let "drifted means no fingerprint recorded" pass every tier.
+    """
+    _, _, older = _older_definition_row()
+    assert pvi.definition_fingerprint_in(older) == _OLDER_DEFINITION, older
+    assert pvi.definition_has_drifted(KB, 1536, older) is True
+
+
+def test_an_index_recording_a_different_definition_is_dispatched_and_rebuilt(monkeypatch):
+    """And the production paths have to act on it too, not just the reader.
+
+    The reconcile, the dispatch check and the start-up sweep each decide drift for
+    themselves, so each one is driven with a present-but-different fingerprint --
+    the state every index carries the *second* time ``per_kb_index_ddl`` changes,
+    which is the state the fingerprint was added to survive.
+    """
+    name = pvi.per_kb_index_name(KB, 1536)
+    conn = _ensure_conn(existing=[_older_definition_row()], rows_by_dims={1536: 20_000})
+    _at_ten_thousand(monkeypatch)
+    assert pvi.index_action(conn, KB) == "build", "the dispatch has to see it too"
+    outcome = _ensure(monkeypatch, conn)
+    assert conn.issued("DROP INDEX CONCURRENTLY"), conn.statements
+    assert outcome["rebuilt_stale_definitions"] == [name], outcome
+    assert outcome["built"] == [name], outcome
+
+    sweep = _FakeConn(
+        answers=[
+            (_SWEEP_CATALOG_QUERY, [_older_definition_row()]),
+            (_COUNT_QUERY, [(KB, 1536, 20_000)]),
+        ]
+    )
+    assert _sweep(sweep) == [KB], "and the start-up sweep has to see it too"
 
 
 def test_the_fingerprint_changes_with_the_definition_and_not_with_the_name():
@@ -1583,6 +1648,26 @@ def test_every_combination_of_the_three_facts_survives_a_round_trip(
 def test_nothing_to_record_is_no_comment_at_all():
     """Which is what ``COMMENT ON ... IS NULL`` writes, and what a clean index has."""
     assert pvi.per_kb_index_comment(0, 0, None) is None
+
+
+@pytest.mark.parametrize("rebuilds", [0, 2])
+@pytest.mark.parametrize("failures, interrupted", [(0, 0), (2, 0), (0, 5), (2, 5)])
+def test_the_comment_is_safe_in_the_sql_literal_it_is_interpolated_into(
+    failures, interrupted, rebuilds
+):
+    """``COMMENT ON`` takes no parameter, so every sentence here is interpolated.
+
+    Two consequences the wording has to respect, and neither is visible at the call
+    site: an apostrophe closes the literal the body is written into, and ``:word``
+    is read by ``text()`` as a bind parameter. Both are ordinary English, so this is
+    pinned on the composed comment rather than trusted to a note above the strings
+    -- it was reworded during this review and an apostrophe went in.
+    """
+    comment = pvi.per_kb_index_comment(
+        failures, interrupted, "abcdef012345", rebuilds
+    ) or pvi.per_kb_index_comment(0, 0, "abcdef012345")
+    assert "'" not in comment, comment
+    assert not re.search(r"(?<!:):[A-Za-z_]", comment), comment
 
 
 @pytest.mark.parametrize(
@@ -1965,6 +2050,84 @@ def test_a_transient_repair_drop_failure_spends_the_larger_bound_too(monkeypatch
     for one in written:
         assert pvi.build_failures_in(one) == 1, one
         assert pvi.interrupted_builds_in(one) == 1, one
+
+
+# -- which definition a failed attempt is allowed to claim -------------------
+
+
+def test_a_failed_build_records_todays_definition_because_it_built_that_index(monkeypatch):
+    """The one caller that may claim today, and the reason it may.
+
+    ``CREATE INDEX CONCURRENTLY`` that fails leaves an INVALID index behind, and that
+    index really was created from the DDL this version emits -- so writing today's
+    fingerprint on it states a fact about the object on disk. The positive control
+    for the spec below.
+    """
+    conn = _ensure_conn(rows_by_dims={1536: 20_000}, fail_on="CREATE INDEX")
+    with pytest.raises(RuntimeError):
+        _ensure(monkeypatch, conn)
+    written = conn.issued(_FAILURE_COMMENT_DDL)
+    assert len(written) == 1, conn.statements
+    assert pvi.definition_fingerprint_in(written[0]) == _current_fingerprint(KB, 1536), written
+
+
+def test_a_failed_repair_drop_leaves_the_definition_the_index_really_carries(monkeypatch):
+    """The drop failed, so the index on disk is the one that was already there.
+
+    Claiming today for it is not a fact about anything: the index was built from
+    whatever built it, and an index carrying an *older* definition reaches this path
+    by a route inside this module -- a drift drop cancelled part-way leaves the
+    old-definition index INVALID, the next reconcile repairs it, and that drop fails
+    too.
+    """
+    older = _OLDER_DEFINITION
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False, fingerprint=older)],
+        rows_by_dims={1536: 20_000},
+        fail_on="DROP INDEX",
+    )
+    with pytest.raises(RuntimeError):
+        _ensure(monkeypatch, conn)
+    written = conn.issued(_FAILURE_COMMENT_DDL)
+    assert written, "an uncounted attempt is an unbounded loop"
+    assert pvi.build_failures_in(written[0]) == 1, written
+    assert pvi.definition_fingerprint_in(written[0]) == older, written
+    assert pvi.definition_fingerprint_in(written[0]) != _current_fingerprint(KB, 1536), written
+
+
+def test_a_mis_stamped_definition_would_certify_a_stale_index_for_ever(monkeypatch):
+    """Why the spec above is about damage and not about tidiness.
+
+    ``REINDEX`` is what the PostgreSQL manual recommends for an INVALID index, so it
+    is what an operator reaches for -- and, measured both plain and
+    ``CONCURRENTLY``, it rebuilds from the *stored* predicate and preserves the
+    ``pg_class`` comment. So the comment a failed repair drop leaves behind is the
+    comment the reindexed, now-valid, still-stale index carries. If it claims today,
+    every later reconcile agrees the index is current: measured 0.559 mean recall@20
+    against 0.993, with no log line and nothing dispatched ever again.
+
+    Driven through the reconcile and the dispatch rather than asserted on the
+    string, so this is about what the module concludes from what it wrote.
+    """
+    conn = _ensure_conn(
+        existing=[_index_row(KB, 1536, False, fingerprint=_OLDER_DEFINITION)],
+        rows_by_dims={1536: 20_000},
+        fail_on="DROP INDEX",
+    )
+    with pytest.raises(RuntimeError):
+        _ensure(monkeypatch, conn)
+    preserved = conn.issued(_FAILURE_COMMENT_DDL)[0].split("'")[-2]
+
+    # What ``REINDEX`` leaves: valid again, the old predicate, and that same comment.
+    reindexed = _ensure_conn(
+        existing=[(pvi.per_kb_index_name(KB, 1536), True, preserved)],
+        rows_by_dims={1536: 20_000},
+    )
+    assert pvi.definition_has_drifted(KB, 1536, preserved) is True, preserved
+    _at_ten_thousand(monkeypatch)
+    assert pvi.index_action(reindexed, KB) == "build", "nothing would ever reconcile it again"
+    outcome = _ensure(monkeypatch, reindexed)
+    assert outcome["rebuilt_stale_definitions"] == [pvi.per_kb_index_name(KB, 1536)], outcome
 
 
 def test_a_knowledge_base_whose_builds_only_ever_get_interrupted_is_given_up_on(monkeypatch):

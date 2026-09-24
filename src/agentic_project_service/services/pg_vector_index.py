@@ -284,8 +284,15 @@ MAX_CONSECUTIVE_INTERRUPTED_BUILDS = 25
 _BUILD_FAILURES_SENTENCE = "{n} consecutive failed attempts to build this partial HNSW index."
 _INTERRUPTED_BUILDS_SENTENCE = "{n} consecutive builds of this partial HNSW index were interrupted."
 _INVALID_INDEX_PROSE = (
-    "It is INVALID: it answers no query and is maintained on every write. Drop it "
-    "once the cause is fixed; the next reconcile then builds it again."
+    "The last attempt left it INVALID, and while it is, it answers no query and is "
+    "maintained on every write. Drop it once the cause is fixed; the next reconcile "
+    "then builds it again. A REINDEX makes it valid without clearing this comment, "
+    "so the counts above are the history of that attempt and not a claim about the "
+    "index now. The definition below is a claim about the index now: it is what the "
+    "index on disk was built from, reindexed or not."
+)
+_REBUILDS_SENTENCE = (
+    "{n} consecutive rebuilds of this partial HNSW index for a definition change have not settled."
 )
 _DEFINITION_SENTENCE = "Built from definition {fp}."
 
@@ -299,6 +306,10 @@ _BUILD_FAILURES_PATTERN = re.compile(
 )
 _INTERRUPTED_BUILDS_PATTERN = re.compile(
     r"(\d+) consecutive builds of this partial HNSW index were interrupted\."
+)
+_REBUILDS_PATTERN = re.compile(
+    r"(\d+) consecutive rebuilds of this partial HNSW index for a definition change "
+    r"have not settled\."
 )
 _DEFINITION_PATTERN = re.compile(r"Built from definition ([0-9a-f]{12})\.")
 
@@ -1119,15 +1130,20 @@ def per_kb_index_fingerprint(knowledge_base_id: Any, dims: Any) -> str:
 
 
 def per_kb_index_comment(
-    failures: int = 0, interrupted: int = 0, fingerprint: str | None = None
+    failures: int = 0,
+    interrupted: int = 0,
+    fingerprint: str | None = None,
+    rebuilds: int = 0,
 ) -> str | None:
     """The ``pg_class`` comment recording what is known about one of these indexes.
 
     ``None`` when there is nothing to record, which is what ``COMMENT ON ... IS
-    NULL`` writes. The prose about an INVALID index is appended only when a count
-    is being recorded, because that is the only time the index is INVALID.
+    NULL`` writes. The prose about an INVALID index is appended only when one of the
+    two *build* counts is being recorded, because that is the only time the index is
+    INVALID -- a rebuild count sits on a valid index that is still answering
+    searches.
 
-    Composed here, and read back by the three ``_in`` functions below, so the
+    Composed here, and read back by the four ``_in`` functions below, so the
     wording lives in one place and a reworded sentence moves both directions at
     once.
     """
@@ -1138,6 +1154,8 @@ def per_kb_index_comment(
         parts.append(_INTERRUPTED_BUILDS_SENTENCE.format(n=int(interrupted)))
     if parts:
         parts.append(_INVALID_INDEX_PROSE)
+    if rebuilds:
+        parts.append(_REBUILDS_SENTENCE.format(n=int(rebuilds)))
     if fingerprint:
         parts.append(_DEFINITION_SENTENCE.format(fp=fingerprint))
     return " ".join(parts) or None
@@ -1157,6 +1175,19 @@ def build_failures_in(comment: str | None) -> int:
 def interrupted_builds_in(comment: str | None) -> int:
     """The consecutive interrupted-build count a comment records, or zero."""
     match = _INTERRUPTED_BUILDS_PATTERN.search(comment or "")
+    return int(match.group(1)) if match else 0
+
+
+def definition_rebuilds_in(comment: str | None) -> int:
+    """How many consecutive definition rebuilds of this index have not settled, or zero.
+
+    A third count, on a *third* bound (``MAX_CONSECUTIVE_DEFINITION_REBUILDS``), and
+    deliberately not part of either build bound: it is written before a drift drop
+    and cleared by the success that records the new definition, so a number here
+    means the drop-and-rebuild the drift detector asks for is not completing. See
+    ``MAX_CONSECUTIVE_DEFINITION_REBUILDS`` for what it bounds and what it cannot.
+    """
+    match = _REBUILDS_PATTERN.search(comment or "")
     return int(match.group(1)) if match else 0
 
 
@@ -1217,7 +1248,13 @@ def recorded_build_failures(conn, kb_id: str, dims: int) -> int:
 
 
 def _write_index_comment(
-    conn, kb_id: str, dims: int, failures: int, interrupted: int, fingerprint: str | None
+    conn,
+    kb_id: str,
+    dims: int,
+    failures: int,
+    interrupted: int,
+    fingerprint: str | None,
+    rebuilds: int = 0,
 ) -> None:
     """Record what is known about this index on the index itself. Best effort.
 
@@ -1226,35 +1263,61 @@ def _write_index_comment(
     the build failed. A failure so early that no catalog entry exists yet leaves
     nothing to comment on, and the next reconcile is then exactly as it is today.
 
+    **Best effort is why the drift path may not trust it.** The fingerprint written
+    here is the only thing that stops the next reconcile calling the same index
+    stale again, and a drift drop is (correctly) charged to neither build bound, so
+    a write that quietly does nothing turns the drift detector into an unbounded
+    drop-and-rebuild loop -- reproduced at 6 reconciles and 6 distinct index oids
+    with this function no-op'd, and 4 consecutive rebuilds with ``COMMENT``
+    refused server-side, each iteration a real ``DROP`` plus
+    ``CREATE INDEX CONCURRENTLY`` with both timeouts lifted. So that caller writes
+    through ``_count_a_definition_rebuild``, which reads the write back before it
+    drops anything.
+
     The comment is generated here in full -- the only values from outside are two
     integers this module counted and a hex digest it computed -- so there is
     nothing in it to quote.
     """
-    body = per_kb_index_comment(failures, interrupted, fingerprint)
+    body = per_kb_index_comment(failures, interrupted, fingerprint, rebuilds)
     literal = "NULL" if body is None else f"'{body}'"
     try:
         conn.execute(text(f"COMMENT ON INDEX {_qualified_index(kb_id, dims)} IS {literal}"))
     except Exception as exc:
         logger.warning(
-            "Could not record the build history of %s (%d failed, %d interrupted, "
-            "definition %s) (%s); a later reconcile will count from what it can read, and a "
-            "definition it cannot read is treated as one this module did not build",
+            "Could not record the build history of %s (%d failed, %d interrupted, %d "
+            "unsettled rebuilds, definition %s) (%s); a later reconcile will count from what "
+            "it can read, and a definition it cannot read is treated as one this module did "
+            "not build",
             _qualified_index(kb_id, dims),
             failures,
             interrupted,
+            rebuilds,
             fingerprint or "unknown",
             first_error_line(exc),
         )
 
 
-def _record_build_failure(conn, kb_id: str, dims: int, failures: int) -> None:
-    """Record a permanent-looking failure count, keeping the definition on record.
+def _record_build_failure(
+    conn, kb_id: str, dims: int, failures: int, interrupted: int | None = None
+) -> None:
+    """Record a failed attempt, keeping whatever definition the index really carries.
 
-    The narrow entry point kept for callers that only have a count to write -- the
-    general form is ``_write_index_comment``, which carries all three facts. It
-    reads the definition back off the index rather than assuming today's, so
-    recording a failure on an index built from an older definition does not quietly
-    relabel it as current.
+    The entry point for every caller that is *not* recording an attempt it just
+    made against today's DDL. It reads the definition back off the index rather
+    than assuming today's, so recording a failure on an index built from an older
+    definition does not quietly relabel it as current. ``interrupted`` is read back
+    too when the caller has no number of its own.
+
+    That is a behavioural distinction, not a tidiness one, because the mis-stamp is
+    not recoverable. ``REINDEX`` -- what the PostgreSQL manual recommends for an
+    INVALID index, and so what an operator reaches for -- rebuilds from the
+    *stored* predicate and preserves the ``pg_class`` comment, measured both plain
+    and ``CONCURRENTLY``. An older-definition index stamped with today's
+    fingerprint and then reindexed is therefore valid, stale, and certified
+    current: ``definition_has_drifted`` says no, ``index_action`` returns None, the
+    start-up sweep returns nothing, and no log line is written ever again.
+    Measured on a stale two-clause index, mean recall@20 0.559 against 0.993 for
+    the same index built from today's definition.
     """
     comment = index_comment(conn, kb_id, dims)
     _write_index_comment(
@@ -1262,8 +1325,9 @@ def _record_build_failure(conn, kb_id: str, dims: int, failures: int) -> None:
         kb_id,
         dims,
         failures,
-        interrupted_builds_in(comment),
+        interrupted_builds_in(comment) if interrupted is None else interrupted,
         definition_fingerprint_in(comment),
+        definition_rebuilds_in(comment),
     )
 
 
@@ -1278,15 +1342,10 @@ def _record_the_definition_built(conn, kb_id: str, dims: int) -> None:
     _write_index_comment(conn, kb_id, dims, 0, 0, per_kb_index_fingerprint(kb_id, dims))
 
 
-def _count_a_failed_attempt(
-    conn,
-    kb_id: str,
-    dims: int,
-    prior_failures: int,
-    prior_interrupted: int,
-    exc: BaseException,
-) -> None:
-    """Record this attempt against whichever of the two bounds it belongs to.
+def _counted_attempt(
+    prior_failures: int, prior_interrupted: int, exc: BaseException
+) -> tuple[int, int]:
+    """``(failures, interrupted)`` after charging one failed attempt to its bound.
 
     A failure ``is_transient_db_error`` recognises goes against the larger
     ``MAX_CONSECUTIVE_INTERRUPTED_BUILDS``, because the task that runs these
@@ -1300,16 +1359,66 @@ def _count_a_failed_attempt(
     nothing for a transient failure, which is what this did before, handed the
     whole budget back on every reconcile and made the bound unreachable.
 
-    The fingerprint of the definition this attempt used is written too: the
-    INVALID index left behind really was created from it.
+    Split from the two writes below because the *classification* is common to both
+    and the *definition each one records* is not.
     """
     if is_transient_db_error(exc):
-        interrupted, failures = prior_interrupted + 1, prior_failures
-    else:
-        interrupted, failures = prior_interrupted, prior_failures + 1
+        return prior_failures, prior_interrupted + 1
+    return prior_failures + 1, prior_interrupted
+
+
+def _count_a_failed_build(
+    conn,
+    kb_id: str,
+    dims: int,
+    prior_failures: int,
+    prior_interrupted: int,
+    exc: BaseException,
+) -> None:
+    """Count a ``CREATE INDEX CONCURRENTLY`` that failed, recording today's definition.
+
+    Today's is right **here and only here**: the INVALID index this failure just
+    left behind really was created from today's DDL, so writing today's fingerprint
+    on it states a fact about the object on disk.
+
+    A drop that fails is the same attempt and the same two bounds, but not the same
+    fact -- see ``_count_a_failed_repair_drop``, where the index on disk is the one
+    that was already there.
+    """
+    failures, interrupted = _counted_attempt(prior_failures, prior_interrupted, exc)
     _write_index_comment(
         conn, kb_id, dims, failures, interrupted, per_kb_index_fingerprint(kb_id, dims)
     )
+
+
+def _count_a_failed_repair_drop(
+    conn,
+    kb_id: str,
+    dims: int,
+    prior_failures: int,
+    prior_interrupted: int,
+    exc: BaseException,
+) -> None:
+    """Count a repair drop that raised, leaving the recorded definition as it was.
+
+    Charged to the same two bounds as the build it precedes, by the same rule and
+    for the same reason: it is the second way one reconcile of an INVALID index can
+    end without an index, and counting only the first left the bound reachable from
+    one side and not the other.
+
+    What it must **not** do is write today's fingerprint, which is the one thing
+    ``_count_a_failed_build`` may. The drop failed, so the index on disk is the
+    pre-existing one, built from whatever definition built it -- and an index
+    carrying an *older* definition reaches exactly this path: a drift drop
+    cancelled part-way leaves the old-definition index INVALID
+    (``indisvalid = false, indisready = true``, the state ``_drop_index``
+    documents), the next reconcile repairs it, and that drop fails too. Stamping
+    today's fingerprint there certifies a stale index as current, permanently once
+    an operator reindexes it. ``_record_build_failure`` reads the definition back
+    instead, and takes the numbers this caller carried across the drop.
+    """
+    failures, interrupted = _counted_attempt(prior_failures, prior_interrupted, exc)
+    _record_build_failure(conn, kb_id, dims, failures, interrupted)
 
 
 def _build_in_progress(conn, kb_id: str, dims: int) -> bool:
@@ -1413,7 +1522,7 @@ def _create_index(
         # process, after a deploy, whenever -- can see how many times this has
         # already been tried. Both prior counts are the ones read before the
         # repair drop took the previous record away with the index.
-        _count_a_failed_attempt(conn, kb_id, dims, prior_failures, prior_interrupted, exc)
+        _count_a_failed_build(conn, kb_id, dims, prior_failures, prior_interrupted, exc)
         raise
     else:
         # On every success, not only after a failure: this write is also what
@@ -1500,6 +1609,11 @@ def _repair_invalid(
     other. Measured before it was: five consecutive reconciles whose repair drop
     failed each recorded one failure and each asked for a build again, because the
     count is written past this point, in the build.
+
+    It is counted through ``_count_a_failed_repair_drop`` and not through the build's
+    ``_count_a_failed_build``, because the index the count lands on is the one that
+    was already there: the drop is what failed, so its recorded definition has to be
+    read back rather than assumed to be today's.
     """
     logger.warning(
         "Partial HNSW index %s.%s is INVALID and no build is running on %s.embeddings (an "
@@ -1511,7 +1625,7 @@ def _repair_invalid(
     try:
         _drop_index(conn, kb_id, dims)
     except Exception as exc:
-        _count_a_failed_attempt(conn, kb_id, dims, prior_failures, prior_interrupted, exc)
+        _count_a_failed_repair_drop(conn, kb_id, dims, prior_failures, prior_interrupted, exc)
         raise
 
 
