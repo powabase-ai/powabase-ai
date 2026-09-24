@@ -143,10 +143,13 @@ PER_KB_INDEX_ITEM_TABLE = pg_vector_index.PER_KB_INDEX_ITEM_TABLE
 # dominant input to *which* plan the planner picks, which is the cliff described
 # eight lines up. Measured on one query and one fixture with both indexes present:
 # 40 chose an exact sort, 50 the shared per-dimension index, 60 this knowledge
-# base's partial index, and 800 the shared one again. The shipped 120 sits in the
-# plateau where the partial index wins, and that plateau is the reason the value
-# is what it is -- so a change to it is a change to plan choice, not only to
-# recall, and belongs with a fresh measurement of both.
+# base's partial index, and 800 the shared one again. The shipped 120 sits inside
+# that fixture's plateau, and the plateau is *not* why the value is 120: the
+# recall band twelve lines up is, and this measurement came afterwards. Another
+# fixture's plateau runs from 40 to 600, which does not distinguish 120 from
+# pgvector's own default. What the plateau does establish is the consequence -- a
+# change to this value is a change to plan choice and not only to recall, so it
+# belongs with a fresh measurement of both.
 #
 # It is still set only when the probe has found an index to be on, because that is
 # where it has anything to decide.
@@ -630,19 +633,39 @@ class BasePgVectorStore:
         scan cannot promise that.
 
         **Why not simply leave the planner alone.** Because the planner's own
-        choice is a cost race, and the race comes out differently at different
-        widths. At 384 dimensions a vector is inline, the ANN scan prices below
-        the sort, and the planner takes the partial index for a restricted search
-        unaided -- returning a *full* page of ``top_k`` rows in which 12 to 17 of
-        20 are not the nearest matching ones. A full page is the failure mode with
-        no signal in it: nothing is short, so nothing can notice. At 1536
-        dimensions, the width production runs, the same planner declines the index
-        and the search is already exact. Pinning that is the whole of this block.
+        choice is a cost race, and on some shapes of the table it comes out for the
+        approximate index: it takes the partial index for a restricted search
+        unaided and returns a *full* page of ``top_k`` rows in which 12 to 17 of 20
+        are not the nearest matching ones. A full page is the failure mode with no
+        signal in it: nothing is short, so nothing can notice.
 
-        **So this is not a regression, it is the behaviour production already
-        has.** Measured at 1536 dimensions on a 12,000-row knowledge base with its
-        partial index built and valid, median of six query vectors, against a
-        seq-scan-and-sort ground truth:
+        **Which shapes those are is decided by the table, not by the vector width,
+        and the earlier claim that 1536 dimensions is already exact is withdrawn.**
+        Measured on a 4,000-row knowledge base with its own partial index, varying
+        only how many rows other knowledge bases hold, for a ``source_ids`` search:
+
+        | the knowledge base's share | 1536 d, planner unaided | 384 d, planner unaided |
+        |---|---|---|
+        | 4,000 of 4,000 rows (100 %) | **the partial index**, cost 159.08 | **the partial index**, cost 531.79 |
+        | 4,000 of 10,000 (40 %) | **the partial index**, cost 400.28 | **the partial index**, cost 668.04 |
+        | 4,000 of 24,000 (17 %) | an exact plan, cost 614.51 | **the partial index**, cost 1047.07 |
+        | 4,000 of 44,000 (9 %) | an exact plan, cost 1677.33 | **the partial index**, cost 1665.59 |
+
+        This block produced an exact plan on all eight. So at 1536 dimensions it is
+        load-bearing on two of those four shapes and inert on the other two, and at
+        384 dimensions it is load-bearing on all four -- while on a different
+        384-dimension fixture the planner was already exact on all four restricted
+        *shapes* and the block was a pure regression there, 36.3 -> 123.8 ms on
+        ``source_ids`` and 1.6 -> 37.7 ms on ``item_ids`` (3.4x and 23x). The width
+        makes the race close; the number of rows the rest of the table holds
+        decides it. **There is no shape on which this block makes an answer less
+        exact**, which is the property it is here for, and the price of it is
+        anything from nothing to the 23x above.
+
+        **What it costs where the planner was already exact.** Measured at 1536
+        dimensions on a 12,000-row knowledge base with its partial index built and
+        valid, median of six query vectors, against a seq-scan-and-sort ground
+        truth -- one of the shapes where the plan does not change:
 
         | restricted search | planner unaided | this block |
         |---|---|---|
@@ -706,11 +729,12 @@ class BasePgVectorStore:
         | ``item_ids``, 200 named | 2.5 -> **2.3 ms** | +1.1 ms |
         | ``filter_metadata`` | 14.8 -> 15.3 ms | +1.4 ms |
 
-        **Those are 1536-dimension numbers, and at 1536 dimensions this block
-        changes no plan** -- the planner declines the index there unaided, so what
-        the table above measures is three round trips against a plan that was
-        already going to be chosen. At **384 dimensions**, the width the block
-        exists for, it changes the plan and it is not free. Same fixture as the
+        **On that fixture the block changes no plan**, so what the table above
+        measures is three round trips against a plan that was already going to be
+        chosen. It is not the fixture to generalise from in either direction: the
+        sweep further up finds the same width choosing the index unaided once the
+        knowledge base is 40 % of the table or more. On a fixture where the plan
+        *does* change, at **384 dimensions**, it is not free. Same fixture as the
         ``Seq Scan`` reading above, median of six query vectors, eight executions
         each, recall against a ground truth computed with every scan priced out:
 
@@ -726,6 +750,13 @@ class BasePgVectorStore:
         which two in five are not among the nearest matching ones. There is no
         signal in a full page. The block buys that back for an order of magnitude
         of latency on a millisecond-scale query.
+
+        And on another 384-dimension fixture none of the four restricted shapes
+        went to the index unaided, so there was nothing to buy back and the block
+        was a pure regression -- 3.4x on ``source_ids`` and 23x on ``item_ids``.
+        Both readings are real and neither is *the* behaviour: a merger should read
+        this block as an unconditional insurance premium whose size depends on the
+        table it is paid on, not as a measured win.
 
         **The earlier claim that the plan is a *saving* on three of four shapes
         did not reproduce and is withdrawn.** On the shapes where the block
@@ -785,15 +816,16 @@ class BasePgVectorStore:
         except Exception as e:  # pragma: no cover - needs a live server
             # What actually happens now: the setting is back where it was, the
             # transaction is usable, and the search runs on the plan the planner
-            # picks for itself. At the width production runs that plan is the exact
-            # one anyway; at narrow widths, where a vector is stored inline, it can
-            # be an ordered index scan that answers with a full page of rows that
-            # are not the nearest ones among those the caller named.
+            # picks for itself. Whether that plan is the exact one depends on the
+            # shape of the table rather than on the vector width -- see the sweep
+            # in the docstring -- so the honest statement is that this search may
+            # come back with a full page of rows that are not the nearest ones
+            # among those the caller named.
             logger.warning(
                 "Could not price the approximate index out for KB %s: %s; this "
                 "restricted vector search will run on the planner's own plan, which "
-                "at narrow vector widths can be an approximate index scan returning "
-                "a full page of rows that are not the nearest matching ones",
+                "on some tables is an approximate index scan returning a full page "
+                "of rows that are not the nearest matching ones",
                 self.kb_id,
                 e,
             )
@@ -839,13 +871,41 @@ class BasePgVectorStore:
         PostgreSQL then prices an exact scan as 656 pages plus a sort of narrow
         tuples, and prices detoasting -- 12,000 out-of-line reads and 12,000
         1536-value distance computations -- at nothing at all. So the exact scan
-        is systematically underpriced and the ordered index scan overpriced, and
-        the gap does not close as the knowledge base grows: on a
-        20-knowledge-base, 39,995-row fixture at 1536 dimensions the planner
-        declined the index at every share of the table from 21% to 70%. At 384
-        dimensions the vector is inline, the two paths cost about the same, and
-        the planner takes the index on its own -- which is why this was invisible
-        until the suite was measured at a production width.
+        is systematically underpriced and the ordered index scan overpriced. That
+        is why the race is close at this width; it is not why either side of it
+        wins.
+
+        **Which side wins is decided by the shape of the table, and the earlier
+        claim that 1536 dimensions is the width at which "the planner declines the
+        index" is withdrawn.** It declined on the fixture this block was developed
+        against -- 20 knowledge bases, 39,995 rows, every share of the table from
+        21 % to 70 % -- and on others at the same width it takes the index unaided.
+        Measured on a 4,000-row knowledge base at 1536 dimensions with its own
+        partial index built and valid, the only thing changing between rows being
+        how many rows *other* knowledge bases hold:
+
+        | the knowledge base's share | planner unaided | with this block |
+        |---|---|---|
+        | 4,000 of 4,000 rows (100 %) | **the partial index**, cost 159.06 | the same plan at the same cost |
+        | 4,000 of 10,000 (40 %) | **the partial index**, cost 400.22 | the same plan at the same cost |
+        | 4,000 of 24,000 (17 %) | an exact plan, cost 609.51 | the partial index, cost 1009.06 |
+        | 4,000 of 44,000 (9 %) | an exact plan, cost 1672.36 | the partial index, cost 3122.14 |
+
+        A third fixture at this width takes the index unaided at every
+        ``ef_search`` from 40 to 600 (cost 846.66 against an exact scan's
+        1918.58). The same sweep at 384 dimensions, where a vector is inline, took
+        the index unaided on all four shapes.
+
+        **So this block is insurance, and on some shapes it buys a round trip and
+        two session settings for the plan the planner had already picked.** Nothing
+        here can tell those shapes apart at search time: the probe answers whether
+        the index exists, not whether the planner needed persuading. That is a
+        deliberate trade rather than an omission -- being wrong in this direction
+        costs the +0.3 ms the probe measures below, and being wrong in the other
+        costs the 50.5 -> 5.2 ms row in the table that follows. What it is not is a
+        property of the vector width, so a later measurement that finds the index
+        chosen unaided at 1536 dimensions is reproducing the table above rather
+        than contradicting it.
 
         Measured through ``vector_search`` itself, 12 executions on one pooled
         connection under ``force_generic_plan``, ``top_k`` 20, on that fixture,
@@ -925,11 +985,15 @@ class BasePgVectorStore:
         the index out rather than merely declining to force it in.
 
         **Not forcing is not enough, and that is worth stating because it was the
-        first fix tried.** The planner's own choice is a cost race that comes out
-        differently at 384 dimensions, where it takes the index for a restricted
-        search unaided and answers with a full page of ``top_k`` rows of which 12
-        to 17 of 20 are not the nearest matching ones. There is no signal in a full
-        page. Nor can a re-run repair it: where the planner already prefers the
+        first fix tried.** The planner's own choice is the same cost race, and on
+        the shapes where it comes out for the index a *restricted* search gets an
+        approximate answer unaided -- a full page of ``top_k`` rows of which 12 to
+        17 of 20 were not the nearest matching ones, counted on the 384-dimension
+        fixture where they were counted. Which shapes those are is again a question
+        about the table and not about the width: the sweep above took the index
+        unaided for a restricted search at 384 dimensions on every share from 9 %
+        to 100 %, and at 1536 dimensions on the two shapes where the knowledge base
+        held 40 % of the table or more. There is no signal in a full page. Nor can a re-run repair it: where the planner already prefers the
         index, the re-run replays the same approximate scan. So the restricted case
         is made exact by construction, on both sides of the race.
 
@@ -1057,10 +1121,11 @@ class BasePgVectorStore:
                 self.session.execute(text("SELECT set_config('enable_sort', 'off', true)"))
         except Exception as e:  # pragma: no cover - needs a live server
             # What actually happens now: nothing was changed, the transaction is
-            # usable, and the search runs on the planner's own plan -- which at
-            # the width production runs is the exact scan this block exists to
-            # price out, so the answer is right and the latency is what it was
-            # before the feature.
+            # usable, and the search runs on the planner's own plan. On the shapes
+            # where that plan is the exact scan this block exists to price out, the
+            # answer is right and the latency is what it was before the feature; on
+            # the shapes where the planner takes the index unaided it is the plan
+            # this block wanted anyway.
             logger.warning(
                 "Could not price the exact sort out for KB %s: %s; this vector search "
                 "runs on the planner's own plan and so may miss the knowledge base's "
@@ -1549,8 +1614,25 @@ class BasePgVectorStore:
         The remaining parameters stay bound for the same reason: with no ordered
         index scan there is no unknown row estimate to price one out, so a generic
         plan costs nothing and one shared statement text serves every knowledge
-        base. A ``LIMIT`` on the distance order would make this ``vector_search``'s
-        shape, and all of that would have to be revisited together.
+        base.
+
+        **A ``LIMIT`` on the distance order would make this ``vector_search``'s
+        shape -- and this query cannot reach the partial index even then, because
+        it does not carry ``e.item_table``.** The index's predicate names one
+        population (see ``PER_KB_INDEX_ITEM_TABLE``), and PostgreSQL matches a
+        partial index only from restriction clauses that *prove* the predicate, so
+        without that literal there is no plan in which this statement uses the
+        index -- the measurement above is right today for a reason it does not
+        mention. Measured by taking ``vector_search``'s own statement, which does
+        reach the index (cost 1,681.79), and deleting only that one clause: the
+        planner reaches no HNSW index at all, and ``enable_sort = off`` does not
+        recover it -- it adds the disable penalty to the same exact plan
+        (5,084.26 -> 10,000,005,084.26). With the shared per-dimension index still
+        in place the statement would land on that instead, which is the plan this
+        query has today anyway. Anyone adding the ``LIMIT`` has to add the ``item_table`` literal
+        and the gate with it, or the change lands as a query that has given up the
+        sort it was built on and gained no index in exchange. That is three
+        statements, not one, which is why none of them is here.
         """
         embedding_str = f"[{','.join(str(x) for x in embedding)}]"
         effective_dims = int(dims or len(embedding))

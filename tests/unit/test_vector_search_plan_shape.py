@@ -359,10 +359,12 @@ def test_a_restricted_search_has_the_index_priced_out_not_merely_unforced(restri
 
     Two propositions in one spec, because either alone passes a broken
     implementation: the sort penalty must not be applied, *and* the index must be
-    priced out. Not forcing is not enough -- at 384 dimensions the planner takes
-    the index for a restricted search unaided and returns a full page of ``top_k``
-    rows of which 12 to 17 of 20 are not the nearest matching ones, and a full page
-    has no signal in it.
+    priced out. Not forcing is not enough -- on a table shape where the planner
+    takes the index for a restricted search unaided it returns a full page of
+    ``top_k`` rows of which 12 to 17 of 20 were not the nearest matching ones, and
+    a full page has no signal in it. Which shapes those are is measured in
+    ``_insisting_on_an_exact_search``'s docstring and is a property of the table
+    rather than of the vector width.
 
     An empty id set is the most starved restriction there is -- it matches nothing
     -- so keying on ``is not None`` rather than truthiness is load-bearing, and
@@ -872,7 +874,10 @@ def test_the_per_source_search_is_left_on_the_planners_own_plan():
     remove, and ``enable_sort = off`` made it 4.8x slower (50.5 -> 244.7 ms).
 
     A ``LIMIT`` on the distance order would make this ``vector_search``'s shape,
-    and this spec is where that change gets noticed.
+    and this spec is where that change gets noticed. It would not be enough: the
+    query does not select ``e.item_table``, and the partial index's predicate names
+    it, so a statement that cannot prove that clause matches no partial index
+    however it is planned. The ``LIMIT``, the literal and the gate are one change.
     """
     session = MagicMock()
     captured: list[tuple[str, dict]] = []
