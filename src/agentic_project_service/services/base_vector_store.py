@@ -987,15 +987,17 @@ class BasePgVectorStore:
         **Not forcing is not enough, and that is worth stating because it was the
         first fix tried.** The planner's own choice is the same cost race, and on
         the shapes where it comes out for the index a *restricted* search gets an
-        approximate answer unaided -- a full page of ``top_k`` rows of which 12 to
-        17 of 20 were not the nearest matching ones, counted on the 384-dimension
-        fixture where they were counted. Which shapes those are is again a question
-        about the table and not about the width: the sweep above took the index
-        unaided for a restricted search at 384 dimensions on every share from 9 %
-        to 100 %, and at 1536 dimensions on the two shapes where the knowledge base
-        held 40 % of the table or more. There is no signal in a full page. Nor can a re-run repair it: where the planner already prefers the
-        index, the re-run replays the same approximate scan. So the restricted case
-        is made exact by construction, on both sides of the race.
+        approximate answer unaided: a full page of ``top_k`` rows of which 12 to 17
+        of 20 were not the nearest matching ones, on the 384-dimension fixture
+        where that was counted. Which shapes those are is again a question about
+        the table rather than about the width -- the same sweep, read for a
+        restricted search in ``_insisting_on_an_exact_search``'s docstring, took
+        the index unaided at 384 dimensions on every share from 9 % to 100 %, and
+        at 1536 dimensions on the two shapes where the knowledge base held 40 % of
+        the table or more. There is no signal in a full page. Nor can a re-run
+        repair it: where the planner already prefers the index, the re-run replays
+        the same approximate scan. So the restricted case is made exact by
+        construction, on both sides of the race.
 
         The cost of a restricted search that did get here anyway is bounded
         rather than proportional: pgvector stops an iterative scan at
