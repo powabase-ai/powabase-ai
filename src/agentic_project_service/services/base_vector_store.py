@@ -959,12 +959,23 @@ class BasePgVectorStore:
         ``_fetch_with_timeout`` restores its budget and
         ``_insisting_on_an_exact_search`` restores ``enable_indexscan``.
 
-        One exception, and it is deliberate: when the probe read no ``ef_search``
-        at all -- which is what a fresh pooled connection always reports, because
-        pgvector has not registered the GUC yet -- there is no value to put back,
-        so the raise is not restored. It is a transaction-local placeholder that
-        dies at the end of the transaction, and nothing between here and there
-        reads it: the keyword leg's ranking is a sort, not an ANN scan.
+        One case is deliberately *not* restored, and it is the common one rather
+        than an edge: when the probe read no ``ef_search`` at all. That is what a
+        fresh pooled connection always reports, because pgvector registers the GUC
+        on the first use of the vector type and the probe runs before any -- so
+        there is no prior value to bind, and the guard on the restore is kept
+        rather than made to invent one.
+
+        What that leaves is the raised value in force for the rest of *this*
+        transaction. The bound is the transaction and nothing wider: the third
+        argument to ``set_config`` makes it transaction-local, so it dies at
+        commit or rollback and cannot follow the connection back into the pool --
+        checked on a live server, where the next transaction on the same
+        connection read pgvector's own default again. Nothing between here and
+        that point reads it either; the keyword leg ``hybrid_search`` runs on this
+        session ranks with a sort, not an ANN scan. So this is a choice, not an
+        omission, and no spec asserts anything about the value after the search
+        because there is nothing about it worth pinning.
 
         A failure on any side degrades latency, never the answer, so all of them
         are logged rather than raised -- and the restore is expected to fail when

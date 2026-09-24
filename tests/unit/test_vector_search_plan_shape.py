@@ -480,11 +480,6 @@ def test_the_chunks_store_is_the_one_that_does_enter_it():
 
 
 # ---------------------------------------------------------------------------
-# The re-run, which is what makes the setting safe on a restricted search
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # hnsw.ef_search, which decides how accurate the index scan is once it happens
 # ---------------------------------------------------------------------------
 
