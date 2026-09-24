@@ -200,9 +200,7 @@ def test_the_item_table_reaches_sql_as_a_literal_too(store, item_table):
         "the item table must be a literal on the embeddings side, or the index "
         f"predicate cannot be proved:\n{sql}"
     )
-    assert "item_table" not in params, (
-        f"a bound item table proves nothing to the planner: {params}"
-    )
+    assert "item_table" not in params, f"a bound item table proves nothing to the planner: {params}"
 
 
 def test_an_item_table_that_could_break_the_quoting_is_rejected():
@@ -329,8 +327,7 @@ def test_the_restore_puts_back_the_value_the_probe_read():
     sql, params = statements[restore_at]
     normalized = "".join(sql.split()).lower()
     assert "set_config('enable_sort',:prior,true)" in normalized, (
-        "the restore must bind the value the probe read and stay "
-        f"transaction-local:\n{sql}"
+        f"the restore must bind the value the probe read and stay transaction-local:\n{sql}"
     )
     assert params.get("prior") == ENABLE_SORT_WAS, (
         f"the restore must bind the value the probe read, not a guess: {sql} {params}"
@@ -411,8 +408,7 @@ def test_the_exact_search_puts_enable_indexscan_back(restriction, store):
     sql, params = statements[touched[1]]
     normalized = "".join(sql.split()).lower()
     assert "set_config('enable_indexscan',:prior,true)" in normalized, (
-        "the restore must bind the value that was read and stay "
-        f"transaction-local:\n{sql}"
+        f"the restore must bind the value that was read and stay transaction-local:\n{sql}"
     )
     assert params.get("prior") == ENABLE_INDEXSCAN_WAS, statements[touched[1]]
     search_at = next(i for i, (sql, _) in enumerate(statements) if "ORDER BY" in sql)
@@ -455,11 +451,15 @@ def test_an_empty_metadata_filter_is_not_a_restriction(empty):
 def test_the_gate_is_only_for_the_item_table_it_was_measured_on():
     """``ai.embeddings`` is polymorphic and four stores inherit this search.
 
-    The partial index's predicate and the probe name ``(knowledge_base_id, dims)``
-    only, so a knowledge base whose embeddings are mostly chunks but whose search
-    routes to a document-level store passes the probe and is driven into an HNSW
-    walk of rows that cannot join: measured 2.2 -> 25.9 ms and recall 1.00 -> 0.33
-    on a 40-row table. The other stores keep the planner's own choice.
+    The index is *named* after ``(knowledge_base_id, dims)`` and the probe can only
+    look for a name, so a knowledge base whose search routes to a document-level
+    store passes the probe just the same -- and would be driven into an HNSW walk
+    of an index whose predicate restricts it to another store's rows: measured
+    2.2 -> 25.9 ms and recall 1.00 -> 0.33 on a 40-row table.
+
+    "The other stores keep the planner's own choice" holds for the *unrestricted*
+    search only, which is the one this spec drives. A restricted search from those
+    stores is priced off the index like any other, and that is pinned separately.
     """
     statements = _capture(partial_index=True, store=_FakeDocumentStore)
     assert not _enable_sort(statements), (
@@ -585,7 +585,7 @@ def test_ef_search_is_raised_even_when_the_probe_read_no_value_at_all():
     sql, params = statements[raised[0]]
     assert params.get("ef") == str(PER_KB_HNSW_EF_SEARCH), statements[raised[0]]
     assert "None" not in str(params.values()), (
-        f"the NULL must not become a set_config of the string \"None\": {params}"
+        f'the NULL must not become a set_config of the string "None": {params}'
     )
     normalized = "".join(sql.split()).lower()
     assert "set_config('hnsw.ef_search',:ef,true)" in normalized, sql
