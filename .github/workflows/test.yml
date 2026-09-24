@@ -68,6 +68,11 @@ jobs:
       # run and did not. Measured: an injected skip failed the job as intended,
       # while `-k "not <test>"` reported `2286 passed, 1 deselected` and the
       # one-word guard stayed quiet.
+      #
+      # What it cannot see, and no grep on a log can: a test that was never
+      # collected at all -- renamed, `--ignore`d, or dropped by a
+      # `collect_ignore` -- because pytest reports nothing about a test it never
+      # found. Only the counts moving says that happened.
       - name: Run unit tests
         run: |
           set -o pipefail
