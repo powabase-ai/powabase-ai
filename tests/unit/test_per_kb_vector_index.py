@@ -489,9 +489,23 @@ def _failure_comment(failures: int) -> str:
     return pvi._BUILD_FAILURES_COMMENT.format(n=failures)
 
 
-# The catalog row shape both the ensure survey and the boot sweep read.
+# The catalog row shape the ensure survey reads.
 def _index_row(kb_id: str, dims: int, valid: bool = True):
     return (pvi.per_kb_index_name(kb_id, dims), valid)
+
+
+def _sweep_index_row(kb_id: str, dims: int, valid: bool = True, failures: int = 0):
+    """The boot sweep's catalog row, which carries the index's build history too.
+
+    Read in the same pass as ``indisvalid`` so the sweep can tell an INVALID index
+    worth repairing from one that has already been given up on, with no extra
+    query.
+    """
+    return (
+        pvi.per_kb_index_name(kb_id, dims),
+        valid,
+        _failure_comment(failures) if failures else None,
+    )
 
 
 def _ensure(monkeypatch, conn, kb_id=KB, build_at=10_000, drop_below=5_000, **kwargs):
@@ -605,6 +619,9 @@ _KBS = [str(uuid.UUID(int=n)) for n in range(1, 40)]
 
 _COUNT_QUERY = "GROUP BY 1, 2"
 _CATALOG_QUERY = "i.indisvalid"
+# The sweep reads the index's comment in the same pass, so its catalog SELECT is
+# not the ensure survey's and the fakes answer them separately.
+_SWEEP_CATALOG_QUERY = "obj_description(c.oid, 'pg_class') FROM pg_class"
 
 
 def _sweep(conn):
@@ -712,7 +729,7 @@ def test_a_settings_read_that_cannot_be_made_does_not_stop_the_boot_sweep():
     """End to end: the sweep still clears the INVALID indexes it exists for."""
     conn = _BlockedSettingsSweepConn(
         answers=[
-            (_CATALOG_QUERY, [_index_row(_KBS[0], 1536, False)]),
+            (_SWEEP_CATALOG_QUERY, [_sweep_index_row(_KBS[0], 1536, False)]),
             (_COUNT_QUERY, [(_KBS[0], 1536, 3)]),
         ]
     )
@@ -727,8 +744,8 @@ def test_an_abandoned_boot_count_does_not_dispatch_every_indexed_knowledge_base(
     every indexed knowledge base -- up to ``MAX_PER_KB_INDEXES`` unbounded
     builds against the database that was already struggling.
     """
-    healthy = [_index_row(kb, 1536) for kb in _KBS[:5]]
-    conn = _FakeConn(answers=[(_CATALOG_QUERY, healthy)], fail_on=_COUNT_QUERY)
+    healthy = [_sweep_index_row(kb, 1536) for kb in _KBS[:5]]
+    conn = _FakeConn(answers=[(_SWEEP_CATALOG_QUERY, healthy)], fail_on=_COUNT_QUERY)
     with caplog.at_level(logging.WARNING):
         assert _sweep(conn) == []
     assert "Could not count embeddings" in caplog.text
@@ -736,8 +753,8 @@ def test_an_abandoned_boot_count_does_not_dispatch_every_indexed_knowledge_base(
 
 def test_an_invalid_index_is_still_dispatched_when_the_boot_count_is_abandoned():
     """The catalog cases need no count, which is what the count's warning promises."""
-    rows = [_index_row(_KBS[0], 1536, False), _index_row(_KBS[1], 1536, True)]
-    conn = _FakeConn(answers=[(_CATALOG_QUERY, rows)], fail_on=_COUNT_QUERY)
+    rows = [_sweep_index_row(_KBS[0], 1536, False), _sweep_index_row(_KBS[1], 1536, True)]
+    conn = _FakeConn(answers=[(_SWEEP_CATALOG_QUERY, rows)], fail_on=_COUNT_QUERY)
     assert _sweep(conn) == [_KBS[0]]
 
 
@@ -745,7 +762,7 @@ def test_a_knowledge_base_whose_rows_are_all_gone_is_dispatched_when_the_count_r
     """The other side of the guard: an emptied knowledge base has no group at all."""
     conn = _FakeConn(
         answers=[
-            (_CATALOG_QUERY, [_index_row(_KBS[0], 1536)]),
+            (_SWEEP_CATALOG_QUERY, [_sweep_index_row(_KBS[0], 1536)]),
             (_COUNT_QUERY, [(_KBS[1], 1536, 100)]),
         ]
     )
@@ -754,8 +771,8 @@ def test_a_knowledge_base_whose_rows_are_all_gone_is_dispatched_when_the_count_r
 
 def test_the_boot_sweep_caps_how_many_reconciles_one_start_up_sets_off(caplog):
     """Every dispatch can start an unbounded build; the index cap does not bound those."""
-    rows = [_index_row(kb, 1536, False) for kb in _KBS[: pvi.MAX_SWEEP_DISPATCH + 4]]
-    conn = _FakeConn(answers=[(_CATALOG_QUERY, rows)])
+    rows = [_sweep_index_row(kb, 1536, False) for kb in _KBS[: pvi.MAX_SWEEP_DISPATCH + 4]]
+    conn = _FakeConn(answers=[(_SWEEP_CATALOG_QUERY, rows)])
     with caplog.at_level(logging.WARNING):
         pending = _sweep(conn)
     assert len(pending) == pvi.MAX_SWEEP_DISPATCH
@@ -768,13 +785,72 @@ def test_the_capped_dispatch_keeps_the_invalid_indexes_ahead_of_the_rest():
     over_threshold = _KBS[1 : pvi.MAX_SWEEP_DISPATCH + 5]
     conn = _FakeConn(
         answers=[
-            (_CATALOG_QUERY, [_index_row(_KBS[0], 1536, False)]),
+            (_SWEEP_CATALOG_QUERY, [_sweep_index_row(_KBS[0], 1536, False)]),
             (_COUNT_QUERY, [(kb, 1536, 60_000) for kb in over_threshold]),
         ]
     )
     pending = _sweep(conn)
     assert len(pending) == pvi.MAX_SWEEP_DISPATCH
     assert pending[0] == _KBS[0], "the INVALID index must not be the one left behind"
+
+
+def test_the_boot_sweep_leaves_out_an_index_at_the_failure_bound(caplog):
+    """A start-up budget spent on builds nothing will attempt.
+
+    Measured against a real server: ``failures=3``, ``index_action`` already
+    ``None``, and the sweep returned the knowledge base anyway. The list is
+    INVALID-first and truncated to ``MAX_SWEEP_DISPATCH``, so that many given-up
+    indexes consume the whole budget on every boot while a repairable one is never
+    reached.
+    """
+    doomed = [
+        _sweep_index_row(kb, 1536, False, failures=pvi.MAX_CONSECUTIVE_BUILD_FAILURES)
+        for kb in _KBS[: pvi.MAX_SWEEP_DISPATCH]
+    ]
+    repairable = _sweep_index_row(_KBS[pvi.MAX_SWEEP_DISPATCH], 1536, False)
+    conn = _FakeConn(
+        answers=[(_SWEEP_CATALOG_QUERY, doomed + [repairable])], fail_on=_COUNT_QUERY
+    )
+    with caplog.at_level(logging.WARNING):
+        assert _sweep(conn) == [_KBS[pvi.MAX_SWEEP_DISPATCH]]
+    assert str(pvi.MAX_SWEEP_DISPATCH) in caplog.text, (
+        "an index no reconcile will attempt again needs an operator, so the boot says so"
+    )
+
+
+def test_an_index_one_attempt_short_of_the_bound_is_still_dispatched():
+    """The positive control: the bound is the bound, not a fear of failure."""
+    rows = [_sweep_index_row(_KBS[0], 1536, False, failures=pvi.MAX_CONSECUTIVE_BUILD_FAILURES - 1)]
+    conn = _FakeConn(answers=[(_SWEEP_CATALOG_QUERY, rows)], fail_on=_COUNT_QUERY)
+    assert _sweep(conn) == [_KBS[0]]
+
+
+def test_a_given_up_index_whose_knowledge_base_shrank_is_still_dispatched_to_be_dropped():
+    """Only the *repair* is given up on; the index still costs every write.
+
+    A knowledge base at or below the drop threshold wants that index gone, and
+    dropping it is also what re-arms the build, so this is the one dispatch a
+    given-up index must still get.
+    """
+    rows = [_sweep_index_row(_KBS[0], 1536, False, failures=pvi.MAX_CONSECUTIVE_BUILD_FAILURES)]
+    conn = _FakeConn(
+        answers=[
+            (_SWEEP_CATALOG_QUERY, rows),
+            (_COUNT_QUERY, [(_KBS[0], 1536, 1)]),
+        ]
+    )
+    assert _sweep(conn) == [_KBS[0]]
+
+
+def test_the_sweeps_failure_history_comes_from_the_query_it_already_runs():
+    """No second round trip per index: one column on the catalog SELECT."""
+    conn = _FakeConn()
+    _sweep(conn)
+    catalog = conn.issued(_SWEEP_CATALOG_QUERY)
+    assert len(catalog) == 1, conn.statements
+    assert conn.issued("obj_description(to_regclass") == [], (
+        "a per-index read would be one round trip per index on the boot path"
+    )
 
 
 # ---------------------------------------------------------------------------

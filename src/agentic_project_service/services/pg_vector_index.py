@@ -783,6 +783,16 @@ def recorded_build_failures(conn, kb_id: str, dims: int) -> int:
         text("SELECT obj_description(to_regclass(:index)::oid, 'pg_class')"),
         {"index": _qualified_index(kb_id, dims)},
     ).scalar()
+    return build_failures_in(comment)
+
+
+def build_failures_in(comment: str | None) -> int:
+    """The consecutive-failure count a ``pg_class`` comment records, or zero.
+
+    Split out from ``recorded_build_failures`` because the start-up sweep reads
+    these comments in bulk, as a column of the catalog SELECT it already runs,
+    rather than one round trip per index on the boot path.
+    """
     match = _BUILD_FAILURES_PATTERN.match(comment or "")
     return int(match.group(1)) if match else 0
 
@@ -1437,11 +1447,28 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
     cheap; the first two need the grouped count, which is not, so it runs under
     ``SWEEP_TIMEOUT_MS``.
 
+    An ``INVALID`` index that has already reached
+    ``MAX_CONSECUTIVE_BUILD_FAILURES`` is not one of them: the reconcile would
+    read the same count and decline, so dispatching it only spends one of
+    ``MAX_SWEEP_DISPATCH`` places -- and because the list is ``INVALID``-first,
+    that many given-up indexes would fill it on every boot. Its history comes from
+    the comment column on the catalog SELECT above, not from a read per index. It
+    is still dispatched for the other two reasons: giving up on the *repair* is not
+    giving up on the *drop*, and a knowledge base that has since fallen below the
+    drop threshold wants the index gone -- which is also what re-arms the build.
+
     An abandoned count is not evidence about any knowledge base, so when it
     fails nothing is concluded from it -- only the ``INVALID`` indexes are
     returned. In particular the "a knowledge base whose rows are all gone still
     has its index" case cannot be told apart from a count that never ran, so it
     is only considered when the count finished.
+
+    One case it does not catch: an index at a dimension the knowledge base no
+    longer has any rows at -- an embedding model change, where the grouped count
+    has a group for the new dimension and none for the old one, so neither the
+    "no index" nor the "all rows gone" test fires for the stale one. Left to
+    ``index_action``, which unions the dimensions in play with the dimensions that
+    have an index and asks for the drop on the next source that finishes indexing.
 
     At most ``MAX_SWEEP_DISPATCH`` ids come back, because each one can start an
     unbounded index build.
@@ -1452,13 +1479,15 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
     """
     engine = _engine(engine)
     needing: dict[str, None] = {}
+    given_up: list[str] = []
 
     try:
         with engine.connect() as conn:
             build_at, drop_below = thresholds(read_overrides(conn, *_THRESHOLD_KEYS))
             rows = conn.execute(
                 text(
-                    "SELECT c.relname, i.indisvalid FROM pg_class c "
+                    "SELECT c.relname, i.indisvalid, obj_description(c.oid, 'pg_class') "
+                    "FROM pg_class c "
                     "JOIN pg_index i ON i.indexrelid = c.oid "
                     "JOIN pg_namespace n ON n.oid = c.relnamespace "
                     r"WHERE n.nspname = :schema AND c.relkind = 'i' "
@@ -1467,7 +1496,7 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
                 {"schema": AI_SCHEMA, "prefix": _like_prefix(INDEX_NAME_PREFIX)},
             ).all()
             indexed: dict[str, list[int]] = {}
-            for relname, valid in rows:
+            for relname, valid, comment in rows:
                 body = relname[len(INDEX_NAME_PREFIX) :]
                 kb_hex, _, dims_part = body.rpartition("_")
                 if len(kb_hex) != 32 or not dims_part.isdigit():
@@ -1478,6 +1507,15 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
                     continue
                 indexed.setdefault(kb_id, []).append(int(dims_part))
                 if not valid:
+                    if build_failures_in(comment) >= MAX_CONSECUTIVE_BUILD_FAILURES:
+                        # Nothing would come of dispatching this one: the reconcile
+                        # reads the same count and declines. Left in the list it
+                        # would take one of ``MAX_SWEEP_DISPATCH`` places -- and the
+                        # list is INVALID-first, so that many given-up indexes would
+                        # consume the whole start-up budget on every boot while a
+                        # repairable one was never reached.
+                        given_up.append(f"{AI_SCHEMA}.{relname}")
+                        continue
                     needing[kb_id] = None
             conn.rollback()
     except Exception:
@@ -1485,6 +1523,21 @@ def kbs_needing_a_per_kb_index(engine=None) -> list[str]:
             "Could not read the per-knowledge-base HNSW indexes at start-up", exc_info=True
         )
         return []
+
+    if given_up:
+        logger.warning(
+            "%d partial HNSW index(es) are INVALID after %d consecutive failed builds, so this "
+            "start-up does not reconcile them: %s%s. Each answers no query and is maintained on "
+            "every write to %s.embeddings until an operator drops it by hand, which is also what "
+            "lets a later reconcile try again",
+            len(given_up),
+            MAX_CONSECUTIVE_BUILD_FAILURES,
+            ", ".join(given_up[:MAX_SWEEP_DISPATCH]),
+            f" (and {len(given_up) - MAX_SWEEP_DISPATCH} more)"
+            if len(given_up) > MAX_SWEEP_DISPATCH
+            else "",
+            AI_SCHEMA,
+        )
 
     counted_ok = True
     try:
