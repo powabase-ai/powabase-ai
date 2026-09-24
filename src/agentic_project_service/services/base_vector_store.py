@@ -134,8 +134,23 @@ PER_KB_INDEX_ITEM_TABLE = pg_vector_index.PER_KB_INDEX_ITEM_TABLE
 # kept the partial index at 6.9 ms and 800 took the shared index at 18.8 ms with
 # *lower* recall. The size matters: that cliff is a small-index property. At
 # 10,000 rows ``ef_search`` 800 cost 235.61 ms, and at 50,000 rows there was no
-# flip at all. So 80-400 is the band the *measured* sizes agree on, not a
-# threshold that holds at every size. 120 is deliberately well inside it.
+# flip at all. So 80-400 is a band the measured sizes were comfortable inside,
+# not a threshold that holds at every size. 120 is deliberately well inside it.
+#
+# **The upper edge is not a measured-safe edge: 120 is safe by margin, not by
+# guard.** Read this before raising the value. On a further fixture the flip to
+# the shared per-dimension index had already happened at ``ef_search`` **400** --
+# the band's own upper bound -- so the bound is a convention that 120 sits well
+# below rather than a value shown to be safe in itself, and which side of it a
+# given knowledge base is on depends on the shape of its table. Nothing detects
+# the flip: the forcing beside this setting is a penalty on sorts, which cannot
+# choose between two index plans (see
+# ``BasePgVectorStore._preferring_this_kbs_partial_index``), and no statement
+# reads back which index the plan used. Safe *by guard* would need exactly that
+# missing read -- confirming that the index the plan reached is this knowledge
+# base's own, and reporting or standing down when it is not -- and this change
+# does not have it. Until it does, a raise is a per-shape measurement of plan
+# choice as well as of recall, on the sizes that are actually in the table.
 #
 # **Not orthogonal to the forcing beside it**, and the earlier claim that it was
 # is withdrawn. It does decide how accurate an index scan is once the planner is
@@ -306,8 +321,15 @@ def ensure_embedding_index(session: Session, schema: str, dims: int) -> None:
     ``doc2json_documents`` embeddings are excluded from the per-KB index by
     ``item_table`` and from the residual one by ``knowledge_base_id``, so they end
     up with no HNSW index at all and every document-store vector search on that
-    knowledge base sequential-scans the table. ``pg_vector_index``'s module
-    docstring holds the constraint in full.
+    knowledge base sequential-scans the table.
+
+    **The two paragraphs above are the constraint in full, and this docstring is
+    where it is kept** -- next to the index it constrains, which is the one created
+    here. ``pg_vector_index`` builds the per-knowledge-base index and is the place
+    to read for *that* index's predicate and the population it covers; it names the
+    same follow-up, but from the build side, where the shared index is not the
+    subject. So do not read the sequencing or the residual predicate's shape from
+    there: read them here, or from #88's own deploy note.
     """
     dims = int(dims)
     if not (1 <= dims <= 8192):
@@ -986,6 +1008,32 @@ class BasePgVectorStore:
         which for a knowledge base that has no index is the whole of what this
         adds: +0.3 ms, measured over 120 searches each at 400, 2,000 and 8,400
         rows.
+
+        **What the probe cannot buy, and this is a standing limitation rather than
+        a fixed bug: a sort penalty cannot break a tie between two index plans, so
+        where the shared index is cheaper the gate hands the search to it.**
+        ``enable_sort = off`` adds a penalty to every sort path and to nothing
+        else; it does not price one index above another. So it can move a search
+        off an exact plan -- the case the tables above measure, and the case it is
+        here for -- but between this knowledge base's partial index and the shared
+        per-dimension one it changes no ordering at all. That leaves three
+        outcomes, and the probe distinguishes none of them: where the planner had
+        already chosen the partial index the block is inert; where the exact sort
+        was winning it is load-bearing; and where the shared index prices below the
+        partial one it is *worse* than doing nothing, because it takes away the
+        exact plan and what the search lands on is the index spanning every other
+        knowledge base. The probe answers "does this knowledge base have a valid
+        partial index", and nothing here reads back which index the plan actually
+        used.
+
+        Stated as a property rather than with a window of ``ef_search`` values,
+        deliberately: the crossover moves with the fixture, and three successive
+        measured windows each turned out to be a fact about one fixture rather than
+        about the mechanism. The mechanism is the sentence in bold, which follows
+        from what the GUC prices rather than from any fixture. Shipped knowingly:
+        the case it was measured on is real and common, and the remedy is not a
+        cost penalty (see ``PER_KB_HNSW_EF_SEARCH`` for what a guard would have to
+        read).
 
         **Only for an unrestricted search, and that is the other half of the
         gate.** The probe answers "does this knowledge base have a valid partial

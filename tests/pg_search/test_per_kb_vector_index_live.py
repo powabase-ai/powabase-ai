@@ -29,7 +29,11 @@ false at 75%:
 - a knowledge base below the build threshold is small in absolute terms as well
   as relative, which is the population the threshold decides for;
 - the shared per-dimension index post-filters away 70-99% of what it returns,
-  so recall through it is genuinely poor rather than a wash.
+  which is the mechanism the whole gain comes from. That is a claim about the
+  post-filter and not a recall figure: measured on this fixture the two indexes
+  come out level at 30% of the table and the partial one ahead at 21%, and an
+  absolute recall on synthetic vectors is an artifact of the generator either way
+  (see ``test_the_partial_index_answers_only_from_its_own_knowledge_base_in_order``).
 
 Sizes are chosen against the planner, not for roundness: the partial index has
 to be the cheapest plan for the indexed knowledge base, or the plan tests would
@@ -44,8 +48,9 @@ Why 384 dimensions, and what that leaves unpinned
 difference matters more than a fixture's usually does.
 
 At 384 the vector is stored in line, the exact scan and the ordered index scan
-cost about the same, and the planner takes the index on its own. That is what
-makes this width the right one for most of the module: the specs below about
+cost about the same, and on every shape measured here the planner takes the index
+on its own. That is what makes this width the right one for most of the module:
+the specs below about
 *matchability* -- that the embeddings-side predicate is what lets the index be
 used at all, that a prepared statement's generic plan can prove the index's
 predicate only when all of the KB id, ``dims`` and the LIMIT are literals -- can
@@ -60,9 +65,22 @@ across all-1536 fixtures of one shape: the index was declined at 6,000 and
 12,000 rows, chosen at 20,000, and declined again at 40,000. On the 40,000-row
 one it stayed declined as the knowledge base's share was raised from 21% to 70%.
 
-So at production widths the feature cannot be left to the planner, and
+**The width is what makes the race close; it is not what decides it, and the
+"1536 is the width at which the planner declines the index" reading is withdrawn
+in the source.** Which plan wins is a cost race settled by the shape of the
+table: measured on a 4,000-row knowledge base at 1536 dimensions, varying only
+how many rows *other* knowledge bases hold, the planner takes the partial index
+unaided at 100% and 40% of the table and an exact plan at 17% and 9%. So a later
+measurement that finds the index chosen unaided at 1536 dimensions is reproducing
+that table rather than contradicting this module.
+
+What follows for the feature is therefore about shapes and not widths: on the
+shapes where the planner declines it, the index the service built buys nothing
+unless something asks for it, so
 ``BasePgVectorStore._preferring_this_kbs_partial_index`` prices the exact sort
-out of the search when the knowledge base has a valid partial index to fall on.
+out of the search when the knowledge base has a valid partial index to fall on --
+and its docstring is also where the bound on that is written down, since a sort
+penalty cannot choose between two index plans.
 Its docstring carries the 1536 measurements. **This module cannot reproduce them
 cheaply.** A 1536-dimension knowledge base added to this fixture does not
 reproduce them at all, and that is worth knowing: the 384 rows inflate the
@@ -80,10 +98,15 @@ knowledge base with an index to fall on, that the answer for a knowledge base
 without one does not change, and that a search the caller restricted -- named
 rows, a source, a metadata filter -- is given the exact plan instead and returns
 exactly what an exact scan returns. That last one is the half of the design that
-does not depend on the width at all: at 1536 dimensions the planner declines an
-HNSW index for a restricted search anyway, so insisting on it changes nothing
-there and costs 42.7 ms against 44.8 ms; at 384 the planner would take the index
-and answer a full page of the wrong rows.
+does not depend on the width at all -- which is the point, and not the same as
+saying the planner is already exact at 1536. It is exact on *some* shapes there:
+on the 12,000-row shape the source measured, insisting changes no plan and costs
+42.7 ms against 44.8 ms, while on shapes where the knowledge base holds 40% of
+the table or more it takes the ANN index for a restricted search at 1536 too. At
+384 it takes the index and answers a full page of the wrong rows. So insisting is
+load-bearing at both widths and inert at both widths, depending on the shape, and
+what is width-independent is the outcome it guarantees rather than the work it
+does.
 
 Every test works in a scratch schema of its own, shaped like ``ai.chunks`` and
 ``ai.embeddings``, and the module fixture costs about 15 s, once.
@@ -2195,12 +2218,19 @@ def test_hybrid_search_has_a_vector_leg_that_reaches_the_partial_index(
 # of six query vectors:
 #
 #   share   rows    the planner's own choice     the same, ungated
-#    21 %   8,400   exact scan, 34.4 ms, r=1.00  shared index, 6.3 ms, r=0.04
-#     5 %   2,000   exact scan,  9.4 ms, r=1.00  shared index, 31.3 ms, r=0.04
-#     1 %     400   exact scan,  1.8 ms, r=1.00  shared index, 39.8 ms, r=0.36
+#    21 %   8,400   exact scan, 34.4 ms, r=1.00  shared index, 6.3 ms
+#     5 %   2,000   exact scan,  9.4 ms, r=1.00  shared index, 31.3 ms
+#     1 %     400   exact scan,  1.8 ms, r=1.00  shared index, 39.8 ms
 #
-# Slower and wrong, so the gate is the fix rather than a refinement on it. These
-# specs pin it from the outside: same answers, same index counters, for a
+# The recall this table used to carry in the right-hand column (0.04 at 5 %) is
+# gone from it deliberately: the source docstring withdraws those figures as a
+# generator artifact -- real embeddings at the same shapes give 0.927 and 0.964 --
+# so "wrong" is not the claim to hang the gate on. What survives on real data is
+# the latency inversion above, the shared index getting *slower* as the knowledge
+# base gets smaller because its post-filter discards more, plus a bad tail at 1 %.
+# And what these specs actually pin is neither: an exact answer becoming an
+# approximate one at all, whatever its recall turns out to be on a given corpus.
+# They pin it from the outside -- same answers, same index counters -- for a
 # knowledge base the build threshold left alone and for one whose index is on
 # disk but INVALID.
 #
