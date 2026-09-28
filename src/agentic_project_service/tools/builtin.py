@@ -12,12 +12,14 @@ import litellm
 import requests as http_requests
 from sqlalchemy import text
 
-from ..db import db
+from ..services import agent_sql
+from ..services.agent_sql import AgentSqlRejected
 from ..services.external_api import parse_retry_after
 from ..services.llm_call import with_llm_key
 from ..services.rate_limit import external_limiter
 from ..services.settings_registry import get_setting
-from ..services.storage import get_storage
+from ..services.storage import SOURCES_BUCKET, get_storage, get_storage_for_user
+from ..services.tool_caller import ToolCaller
 
 logger = logging.getLogger(__name__)
 
@@ -331,8 +333,24 @@ def _resolve_table(table, schemas_config):
     return matching[0], table, None
 
 
+_NO_CALLER_MESSAGE = "This tool is not available here: the run does not say who it acts for"
+
+
+def _pop_caller(arguments) -> ToolCaller | None:
+    """The caller the tool loader injected. Anything else in the key is ignored:
+    tool arguments come from the model, which must never choose who it acts as."""
+    caller = arguments.pop("_caller", None)
+    return caller if isinstance(caller, ToolCaller) else None
+
+
 def database_write_handler(arguments, context):
-    """Perform a structured INSERT, UPDATE, or DELETE on the configured schema(s)."""
+    """Perform a structured INSERT, UPDATE, or DELETE on the configured schema(s).
+
+    Runs as the run's caller (see services/agent_sql.py), never on the
+    service's own session.
+    """
+    caller = _pop_caller(arguments)
+    agent_id = arguments.pop("_agent_id", None)
     original_table = arguments.get("table", "")
     operation = arguments.get("operation", "")
     data = arguments.get("data") or {}
@@ -449,73 +467,14 @@ def database_write_handler(arguments, context):
                     }
                 )
 
+    if caller is None or agent_id is None:
+        return json.dumps({"success": False, "message": _NO_CALLER_MESSAGE})
+
     try:
-        search_path = ", ".join(f'"{s}"' for s in effective_schemas)
-        db.session.execute(text(f"SET LOCAL search_path TO {search_path}"))
-
-        if operation == "insert":
-            # Strip auto-generated columns (SERIAL, IDENTITY) to prevent sequence desync
-            auto_gen_cols = set()
-            try:
-                schema_name = effective_schemas[0] if effective_schemas else "public"
-                db.session.execute(text("SAVEPOINT _autogen_check"))
-                result = db.session.execute(
-                    text("""
-                        SELECT column_name
-                        FROM information_schema.columns
-                        WHERE table_schema = :schema
-                          AND table_name = :table
-                          AND (
-                              column_default LIKE 'nextval(%'
-                              OR is_identity = 'YES'
-                          )
-                    """),
-                    {"schema": schema_name, "table": table},
-                )
-                auto_gen_cols = {r[0] for r in result}
-                db.session.execute(text("RELEASE SAVEPOINT _autogen_check"))
-            except Exception:
-                db.session.execute(text("ROLLBACK TO SAVEPOINT _autogen_check"))
-                # Introspection failed; proceed without stripping
-
-            if auto_gen_cols:
-                rows = [{k: v for k, v in row.items() if k not in auto_gen_cols} for row in rows]
-                if not rows or not any(row for row in rows):
-                    return json.dumps(
-                        {
-                            "success": False,
-                            "message": "INSERT data contains only auto-generated columns — nothing to insert.",
-                        }
-                    )
-                # Recompute columns from the stripped rows
-                columns = list(rows[0].keys())
-
-            col_sql = ", ".join(f'"{k}"' for k in columns)
-            placeholders = ", ".join(f":{k}" for k in columns)
-            sql = f'INSERT INTO "{table}" ({col_sql}) VALUES ({placeholders})'
-            total_affected = 0
-            for row in rows:
-                result = db.session.execute(text(sql), row)
-                total_affected += result.rowcount
-
-        elif operation == "update":
-            update_data = rows[0]  # update uses single object
-            set_clause = ", ".join(f'"{k}" = :set_{k}' for k in update_data.keys())
-            where_clause = " AND ".join(f'"{k}" = :where_{k}' for k in where.keys())
-            params = {f"set_{k}": v for k, v in update_data.items()}
-            params.update({f"where_{k}": v for k, v in where.items()})
-            sql = f'UPDATE "{table}" SET {set_clause} WHERE {where_clause}'
-            result = db.session.execute(text(sql), params)
-            total_affected = result.rowcount
-
-        else:  # delete
-            where_clause = " AND ".join(f'"{k}" = :where_{k}' for k in where.keys())
-            params = {f"where_{k}": v for k, v in where.items()}
-            sql = f'DELETE FROM "{table}" WHERE {where_clause}'
-            result = db.session.execute(text(sql), params)
-            total_affected = result.rowcount
-
-        db.session.commit()
+        with agent_sql.agent_transaction(
+            caller, agent_id, effective_schemas, read_only=False
+        ) as conn:
+            total_affected = _run_write(conn, operation, table, rows, where, effective_schemas)
         return json.dumps(
             {
                 "success": True,
@@ -523,45 +482,107 @@ def database_write_handler(arguments, context):
                 "message": f"{operation} completed.",
             }
         )
-
+    except _NothingToInsert:
+        return json.dumps(
+            {
+                "success": False,
+                "message": "INSERT data contains only auto-generated columns — nothing to insert.",
+            }
+        )
     except Exception as e:
-        db.session.rollback()
         return json.dumps({"success": False, "message": str(e)})
 
 
-def database_query_handler(arguments, context):
-    """Run read-only SQL against the project's Postgres."""
-    sql = arguments.get("query", "").strip().rstrip(";").strip()
-    allowed_schemas = arguments.pop("_allowed_schemas", ["public"])
-    schemas_config = arguments.pop("_schemas_config", {})
-    arguments.pop("_allowed_tables", None)
+class _NothingToInsert(Exception):
+    """Every column the caller gave is generated by the database."""
 
-    # Use schemas_config if available, otherwise fall back to allowed_schemas
-    effective_schemas = list(schemas_config.keys()) if schemas_config else allowed_schemas
+
+def _run_write(conn, operation, table, rows, where, effective_schemas) -> int:
+    """Execute a validated write on ``conn``; return the rows affected."""
+    if operation == "insert":
+        # Strip auto-generated columns (SERIAL, IDENTITY) to prevent sequence desync
+        auto_gen_cols = set()
+        try:
+            schema_name = effective_schemas[0] if effective_schemas else "public"
+            conn.execute(text("SAVEPOINT _autogen_check"))
+            result = conn.execute(
+                text("""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = :schema
+                      AND table_name = :table
+                      AND (
+                          column_default LIKE 'nextval(%'
+                          OR is_identity = 'YES'
+                      )
+                """),
+                {"schema": schema_name, "table": table},
+            )
+            auto_gen_cols = {r[0] for r in result}
+            conn.execute(text("RELEASE SAVEPOINT _autogen_check"))
+        except Exception:
+            conn.execute(text("ROLLBACK TO SAVEPOINT _autogen_check"))
+            # Introspection failed; proceed without stripping
+
+        if auto_gen_cols:
+            rows = [{k: v for k, v in row.items() if k not in auto_gen_cols} for row in rows]
+            if not rows or not any(row for row in rows):
+                raise _NothingToInsert()
+
+        columns = list(rows[0].keys())
+        col_sql = ", ".join(f'"{k}"' for k in columns)
+        placeholders = ", ".join(f":{k}" for k in columns)
+        sql = f'INSERT INTO "{table}" ({col_sql}) VALUES ({placeholders})'
+        total_affected = 0
+        for row in rows:
+            result = conn.execute(text(sql), row)
+            total_affected += result.rowcount
+        return total_affected
+
+    if operation == "update":
+        update_data = rows[0]  # update uses single object
+        set_clause = ", ".join(f'"{k}" = :set_{k}' for k in update_data.keys())
+        where_clause = " AND ".join(f'"{k}" = :where_{k}' for k in where.keys())
+        params = {f"set_{k}": v for k, v in update_data.items()}
+        params.update({f"where_{k}": v for k, v in where.items()})
+        sql = f'UPDATE "{table}" SET {set_clause} WHERE {where_clause}'
+        return conn.execute(text(sql), params).rowcount
+
+    # delete
+    where_clause = " AND ".join(f'"{k}" = :where_{k}' for k in where.keys())
+    params = {f"where_{k}": v for k, v in where.items()}
+    sql = f'DELETE FROM "{table}" WHERE {where_clause}'
+    return conn.execute(text(sql), params).rowcount
+
+
+def database_query_handler(arguments, context):
+    """Run read-only SQL against the project's Postgres, as the run's caller.
+
+    The SQL is parsed and held to the agent's configured tables before it
+    runs, on a non-superuser login (see services/agent_sql.py).
+    """
+    sql = arguments.get("query", "").strip().rstrip(";").strip()
+    caller = _pop_caller(arguments)
+    agent_id = arguments.pop("_agent_id", None)
+    arguments.pop("_allowed_schemas", None)
+    arguments.pop("_allowed_tables", None)
+    schemas_config = arguments.pop("_schemas_config", {})
 
     # Defense-in-depth: validate schema names
-    for s in effective_schemas:
+    for s in schemas_config:
         if not _IDENTIFIER_RE.match(s):
             return json.dumps({"error": f"Invalid schema name: {s}"})
 
-    if not sql.upper().startswith("SELECT"):
-        return json.dumps({"error": "Only SELECT queries are allowed"})
-
-    # Block obvious multi-statement attacks (after stripping trailing semicolons)
-    if ";" in sql:
-        return json.dumps({"error": "Multi-statement queries are not allowed"})
+    if caller is None or agent_id is None or not schemas_config:
+        return json.dumps({"error": _NO_CALLER_MESSAGE})
 
     try:
-        search_path = ", ".join(f'"{s}"' for s in effective_schemas)
-        db.session.execute(text(f"SET LOCAL search_path TO {search_path}"))
-        result = db.session.execute(text(sql))
-        rows = [dict(row._mapping) for row in result]
-        output = json.dumps(rows, default=str)
-        db.session.rollback()
-        return output[:50000]
-    except Exception as e:
-        db.session.rollback()
+        rows = agent_sql.run_query(caller, agent_id, sql, schemas_config)
+    except AgentSqlRejected as e:
         return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+    return json.dumps(rows, default=str)[:50000]
 
 
 def http_request_handler(arguments, context):
@@ -624,18 +645,38 @@ def code_execute_handler(arguments, context):
         return json.dumps({"error": f"Sandbox unavailable: {e}"})
 
 
+def _storage_refusal(caller: ToolCaller | None, bucket: str) -> str | None:
+    """Why this storage call may not run, as the tool's JSON reply, or None."""
+    if caller is None:
+        return json.dumps({"error": _NO_CALLER_MESSAGE})
+    if bucket == SOURCES_BUCKET:
+        return json.dumps(
+            {"error": f"The '{SOURCES_BUCKET}' bucket is internal and not available to agents"}
+        )
+    return None
+
+
+def _storage_for(caller: ToolCaller):
+    """Storage as the caller: the end user's own token, or the service role."""
+    return get_storage_for_user(caller.token) if caller.is_end_user else get_storage()
+
+
 def storage_read_handler(arguments, context):
     """List objects in a bucket prefix or download a file from project storage."""
+    caller = _pop_caller(arguments)
     operation = arguments.get("operation", "")
     bucket = arguments.get("bucket", "")
     path = arguments.get("path", "") or ""
 
     if not bucket:
         return json.dumps({"error": "bucket is required"})
+    refusal = _storage_refusal(caller, bucket)
+    if refusal:
+        return refusal
 
     if operation == "list":
         try:
-            storage = get_storage()
+            storage = _storage_for(caller)
             # NOTE: Uses storage._request (private API) — should be replaced with
             # a public list_objects method if the storage service API changes.
             response = storage._request(
@@ -653,7 +694,7 @@ def storage_read_handler(arguments, context):
         if not path:
             return json.dumps({"error": "path is required for download"})
         try:
-            storage = get_storage()
+            storage = _storage_for(caller)
             data = storage.download_from_path(f"{bucket}/{path}")
             try:
                 content = data.decode("utf-8")
@@ -674,6 +715,7 @@ def storage_read_handler(arguments, context):
 
 def storage_write_handler(arguments, context):
     """Upload text content to a project storage bucket."""
+    caller = _pop_caller(arguments)
     bucket = arguments.get("bucket", "")
     path = arguments.get("path", "")
     content = arguments.get("content", "")
@@ -683,10 +725,13 @@ def storage_write_handler(arguments, context):
         return json.dumps({"error": "bucket is required"})
     if not path:
         return json.dumps({"error": "path is required"})
+    refusal = _storage_refusal(caller, bucket)
+    if refusal:
+        return refusal
 
     try:
         encoded = content.encode("utf-8")
-        storage = get_storage()
+        storage = _storage_for(caller)
         storage_path = storage.upload(bucket, path, encoded, content_type)
         return json.dumps({"path": storage_path, "size": len(encoded)})
     except Exception as e:

@@ -24,6 +24,7 @@ from ..services.ai_provider_keys_resolver import (
     resolve_api_key_or_raise_for_drop_using,
 )
 from ..services.settings_registry import get_setting
+from ..services.tool_caller import ToolCaller
 from ..services.tool_registry import load_all_tools_for_agent
 
 logger = logging.getLogger(__name__)
@@ -32,8 +33,11 @@ logger = logging.getLogger(__name__)
 def build_orchestration(
     orch_id: str,
     runtime_kb_configs: list[dict] | None = None,
+    caller: ToolCaller | None = None,
 ) -> tuple[OrchestrationModel, Orchestration]:
     """Build a core Orchestration object from DB models.
+
+    ``caller`` is who the run acts for; sub-agents' data tools act as it.
 
     Returns (orm_model, core_orchestration).
     """
@@ -114,6 +118,7 @@ def build_orchestration(
                 max_tool_output_length=get_setting("MAX_TOOL_OUTPUT_LENGTH"),
                 default_max_result_chars=get_setting("DEFAULT_MAX_RESULT_CHARS"),
                 runtime_kb_configs=runtime_kb_configs,
+                caller=caller,
             )
 
             entity_config = entity.config or {}

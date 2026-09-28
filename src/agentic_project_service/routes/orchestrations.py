@@ -51,6 +51,7 @@ from ..services.run_context import (
     set_run_id,
 )
 from ..services.session import _load_tool_calls_for_runs, persist_agent_run
+from ..services.tool_caller import ToolCaller
 from ._runtime_kb import validate_runtime_knowledge_bases
 
 logger = logging.getLogger(__name__)
@@ -973,7 +974,9 @@ def run_orchestration_stream(orch_id: str):
             )
 
             orch_row, orchestration = build_orchestration(
-                orch_id, runtime_kb_configs=runtime_kb_configs or None
+                orch_id,
+                runtime_kb_configs=runtime_kb_configs or None,
+                caller=ToolCaller.from_request(),
             )
 
             hooks = load_hooks_for_orchestration(orch_id)

@@ -116,6 +116,27 @@ creating the session so the conversation still belongs to that user.
 Without `SERVICE_ROLE_KEY` set, no caller is the service role and every
 management route answers `403`.
 
+### What an agent's tools can reach
+
+An agent's `database_query`, `database_write`, `storage_read` and
+`storage_write` tools act as whoever started the run, never as this service's
+own database login:
+
+- **An end user's run** queries Postgres as `authenticated` with that user's JWT
+  claims, and calls Storage with their own token. The agent can read and write
+  exactly what the user could through the REST API themselves: your grants and
+  RLS policies decide.
+- **A service-role run** queries Postgres as a role of its own that holds grants
+  on exactly the tables configured on the agent's database tools, and bypasses
+  RLS on those tables only.
+
+`database_query` accepts one plain `SELECT` that reads only the configured
+tables and calls only built-in functions; `set_config`, functions that run a SQL
+string, and functions defined in your own schemas are rejected. The tools log in
+as `powabase_agent_user` and `powabase_agent_backend`, which the service creates
+at startup with its own database password. Neither is a superuser or can bypass
+RLS itself.
+
 ## API Endpoints
 
 - `GET /api/health` - Health check

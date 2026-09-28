@@ -81,6 +81,8 @@ from ..services.session import (
     session_accessible_to,
     update_agent_run,
 )
+from ..services import agent_sql
+from ..services.tool_caller import ToolCaller
 from ..services.run_registry import (
     get_active_run_context,
     get_active_run_owner,
@@ -564,12 +566,18 @@ def update_agent(agent_id: str):
 @agents_bp.route("/<agent_id>", methods=["DELETE"])
 @require_service_role
 def delete_agent(agent_id: str):
-    """Delete an agent."""
+    """Delete an agent, and the database role its tools acted as."""
     db.session.execute(
         text(f'DELETE FROM "{AI_SCHEMA}".agents WHERE id = :id'),
         {"id": agent_id},
     )
     db.session.commit()
+    try:
+        agent_sql.drop_agent_role(agent_id)
+    except ValueError:
+        pass  # not a uuid: there was never a role
+    except Exception:
+        logger.exception("Could not drop the database role of deleted agent %s", agent_id)
 
     return jsonify({"message": "Agent deleted"})
 
@@ -2141,6 +2149,7 @@ def run_agent_stream(agent_id: str):
                 max_tool_output_length=max_tool_output,
                 default_max_result_chars=max_result_chars,
                 runtime_kb_configs=runtime_kb_configs or None,
+                caller=ToolCaller.from_request(),
             )
 
             # Citation handling — gate on context being available either from

@@ -1615,3 +1615,49 @@ class TestPreResponseReconciliation:
             assert row is not None
             assert row[0] == "REDACTED"
             assert row[0] != "RAW ANSWER"
+
+
+class TestToolsActAsTheCaller:
+    """The run's tools are loaded for whoever called run/stream."""
+
+    def _captured_caller(self, client, react_agent_id, auth_headers, monkeypatch):
+        from agentic_project_service.services import tool_registry
+
+        captured = {}
+        real_loader = tool_registry.load_all_tools_for_agent
+
+        def spy(*args, **kwargs):
+            captured["caller"] = kwargs.get("caller")
+            return real_loader(*args, **kwargs)
+
+        monkeypatch.setattr(tool_registry, "load_all_tools_for_agent", spy)
+        # Only the tool loading is under test, not whether an LLM key is configured.
+        monkeypatch.setattr(
+            "agentic_project_service.routes.agents.check_model_available", lambda model: None
+        )
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        with patch(
+            "agentic.agent.agent.Agent.run",
+            side_effect=lambda messages, **kw: _make_fake_agent_output("ok"),
+        ):
+            resp = client.post(
+                f"/api/agents/{react_agent_id}/run/stream",
+                json={"message": "go"},
+                headers=auth_headers,
+                buffered=True,
+            )
+        assert resp.status_code == 200
+        return captured["caller"]
+
+    def test_end_user_run_loads_tools_as_that_user(
+        self, client, mock_user_auth, auth_headers, react_agent_id, monkeypatch
+    ):
+        caller = self._captured_caller(client, react_agent_id, auth_headers, monkeypatch)
+        assert caller.is_end_user
+        assert caller.claims["sub"] == mock_user_auth
+
+    def test_service_role_run_loads_tools_as_the_service(
+        self, client, mock_auth, auth_headers, react_agent_id, monkeypatch
+    ):
+        caller = self._captured_caller(client, react_agent_id, auth_headers, monkeypatch)
+        assert caller is not None and not caller.is_end_user

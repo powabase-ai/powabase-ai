@@ -29,8 +29,15 @@ class SupabaseStorage:
         url: str | None = None,
         service_key: str | None = None,
         public_url: str | None = None,
+        bearer: str | None = None,
     ):
-        """Initialize the storage client."""
+        """Initialize the storage client.
+
+        ``bearer`` makes Storage authorize as that JWT (an end user, whose
+        storage policies then apply) instead of the service role. The service
+        key still goes in ``apikey`` for the gateway, which only checks that a
+        project key is present.
+        """
         self.service_key = service_key or os.getenv("SERVICE_ROLE_KEY")
 
         if not self.service_key:
@@ -45,7 +52,7 @@ class SupabaseStorage:
             self.url = (url or os.getenv("SUPABASE_URL", "http://kong:8000")).rstrip("/")
             self.storage_url = f"{self.url}/storage/v1"
         self.headers = {
-            "Authorization": f"Bearer {self.service_key}",
+            "Authorization": f"Bearer {bearer or self.service_key}",
             "apikey": self.service_key,
         }
 
@@ -353,3 +360,8 @@ def get_storage() -> SupabaseStorage:
     if _storage_client is None:
         _storage_client = SupabaseStorage()
     return _storage_client
+
+
+def get_storage_for_user(token: str) -> SupabaseStorage:
+    """A storage client that acts as the end user holding ``token``."""
+    return SupabaseStorage(bearer=token)

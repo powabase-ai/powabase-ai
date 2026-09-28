@@ -475,6 +475,18 @@ def create_app(testing: bool = False):
             db.session.rollback()
             raise SystemExit(1)
 
+    # The logins agent database tools run on, so their SQL never runs as this
+    # service's own (superuser) login. Refreshed every boot so a database
+    # password rotation follows. Not fatal: without them the database tools
+    # refuse, and everything else works.
+    with app.app_context():
+        try:
+            from .services.agent_sql import ensure_login_roles
+
+            ensure_login_roles()
+        except Exception:
+            logger.exception("Could not set up the agent tool database logins")
+
     return app
 
 

@@ -599,3 +599,48 @@ class TestHooksReachTheEngine:
                 buffered=True,
             )
         assert captured["hooks"] is None
+
+
+class TestSubAgentToolsActAsTheCaller:
+    """Each sub-agent's tools are loaded for whoever called run/stream."""
+
+    def _captured_callers(self, client, orch_id, auth_headers, monkeypatch):
+        from agentic_project_service.services import orchestration as orchestration_service
+
+        callers = []
+        real_loader = orchestration_service.load_all_tools_for_agent
+
+        def spy(*args, **kwargs):
+            callers.append(kwargs.get("caller"))
+            return real_loader(*args, **kwargs)
+
+        monkeypatch.setattr(orchestration_service, "load_all_tools_for_agent", spy)
+        # Only the tool loading is under test, not whether an LLM key is configured.
+        monkeypatch.setattr(
+            "agentic_project_service.routes.orchestrations.check_model_available",
+            lambda model: None,
+        )
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        with patch(
+            "agentic.orchestration.orchestration.Orchestration.run",
+            side_effect=lambda input, context=None, **kw: _make_completed_output(
+                context.execution_id
+            ),
+        ):
+            resp = client.post(
+                f"/api/orchestrations/{orch_id}/run/stream",
+                json={"message": "go"},
+                headers=auth_headers,
+                buffered=True,
+            )
+        assert resp.status_code == 200
+        assert callers, "no sub-agent tools were loaded"
+        return callers
+
+    def test_end_user_run(self, client, mock_user_auth, auth_headers, orch_with_agent, monkeypatch):
+        callers = self._captured_callers(client, orch_with_agent, auth_headers, monkeypatch)
+        assert all(c.is_end_user and c.claims["sub"] == mock_user_auth for c in callers)
+
+    def test_service_role_run(self, client, mock_auth, auth_headers, orch_with_agent, monkeypatch):
+        callers = self._captured_callers(client, orch_with_agent, auth_headers, monkeypatch)
+        assert all(c is not None and not c.is_end_user for c in callers)

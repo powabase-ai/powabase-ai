@@ -13,6 +13,7 @@ from agentic.agent.tools import BuiltinTool, CustomTool, KnowledgeSearchTool, To
 from ..models.tenant import AgentKnowledgeBase, AgentMcpServer, AgentTool, KnowledgeBase, Tool
 from ..services.context_handler import create_and_execute
 from ..tools.builtin import BUILTIN_HANDLERS, BUILTIN_TOOL_DEFINITIONS
+from . import agent_sql
 from . import billing_port as billing
 from .run_context import (
     get_run_id,
@@ -20,6 +21,7 @@ from .run_context import (
     next_call_seq,
 )
 from .settings_registry import get_setting
+from .tool_caller import ToolCaller
 
 
 def _derive_tool_idempotency_inputs(action: str, arguments: dict | None) -> tuple[str, str]:
@@ -667,12 +669,50 @@ def _introspect_table_metadata(db_session, schemas_config: dict[str, list[str]])
     return "\n".join(lines)
 
 
+# Built-in tools (other than the database tools) that reach project data and
+# so must act as the run's caller.
+_CALLER_SCOPED_TOOLS = frozenset({"storage_read", "storage_write"})
+
+
+def _with_caller(handler, caller: ToolCaller | None):
+    """Always set the caller the loader was given, over anything the model sent."""
+
+    def with_caller(arguments, context):
+        arguments["_caller"] = caller
+        return handler(arguments, context)
+
+    return with_caller
+
+
+def _sync_agent_role_for_service_run(agent_id: str, assignments) -> None:
+    """Bring the agent's Postgres role in line with its database tools' tables.
+
+    A service-role run's database tools act as that role, so it must hold
+    exactly the configured tables before they run. A failure is logged, not
+    raised: the tools then fail on permissions, which says what went wrong.
+    """
+    tables: dict[str, dict[str, list[str]]] = {"database_query": {}, "database_write": {}}
+    for assignment in assignments:
+        if assignment.tool_type == "builtin" and assignment.tool_name in tables:
+            schemas = (assignment.config_override or {}).get("schemas", {})
+            tables[assignment.tool_name] = {s: list(t) for s, t in schemas.items() if t}
+    try:
+        agent_sql.sync_agent_role(
+            agent_id,
+            read_tables=tables["database_query"],
+            write_tables=tables["database_write"],
+        )
+    except Exception:
+        logger.exception("Could not sync the database role for agent %s", agent_id)
+
+
 def load_all_tools_for_agent(
     agent_id: str,
     db_session,
     max_tool_output_length: int | None = None,
     default_max_result_chars: int | None = None,
     runtime_kb_configs: list[dict] | None = None,
+    caller: ToolCaller | None = None,
 ) -> dict[str, ToolDefinition]:
     """Load all tools assigned to an agent: built-in + custom.
 
@@ -681,11 +721,16 @@ def load_all_tools_for_agent(
         default_max_result_chars: Override for ToolDefinition.max_result_chars.
         runtime_kb_configs: Per-request KB configs merged into the agent's
             knowledge_search tool for this run only.
+        caller: Who the run acts for. The database and storage tools act as
+            this caller; with None they refuse to run.
     """
     tools: dict[str, ToolDefinition] = {}
     app = _get_flask_app()
 
     assignments = AgentTool.query.filter_by(agent_id=agent_id).all()
+
+    if caller is not None and not caller.is_end_user:
+        _sync_agent_role_for_service_run(agent_id, assignments)
 
     for assignment in assignments:
         if assignment.tool_type == "builtin":
@@ -743,6 +788,8 @@ def load_all_tools_for_agent(
                         arguments["_allowed_schemas"] = schemas
                         arguments["_allowed_tables"] = tables
                         arguments["_schemas_config"] = sc
+                        arguments["_caller"] = caller
+                        arguments["_agent_id"] = agent_id
                         return h(arguments, context)
 
                     return restricted
@@ -779,6 +826,8 @@ def load_all_tools_for_agent(
             # = deep) is present in `arguments` when the billing wrapper
             # resolves the action. Wrapping the other way bills the standard
             # rate while running the pricier deep search.
+            if tool_name in _CALLER_SCOPED_TOOLS:
+                handler = _with_caller(handler, caller)
             tool_handler = _wrap_handler_with_billing(
                 _ensure_app_context(handler, app), defn["name"]
             )

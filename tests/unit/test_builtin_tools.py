@@ -6,9 +6,11 @@ The storage handlers mock get_storage() to avoid real storage connections.
 """
 
 import json
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import agentic_project_service.tools.builtin as builtin_mod
+from agentic_project_service.services.tool_caller import ToolCaller
 from agentic_project_service.tools.builtin import (
     BUILTIN_HANDLERS,
     BUILTIN_TOOL_DEFINITIONS,
@@ -18,6 +20,26 @@ from agentic_project_service.tools.builtin import (
     storage_write_handler,
     web_search_handler,
 )
+
+_SERVICE = ToolCaller.service()
+_AGENT = "3f9a1c2e-5b7d-4e11-9a3c-8d2f6b4e1a70"
+
+
+@contextmanager
+def _as_tool_transaction(conn):
+    """Stand in for agent_sql.agent_transaction: every write runs on ``conn``.
+
+    Yields the read_only flag of each transaction opened.
+    """
+    opened = []
+
+    @contextmanager
+    def transaction(caller, agent_id, schemas, *, read_only):
+        opened.append(read_only)
+        yield conn
+
+    with patch.object(builtin_mod.agent_sql, "agent_transaction", transaction):
+        yield opened
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +467,7 @@ class TestStorageReadList:
             return_value=mock_storage,
         ):
             result = storage_read_handler(
-                {"operation": "list", "bucket": "my-bucket", "path": ""},
+                {"_caller": _SERVICE, "operation": "list", "bucket": "my-bucket", "path": ""},
                 context=None,
             )
 
@@ -460,7 +482,7 @@ class TestStorageReadList:
             return_value=mock_storage,
         ):
             storage_read_handler(
-                {"operation": "list", "bucket": "my-bucket", "path": "docs/"},
+                {"_caller": _SERVICE, "operation": "list", "bucket": "my-bucket", "path": "docs/"},
                 context=None,
             )
 
@@ -476,7 +498,7 @@ class TestStorageReadList:
             return_value=mock_storage,
         ):
             result = storage_read_handler(
-                {"operation": "list", "bucket": "empty-bucket", "path": ""},
+                {"_caller": _SERVICE, "operation": "list", "bucket": "empty-bucket", "path": ""},
                 context=None,
             )
 
@@ -489,7 +511,7 @@ class TestStorageReadList:
             return_value=MagicMock(),
         ):
             result = storage_read_handler(
-                {"operation": "list", "bucket": "", "path": ""},
+                {"_caller": _SERVICE, "operation": "list", "bucket": "", "path": ""},
                 context=None,
             )
 
@@ -504,7 +526,7 @@ class TestStorageReadList:
             return_value=mock_storage,
         ):
             result = storage_read_handler(
-                {"operation": "list", "bucket": "b", "path": ""},
+                {"_caller": _SERVICE, "operation": "list", "bucket": "b", "path": ""},
                 context=None,
             )
 
@@ -527,7 +549,12 @@ class TestStorageReadDownloadText:
             return_value=mock_storage,
         ):
             result = storage_read_handler(
-                {"operation": "download", "bucket": "my-bucket", "path": "notes.txt"},
+                {
+                    "_caller": _SERVICE,
+                    "operation": "download",
+                    "bucket": "my-bucket",
+                    "path": "notes.txt",
+                },
                 context=None,
             )
 
@@ -544,7 +571,12 @@ class TestStorageReadDownloadText:
             return_value=mock_storage,
         ):
             storage_read_handler(
-                {"operation": "download", "bucket": "bucket-a", "path": "dir/file.txt"},
+                {
+                    "_caller": _SERVICE,
+                    "operation": "download",
+                    "bucket": "bucket-a",
+                    "path": "dir/file.txt",
+                },
                 context=None,
             )
 
@@ -556,7 +588,7 @@ class TestStorageReadDownloadText:
             return_value=MagicMock(),
         ):
             result = storage_read_handler(
-                {"operation": "download", "bucket": "", "path": "file.txt"},
+                {"_caller": _SERVICE, "operation": "download", "bucket": "", "path": "file.txt"},
                 context=None,
             )
 
@@ -569,7 +601,7 @@ class TestStorageReadDownloadText:
             return_value=MagicMock(),
         ):
             result = storage_read_handler(
-                {"operation": "download", "bucket": "b", "path": ""},
+                {"_caller": _SERVICE, "operation": "download", "bucket": "b", "path": ""},
                 context=None,
             )
 
@@ -594,7 +626,12 @@ class TestStorageReadDownloadBinary:
             return_value=mock_storage,
         ):
             result = storage_read_handler(
-                {"operation": "download", "bucket": "assets", "path": "image.png"},
+                {
+                    "_caller": _SERVICE,
+                    "operation": "download",
+                    "bucket": "assets",
+                    "path": "image.png",
+                },
                 context=None,
             )
 
@@ -612,7 +649,12 @@ class TestStorageReadDownloadBinary:
             return_value=mock_storage,
         ):
             storage_read_handler(
-                {"operation": "download", "bucket": "assets", "path": "img.png"},
+                {
+                    "_caller": _SERVICE,
+                    "operation": "download",
+                    "bucket": "assets",
+                    "path": "img.png",
+                },
                 context=None,
             )
 
@@ -664,6 +706,7 @@ class TestStorageWriteUpload:
         ):
             result = storage_write_handler(
                 {
+                    "_caller": _SERVICE,
                     "bucket": "my-bucket",
                     "path": "output/result.txt",
                     "content": "hello storage",
@@ -687,6 +730,7 @@ class TestStorageWriteUpload:
         ):
             storage_write_handler(
                 {
+                    "_caller": _SERVICE,
                     "bucket": "bucket",
                     "path": "path/file.txt",
                     "content": "some content",
@@ -708,7 +752,7 @@ class TestStorageWriteUpload:
             return_value=MagicMock(),
         ):
             result = storage_write_handler(
-                {"bucket": "", "path": "file.txt", "content": "data"},
+                {"_caller": _SERVICE, "bucket": "", "path": "file.txt", "content": "data"},
                 context=None,
             )
 
@@ -721,7 +765,7 @@ class TestStorageWriteUpload:
             return_value=MagicMock(),
         ):
             result = storage_write_handler(
-                {"bucket": "b", "path": "", "content": "data"},
+                {"_caller": _SERVICE, "bucket": "b", "path": "", "content": "data"},
                 context=None,
             )
 
@@ -737,7 +781,7 @@ class TestStorageWriteUpload:
             return_value=mock_storage,
         ):
             storage_write_handler(
-                {"bucket": "bucket", "path": "file.txt", "content": "data"},
+                {"_caller": _SERVICE, "bucket": "bucket", "path": "file.txt", "content": "data"},
                 context=None,
             )
 
@@ -754,7 +798,7 @@ class TestStorageWriteUpload:
             return_value=mock_storage,
         ):
             result = storage_write_handler(
-                {"bucket": "bad", "path": "f.txt", "content": "x"},
+                {"_caller": _SERVICE, "bucket": "bad", "path": "f.txt", "content": "x"},
                 context=None,
             )
 
@@ -837,16 +881,22 @@ class TestDatabaseWriteHandler:
         mock_db = MagicMock()
         mock_db.session = mock_session
 
-        with patch("agentic_project_service.tools.builtin.db", mock_db):
+        with _as_tool_transaction(mock_session) as opened:
             result = database_write_handler(
-                {"table": "items", "operation": "insert", "data": {"name": "widget"}},
+                {
+                    "table": "items",
+                    "_caller": _SERVICE,
+                    "_agent_id": _AGENT,
+                    "operation": "insert",
+                    "data": {"name": "widget"},
+                },
                 context=None,
             )
 
         data = json.loads(result)
         assert data["success"] is True
         assert data["rows_affected"] == 1
-        mock_session.commit.assert_called_once()
+        assert opened == [False]  # one write transaction, committed by agent_sql
 
     def test_insert_strips_auto_generated_serial_columns(self):
         """Auto-generated columns (SERIAL/IDENTITY) should be stripped from INSERT data."""
@@ -868,10 +918,12 @@ class TestDatabaseWriteHandler:
         mock_db = MagicMock()
         mock_db.session = mock_session
 
-        with patch("agentic_project_service.tools.builtin.db", mock_db):
+        with _as_tool_transaction(mock_session):
             result = database_write_handler(
                 {
                     "table": "items",
+                    "_caller": _SERVICE,
+                    "_agent_id": _AGENT,
                     "operation": "insert",
                     "data": {"id": 1, "name": "widget"},
                 },
@@ -904,10 +956,12 @@ class TestDatabaseWriteHandler:
         mock_db = MagicMock()
         mock_db.session = mock_session
 
-        with patch("agentic_project_service.tools.builtin.db", mock_db):
+        with _as_tool_transaction(mock_session):
             result = database_write_handler(
                 {
                     "table": "items",
+                    "_caller": _SERVICE,
+                    "_agent_id": _AGENT,
                     "operation": "insert",
                     "data": {"id": 1},
                 },
@@ -935,10 +989,12 @@ class TestDatabaseWriteHandler:
         mock_db = MagicMock()
         mock_db.session = mock_session
 
-        with patch("agentic_project_service.tools.builtin.db", mock_db):
+        with _as_tool_transaction(mock_session):
             result = database_write_handler(
                 {
                     "table": "items",
+                    "_caller": _SERVICE,
+                    "_agent_id": _AGENT,
                     "operation": "insert",
                     "data": {"id": 1, "name": "widget"},
                 },
@@ -967,10 +1023,12 @@ class TestDatabaseWriteHandler:
         mock_db = MagicMock()
         mock_db.session = mock_session
 
-        with patch("agentic_project_service.tools.builtin.db", mock_db):
+        with _as_tool_transaction(mock_session):
             result = database_write_handler(
                 {
                     "table": "items",
+                    "_caller": _SERVICE,
+                    "_agent_id": _AGENT,
                     "operation": "insert",
                     "data": {"id": 1, "name": "widget"},
                 },
