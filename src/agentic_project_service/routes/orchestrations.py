@@ -24,7 +24,13 @@ from agentic.agent.hooks import (
 from agentic.agent.message import Message
 from agentic.execution.status import ExecutionStatus
 
-from ..auth import get_current_user_id, require_auth
+from ..auth import (
+    end_user_run_body_error,
+    get_current_user_id,
+    is_service_role_request,
+    require_service_role,
+    require_user_auth,
+)
 from ..db import db, AI_SCHEMA
 from ..models.tenant import (
     Agent as AgentModel,
@@ -144,7 +150,7 @@ def _require_uuid(value: str, label: str = "id"):
 
 
 @orchestrations_bp.route("", methods=["POST"])
-@require_auth
+@require_service_role
 def create_orchestration():
     data = request.get_json()
     name = data.get("name")
@@ -177,7 +183,7 @@ def create_orchestration():
 
 
 @orchestrations_bp.route("", methods=["GET"])
-@require_auth
+@require_service_role
 def list_orchestrations():
     """List orchestrations.
 
@@ -271,7 +277,7 @@ def list_orchestrations():
 
 
 @orchestrations_bp.route("/<orch_id>", methods=["GET"])
-@require_auth
+@require_service_role
 def get_orchestration(orch_id):
     orch = db.session.get(OrchestrationModel, orch_id)
     if not orch:
@@ -307,7 +313,7 @@ def get_orchestration(orch_id):
 
 
 @orchestrations_bp.route("/<orch_id>", methods=["PUT"])
-@require_auth
+@require_service_role
 def update_orchestration(orch_id):
     orch = db.session.get(OrchestrationModel, orch_id)
     if not orch:
@@ -359,7 +365,7 @@ def update_orchestration(orch_id):
 
 
 @orchestrations_bp.route("/<orch_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_orchestration(orch_id):
     orch = db.session.get(OrchestrationModel, orch_id)
     if not orch:
@@ -375,7 +381,7 @@ def delete_orchestration(orch_id):
 
 
 @orchestrations_bp.route("/<orch_id>/entities", methods=["POST"])
-@require_auth
+@require_service_role
 def add_entity(orch_id):
     orch = db.session.get(OrchestrationModel, orch_id)
     if not orch:
@@ -412,7 +418,7 @@ def add_entity(orch_id):
 
 
 @orchestrations_bp.route("/<orch_id>/entities", methods=["GET"])
-@require_auth
+@require_service_role
 def list_entities(orch_id):
     orch = db.session.get(OrchestrationModel, orch_id)
     if not orch:
@@ -442,7 +448,7 @@ def list_entities(orch_id):
 
 
 @orchestrations_bp.route("/<orch_id>/entities/<entity_id>", methods=["PUT"])
-@require_auth
+@require_service_role
 def update_entity(orch_id, entity_id):
     entity = db.session.get(OrchestrationEntityModel, entity_id)
     if not entity or str(entity.orchestration_id) != orch_id:
@@ -458,7 +464,7 @@ def update_entity(orch_id, entity_id):
 
 
 @orchestrations_bp.route("/<orch_id>/entities/<entity_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def remove_entity(orch_id, entity_id):
     entity = db.session.get(OrchestrationEntityModel, entity_id)
     if not entity or str(entity.orchestration_id) != orch_id:
@@ -474,7 +480,7 @@ def remove_entity(orch_id, entity_id):
 
 
 @orchestrations_bp.route("/<orch_id>/hooks", methods=["POST"])
-@require_auth
+@require_service_role
 def add_orchestration_hook(orch_id):
     """Add a hook to an orchestration."""
     orch = db.session.get(OrchestrationModel, orch_id)
@@ -606,7 +612,7 @@ def add_orchestration_hook(orch_id):
 
 
 @orchestrations_bp.route("/<orch_id>/hooks", methods=["GET"])
-@require_auth
+@require_service_role
 def list_orchestration_hooks(orch_id):
     """List hooks configured for an orchestration."""
     orch = db.session.get(OrchestrationModel, orch_id)
@@ -638,7 +644,7 @@ def list_orchestration_hooks(orch_id):
 
 
 @orchestrations_bp.route("/<orch_id>/hooks/<hook_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_orchestration_hook(orch_id, hook_id):
     """Remove a hook from an orchestration."""
     err = _require_uuid(orch_id, "orchestration id") or _require_uuid(hook_id, "hook id")
@@ -658,7 +664,7 @@ def delete_orchestration_hook(orch_id, hook_id):
 
 
 @orchestrations_bp.route("/<orch_id>/sessions", methods=["GET"])
-@require_auth
+@require_user_auth
 def list_orchestration_sessions(orch_id: str):
     """List sessions for an orchestration with run counts.
 
@@ -727,7 +733,7 @@ def _summary_from_events(events: list[dict]) -> str | None:
 
 
 @orchestrations_bp.route("/<orch_id>/sessions/<session_id>/messages", methods=["GET"])
-@require_auth
+@require_user_auth
 def get_orchestration_session_messages(orch_id: str, session_id: str):
     """Get assembled messages for an orchestration session.
 
@@ -862,7 +868,7 @@ def get_orchestration_session_messages(orch_id: str, session_id: str):
 
 
 @orchestrations_bp.route("/<orch_id>/run/stream", methods=["POST"])
-@require_auth
+@require_user_auth
 def run_orchestration_stream(orch_id: str):
     """Run an orchestration with SSE streaming.
 
@@ -889,18 +895,19 @@ def run_orchestration_stream(orch_id: str):
     request, a sub-agent with no attached KBs honors it while a sibling with
     several falls back to the project default.
 
-    Security: this is NOT enforced server-side. Any caller authorized to run
-    this orchestration — i.e. any authenticated project JWT — can reference
-    any knowledge base in the project via this field. This matches the
-    project-wide access posture of the `ai` schema (an authenticated
-    project JWT already reaches every KB in the project through it); it is
-    documented here rather than enforced. Expose this endpoint from trusted
-    backends only.
+    Security: only the service role key may set this field. An end user's
+    JWT gets 403, so an end user's run can only read the knowledge bases
+    configured on the orchestration's agents.
     """
     data = request.get_json()
     message = data.get("message")
     if not message:
         return jsonify({"error": "message is required"}), 400
+
+    if not is_service_role_request():
+        body_error = end_user_run_body_error(data)
+        if body_error:
+            return jsonify({"error": body_error}), 403
 
     session_id = data.get("session_id")
     user_id = get_current_user_id()
@@ -1361,12 +1368,30 @@ def run_orchestration_stream(orch_id: str):
 
 
 @orchestrations_bp.route("/runs/<run_id>", methods=["GET"])
-@require_auth
+@require_user_auth
 def get_orchestration_run(run_id: str):
-    """Get orchestration run status, events, and child runs."""
+    """Get orchestration run status, events, and child runs.
+
+    An end user sees a run only when it belongs to an orchestration session
+    they own; service-role bypasses the check.
+    """
     run = OrchestrationRunModel.query.filter_by(run_id=run_id).first()
     if not run:
         return jsonify({"error": "Run not found"}), 404
+
+    if not is_service_role_request():
+        session = (
+            OrchestrationSessionModel.query.filter_by(id=run.session_id).first()
+            if run.session_id
+            else None
+        )
+        if (
+            session is None
+            or session.user_id is None
+            or str(session.user_id) != get_current_user_id()
+        ):
+            # Same shape as not-found, so existence does not leak.
+            return jsonify({"error": "Run not found"}), 404
 
     # Get child agent runs
     child_runs = AgentRun.query.filter_by(parent_orchestration_run_id=str(run.id)).all()

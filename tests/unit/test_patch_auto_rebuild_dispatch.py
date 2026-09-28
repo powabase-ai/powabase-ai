@@ -44,7 +44,7 @@ def _auth_headers():
 # Patch decode_jwt so require_auth passes without a real JWT_SECRET / token.
 _FAKE_DECODE = patch(
     "agentic_project_service.auth.decode_jwt",
-    return_value={"role": "service_role"},
+    return_value={"role": "service_role", "is_service_role": True},
 )
 
 

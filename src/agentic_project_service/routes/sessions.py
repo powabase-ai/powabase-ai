@@ -4,7 +4,7 @@ import logging
 
 from flask import Blueprint, g, jsonify, request
 
-from ..auth import get_current_user_id, require_auth
+from ..auth import get_current_user_id, require_user_auth
 from ..db import db
 from ..services.context_handler import resolve_tool_call_image_refs
 from ..services.session import (
@@ -40,7 +40,7 @@ def _verify_session_access(session_id: str):
 
 
 @sessions_bp.route("/<session_id>", methods=["GET"])
-@require_auth
+@require_user_auth
 def get_session(session_id: str):
     """Get a session by its session_id."""
     denial = _verify_session_access(session_id)
@@ -55,7 +55,7 @@ def get_session(session_id: str):
 
 
 @sessions_bp.route("/<session_id>/messages", methods=["GET"])
-@require_auth
+@require_user_auth
 def get_messages(session_id: str):
     """
     Get chat messages for a session.
@@ -93,7 +93,7 @@ def get_messages(session_id: str):
 
 
 @sessions_bp.route("/<session_id>/runs", methods=["GET"])
-@require_auth
+@require_user_auth
 def get_runs(session_id: str):
     """
     Get all runs for a session.
@@ -139,7 +139,7 @@ def get_runs(session_id: str):
 
 
 @sessions_bp.route("/<session_id>/runs/<run_id>/retrieved-context", methods=["GET"])
-@require_auth
+@require_user_auth
 def get_run_retrieved_context_route(session_id: str, run_id: str):
     """Get retrieved context for a single run in a session."""
     denial = _verify_session_access(session_id)
@@ -159,7 +159,7 @@ def get_run_retrieved_context_route(session_id: str, run_id: str):
 
 
 @sessions_bp.route("/<session_id>", methods=["DELETE"])
-@require_auth
+@require_user_auth
 def delete_session_route(session_id: str):
     """
     Delete a session and all its runs.

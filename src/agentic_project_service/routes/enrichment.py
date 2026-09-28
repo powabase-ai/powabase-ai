@@ -9,7 +9,7 @@ from sqlalchemy import text
 
 from agentic.knowledge.model_config import METADATA_ENRICHMENT_DEFAULT_MAX_TOKENS
 
-from ..auth import require_auth
+from ..auth import require_service_role
 from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
 from ..services.metadata_enricher import MetadataEnricher
@@ -185,7 +185,7 @@ def _get_existing_config(kb_id: str) -> dict | None:
 
 
 @enrichment_bp.route("/<kb_id>/enrichment", methods=["PUT"])
-@require_auth
+@require_service_role
 def put_enrichment_config(kb_id: str):
     """Create or replace enrichment config for a knowledge base."""
     data = request.get_json()
@@ -346,7 +346,7 @@ def put_enrichment_config(kb_id: str):
 
 
 @enrichment_bp.route("/<kb_id>/enrichment", methods=["GET"])
-@require_auth
+@require_service_role
 def get_enrichment_config(kb_id: str):
     """Get current enrichment config and status."""
     config = _get_existing_config(kb_id)
@@ -357,7 +357,7 @@ def get_enrichment_config(kb_id: str):
 
 
 @enrichment_bp.route("/<kb_id>/enrichment", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_enrichment_config(kb_id: str):
     """Remove enrichment config and all results."""
     existing = _get_existing_config(kb_id)
@@ -388,7 +388,7 @@ def delete_enrichment_config(kb_id: str):
 
 
 @enrichment_bp.route("/<kb_id>/enrichment/results", methods=["GET"])
-@require_auth
+@require_service_role
 def get_enrichment_results(kb_id: str):
     """Fetch enrichment metadata for specific items."""
     existing = _get_existing_config(kb_id)
@@ -449,7 +449,7 @@ def get_enrichment_results(kb_id: str):
 
 
 @enrichment_bp.route("/<kb_id>/enrichment/run", methods=["POST"])
-@require_auth
+@require_service_role
 def trigger_enrichment(kb_id: str):
     """Manually trigger (re-)enrichment."""
     existing = _get_existing_config(kb_id)

@@ -5,7 +5,7 @@ import logging
 from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 
-from ..auth import require_auth
+from ..auth import require_service_role
 from ..db import AI_SCHEMA, db
 from ..services.settings_registry import (
     CATEGORY_META,
@@ -21,14 +21,14 @@ settings_bp = Blueprint("settings", __name__, url_prefix="/api/settings")
 
 
 @settings_bp.route("", methods=["GET"])
-@require_auth
+@require_service_role
 def get_settings():
     """Return all settings with defaults and current overrides."""
     return jsonify(get_all_settings())
 
 
 @settings_bp.route("", methods=["PUT"])
-@require_auth
+@require_service_role
 def update_settings():
     """Bulk-update settings. Body: { "settings": { key: value, ... } }"""
     data = request.get_json(silent=True) or {}
@@ -75,7 +75,7 @@ def update_settings():
 
 
 @settings_bp.route("/<key>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def reset_setting(key: str):
     """Remove a single override, reverting to default."""
     if key not in SETTINGS_REGISTRY:
@@ -96,7 +96,7 @@ def reset_setting(key: str):
 
 
 @settings_bp.route("/reset-category", methods=["POST"])
-@require_auth
+@require_service_role
 def reset_category():
     """Reset all overrides in a category. Body: { "category": "copilot" }"""
     data = request.get_json(silent=True) or {}

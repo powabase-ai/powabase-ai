@@ -34,7 +34,7 @@ def test_non_streaming_run_rejects_runtime_kbs():
     app = _make_test_app()
     with patch(
         "agentic_project_service.auth.decode_jwt",
-        return_value={"sub": "user-1", "role": "authenticated"},
+        return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
     ):
         with app.test_client() as client:
             resp = client.post(
@@ -53,7 +53,7 @@ def test_non_streaming_run_rejects_empty_runtime_kbs_list():
     app = _make_test_app()
     with patch(
         "agentic_project_service.auth.decode_jwt",
-        return_value={"sub": "user-1", "role": "authenticated"},
+        return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
     ):
         with app.test_client() as client:
             resp = client.post(
@@ -69,7 +69,7 @@ def test_stream_run_400s_on_invalid_runtime_kbs_before_streaming():
     app = _make_test_app()
     with patch(
         "agentic_project_service.auth.decode_jwt",
-        return_value={"sub": "user-1", "role": "authenticated"},
+        return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
     ):
         with patch.object(
             agents_route,
@@ -93,7 +93,7 @@ def test_runtime_kbs_do_not_trip_mutual_exclusivity():
     app = _make_test_app()
     with patch(
         "agentic_project_service.auth.decode_jwt",
-        return_value={"sub": "user-1", "role": "authenticated"},
+        return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
     ):
         with patch.object(
             agents_route, "validate_runtime_knowledge_bases", return_value=([{"id": "kb-1"}], None)
@@ -145,7 +145,7 @@ def test_run_stream_wires_validated_runtime_kb_configs_to_tool_loader():
     with (
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
         patch.object(
             agents_route,
@@ -187,7 +187,7 @@ def test_orchestration_stream_400s_on_invalid_runtime_kbs_before_streaming():
     app = _make_orchestrations_test_app()
     with patch(
         "agentic_project_service.auth.decode_jwt",
-        return_value={"sub": "user-1", "role": "authenticated"},
+        return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
     ):
         with patch.object(
             orch_route,

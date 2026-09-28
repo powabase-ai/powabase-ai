@@ -206,6 +206,29 @@ def get_or_create_session(
     return db_session_uuid, new_session_id, True
 
 
+def session_accessible_to(db_session: Session, session_id: str, user_id: str | None) -> bool:
+    """Whether an end user may continue the session with this session_id.
+
+    True when no such session exists yet (the run creates it, owned by the
+    caller) or when the caller owns it. A session with no owner was created by
+    a backend with the service role key and belongs to no end user, so it is
+    not accessible — unlike :func:`get_session_owner`, which cannot tell
+    "missing" from "ownerless".
+    """
+    row = db_session.execute(
+        text(
+            f"""
+            SELECT user_id FROM "{AI_SCHEMA}".agent_sessions
+            WHERE session_id = :session_id
+            """
+        ),
+        {"session_id": session_id},
+    ).fetchone()
+    if row is None:
+        return True
+    return row[0] is not None and user_id is not None and str(row[0]) == user_id
+
+
 def get_session_by_id(
     db_session: Session,
     session_id: str,

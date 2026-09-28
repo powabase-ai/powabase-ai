@@ -8,7 +8,7 @@ the compute-tier bundle.
 from flask import Blueprint, g, jsonify
 from sqlalchemy import text
 
-from ..auth import require_auth
+from ..auth import require_service_role
 from ..db import db
 
 internal_bp = Blueprint("internal", __name__, url_prefix="/api/internal")
@@ -51,7 +51,7 @@ _THIRD_PARTY_MAU_SQL = text(
 
 
 @internal_bp.route("/mau-count", methods=["GET"])
-@require_auth
+@require_service_role
 def mau_count():
     """Return this project's trailing-30d MAU / SSO-MAU / third-party-MAU counts.
 

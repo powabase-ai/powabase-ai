@@ -4,7 +4,7 @@ import logging
 
 from flask import Blueprint, jsonify, request
 
-from ..auth import require_auth
+from ..auth import require_service_role
 from ..db import db
 from ..models.tenant import Tool
 from ..tools.builtin import BUILTIN_TOOL_DEFINITIONS
@@ -15,7 +15,7 @@ tools_bp = Blueprint("tools", __name__, url_prefix="/api/tools")
 
 
 @tools_bp.route("", methods=["POST"])
-@require_auth
+@require_service_role
 def create_tool():
     data = request.get_json()
     name = data.get("name")
@@ -56,7 +56,7 @@ def create_tool():
 
 
 @tools_bp.route("", methods=["GET"])
-@require_auth
+@require_service_role
 def list_tools():
     builtins = [
         {
@@ -86,7 +86,7 @@ def list_tools():
 
 
 @tools_bp.route("/<tool_id>", methods=["GET"])
-@require_auth
+@require_service_role
 def get_tool(tool_id: str):
     tool = db.session.get(Tool, tool_id)
     if not tool:
@@ -104,7 +104,7 @@ def get_tool(tool_id: str):
 
 
 @tools_bp.route("/<tool_id>", methods=["PUT"])
-@require_auth
+@require_service_role
 def update_tool(tool_id: str):
     tool = db.session.get(Tool, tool_id)
     if not tool:
@@ -118,7 +118,7 @@ def update_tool(tool_id: str):
 
 
 @tools_bp.route("/<tool_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_tool(tool_id: str):
     tool = db.session.get(Tool, tool_id)
     if not tool:

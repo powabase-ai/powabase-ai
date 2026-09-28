@@ -74,7 +74,7 @@ def _post_chat(client, message="hello"):
 @patch("agentic_project_service.routes.copilot.db")
 @patch(
     "agentic_project_service.auth.decode_jwt",
-    return_value={"sub": "user-1", "role": "authenticated"},
+    return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
 )
 def test_second_concurrent_turn_rejected_409(_mock_jwt, mock_db, mock_chat):
     """While a turn is in flight for the session, a second POST is rejected 409
@@ -101,7 +101,7 @@ def test_second_concurrent_turn_rejected_409(_mock_jwt, mock_db, mock_chat):
 @patch("agentic_project_service.routes.copilot.db")
 @patch(
     "agentic_project_service.auth.decode_jwt",
-    return_value={"sub": "user-1", "role": "authenticated"},
+    return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
 )
 def test_history_query_is_bounded_and_lock_released(_mock_jwt, mock_db, mock_chat):
     """The history query applies the trailing window (LIMIT :lim), and the lock
@@ -143,7 +143,7 @@ def test_history_query_is_bounded_and_lock_released(_mock_jwt, mock_db, mock_cha
 @patch("agentic_project_service.routes.copilot.db")
 @patch(
     "agentic_project_service.auth.decode_jwt",
-    return_value={"sub": "user-1", "role": "authenticated"},
+    return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
 )
 def test_trailing_orphan_user_row_never_builds_user_user(_mock_jwt, mock_db, mock_chat):
     """A trailing orphan 'user' row (crashed prior turn) must not produce a
@@ -188,7 +188,7 @@ def test_trailing_orphan_user_row_never_builds_user_user(_mock_jwt, mock_db, moc
 @patch("agentic_project_service.routes.copilot.db")
 @patch(
     "agentic_project_service.auth.decode_jwt",
-    return_value={"sub": "user-1", "role": "authenticated"},
+    return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
 )
 def test_window_leading_assistant_trimmed_to_user_boundary(_mock_jwt, mock_db, mock_chat):
     """Once the window slides, it can start with an assistant row; the input
@@ -226,7 +226,7 @@ def test_window_leading_assistant_trimmed_to_user_boundary(_mock_jwt, mock_db, m
 @patch("agentic_project_service.routes.copilot.db")
 @patch(
     "agentic_project_service.auth.decode_jwt",
-    return_value={"sub": "user-1", "role": "authenticated"},
+    return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
 )
 def test_lock_released_when_pre_thread_setup_fails(_mock_jwt, mock_db, mock_chat):
     """A failure between lock acquisition and worker start (e.g. the user-row

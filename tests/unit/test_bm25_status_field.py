@@ -13,7 +13,7 @@ _FAKE_JWT = "fake.jwt.token"
 # Patch decode_jwt in the auth module so require_auth passes without a real JWT.
 _AUTH_PATCH = patch(
     "agentic_project_service.auth.decode_jwt",
-    return_value={"role": "service_role"},
+    return_value={"role": "service_role", "is_service_role": True},
 )
 
 

@@ -24,7 +24,7 @@ from flask import Blueprint, Response, current_app, jsonify, request, stream_wit
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
-from ..auth import require_auth
+from ..auth import require_service_role
 from ..db import db, AI_SCHEMA
 from ..services.project_copilot import PROJECT_COPILOT_MODEL, run_project_copilot_chat
 from ..services.run_context import run_scope
@@ -108,7 +108,7 @@ def _release_turn_lock(session_id: str, token: str) -> None:
 
 
 @project_copilot_bp.route("/sessions", methods=["POST"])
-@require_auth
+@require_service_role
 def create_session():
     """Get-or-create the project's single copilot session.
 
@@ -146,7 +146,7 @@ def _current_session_id() -> str | None:
 
 
 @project_copilot_bp.route("/sessions", methods=["GET"])
-@require_auth
+@require_service_role
 def get_session():
     """Get the project's most recent copilot session (or null)."""
     row = db.session.execute(
@@ -170,7 +170,7 @@ def get_session():
 
 
 @project_copilot_bp.route("/sessions/<session_id>/messages", methods=["GET"])
-@require_auth
+@require_service_role
 def get_messages(session_id: str):
     """Conversation history for a session."""
     rows = db.session.execute(
@@ -197,7 +197,7 @@ def get_messages(session_id: str):
 
 
 @project_copilot_bp.route("/sessions/<session_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_session(session_id: str):
     """Delete a session (cascade deletes messages) — lets a user reset the chat."""
     db.session.execute(
@@ -214,7 +214,7 @@ def delete_session(session_id: str):
 
 
 @project_copilot_bp.route("/sessions/<session_id>/chat", methods=["POST"])
-@require_auth
+@require_service_role
 def chat(session_id: str):
     """Send a user message and stream the assistant response (SSE)."""
     data = request.get_json() or {}

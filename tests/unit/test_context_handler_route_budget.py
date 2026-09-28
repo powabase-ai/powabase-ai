@@ -50,7 +50,7 @@ def _post(body, settings=None):
 
     with patch(
         "agentic_project_service.auth.decode_jwt",
-        return_value={"sub": "user-1", "role": "authenticated"},
+        return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
     ):
         with patch.object(ch_routes, "create_and_execute", _fake_execute):
             with patch.object(ch_routes, "get_setting", lambda key: resolved[key]):

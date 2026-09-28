@@ -8,7 +8,7 @@ import logging
 
 from flask import Blueprint, jsonify, request
 
-from ..auth import require_auth
+from ..auth import require_service_role
 from ..db import db
 from ..services.settings_registry import get_setting
 from ..services.context_handler import (
@@ -23,7 +23,7 @@ context_handlers_bp = Blueprint("context_handlers", __name__, url_prefix="/api/c
 
 
 @context_handlers_bp.route("", methods=["GET"])
-@require_auth
+@require_service_role
 def list_handlers():
     """
     List context handlers with pagination.
@@ -56,7 +56,7 @@ def list_handlers():
 
 
 @context_handlers_bp.route("", methods=["POST"])
-@require_auth
+@require_service_role
 def create_context_handler():
     """
     Create and execute a context handler.
@@ -118,7 +118,7 @@ def create_context_handler():
 
 
 @context_handlers_bp.route("/<handler_id>", methods=["GET"])
-@require_auth
+@require_service_role
 def get_handler(handler_id: str):
     """
     Fetch a context handler by ID.

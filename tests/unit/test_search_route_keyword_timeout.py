@@ -50,7 +50,7 @@ def _timeout_503(
         )
     )
     with (
-        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role"}),
+        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role", "is_service_role": True}),
         patch("agentic_project_service.routes.knowledge_bases.db"),
         patch(
             "agentic_project_service.routes.knowledge_bases.get_setting",
@@ -223,7 +223,7 @@ def _post(client, kb_id: str, method: str = "hybrid"):
     )
 
 
-@patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role"})
+@patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role", "is_service_role": True})
 @patch("agentic_project_service.routes.knowledge_bases.db")
 @patch("agentic_project_service.services.knowledge_search.search_knowledge_base")
 def test_degraded_hybrid_search_reports_the_dropped_leg(mock_search, _db, _jwt):
@@ -250,7 +250,7 @@ def test_degraded_hybrid_search_reports_the_dropped_leg(mock_search, _db, _jwt):
     assert body["retrieval_method"] == "hybrid"
 
 
-@patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role"})
+@patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role", "is_service_role": True})
 @patch("agentic_project_service.routes.knowledge_bases.db")
 @patch("agentic_project_service.services.knowledge_search.search_knowledge_base")
 def test_healthy_search_omits_the_degraded_field(mock_search, _db, _jwt):
@@ -264,7 +264,7 @@ def test_healthy_search_omits_the_degraded_field(mock_search, _db, _jwt):
     assert "degraded" not in resp.get_json()
 
 
-@patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role"})
+@patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role", "is_service_role": True})
 @patch("agentic_project_service.routes.knowledge_bases.db")
 @patch("agentic_project_service.services.knowledge_search.search_knowledge_base")
 def test_degradation_does_not_leak_into_the_next_request(mock_search, _db, _jwt):

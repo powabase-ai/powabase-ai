@@ -296,7 +296,7 @@ def _make_test_app():
 @patch("agentic_project_service.routes.knowledge_bases.db", new=MagicMock())
 @patch(
     "agentic_project_service.auth.decode_jwt",
-    return_value={"sub": "user-1", "role": "service_role"},
+    return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
 )
 @patch("agentic_project_service.routes.knowledge_bases.ensure_pg_bm25_index")
 @patch("agentic_project_service.routes.knowledge_bases.build_bm25_for_kb")

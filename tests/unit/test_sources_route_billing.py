@@ -93,7 +93,7 @@ def test_reextract_balance_check_blocks_status_mutation(billing_env):
         patch.object(sources_route, "get_all_user_provider_keys", return_value={}),
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
     ):
         with app.test_client() as client:
@@ -149,7 +149,7 @@ def test_reextract_balance_check_propagates_503(billing_env):
         patch.object(sources_route, "get_all_user_provider_keys", return_value={}),
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
     ):
         with app.test_client() as client:
@@ -199,7 +199,7 @@ def test_reextract_dispatches_task_when_balance_check_passes(billing_env):
         patch.object(sources_route, "get_all_user_provider_keys", return_value={}),
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
     ):
         with app.test_client() as client:
@@ -257,7 +257,7 @@ def test_reextract_checks_balance_unconditionally(no_billing_env):
         patch.object(sources_route, "get_all_user_provider_keys", return_value={}),
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
     ):
         with app.test_client() as client:
@@ -300,7 +300,7 @@ def test_reextract_threads_per_call_seed_to_task(billing_env):
         patch.object(sources_route, "get_all_user_provider_keys", return_value={}),
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
     ):
         with app.test_client() as client:

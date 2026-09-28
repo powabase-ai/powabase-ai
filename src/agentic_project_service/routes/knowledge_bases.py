@@ -9,7 +9,7 @@ from typing import Any
 from flask import Blueprint, jsonify, make_response, request
 from sqlalchemy import text
 
-from ..auth import require_auth
+from ..auth import require_service_role
 from ..celery import celery_app
 from ..db import db, AI_SCHEMA
 from ..services.ai_provider_keys_resolver import get_all_user_provider_keys
@@ -724,7 +724,7 @@ def _bm25_status_detail(kb, recorded: dict | None = None) -> tuple[str | None, s
 
 
 @knowledge_bases_bp.route("", methods=["GET"])
-@require_auth
+@require_service_role
 def list_knowledge_bases():
     """List knowledge bases with pagination, search, sort, and aggregates."""
     from ..services.list_params import parse_list_params, escape_like, ListParamsError
@@ -821,7 +821,7 @@ def list_knowledge_bases():
 
 
 @knowledge_bases_bp.route("", methods=["POST"])
-@require_auth
+@require_service_role
 def create_knowledge_base():
     """Create a new knowledge base."""
     data = request.get_json()
@@ -890,7 +890,7 @@ def create_knowledge_base():
 
 
 @knowledge_bases_bp.route("/<kb_id>", methods=["GET"])
-@require_auth
+@require_service_role
 def get_knowledge_base(kb_id: str):
     """Get a specific knowledge base.
 
@@ -955,7 +955,7 @@ def get_knowledge_base(kb_id: str):
 
 
 @knowledge_bases_bp.route("/<kb_id>", methods=["PATCH"])
-@require_auth
+@require_service_role
 def update_knowledge_base(kb_id: str):
     """Update a knowledge base."""
     err = _require_uuid(kb_id, "knowledge base id")
@@ -1093,7 +1093,7 @@ def _dispatch_pg_ensure_from_patch(
 
 
 @knowledge_bases_bp.route("/<kb_id>/sources", methods=["GET"])
-@require_auth
+@require_service_role
 def list_indexed_sources(kb_id: str):
     """Paginated, filterable, sortable list of indexed_sources for a KB.
 
@@ -1205,7 +1205,7 @@ def list_indexed_sources(kb_id: str):
 
 
 @knowledge_bases_bp.route("/<kb_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_knowledge_base(kb_id: str):
     """Delete a knowledge base and all its chunks."""
     err = _require_uuid(kb_id, "knowledge base id")
@@ -1402,7 +1402,7 @@ def index_source_into_kb(kb_id: str, source_id: str) -> dict:
 
 
 @knowledge_bases_bp.route("/<kb_id>/sources", methods=["POST"])
-@require_auth
+@require_service_role
 def add_source_to_kb(kb_id: str):
     """Add a source to a knowledge base for indexing."""
     err = _require_uuid(kb_id, "knowledge base id")
@@ -1421,7 +1421,7 @@ def add_source_to_kb(kb_id: str):
 
 
 @knowledge_bases_bp.route("/<kb_id>/sources/<indexed_source_id>/cancel", methods=["POST"])
-@require_auth
+@require_service_role
 def cancel_indexing(kb_id: str, indexed_source_id: str):
     """Cancel an in-progress indexing task."""
     err = _require_uuid(kb_id, "knowledge base id") or _require_uuid(
@@ -1466,7 +1466,7 @@ def cancel_indexing(kb_id: str, indexed_source_id: str):
 
 
 @knowledge_bases_bp.route("/<kb_id>/sources/<indexed_source_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def remove_source_from_kb(kb_id: str, indexed_source_id: str):
     """Remove a source from a knowledge base.
 
@@ -1540,7 +1540,7 @@ def remove_source_from_kb(kb_id: str, indexed_source_id: str):
 
 
 @knowledge_bases_bp.route("/<kb_id>/reindex", methods=["POST"])
-@require_auth
+@require_service_role
 def reindex_kb(kb_id: str):
     """Re-index sources in a knowledge base.
 
@@ -1803,7 +1803,7 @@ def _unmark_reenriching(kb_id: str, indexed_source_id: str | None, task_id: str)
 
 
 @knowledge_bases_bp.route("/<kb_id>/graph-enrichment/run", methods=["POST"])
-@require_auth
+@require_service_role
 def run_graph_reenrichment(kb_id: str):
     """Re-run graph reference enrichment (Stages 2+3) without full reindex."""
     err = _require_uuid(kb_id, "knowledge base id")
@@ -1885,7 +1885,7 @@ def run_graph_reenrichment(kb_id: str):
 
 
 @knowledge_bases_bp.route("/<kb_id>/graph-enrichment/errors", methods=["GET"])
-@require_auth
+@require_service_role
 def get_graph_enrichment_errors(kb_id: str):
     """Get per-source enrichment error counts for a graph_index KB."""
     err = _require_uuid(kb_id, "knowledge base id")
@@ -1913,7 +1913,7 @@ def get_graph_enrichment_errors(kb_id: str):
 
 
 @knowledge_bases_bp.route("/<kb_id>/items", methods=["POST"])
-@require_auth
+@require_service_role
 def get_items_by_sources(kb_id: str):
     """Fetch all indexed content items for specific source document(s)."""
     err = _require_uuid(kb_id, "knowledge base id")
@@ -2169,7 +2169,7 @@ def _keyword_timeout_remedy(kb_id: str) -> str:
 
 
 @knowledge_bases_bp.route("/<kb_id>/search", methods=["POST"])
-@require_auth
+@require_service_role
 def search_knowledge_base_route(kb_id: str):
     """Search the knowledge base."""
     err = _require_uuid(kb_id, "knowledge base id")
@@ -2249,7 +2249,7 @@ def search_knowledge_base_route(kb_id: str):
 
 
 @knowledge_bases_bp.route("/<kb_id>/build-bm25", methods=["POST"])
-@require_auth
+@require_service_role
 def build_bm25_endpoint(kb_id: str):
     """Dispatch a one-shot BM25 rebuild for this KB.
 
@@ -2445,7 +2445,7 @@ def _require_indexed_source_in_kb(kb_id: str, indexed_source_id: str):
 
 
 @knowledge_bases_bp.route("/<kb_id>/available-sources", methods=["GET"])
-@require_auth
+@require_service_role
 def list_available_sources(kb_id: str):
     """Extracted sources NOT yet indexed into this KB — the "Add source" modal.
 
@@ -2492,7 +2492,7 @@ def list_available_sources(kb_id: str):
 
 
 @knowledge_bases_bp.route("/<kb_id>/indexed-sources/<indexed_source_id>/chunks", methods=["GET"])
-@require_auth
+@require_service_role
 def list_chunks_for_indexed_source(kb_id: str, indexed_source_id: str):
     """Paginated chunk_embed chunks for one indexed source (inspector modal)."""
     err = _require_uuid(kb_id, "knowledge base id")
@@ -2609,7 +2609,7 @@ def _fetch_index_toc(table: str, indexed_source_id: str, kb_id: str) -> dict | N
 @knowledge_bases_bp.route(
     "/<kb_id>/indexed-sources/<indexed_source_id>/page-index-nodes", methods=["GET"]
 )
-@require_auth
+@require_service_role
 def list_page_index_nodes(kb_id: str, indexed_source_id: str):
     """All page_index nodes for one indexed source (inspector modal)."""
     err = _require_uuid(kb_id, "knowledge base id")
@@ -2624,7 +2624,7 @@ def list_page_index_nodes(kb_id: str, indexed_source_id: str):
 @knowledge_bases_bp.route(
     "/<kb_id>/indexed-sources/<indexed_source_id>/page-index-toc", methods=["GET"]
 )
-@require_auth
+@require_service_role
 def get_page_index_toc(kb_id: str, indexed_source_id: str):
     """The page_index table-of-contents row for one indexed source, or null."""
     err = _require_uuid(kb_id, "knowledge base id")
@@ -2639,7 +2639,7 @@ def get_page_index_toc(kb_id: str, indexed_source_id: str):
 @knowledge_bases_bp.route(
     "/<kb_id>/indexed-sources/<indexed_source_id>/graph-index-nodes", methods=["GET"]
 )
-@require_auth
+@require_service_role
 def list_graph_index_nodes(kb_id: str, indexed_source_id: str):
     """All graph_index nodes for one indexed source (inspector modal)."""
     err = _require_uuid(kb_id, "knowledge base id")
@@ -2654,7 +2654,7 @@ def list_graph_index_nodes(kb_id: str, indexed_source_id: str):
 @knowledge_bases_bp.route(
     "/<kb_id>/indexed-sources/<indexed_source_id>/graph-index-toc", methods=["GET"]
 )
-@require_auth
+@require_service_role
 def get_graph_index_toc(kb_id: str, indexed_source_id: str):
     """The graph_index table-of-contents row for one indexed source, or null."""
     err = _require_uuid(kb_id, "knowledge base id")
@@ -2669,7 +2669,7 @@ def get_graph_index_toc(kb_id: str, indexed_source_id: str):
 @knowledge_bases_bp.route(
     "/<kb_id>/indexed-sources/<indexed_source_id>/full-document", methods=["GET"]
 )
-@require_auth
+@require_service_role
 def get_full_document(kb_id: str, indexed_source_id: str):
     """The full_document summary row for one indexed source, or null."""
     err = _require_uuid(kb_id, "knowledge base id")
@@ -2708,7 +2708,7 @@ def get_full_document(kb_id: str, indexed_source_id: str):
 @knowledge_bases_bp.route(
     "/<kb_id>/indexed-sources/<indexed_source_id>/doc2json-document", methods=["GET"]
 )
-@require_auth
+@require_service_role
 def get_doc2json_document(kb_id: str, indexed_source_id: str):
     """The doc2json extraction row for one indexed source (or null), plus the
     linked source's `derivatives` (the modal needs image/text derivative

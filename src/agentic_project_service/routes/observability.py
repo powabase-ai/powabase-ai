@@ -16,7 +16,7 @@ that logic (already reviewed, already correct) stays untouched.
 from flask import Blueprint, jsonify, request
 from sqlalchemy import text
 
-from ..auth import require_auth
+from ..auth import require_service_role
 from ..db import db, AI_SCHEMA
 
 observability_bp = Blueprint("observability", __name__, url_prefix="/api/observability")
@@ -36,7 +36,7 @@ def _parse_limit(default: int, cap: int) -> int:
 
 
 @observability_bp.route("/agent-runs", methods=["GET"])
-@require_auth
+@require_service_role
 def list_observability_agent_runs():
     """Bounded ai.agent_runs rows for the runs-chart + tokens-by-agent-runs
     hooks. `since` is required (both callers always compute a window)."""
@@ -95,7 +95,7 @@ def list_observability_agent_runs():
 
 
 @observability_bp.route("/orchestration-runs", methods=["GET"])
-@require_auth
+@require_service_role
 def list_observability_orchestration_runs():
     """Bounded ai.orchestration_runs rows for the tokens dashboard."""
     since = request.args.get("since")
@@ -144,7 +144,7 @@ def list_observability_orchestration_runs():
 
 
 @observability_bp.route("/workflow-block-logs", methods=["GET"])
-@require_auth
+@require_service_role
 def list_observability_workflow_block_logs():
     """Bounded ai.workflow_block_logs rows (block_type='agent' only — the
     sole caller, the tokens dashboard, never wants other block types) for
@@ -196,7 +196,7 @@ def list_observability_workflow_block_logs():
 
 
 @observability_bp.route("/tool-calls", methods=["GET"])
-@require_auth
+@require_service_role
 def list_observability_tool_calls():
     """Bounded ai.tool_call_events rows for the tool-call panels."""
     since = request.args.get("since")
@@ -246,7 +246,7 @@ def list_observability_tool_calls():
 
 
 @observability_bp.route("/extraction-status", methods=["GET"])
-@require_auth
+@require_service_role
 def get_observability_extraction_status():
     """Raw (extraction_status | index_status) columns, bounded at 10k rows
     each — the extraction/indexing status donuts tally these client-side."""
@@ -269,7 +269,7 @@ def get_observability_extraction_status():
 
 
 @observability_bp.route("/filter-options", methods=["GET"])
-@require_auth
+@require_service_role
 def get_observability_filter_options():
     """Distinct agent_runs.model values + all agents — populates the
     observability filter bar's model/agent dropdowns."""
@@ -297,7 +297,7 @@ def get_observability_filter_options():
 
 
 @observability_bp.route("/agents-lookup", methods=["GET"])
-@require_auth
+@require_service_role
 def get_observability_agents_lookup():
     """Name resolution for a specific set of agent ids (tokens dashboard's
     "group by agent" dimension)."""
@@ -323,7 +323,7 @@ _STUCK_WORKFLOW_THRESHOLD_MINUTES = 5
 
 
 @observability_bp.route("/health", methods=["GET"])
-@require_auth
+@require_service_role
 def get_observability_health():
     """The 5 stat-card counts at the top of /observability."""
     row = db.session.execute(

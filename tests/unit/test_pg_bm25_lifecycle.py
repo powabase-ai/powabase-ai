@@ -1117,7 +1117,7 @@ def _make_test_app():
 
 _FAKE_JWT = patch(
     "agentic_project_service.auth.decode_jwt",
-    return_value={"sub": "user-1", "role": "service_role"},
+    return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
 )
 
 

@@ -44,6 +44,7 @@ export DATABASE_URL=postgresql://...
 export REDIS_URL=redis://localhost:6379/0
 export OPENAI_API_KEY=sk-...
 export JWT_SECRET=your-jwt-secret
+export SERVICE_ROLE_KEY=your-service-role-key  # required: see Authentication
 
 # Run API server
 gunicorn -w 4 -b 0.0.0.0:5000 agentic_project_service.main:app
@@ -90,6 +91,30 @@ docker run -p 5000:5000 --env-file .env powabase-ai:dev
 # Run Worker
 docker run --env-file .env powabase-ai:dev celery -A agentic_project_service.celery worker --loglevel=info
 ```
+
+## Authentication
+
+Apart from inbound webhooks and the internal docs search, which each verify
+their own secret, every `/api` route takes a `Bearer` token. There are two kinds
+of caller:
+
+- **Service role** — the bearer is exactly `SERVICE_ROLE_KEY`. This is how the
+  dashboard and your own backend call the API. Every route is available.
+- **End user** — a JWT for a signed-in user of the project (audience
+  `authenticated`, signed with `JWT_SECRET`). An end user may only hold
+  conversations: create, list, continue and delete *their own* agent and
+  orchestration sessions, run agents and orchestrations in them, read their own
+  runs, and approve their own paused runs. Every other route answers `403`.
+
+An end user's run uses the knowledge bases configured on the agent. The run-body
+fields that point it at other stored data — `knowledge_bases`,
+`runtime_knowledge_bases`, `context_handler_id` and by-reference `context_items`
+— are service-role only. To let users search particular knowledge bases, run
+the agent from your backend with the service role key, and pass `user_id` when
+creating the session so the conversation still belongs to that user.
+
+Without `SERVICE_ROLE_KEY` set, no caller is the service role and every
+management route answers `403`.
 
 ## API Endpoints
 

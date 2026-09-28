@@ -82,26 +82,103 @@ def get_current_user_id() -> str | None:
     return getattr(g, "user_id", None)
 
 
-def require_auth(f):
-    """Decorator to require authentication for a route."""
+def is_service_role_request() -> bool:
+    """True when the current request authenticated with the service role key."""
+    return bool((getattr(g, "jwt_payload", None) or {}).get("is_service_role", False))
+
+
+def _authenticate():
+    """Validate the bearer token and populate ``g``.
+
+    Returns an error response tuple, or None when the caller is authenticated.
+    """
+    token = get_token_from_header()
+    if not token:
+        return jsonify({"error": "Authorization header required"}), 401
+
+    try:
+        payload = decode_jwt(token)
+    except AuthError as e:
+        return jsonify({"error": e.message}), e.status_code
+
+    g.user_id = payload.get("sub")
+    g.user_role = payload.get("role", "authenticated")
+    g.jwt_payload = payload
+    return None
+
+
+# Every /api route takes exactly one of the two decorators below (or, for the
+# few that verify a different credential, neither — see the route inventory
+# test). The project's anon key is public and the gateway accepts it on every
+# route, so any signed-in end user can present their own JWT anywhere; which
+# decorator a route carries is the whole of its access control.
+
+
+def require_service_role(f):
+    """Route callable only with the project's service role key.
+
+    The default for every route: managing knowledge bases, sources, agents,
+    workflows, settings, keys and tables is done from a trusted backend or the
+    dashboard. An end user's JWT gets 403.
+    """
 
     @functools.wraps(f)
     def decorated(*args, **kwargs):
-        token = get_token_from_header()
-        if not token:
-            return jsonify({"error": "Authorization header required"}), 401
-
-        try:
-            payload = decode_jwt(token)
-            g.user_id = payload.get("sub")
-            g.user_role = payload.get("role", "authenticated")
-            g.jwt_payload = payload
-        except AuthError as e:
-            return jsonify({"error": e.message}), e.status_code
-
+        error = _authenticate()
+        if error:
+            return error
+        if not is_service_role_request():
+            return jsonify({"error": "This endpoint requires the project's service role key"}), 403
         return f(*args, **kwargs)
 
+    decorated.auth_mode = "service_role"
     return decorated
+
+
+def require_user_auth(f):
+    """Route an end user may call with their own JWT (the service role may too).
+
+    Only for routes that scope everything they read or change to the caller's
+    own sessions and runs. Adding a route here is a security decision.
+    """
+
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        error = _authenticate()
+        if error:
+            return error
+        return f(*args, **kwargs)
+
+    decorated.auth_mode = "user"
+    return decorated
+
+
+# Run-body fields that make an agent read project data it was not configured
+# with. The service role may use them; an end user may not, or any user could
+# read any knowledge base by naming it in a run.
+_END_USER_FORBIDDEN_RUN_FIELDS = (
+    "knowledge_bases",
+    "runtime_knowledge_bases",
+    "context_handler_id",
+)
+
+
+def end_user_run_body_error(data: dict) -> str | None:
+    """Return why an end user may not send this run body, or None if they may.
+
+    Context the caller supplies themselves (``context_override``, by-value
+    ``context_items``) is allowed; anything that references stored data is not.
+    """
+    named = [field for field in _END_USER_FORBIDDEN_RUN_FIELDS if data.get(field)]
+    items = data.get("context_items") or []
+    if any(isinstance(item, dict) and item.get("item_id") for item in items):
+        named.append("context_items[].item_id")
+    if not named:
+        return None
+    return (
+        f"{', '.join(named)} may only be set with the project's service role key; "
+        "an end user's run uses the knowledge bases configured on the agent"
+    )
 
 
 def optional_auth(f):

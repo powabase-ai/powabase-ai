@@ -34,7 +34,13 @@ from agentic.mcp import McpError, discover_mcp_tools
 from flask import Blueprint, Response, current_app, g, jsonify, request, stream_with_context
 from sqlalchemy import text
 
-from ..auth import get_current_user_id, require_auth
+from ..auth import (
+    end_user_run_body_error,
+    get_current_user_id,
+    is_service_role_request,
+    require_service_role,
+    require_user_auth,
+)
 from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
 from ..services.llm_availability import check_model_available
@@ -69,13 +75,18 @@ from ..services.citations import (
 from ..services.session import (
     build_messages_for_llm,
     get_or_create_session,
-    get_session_owner,
     load_session_history,
     persist_agent_run,
     seed_session_runs,
+    session_accessible_to,
     update_agent_run,
 )
-from ..services.run_registry import get_active_run_context, register_run, unregister_run
+from ..services.run_registry import (
+    get_active_run_context,
+    get_active_run_owner,
+    register_run,
+    unregister_run,
+)
 from ..services.ai_provider_keys_resolver import (
     ProviderKeyDecryptDropped,
     resolve_api_key_or_raise_for_drop,
@@ -370,7 +381,7 @@ def _finish_run_in_background(
 
 
 @agents_bp.route("", methods=["GET"])
-@require_auth
+@require_service_role
 def list_agents():
     """List all agents, paginated, with usage aggregates."""
     from ..services.list_params import parse_list_params, escape_like, ListParamsError
@@ -440,7 +451,7 @@ def list_agents():
 
 
 @agents_bp.route("", methods=["POST"])
-@require_auth
+@require_service_role
 def create_agent():
     """Create a new agent."""
     data = request.get_json()
@@ -479,7 +490,7 @@ def create_agent():
 
 
 @agents_bp.route("/<agent_id>", methods=["GET"])
-@require_auth
+@require_service_role
 def get_agent(agent_id: str):
     """Get a specific agent."""
     result = db.session.execute(
@@ -509,7 +520,7 @@ def get_agent(agent_id: str):
 
 
 @agents_bp.route("/<agent_id>", methods=["PATCH"])
-@require_auth
+@require_service_role
 def update_agent(agent_id: str):
     """Update an agent."""
     data = request.get_json()
@@ -551,7 +562,7 @@ def update_agent(agent_id: str):
 
 
 @agents_bp.route("/<agent_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_agent(agent_id: str):
     """Delete an agent."""
     db.session.execute(
@@ -569,7 +580,7 @@ def delete_agent(agent_id: str):
 
 
 @agents_bp.route("/<agent_id>/tools", methods=["POST"])
-@require_auth
+@require_service_role
 def assign_tool(agent_id: str):
     data = request.get_json()
     tool_type = data.get("tool_type")
@@ -590,7 +601,7 @@ def assign_tool(agent_id: str):
 
 
 @agents_bp.route("/<agent_id>/tools", methods=["GET"])
-@require_auth
+@require_service_role
 def list_agent_tools(agent_id: str):
     assignments = AgentTool.query.filter_by(agent_id=agent_id).all()
     return jsonify(
@@ -610,7 +621,7 @@ def list_agent_tools(agent_id: str):
 
 
 @agents_bp.route("/<agent_id>/tools/<assignment_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def remove_agent_tool(agent_id: str, assignment_id: str):
     assignment = db.session.get(AgentTool, assignment_id)
     if not assignment or str(assignment.agent_id) != agent_id:
@@ -621,7 +632,7 @@ def remove_agent_tool(agent_id: str, assignment_id: str):
 
 
 @agents_bp.route("/<agent_id>/tools/<assignment_id>", methods=["PATCH"])
-@require_auth
+@require_service_role
 def update_agent_tool(agent_id: str, assignment_id: str):
     """Update a tool assignment's config_override."""
     assignment = AgentTool.query.filter_by(id=assignment_id, agent_id=agent_id).first()
@@ -662,7 +673,7 @@ def update_agent_tool(agent_id: str, assignment_id: str):
 
 
 @agents_bp.route("/<agent_id>/knowledge-bases", methods=["POST"])
-@require_auth
+@require_service_role
 def assign_knowledge_base(agent_id: str):
     data = request.get_json()
     kb_id = data.get("knowledge_base_id")
@@ -692,7 +703,7 @@ def assign_knowledge_base(agent_id: str):
 
 
 @agents_bp.route("/<agent_id>/knowledge-bases", methods=["GET"])
-@require_auth
+@require_service_role
 def list_agent_knowledge_bases(agent_id: str):
     assignments = AgentKnowledgeBase.query.filter_by(agent_id=agent_id).all()
     return jsonify(
@@ -710,7 +721,7 @@ def list_agent_knowledge_bases(agent_id: str):
 
 
 @agents_bp.route("/<agent_id>/knowledge-bases/<assignment_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def remove_agent_knowledge_base(agent_id: str, assignment_id: str):
     assignment = db.session.get(AgentKnowledgeBase, assignment_id)
     if not assignment or str(assignment.agent_id) != agent_id:
@@ -726,7 +737,7 @@ def remove_agent_knowledge_base(agent_id: str, assignment_id: str):
 
 
 @agents_bp.route("/<agent_id>/mcp-servers", methods=["POST"])
-@require_auth
+@require_service_role
 def add_mcp_server(agent_id: str):
     """Add an MCP server to an agent."""
     data = request.get_json()
@@ -768,7 +779,7 @@ def add_mcp_server(agent_id: str):
 
 
 @agents_bp.route("/<agent_id>/mcp-servers", methods=["GET"])
-@require_auth
+@require_service_role
 def list_mcp_servers(agent_id: str):
     """List MCP servers configured for an agent."""
     servers = AgentMcpServer.query.filter_by(agent_id=agent_id).all()
@@ -793,7 +804,7 @@ def list_mcp_servers(agent_id: str):
 
 
 @agents_bp.route("/<agent_id>/mcp-servers/<server_id>", methods=["PUT"])
-@require_auth
+@require_service_role
 def update_mcp_server(agent_id: str, server_id: str):
     """Update an MCP server configuration."""
     server = db.session.get(AgentMcpServer, server_id)
@@ -842,7 +853,7 @@ def update_mcp_server(agent_id: str, server_id: str):
 
 
 @agents_bp.route("/<agent_id>/mcp-servers/<server_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_mcp_server(agent_id: str, server_id: str):
     """Remove an MCP server from an agent."""
     server = db.session.get(AgentMcpServer, server_id)
@@ -854,7 +865,7 @@ def delete_mcp_server(agent_id: str, server_id: str):
 
 
 @agents_bp.route("/<agent_id>/mcp-servers/<server_id>/tools", methods=["GET"])
-@require_auth
+@require_service_role
 def discover_mcp_server_tools(agent_id: str, server_id: str):
     """List the tools an MCP server currently advertises.
 
@@ -891,7 +902,7 @@ def discover_mcp_server_tools(agent_id: str, server_id: str):
 
 
 @agents_bp.route("/<agent_id>/hooks", methods=["POST"])
-@require_auth
+@require_service_role
 def add_agent_hook(agent_id: str):
     """Add a hook to an agent."""
     data = request.get_json()
@@ -1002,7 +1013,7 @@ def add_agent_hook(agent_id: str):
 
 
 @agents_bp.route("/<agent_id>/hooks", methods=["GET"])
-@require_auth
+@require_service_role
 def list_agent_hooks(agent_id: str):
     """List hooks configured for an agent."""
     hooks = Hook.query.filter_by(agent_id=agent_id).order_by(Hook.position, Hook.created_at).all()
@@ -1026,7 +1037,7 @@ def list_agent_hooks(agent_id: str):
 
 
 @agents_bp.route("/<agent_id>/hooks/<hook_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_agent_hook(agent_id: str, hook_id: str):
     """Remove a hook from an agent."""
     hook = db.session.get(Hook, hook_id)
@@ -1038,7 +1049,7 @@ def delete_agent_hook(agent_id: str, hook_id: str):
 
 
 @agents_bp.route("/<agent_id>/sessions", methods=["GET"])
-@require_auth
+@require_user_auth
 def list_sessions(agent_id: str):
     """List sessions for an agent with optional search and filters."""
     from ..services.list_params import escape_like
@@ -1242,7 +1253,7 @@ def _validate_seed_messages(messages: list) -> str | None:
 
 
 @agents_bp.route("/<agent_id>/sessions", methods=["POST"])
-@require_auth
+@require_user_auth
 def create_session_for_agent(agent_id: str):
     """Create a session, optionally seeded with an initial conversation.
 
@@ -1380,7 +1391,7 @@ def create_session_for_agent(agent_id: str):
 
 
 @agents_bp.route("/<agent_id>/sessions/<session_id>", methods=["DELETE"])
-@require_auth
+@require_user_auth
 def delete_session_for_agent(agent_id: str, session_id: str):
     """Delete a session and its runs.
 
@@ -1439,7 +1450,7 @@ def delete_session_for_agent(agent_id: str, session_id: str):
 
 
 @agents_bp.route("/<agent_id>/run", methods=["POST"])
-@require_auth
+@require_user_auth
 def run_agent(agent_id: str):
     """
     Run an agent (non-streaming).
@@ -1456,6 +1467,11 @@ def run_agent(agent_id: str):
     message = data.get("message")
     if not message:
         return jsonify({"error": "message is required"}), 400
+
+    if not is_service_role_request():
+        body_error = end_user_run_body_error(data)
+        if body_error:
+            return jsonify({"error": body_error}), 403
 
     session_id = data.get("session_id")
     knowledge_bases = data.get("knowledge_bases", [])
@@ -1494,13 +1510,15 @@ def run_agent(agent_id: str):
     # Get user_id from auth context
     user_id = get_current_user_id()
 
-    # Ownership check: if the client provided a session_id for an existing
-    # session, it must belong to this user (service-role bypasses).
-    is_service_role = (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False)
-    if session_id and not is_service_role:
-        owner = get_session_owner(db.session, session_id)
-        if owner is not None and owner != user_id:
-            return jsonify({"error": "Session not found"}), 404
+    # Ownership check: an end user may only continue a session they own
+    # (service-role bypasses). Ownerless sessions belong to no end user.
+    is_service_role = is_service_role_request()
+    if (
+        session_id
+        and not is_service_role
+        and not session_accessible_to(db.session, session_id, user_id)
+    ):
+        return jsonify({"error": "Session not found"}), 404
 
     # Fetch agent from DB
     result = db.session.execute(
@@ -1820,7 +1838,7 @@ def run_agent(agent_id: str):
 
 
 @agents_bp.route("/<agent_id>/run/stream", methods=["POST"])
-@require_auth
+@require_user_auth
 def run_agent_stream(agent_id: str):
     """
     Stream an agent's response using Server-Sent Events (SSE).
@@ -1858,19 +1876,21 @@ def run_agent_stream(agent_id: str):
     knowledge base (attached + runtime combined); multi-KB runs use the
     project default.
 
-    Security: this is NOT enforced server-side. Any caller authorized to run
-    this agent — i.e. any authenticated project JWT — can reference any
-    knowledge base in the project via this field, regardless of which KBs
-    are attached to the agent. This matches the project-wide access posture
-    of the `ai` schema (an authenticated project JWT already reaches every
-    KB in the project through it); it is documented here rather than
-    enforced. Expose this endpoint from trusted backends only.
+    Security: only the service role key may set this field (or
+    `knowledge_bases`, `context_handler_id`, or by-reference `context_items`).
+    An end user's JWT gets 403 for any of them, so an end user's run can only
+    read the knowledge bases configured on the agent.
     """
     # Parse request
     data = request.get_json() or {}
     message = data.get("message")
     if not message:
         return jsonify({"error": "message is required"}), 400
+
+    if not is_service_role_request():
+        body_error = end_user_run_body_error(data)
+        if body_error:
+            return jsonify({"error": body_error}), 403
 
     session_id = data.get("session_id")
     knowledge_bases = data.get("knowledge_bases", [])
@@ -1904,13 +1924,15 @@ def run_agent_stream(agent_id: str):
     # Get user_id from auth context
     user_id = get_current_user_id()
 
-    # Ownership check: if the client provided a session_id for an existing
-    # session, it must belong to this user (service-role bypasses).
-    is_service_role = (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False)
-    if session_id and not is_service_role:
-        owner = get_session_owner(db.session, session_id)
-        if owner is not None and owner != user_id:
-            return jsonify({"error": "Session not found"}), 404
+    # Ownership check: an end user may only continue a session they own
+    # (service-role bypasses). Ownerless sessions belong to no end user.
+    is_service_role = is_service_role_request()
+    if (
+        session_id
+        and not is_service_role
+        and not session_accessible_to(db.session, session_id, user_id)
+    ):
+        return jsonify({"error": "Session not found"}), 404
 
     # Fetch agent from DB
     result = db.session.execute(
@@ -2209,8 +2231,9 @@ def run_agent_stream(agent_id: str):
                 }
                 yield f"data: {json.dumps(start_event)}\n\n"
 
-                # Register the context so the approval endpoint can resume it
-                register_run(run_id, context)
+                # Register the context so the approval endpoint can resume it.
+                # A backend-started run has no end-user owner to approve it.
+                register_run(run_id, context, owner_user_id=None if is_service_role else user_id)
 
                 # Run the ReAct loop in a background thread so events
                 # stream to the client as they are emitted (live SSE).
@@ -3002,7 +3025,7 @@ def run_agent_stream(agent_id: str):
 
 
 @agents_bp.route("/runs/<run_id>/approve", methods=["POST"])
-@require_auth
+@require_user_auth
 def approve_run(run_id: str):
     """Resume a paused ReAct run by supplying an approval decision.
 
@@ -3015,38 +3038,37 @@ def approve_run(run_id: str):
     if not isinstance(data["approved"], bool):
         return jsonify({"error": "'approved' must be a boolean"}), 400
     context = get_active_run_context(run_id)
-    if not context:
+    if not context or (
+        not is_service_role_request() and get_active_run_owner(run_id) != get_current_user_id()
+    ):
         return jsonify({"error": "Run not found or not waiting for approval"}), 404
     context.set_approval_decision(data)
     return jsonify({"status": "resumed"})
 
 
 @agents_bp.route("/runs/<run_id>", methods=["GET"])
-@require_auth
+@require_user_auth
 def get_agent_run(run_id: str):
     """Fetch a single agent_run row by run_id, independent of session/parent context.
 
-    Ownership scoping: when session_id IS NOT NULL, the run belongs to a session
-    whose user_id must match the caller (service-role bypasses this check).
-    For delegated/block runs (session_id IS NULL) there is no per-user ownership
-    model yet, so require_auth is sufficient — tenant isolation is enforced at
-    the project boundary (Kong + project-scoped auth).
+    Ownership scoping: an end user sees a run only when it belongs to a
+    session they own (service-role bypasses this check). Delegated/block runs
+    (session_id IS NULL) and runs in ownerless sessions belong to no end user.
     """
     row = AgentRun.query.filter_by(run_id=run_id).first()
     if not row:
         return jsonify({"error": "Run not found"}), 404
 
-    if row.session_id:
-        is_service_role = (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False)
-        if not is_service_role:
-            # row.session_id is the UUID FK to ai.agent_sessions.id. The
-            # get_session_owner helper keys by the user-facing sess_xxx string
-            # (VARCHAR), so we query by UUID primary key here instead.
-            session_row = AgentSession.query.filter_by(id=row.session_id).first()
-            owner = str(session_row.user_id) if (session_row and session_row.user_id) else None
-            if owner is not None and owner != get_current_user_id():
-                # Return same shape as not-found to avoid leaking existence
-                return jsonify({"error": "Run not found"}), 404
+    if not is_service_role_request():
+        if not row.session_id:
+            return jsonify({"error": "Run not found"}), 404
+        # row.session_id is the UUID FK to ai.agent_sessions.id, so query by
+        # primary key rather than the user-facing sess_xxx string.
+        session_row = AgentSession.query.filter_by(id=row.session_id).first()
+        owner = str(session_row.user_id) if (session_row and session_row.user_id) else None
+        if owner is None or owner != get_current_user_id():
+            # Return same shape as not-found to avoid leaking existence
+            return jsonify({"error": "Run not found"}), 404
 
     return jsonify(
         {

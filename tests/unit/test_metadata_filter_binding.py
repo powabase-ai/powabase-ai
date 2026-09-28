@@ -257,7 +257,7 @@ def test_the_route_answers_400_for_a_filter_that_is_not_an_object():
     kb_id = str(uuid.uuid4())
 
     with (
-        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "authenticated"}),
+        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role", "is_service_role": True}),
         patch("agentic_project_service.routes.knowledge_bases.db"),
         patch(
             "agentic_project_service.services.knowledge_search.search_knowledge_base",

@@ -36,7 +36,7 @@ def _auth_headers():
 # Patch decode_jwt so require_auth passes without a real JWT_SECRET / token.
 _FAKE_JWT = patch(
     "agentic_project_service.auth.decode_jwt",
-    return_value={"sub": "user-1", "role": "authenticated"},
+    return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
 )
 
 
