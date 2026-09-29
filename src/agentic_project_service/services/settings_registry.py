@@ -1430,13 +1430,16 @@ def _load_overrides() -> dict[str, str]:
     context (a bare thread) the query runs uncached -- still a single lightweight
     SELECT.
 
-    The SELECT runs in a savepoint. It is on the vector search path, on the same
-    session as the search, and a read that fails outside a savepoint -- a
-    cancelled statement, a table that does not exist yet -- would leave that
-    transaction aborted: the search that follows would raise
+    The SELECT runs in a savepoint. It is on the vector search path, and on the
+    single-session paths -- a route or task searching through ``db.session`` --
+    it shares a transaction with the search: a read that failed outside a
+    savepoint -- a cancelled statement, a table that does not exist yet -- would
+    leave that transaction aborted, and the search that follows would raise
     ``InFailedSqlTransaction`` rather than run on the registry default. Rolling
-    back to the savepoint keeps the caller's transaction usable. A failed read
-    returns an empty ``_UnreadableOverrides``.
+    back to the savepoint keeps the caller's transaction usable. (The multi-KB
+    and agent-tool paths search on a private ``Session`` while this reads
+    ``db.session``; they are safe because the parent request fills the cache
+    before fanning out.) A failed read returns an empty ``_UnreadableOverrides``.
     """
     use_cache = _has_g_context()
 
@@ -1446,8 +1449,14 @@ def _load_overrides() -> dict[str, str]:
             return cache
 
     try:
-        with db.session.begin_nested():
-            rows = db.session.execute(
+        # A savepoint on the session's *connection*, not ``Session.begin_nested()``:
+        # the ORM one flushes pending objects first, so an unrelated object whose
+        # flush fails would surface here as an unreadable settings table -- the
+        # defaults returned, "unreadable" cached for the app context, and the
+        # caller's session left needing a rollback. This read flushes nothing.
+        connection = db.session.connection()
+        with connection.begin_nested():
+            rows = connection.execute(
                 text(f'SELECT key, value FROM "{AI_SCHEMA}".project_settings')
             ).fetchall()
         result: dict[str, str] = {row[0]: row[1] for row in rows if row[1] is not None}
