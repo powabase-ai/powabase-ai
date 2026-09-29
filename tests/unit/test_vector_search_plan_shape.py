@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 from sqlalchemy import text
 
+from agentic_project_service.services import base_vector_store as bvs
 from agentic_project_service.services.base_vector_store import (
     PER_KB_HNSW_EF_SEARCH,
     BasePgVectorStore,
@@ -33,6 +34,22 @@ _SOURCE_ID = "3f2504e0-4f89-11d3-9a0c-0305e82c3303"
 ENABLE_SORT_WAS = "off"
 EF_SEARCH_WAS = "55"
 ENABLE_INDEXSCAN_WAS = "off"
+
+
+@pytest.fixture(autouse=True)
+def _exact_search_below_the_floor_off(monkeypatch):
+    """These specs pin the unrestricted statement ``vector_search`` ran before
+    ``VECTOR_EXACT_SEARCH_MAX_ROWS`` existed, which it still runs above that ceiling.
+    Below it the store now runs a fenced exact statement instead -- pinned in
+    ``test_exact_search_below_per_kb_floor.py`` -- and which one a fake session gets
+    depends on how the fake happens to answer the decision's count. So the ceiling
+    is set to 0 here, explicitly, rather than left to that."""
+    shipped = bvs.get_setting_strict
+    monkeypatch.setattr(
+        bvs,
+        "get_setting_strict",
+        lambda key: 0 if key == bvs.EXACT_SEARCH_MAX_ROWS_SETTING else shipped(key),
+    )
 
 
 class _FakeStore(BasePgVectorStore):

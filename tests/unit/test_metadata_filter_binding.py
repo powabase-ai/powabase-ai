@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agentic_project_service.services import base_vector_store as bvs
 from agentic_project_service.services import pg_bm25_index as pgb
 from agentic_project_service.services.base_vector_store import BasePgVectorStore
 
@@ -31,6 +32,22 @@ CROSS_KB_KEY = f"lang AS jsonb) OR c.knowledge_base_id = '{OTHER_KB}' --"
 # A key whose subquery is true, so rows come back; negate it and they do not.
 # That difference is one bit of whatever the database role can read.
 ORACLE_KEY = "lang AS jsonb) OR (SELECT count(*) FROM pg_authid) > 0 --"
+
+
+@pytest.fixture(autouse=True)
+def _exact_search_below_the_floor_off(monkeypatch):
+    """These specs pin the unrestricted statement ``vector_search`` ran before
+    ``VECTOR_EXACT_SEARCH_MAX_ROWS`` existed, which it still runs above that ceiling.
+    Below it the store now runs a fenced exact statement instead -- pinned in
+    ``test_exact_search_below_per_kb_floor.py`` -- and which one a fake session gets
+    depends on how the fake happens to answer the decision's count. So the ceiling
+    is set to 0 here, explicitly, rather than left to that."""
+    shipped = bvs.get_setting_strict
+    monkeypatch.setattr(
+        bvs,
+        "get_setting_strict",
+        lambda key: 0 if key == bvs.EXACT_SEARCH_MAX_ROWS_SETTING else shipped(key),
+    )
 
 
 class _ChunkStore(BasePgVectorStore):
