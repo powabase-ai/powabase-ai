@@ -309,7 +309,7 @@ def test_the_fence_is_around_the_embeddings_and_the_order_is_outside_it():
     That is what makes the shape exact *by construction*: no setting has to
     succeed for the index to be out of reach."""
     flat = _flat(_search_sql(_run(own_index=False, kb_rows=300)))
-    fence = re.search(r"FROM \((SELECT .*? OFFSET 0)\) e", flat)
+    fence = re.search(r"FROM \( ?(SELECT .*? OFFSET 0) ?\) e", flat)
     assert fence, flat
     assert "ORDER BY" not in fence.group(1), flat
     assert "LIMIT" not in fence.group(1), flat

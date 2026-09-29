@@ -1225,6 +1225,50 @@ def _build_registry() -> dict[str, SettingDef]:
             ),
         ),
         SettingDef(
+            key="VECTOR_EXACT_SEARCH_MAX_ROWS",
+            category=cat,
+            label="Exact Vector Search Ceiling (rows)",
+            type="int",
+            default=5000,
+            min=0,
+            max=50000,
+            advanced=True,
+            description=(
+                "A knowledge base with no vector index of its own and at most this "
+                "many embeddings is searched exactly: its own rows are read through "
+                "the knowledge-base lookup and ranked, so the answer is the true "
+                "top-k and the cost depends only on its own size. Without this, such "
+                "a knowledge base searches the project-wide index, which ranks every "
+                "knowledge base's vectors and discards the others' afterwards: "
+                "measured on a production project with a 4.97M-row embeddings table, "
+                "300 to 600 ms cold, and 0 of 20 requested rows returned for a "
+                "24,118-row knowledge base whose nearest vectors lay in other "
+                "knowledge bases. An exact search reads about four pages per "
+                "embedding at 1536 dimensions, so it suits small knowledge bases: "
+                "117 to 143 ms warm at 24,118 rows and 360 to 450 ms at 73,288 on "
+                "that project, which is why the ceiling stops at 50,000 — above it a "
+                "knowledge base should have an index of its own. Deciding costs two "
+                "short statements per search (a catalog lookup and a count that "
+                "stops one row past this ceiling); a knowledge base with its own "
+                "index pays for the catalog lookup only. 0 turns exact search off. "
+                "HOW IT MEETS THE INDEX THRESHOLDS: a knowledge base gets its own "
+                "index at VECTOR_PER_KB_INDEX_MIN_ROWS and keeps it until it falls "
+                "below VECTOR_PER_KB_INDEX_DROP_ROWS, so with this setting at or "
+                "above VECTOR_PER_KB_INDEX_MIN_ROWS no knowledge base size is left "
+                "on the project-wide index — for example 5,000 here with 5,000 and "
+                "2,500 there — apart from a knowledge base whose index is still being "
+                "built, has failed to build, or is over the 200-index limit, which "
+                "searches the project-wide index until it has one. With the shipped 50,000 build threshold, knowledge "
+                "bases between this ceiling and 50,000 embeddings stay on the "
+                "project-wide index, as before this setting existed. A knowledge base "
+                "that has its own index always uses it, even below this ceiling. The "
+                "index covers text chunks only, so document-level, graph and "
+                "structured-document searches never have one and use exact search "
+                "whenever they are under this ceiling. Searches restricted to named "
+                "sources, items or metadata are exact already and are unaffected."
+            ),
+        ),
+        SettingDef(
             key="VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB",
             category=cat,
             label="Vector Index Build Memory (MB)",
