@@ -1574,7 +1574,7 @@ def run_agent(agent_id: str):
     if (
         session_id
         and not is_service_role
-        and not session_accessible_to(db.session, session_id, user_id)
+        and not session_accessible_to(db.session, session_id, user_id, agent_id)
     ):
         return jsonify({"error": "Session not found"}), 404
 
@@ -2004,7 +2004,7 @@ def run_agent_stream(agent_id: str):
     if (
         session_id
         and not is_service_role
-        and not session_accessible_to(db.session, session_id, user_id)
+        and not session_accessible_to(db.session, session_id, user_id, agent_id)
     ):
         return jsonify({"error": "Session not found"}), 404
 

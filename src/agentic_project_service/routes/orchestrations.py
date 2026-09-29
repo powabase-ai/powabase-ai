@@ -146,15 +146,17 @@ def _verify_orchestration_session_access(session_id: str):
 def _end_user_may_run_in_session(session_id: str, orch_id: str, user_id: str | None) -> bool:
     """Whether an end user may run ``orch_id`` in the session named ``session_id``.
 
-    An unknown id is allowed: the run creates the session, owned by the
-    caller. An existing session must be the caller's own and belong to this
-    orchestration. Ownerless sessions, which a backend started, belong to no
-    end user. Continuing a session replays its history to the model and saves
-    the run under the session's owner, so any other answer leaks it.
+    Only an existing session that is the caller's own and belongs to this
+    orchestration. An end user never names a new session (they omit the id and
+    the run creates one): a backend's ids can be guessable, and a session
+    planted under one would feed the backend's later runs and expose them.
+    Ownerless sessions, which a backend started, belong to no end user.
+    Continuing a session replays its history to the model and saves the run
+    under the session's owner, so any other answer leaks it.
     """
     session = OrchestrationSessionModel.query.filter_by(session_id=session_id).first()
     if session is None:
-        return True
+        return False
     if session.user_id is None or user_id is None or str(session.user_id) != user_id:
         return False
     try:

@@ -153,17 +153,19 @@ def get_or_create_orchestration_session(
     """Get or create an orchestration session.
 
     ``end_user_id`` is the end user a run acts for, or None for the service
-    role. When set, the session is created owned by this user, and an
-    existing one is returned only if it is this user's own session of this
-    orchestration; anything else raises :class:`SessionNotAccessible`.
+    role. When set, a named session must already exist and be this user's own
+    session of this orchestration, and without a name a new one is created
+    owned by this user; anything else raises :class:`SessionNotAccessible`.
+    End users never name a new session (see ``session_accessible_to`` in
+    services/session.py for why).
 
     Returns (db_session_uuid, session_id, is_new).
     """
     if end_user_id is not None:
+        if session_id:
+            return _end_user_existing_session(orchestration_id, session_id, end_user_id)
         return _bind_end_user_session(
-            orchestration_id,
-            session_id or f"orch_sess_{uuid.uuid4().hex[:12]}",
-            end_user_id,
+            orchestration_id, f"orch_sess_{uuid.uuid4().hex[:12]}", end_user_id
         )
 
     if session_id:
@@ -180,6 +182,28 @@ def get_or_create_orchestration_session(
     db.session.add(session)
     db.session.flush()
     return str(session.id), new_session_id, True
+
+
+def _end_user_existing_session(
+    orchestration_id: str, session_id: str, end_user_id: str
+) -> tuple[str, str, bool]:
+    """The end user's own existing session of this orchestration, or SessionNotAccessible."""
+    existing = db.session.execute(
+        text(
+            f"""
+            SELECT id, orchestration_id, user_id FROM "{AI_SCHEMA}".orchestration_sessions
+            WHERE session_id = :session_id
+            """
+        ),
+        {"session_id": session_id},
+    ).fetchone()
+    if (
+        existing is None
+        or not same_uuid(existing[2], end_user_id)
+        or not same_uuid(existing[1], orchestration_id)
+    ):
+        raise SessionNotAccessible(session_id)
+    return str(existing[0]), session_id, False
 
 
 def _bind_end_user_session(

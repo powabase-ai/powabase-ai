@@ -93,6 +93,9 @@ class TestRejectsIdentityAndSqlStringFunctions:
             "WITH c AS (SELECT set_config('role', 'x', true)) SELECT * FROM c",
             "SELECT pg_catalog.set_config('role', 'x', true)",
             "SELECT \"set_config\"('role', 'x', true)",
+            # Quoted names are case-sensitive: "Sum" is not sum.
+            'SELECT "Sum"(1)',
+            "SELECT \"LOWER\"('A')",
             "SELECT SET_CONFIG('role', 'x', true)",
             # Running a SQL string, which the parse gate cannot see into.
             "SELECT query_to_xml('select 1', true, true, '')",
@@ -243,3 +246,11 @@ class TestOperatorsAndCasts:
 
     def test_every_allowed_operator_is_a_symbol(self):
         assert all(not op.isidentifier() for op in ALLOWED_OPERATORS)
+
+
+class TestQuotedNames:
+    def test_quoted_lower_case_is_the_builtin(self):
+        assert parse_select('SELECT "sum"(1)').functions == ["sum"]
+
+    def test_unquoted_upper_case_is_folded(self):
+        assert parse_select("SELECT SUM(1), Lower('A')").functions == ["sum", "lower"]

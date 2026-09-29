@@ -391,6 +391,29 @@ class TestEndUserRuns:
             db.session.execute(text("DROP FUNCTION public.lower(text)"))
             db.session.commit()
 
+    def test_a_quoted_mixed_case_function_is_not_the_builtin(self, agent_id):
+        """Postgres resolves "Sum" case-sensitively, so it is not sum()."""
+        db.session.execute(
+            text(
+                'CREATE FUNCTION public."Sum"(integer) RETURNS text LANGUAGE sql '
+                "AS $$ SELECT current_setting('request.jwt.claims', true) $$"
+            )
+        )
+        db.session.commit()
+        try:
+            _sync(agent_id, read=["agent_sql_orders"])
+            for caller in (_user(USER_A), SERVICE):
+                with pytest.raises(AgentSqlRejected, match="Sum"):
+                    _query(
+                        caller,
+                        agent_id,
+                        'SELECT "Sum"(total) AS s FROM agent_sql_orders',
+                        ["agent_sql_orders"],
+                    )
+        finally:
+            db.session.execute(text('DROP FUNCTION public."Sum"(integer)'))
+            db.session.commit()
+
     def test_a_sql_language_operator_in_an_allowed_schema_is_rejected(self, agent_id):
         db.session.execute(
             text(
@@ -622,10 +645,19 @@ class TestSessionAccessibleTo:
         self._session(agent_id, f"sess_b_{suffix}", USER_B)
         self._session(agent_id, f"sess_none_{suffix}", None)
         try:
-            assert session_accessible_to(db.session, f"sess_a_{suffix}", USER_A) is True
-            assert session_accessible_to(db.session, f"sess_b_{suffix}", USER_A) is False
-            assert session_accessible_to(db.session, f"sess_none_{suffix}", USER_A) is False
-            assert session_accessible_to(db.session, f"sess_new_{suffix}", USER_A) is True
+            other_agent = str(uuid.uuid4())
+            assert session_accessible_to(db.session, f"sess_a_{suffix}", USER_A, agent_id) is True
+            assert (
+                session_accessible_to(db.session, f"sess_a_{suffix}", USER_A, other_agent) is False
+            )
+            assert session_accessible_to(db.session, f"sess_b_{suffix}", USER_A, agent_id) is False
+            assert (
+                session_accessible_to(db.session, f"sess_none_{suffix}", USER_A, agent_id) is False
+            )
+            # End users never name a new session: a backend's ids can be guessed.
+            assert (
+                session_accessible_to(db.session, f"sess_new_{suffix}", USER_A, agent_id) is False
+            )
         finally:
             # End the read, or the between-tests TRUNCATE waits on its lock.
             db.session.rollback()

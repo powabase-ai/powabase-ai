@@ -135,11 +135,16 @@ of caller:
 
   A `session_id`, in a run body or a path, must be a string of at most 255
   characters; anything else answers `400`. An end user's run continues a session only if it
-  is their own session of the same agent or orchestration. The check is made
-  again when the run binds to the session, so a session that another user
-  creates with the same id while the run starts is refused too: the non-streamed
-  run answers `404`, and a streamed run ends with the event
-  `{"event": "error", "error": "Session not found"}`.
+  already exists and is their own session of the same agent or orchestration;
+  an end user can never name a new session. To start one, they omit
+  `session_id` (the run creates a session owned by them and returns its id) or
+  call `POST /api/agents/<agent_id>/sessions`. This matters when your backend
+  chooses session ids someone could guess, such as one per phone number: if an
+  end user could create a session under such an id first, your backend's later
+  runs in it would be fed their planted history, and they could read what
+  those runs said. The check is made again when the run binds to the session:
+  a non-streamed run then answers `404`, and a streamed run ends with the
+  event `{"event": "error", "error": "Session not found"}`.
 
   An end user may approve or reject only the paused runs they started
   themselves. A run your backend started with the service role key has no
@@ -214,11 +219,15 @@ yet may be configured.
 an allowlist of built-in functions and operators and casts only to built-in
 types. Functions that change or read settings or run a SQL string, custom
 functions, operators written in SQL or PL/pgSQL in your schemas, and casts to
-domains are rejected. The allowlists are fixed in the code and cannot be
-configured. Functions and operators that extensions add are generally not on
-them: pgvector's distance operators `<->`, `<=>`, `<#>` and `<+>` are accepted
-when they belong to an installed extension, but other extension functions and
-operators, such as those of pg_trgm or PostGIS, are rejected. A rejected query
+domains are rejected. Function names are matched as Postgres resolves them:
+a quoted `"Sum"` is not `sum`. The allowlists are fixed in the code and cannot
+be configured. An operator an installed extension defines is accepted when its
+symbol is on the list (pgvector's distances `<->`, `<=>`, `<#>` and `<+>`, and
+symbols such as `&&`, `@>` or `->` that other extensions reuse) and the
+extension lives in one of the agent's configured schemas; an extension
+installed in a schema the agent is not configured with, such as Supabase's
+default `extensions` schema, is not visible to its queries. Functions that
+extensions add are rejected. A rejected query
 returns an error naming what was refused, in one of these shapes:
 
 ```text

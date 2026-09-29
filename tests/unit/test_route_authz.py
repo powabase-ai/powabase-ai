@@ -704,30 +704,29 @@ def _session_owner_lookup(row):
 
 
 class TestSessionAccessibleTo:
-    def test_unknown_session_id_is_accessible(self):
-        """Run creates it, owned by the caller."""
+    """Only an existing session of this agent that the caller owns."""
+
+    def _check(self, row, agent=AGENT_ID):
         from agentic_project_service.services.session import session_accessible_to
 
-        assert session_accessible_to(_session_owner_lookup(None), "sess_new", USER_ID) is True
+        return session_accessible_to(_session_owner_lookup(row), "sess_x", USER_ID, agent)
 
-    def test_own_session_is_accessible(self):
-        from agentic_project_service.services.session import session_accessible_to
+    def test_unknown_session_id_is_not(self):
+        """End users never name a new session: a backend's ids can be guessed."""
+        assert self._check(None) is False
 
-        assert session_accessible_to(_session_owner_lookup((USER_ID,)), "sess_a", USER_ID) is True
+    def test_own_session_of_this_agent_is(self):
+        assert self._check((USER_ID, AGENT_ID)) is True
+
+    def test_own_session_of_another_agent_is_not(self):
+        assert self._check((USER_ID, "7c1d2e3f-4a5b-4c6d-8e7f-8091a2b3c4d5")) is False
 
     def test_someone_elses_session_is_not(self):
-        from agentic_project_service.services.session import session_accessible_to
-
-        assert (
-            session_accessible_to(_session_owner_lookup((OTHER_USER_ID,)), "sess_b", USER_ID)
-            is False
-        )
+        assert self._check((OTHER_USER_ID, AGENT_ID)) is False
 
     def test_ownerless_session_is_not(self):
         """Sessions a backend created without a user_id belong to no end user."""
-        from agentic_project_service.services.session import session_accessible_to
-
-        assert session_accessible_to(_session_owner_lookup((None,)), "sess_c", USER_ID) is False
+        assert self._check((None, AGENT_ID)) is False
 
 
 class TestRunRoutesUseStrictOwnership:
@@ -747,7 +746,7 @@ class TestRunRoutesUseStrictOwnership:
             resp = c.post(path, headers=HEADERS, json={"message": "hi", "session_id": "sess_x"})
         assert resp.status_code == 404
         check.assert_called_once()
-        assert check.call_args.args[1:] == ("sess_x", USER_ID)
+        assert check.call_args.args[1:] == ("sess_x", USER_ID, AGENT_ID)
 
     @pytest.mark.parametrize(
         "path",

@@ -292,7 +292,9 @@ def _walk(node, visible_ctes: tuple[frozenset[str], ...], parsed: ParsedSelect) 
 
     if isinstance(node, ast.FuncCall):
         parts = _names(node.funcname)
-        name = parts[-1].lower()
+        # As written: pglast already folds unquoted names, and a quoted
+        # "Sum" is a different function from sum to Postgres.
+        name = parts[-1]
         if (len(parts) > 1 and parts[0] != "pg_catalog") or name not in ALLOWED_FUNCTIONS:
             raise AgentSqlRejected(
                 f"Function {'.'.join(parts)} is not allowed: only a fixed set of "
@@ -809,9 +811,12 @@ def _engine(login: str) -> Engine:
                     pool_pre_ping=True,
                     pool_recycle=1800,
                     connect_args=connect_args,
+                    hide_parameters=True,
                 )
             else:
-                engine = create_engine(url, poolclass=NullPool, connect_args=connect_args)
+                engine = create_engine(
+                    url, poolclass=NullPool, connect_args=connect_args, hide_parameters=True
+                )
             _engines[login] = engine
         return engine
 

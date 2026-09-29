@@ -1,20 +1,17 @@
 """An end user's session bind, against Postgres.
 
-``get_or_create_session`` and ``get_or_create_orchestration_session`` with
-``end_user_id`` create the session with ``INSERT ... ON CONFLICT DO NOTHING``
-and refuse an existing one that is not the caller's own in this agent or
-orchestration. These tests run that SQL for real, including two creators of
-one session id racing: whoever commits first owns it, and the other is refused
-rather than bound to it or failing on the unique constraint.
+With ``end_user_id``, ``get_or_create_session`` and
+``get_or_create_orchestration_session`` continue a named session only if it
+already exists and is the caller's own in this agent or orchestration, and
+create a session only when no id is named. An end user can never name a
+session into existence: a backend's ids can be guessable, and a session
+planted under one would feed the backend's later runs and expose them.
 """
 
-import threading
-import time
 import uuid
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 
 from agentic_project_service.db import db
 from agentic_project_service.services import orchestration as orchestration_service
@@ -63,6 +60,21 @@ def _owners(app, table: str, session_id: str) -> list[tuple[str | None, str | No
     return [(str(u) if u else None, str(o) if o else None) for u, o in rows]
 
 
+def _owned_agent_session(app, agent_id, session_id, user_id):
+    """What POST /api/agents/<id>/sessions does: a session created for a user."""
+    with app.app_context():
+        get_or_create_session(db.session, agent_id, session_id=session_id, user_id=user_id)
+        db.session.commit()
+
+
+def _owned_orchestration_session(app, orch_id, session_id, user_id):
+    with app.app_context():
+        orchestration_service.get_or_create_orchestration_session(
+            orchestration_id=orch_id, session_id=session_id, user_id=user_id
+        )
+        db.session.commit()
+
+
 def _bind_agent(app, agent_id, session_id, end_user_id):
     with app.app_context():
         result = get_or_create_session(
@@ -94,37 +106,41 @@ def _bind_orchestration(app, orch_id, session_id, end_user_id):
 
 
 class TestAgentSessionBind:
-    def test_new_id_is_created_owned_by_the_caller(self, app):
+    def test_naming_an_unknown_id_is_refused_and_creates_nothing(self, app):
+        agent_id, mallory = _agent(app), str(uuid.uuid4())
+        with pytest.raises(SessionNotAccessible):
+            _bind_agent(app, agent_id, "wa_15551234567", mallory)
+        assert _owners(app, "agent_sessions", "wa_15551234567") == []
+
+    def test_no_id_creates_one_owned_by_the_caller(self, app):
         agent_id, alice = _agent(app), str(uuid.uuid4())
-        _, session_id, is_new = _bind_agent(app, agent_id, "sess_new", alice)
-        assert (session_id, is_new) == ("sess_new", True)
-        assert _owners(app, "agent_sessions", "sess_new") == [(alice, agent_id)]
+        _, session_id, is_new = _bind_agent(app, agent_id, None, alice)
+        assert is_new is True
+        assert _owners(app, "agent_sessions", session_id) == [(alice, agent_id)]
 
     def test_own_session_is_continued(self, app):
         agent_id, alice = _agent(app), str(uuid.uuid4())
-        first, _, _ = _bind_agent(app, agent_id, "sess_own", alice)
-        again, _, is_new = _bind_agent(app, agent_id, "sess_own", alice)
-        assert (again, is_new) == (first, False)
+        _owned_agent_session(app, agent_id, "sess_own", alice)
+        _, session_id, is_new = _bind_agent(app, agent_id, "sess_own", alice)
+        assert (session_id, is_new) == ("sess_own", False)
 
     def test_another_users_session_is_refused(self, app):
         agent_id, alice, bob = _agent(app), str(uuid.uuid4()), str(uuid.uuid4())
-        _bind_agent(app, agent_id, "sess_alice", alice)
+        _owned_agent_session(app, agent_id, "sess_alice", alice)
         with pytest.raises(SessionNotAccessible):
             _bind_agent(app, agent_id, "sess_alice", bob)
         assert _owners(app, "agent_sessions", "sess_alice") == [(alice, agent_id)]
 
     def test_ownerless_session_is_refused(self, app):
         agent_id, alice = _agent(app), str(uuid.uuid4())
-        with app.app_context():
-            get_or_create_session(db.session, agent_id, session_id="sess_backend")
-            db.session.commit()
+        _owned_agent_session(app, agent_id, "sess_backend", None)
         with pytest.raises(SessionNotAccessible):
             _bind_agent(app, agent_id, "sess_backend", alice)
         assert _owners(app, "agent_sessions", "sess_backend") == [(None, agent_id)]
 
     def test_own_session_of_another_agent_is_refused(self, app):
         agent_a, agent_b, alice = _agent(app), _agent(app), str(uuid.uuid4())
-        _bind_agent(app, agent_a, "sess_a", alice)
+        _owned_agent_session(app, agent_a, "sess_a", alice)
         with pytest.raises(SessionNotAccessible):
             _bind_agent(app, agent_b, "sess_a", alice)
         assert _owners(app, "agent_sessions", "sess_a") == [(alice, agent_a)]
@@ -136,124 +152,67 @@ class TestAgentSessionBind:
 
 
 class TestOrchestrationSessionBind:
-    def test_new_id_is_created_owned_by_the_caller(self, app):
+    def test_naming_an_unknown_id_is_refused_and_creates_nothing(self, app):
+        orch_id, mallory = _orchestration(app), str(uuid.uuid4())
+        with pytest.raises(SessionNotAccessible):
+            _bind_orchestration(app, orch_id, "wa_15551234567", mallory)
+        assert _owners(app, "orchestration_sessions", "wa_15551234567") == []
+
+    def test_no_id_creates_one_owned_by_the_caller(self, app):
         orch_id, alice = _orchestration(app), str(uuid.uuid4())
-        _, session_id, is_new = _bind_orchestration(app, orch_id, "orch_sess_new", alice)
-        assert (session_id, is_new) == ("orch_sess_new", True)
-        assert _owners(app, "orchestration_sessions", "orch_sess_new") == [(alice, orch_id)]
+        _, session_id, is_new = _bind_orchestration(app, orch_id, None, alice)
+        assert is_new is True
+        assert _owners(app, "orchestration_sessions", session_id) == [(alice, orch_id)]
 
     def test_own_session_is_continued(self, app):
         orch_id, alice = _orchestration(app), str(uuid.uuid4())
-        first, _, _ = _bind_orchestration(app, orch_id, "orch_sess_own", alice)
-        again, _, is_new = _bind_orchestration(app, orch_id, "orch_sess_own", alice)
-        assert (again, is_new) == (first, False)
+        _owned_orchestration_session(app, orch_id, "orch_sess_own", alice)
+        _, session_id, is_new = _bind_orchestration(app, orch_id, "orch_sess_own", alice)
+        assert (session_id, is_new) == ("orch_sess_own", False)
 
     def test_another_users_session_is_refused(self, app):
         orch_id, alice, bob = _orchestration(app), str(uuid.uuid4()), str(uuid.uuid4())
-        _bind_orchestration(app, orch_id, "orch_sess_alice", alice)
+        _owned_orchestration_session(app, orch_id, "orch_sess_alice", alice)
         with pytest.raises(SessionNotAccessible):
             _bind_orchestration(app, orch_id, "orch_sess_alice", bob)
         assert _owners(app, "orchestration_sessions", "orch_sess_alice") == [(alice, orch_id)]
 
     def test_ownerless_session_is_refused(self, app):
         orch_id, alice = _orchestration(app), str(uuid.uuid4())
-        with app.app_context():
-            orchestration_service.get_or_create_orchestration_session(
-                orchestration_id=orch_id, session_id="orch_sess_backend"
-            )
-            db.session.commit()
+        _owned_orchestration_session(app, orch_id, "orch_sess_backend", None)
         with pytest.raises(SessionNotAccessible):
             _bind_orchestration(app, orch_id, "orch_sess_backend", alice)
 
     def test_own_session_of_another_orchestration_is_refused(self, app):
         orch_a, orch_b, alice = _orchestration(app), _orchestration(app), str(uuid.uuid4())
-        _bind_orchestration(app, orch_a, "orch_sess_a", alice)
+        _owned_orchestration_session(app, orch_a, "orch_sess_a", alice)
         with pytest.raises(SessionNotAccessible):
             _bind_orchestration(app, orch_b, "orch_sess_a", alice)
         assert _owners(app, "orchestration_sessions", "orch_sess_a") == [(alice, orch_a)]
 
 
 # ---------------------------------------------------------------------------
-# Two creators of one id: exactly one owns it
+# The squatting attack the rule exists for
 # ---------------------------------------------------------------------------
 
 
-def _wait_until_blocked(app, timeout=10.0) -> None:
-    """Return once some backend is waiting on a lock (the second INSERT)."""
-    deadline = time.monotonic() + timeout
+def test_a_backends_predictable_session_cannot_be_planted(app):
+    """Mallory cannot pre-create the id a backend will later use for Alice."""
+    agent_id, alice, mallory = _agent(app), str(uuid.uuid4()), str(uuid.uuid4())
+    with pytest.raises(SessionNotAccessible):
+        _bind_agent(app, agent_id, "wa_15551234567", mallory)
+    # The backend's own run creates the session for Alice, with nothing planted.
+    _owned_agent_session(app, agent_id, "wa_15551234567", alice)
+    assert _owners(app, "agent_sessions", "wa_15551234567") == [(alice, agent_id)]
     with app.app_context():
-        while time.monotonic() < deadline:
-            waiting = db.session.execute(
-                text(
-                    "SELECT count(*) FROM pg_stat_activity "
-                    "WHERE wait_event_type = 'Lock' AND datname = current_database()"
-                )
-            ).scalar()
-            db.session.rollback()
-            if waiting:
-                return
-            time.sleep(0.05)
-    raise AssertionError("the second creator never waited on the first")
-
-
-@pytest.mark.parametrize("kind", ["agent", "orchestration"])
-def test_a_concurrent_creator_waits_and_is_refused(app, kind):
-    """Alice's create is in flight when Bob creates the same id.
-
-    Bob's INSERT waits for Alice's transaction, then finds her row: he is
-    refused. A check-then-insert would have either bound Bob to her session or
-    failed on the unique constraint.
-    """
-    alice, bob = str(uuid.uuid4()), str(uuid.uuid4())
-    if kind == "agent":
-        scope_id, table, session_id = _agent(app), "agent_sessions", "sess_race"
-    else:
-        scope_id, table, session_id = _orchestration(app), "orchestration_sessions", "orch_race"
-
-    def bind(session: Session, user_id: str):
-        if kind == "agent":
-            return get_or_create_session(
-                session, scope_id, session_id=session_id, user_id=user_id, end_user_id=user_id
-            )
-        # The orchestration bind uses the app's scoped session.
-        with app.app_context():
-            db.session.registry.set(session)
-            try:
-                return orchestration_service.get_or_create_orchestration_session(
-                    orchestration_id=scope_id,
-                    session_id=session_id,
-                    user_id=user_id,
-                    end_user_id=user_id,
-                )
-            finally:
-                db.session.registry.clear()
-
-    outcome: dict[str, object] = {}
-
-    with app.app_context():
-        engine = db.engine
-    alice_session, bob_session = Session(engine), Session(engine)
-    try:
-        _, _, alice_new = bind(alice_session, alice)  # inserted, not yet committed
-
-        def bob_binds():
-            try:
-                outcome["bob"] = bind(bob_session, bob)
-                bob_session.commit()
-            except Exception as exc:  # noqa: BLE001 - recorded for the assertion
-                outcome["bob"] = exc
-                bob_session.rollback()
-
-        bob_thread = threading.Thread(target=bob_binds)
-        bob_thread.start()
-        _wait_until_blocked(app)
-        alice_session.commit()
-        bob_thread.join(10)
-        assert not bob_thread.is_alive()
-    finally:
-        alice_session.close()
-        bob_session.close()
-
-    assert alice_new is True
-    assert isinstance(outcome["bob"], SessionNotAccessible), outcome["bob"]
-    assert _owners(app, table, session_id) == [(alice, scope_id)]
+        runs = db.session.execute(
+            text(
+                'SELECT count(*) FROM "ai".agent_runs r JOIN "ai".agent_sessions s '
+                "ON s.id = r.session_id WHERE s.session_id = :s"
+            ),
+            {"s": "wa_15551234567"},
+        ).scalar()
+    assert runs == 0
+    # And Mallory still cannot bind to it.
+    with pytest.raises(SessionNotAccessible):
+        _bind_agent(app, agent_id, "wa_15551234567", mallory)

@@ -949,8 +949,8 @@ class TestDatabaseWriteHandler:
             call_log.append({"sql": sql_str, "params": params})
             mock_result = MagicMock()
             mock_result.rowcount = 1
-            # For the information_schema query, return a column named "id"
-            if "information_schema" in sql_str:
+            # For the auto-generated-columns query, return a column named "id"
+            if "is_identity" in sql_str:
                 mock_result.__iter__ = lambda self: iter([("id",)])
             return mock_result
 
@@ -989,7 +989,7 @@ class TestDatabaseWriteHandler:
             sql_str = str(stmt) if not hasattr(stmt, "text") else stmt.text
             mock_result = MagicMock()
             mock_result.rowcount = 0
-            if "information_schema" in sql_str:
+            if "is_identity" in sql_str:
                 mock_result.__iter__ = lambda self: iter([("id",)])
             return mock_result
 
@@ -1056,7 +1056,7 @@ class TestDatabaseWriteHandler:
         def mock_execute(stmt, params=None):
             sql_str = str(stmt) if not hasattr(stmt, "text") else stmt.text
             call_log.append({"sql": sql_str, "params": params})
-            if "information_schema" in sql_str:
+            if "is_identity" in sql_str:
                 raise RuntimeError("permission denied for information_schema")
             mock_result = MagicMock()
             mock_result.rowcount = 1

@@ -191,20 +191,19 @@ def get_or_create_session(
         user_id: Optional user ID to associate with new session
         metadata: Optional metadata for new session
         end_user_id: The end user a run acts for, or None for the service
-            role. When set, the session is created owned by this user, and an
-            existing one is returned only if it is this user's own session of
-            this agent; anything else raises :class:`SessionNotAccessible`.
+            role. When set, a named session must already exist and be this
+            user's own session of this agent, and without a name a new one is
+            created owned by this user; anything else raises
+            :class:`SessionNotAccessible` (see :func:`session_accessible_to`).
 
     Returns:
         Tuple of (db_session_uuid, session_id, is_new)
     """
     if end_user_id is not None:
+        if session_id:
+            return _end_user_existing_session(db_session, agent_id, session_id, end_user_id)
         return _bind_end_user_session(
-            db_session,
-            agent_id,
-            session_id or f"sess_{uuid.uuid4().hex[:12]}",
-            end_user_id,
-            metadata,
+            db_session, agent_id, f"sess_{uuid.uuid4().hex[:12]}", end_user_id, metadata
         )
 
     if session_id:
@@ -258,6 +257,28 @@ def same_uuid(a: Any, b: Any) -> bool:
         return uuid.UUID(str(a)) == uuid.UUID(str(b))
     except ValueError:
         return False
+
+
+def _end_user_existing_session(
+    db_session: Session, agent_id: str, session_id: str, end_user_id: str
+) -> tuple[str, str, bool]:
+    """The end user's own existing session of this agent, or SessionNotAccessible."""
+    existing = db_session.execute(
+        text(
+            f"""
+            SELECT id, agent_id, user_id FROM "{AI_SCHEMA}".agent_sessions
+            WHERE session_id = :session_id
+            """
+        ),
+        {"session_id": session_id},
+    ).fetchone()
+    if (
+        existing is None
+        or not same_uuid(existing[2], end_user_id)
+        or not same_uuid(existing[1], agent_id)
+    ):
+        raise SessionNotAccessible(session_id)
+    return str(existing[0]), session_id, False
 
 
 def _bind_end_user_session(
@@ -324,27 +345,31 @@ def _bind_end_user_session(
     return str(existing[0]), session_id, False
 
 
-def session_accessible_to(db_session: Session, session_id: str, user_id: str | None) -> bool:
+def session_accessible_to(
+    db_session: Session, session_id: str, user_id: str | None, agent_id: str
+) -> bool:
     """Whether an end user may continue the session with this session_id.
 
-    True when no such session exists yet (the run creates it, owned by the
-    caller) or when the caller owns it. A session with no owner was created by
-    a backend with the service role key and belongs to no end user, so it is
-    not accessible — unlike :func:`get_session_owner`, which cannot tell
-    "missing" from "ownerless".
+    Only a session that exists, is the caller's own and belongs to this agent.
+    An end user never names a new session: ids a backend chooses can be
+    guessable, and a session an end user created under such an id would feed
+    that user's planted history to the backend's later runs, and let the user
+    read what those runs said. End users start a session by omitting the id
+    (the run creates one) or with ``POST /api/agents/<id>/sessions``. A
+    session with no owner was created by a backend and belongs to no end user.
     """
     row = db_session.execute(
         text(
             f"""
-            SELECT user_id FROM "{AI_SCHEMA}".agent_sessions
+            SELECT user_id, agent_id FROM "{AI_SCHEMA}".agent_sessions
             WHERE session_id = :session_id
             """
         ),
         {"session_id": session_id},
     ).fetchone()
-    if row is None:
-        return True
-    return row[0] is not None and user_id is not None and str(row[0]) == user_id
+    if row is None or row[0] is None or user_id is None:
+        return False
+    return same_uuid(row[0], user_id) and same_uuid(row[1], agent_id)
 
 
 def get_session_by_id(

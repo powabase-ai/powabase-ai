@@ -84,19 +84,22 @@ def _bind_agent_session(existing, *, session_id="sess_x", agent_id=AGENT_ID):
 
 
 class TestAgentSessionBind:
-    def test_a_new_id_is_created_for_the_caller_without_a_race(self):
-        (row_id, session_id, is_new), table = _bind_agent_session(None)
-        assert (row_id, session_id, is_new) == (ROW_ID, "sess_x", True)
+    def test_an_unknown_named_id_is_refused_and_nothing_is_created(self):
+        """End users never name a new session: a backend's ids can be guessed."""
+        table = _FakeSessionTable(None)
+        with pytest.raises(SessionNotAccessible):
+            get_or_create_session(table.session, AGENT_ID, session_id="sess_x", end_user_id=USER_ID)
+        assert table.inserts == []
+
+    def test_no_id_generates_one_for_the_caller_without_a_race(self):
+        (row_id, session_id, is_new), table = _bind_agent_session(None, session_id=None)
+        assert is_new is True and session_id.startswith("sess_")
         [(sql, params)] = table.inserts
         assert "ON CONFLICT (session_id) DO NOTHING" in sql
         assert "RETURNING id" in sql
+        assert params["session_id"] == session_id
         assert params["user_id"] == USER_ID
         assert params["agent_id"] == AGENT_ID
-
-    def test_no_id_generates_one_for_the_caller(self):
-        (row_id, session_id, is_new), table = _bind_agent_session(None, session_id=None)
-        assert is_new is True and session_id.startswith("sess_")
-        assert table.inserts[0][1]["session_id"] == session_id
 
     def test_own_session_of_this_agent_is_continued(self):
         (row_id, session_id, is_new), _ = _bind_agent_session((ROW_ID, AGENT_ID, USER_ID))
@@ -146,19 +149,20 @@ def _bind_orchestration_session(existing, *, session_id="orch_sess_x", orch_id=O
 
 
 class TestOrchestrationSessionBind:
-    def test_a_new_id_is_created_for_the_caller_without_a_race(self):
-        (row_id, session_id, is_new), table = _bind_orchestration_session(None)
-        assert (row_id, session_id, is_new) == (ROW_ID, "orch_sess_x", True)
+    def test_an_unknown_named_id_is_refused_and_nothing_is_created(self):
+        """End users never name a new session: a backend's ids can be guessed."""
+        with pytest.raises(SessionNotAccessible):
+            _bind_orchestration_session(None)
+
+    def test_no_id_generates_one_for_the_caller_without_a_race(self):
+        (_, session_id, is_new), table = _bind_orchestration_session(None, session_id=None)
+        assert is_new is True and session_id.startswith("orch_sess_")
         [(sql, params)] = table.inserts
         assert "ON CONFLICT (session_id) DO NOTHING" in sql
         assert "RETURNING id" in sql
+        assert params["session_id"] == session_id
         assert params["user_id"] == USER_ID
         assert params["orchestration_id"] == ORCH_ID
-
-    def test_no_id_generates_one_for_the_caller(self):
-        (_, session_id, is_new), table = _bind_orchestration_session(None, session_id=None)
-        assert is_new is True and session_id.startswith("orch_sess_")
-        assert table.inserts[0][1]["session_id"] == session_id
 
     def test_own_session_of_this_orchestration_is_continued(self):
         (row_id, session_id, is_new), _ = _bind_orchestration_session((ROW_ID, ORCH_ID, USER_ID))

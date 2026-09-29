@@ -82,6 +82,8 @@ class TestEndUserSessionGate:
             pytest.param(_session(OTHER_USER_ID), id="another-users-session"),
             pytest.param(_session(None), id="ownerless-session"),
             pytest.param(_session(USER_ID, OTHER_ORCH_ID), id="own-session-other-orchestration"),
+            # End users never name a new session: a backend's ids can be guessed.
+            pytest.param(None, id="unknown-session-id"),
         ],
     )
     def test_refused_with_404_before_any_work(self, existing):
@@ -100,11 +102,6 @@ class TestEndUserSessionGate:
         """The path segment is compared as a uuid, not as a string."""
         existing = _session(USER_ID, ORCH_ID.upper())
         resp, check_balance, _ = _run(existing)
-        assert resp is None
-        check_balance.assert_called_once()
-
-    def test_unknown_session_id_proceeds_and_becomes_the_callers(self):
-        resp, check_balance, _ = _run(None)
         assert resp is None
         check_balance.assert_called_once()
 
