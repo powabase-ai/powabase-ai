@@ -170,9 +170,7 @@ def _setting(monkeypatch):
 
 
 def _run(store=_ChunkStore, **kwargs) -> _Session:
-    session_kwargs = {
-        k: kwargs.pop(k) for k in ("own_index", "kb_rows", "fail_at") if k in kwargs
-    }
+    session_kwargs = {k: kwargs.pop(k) for k in ("own_index", "kb_rows", "fail_at") if k in kwargs}
     session = _Session(**session_kwargs)
     kwargs.setdefault("embedding", [0.0] * _DIMS)
     kwargs.setdefault("top_k", 10)
@@ -337,7 +335,9 @@ def test_the_whole_table_scan_is_priced_out_for_the_count_and_the_search_and_put
 def test_the_setting_is_transaction_scoped():
     session = _run(own_index=False, kb_rows=300)
     sets = [
-        "".join(sql.split()) for sql, _ in session.statements if "set_config('enable_seqscan'" in sql
+        "".join(sql.split())
+        for sql, _ in session.statements
+        if "set_config('enable_seqscan'" in sql
     ]
     assert sets, session.statements
     assert all(s.endswith(",true)") for s in sets), (
@@ -459,7 +459,9 @@ def test_the_setting_describes_how_it_meets_the_per_kb_thresholds():
 def test_the_cap_never_exceeds_the_default_build_threshold():
     """Above the build threshold the per-KB index is the designed answer; an exact
     search there costs hundreds of milliseconds (360-450 ms warm at 73,288 rows)."""
-    assert SETTINGS_REGISTRY[SETTING].max <= SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"].default
+    assert (
+        SETTINGS_REGISTRY[SETTING].max <= SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"].default
+    )
 
 
 @pytest.mark.parametrize(("stored", "used"), [(90_000, 50_000), (-3, 0), (1234, 1234)])
