@@ -75,6 +75,30 @@ release contains the fix; Postgres 17 and 18 are not affected.
 docker build -t pg-search-ci:0.25.9-paradedb-6211 ci/pg_search  # compiles pg_search: minutes to tens of minutes
 ```
 
+## Database role permissions
+
+The service expects to own the `ai` schema. Beyond that, one privilege matters
+when `DATABASE_URL` connects as a role that is **not a superuser**:
+
+```sql
+GRANT pg_read_all_stats TO <the service's role>;   -- or pg_monitor
+```
+
+Large knowledge bases get a vector index of their own, built with
+`CREATE INDEX CONCURRENTLY` on the shared `ai.embeddings` table, one build at a
+time per project. Before each build the service reads `pg_stat_activity` to see
+who else holds that table, so it never queues a build behind a running one
+(queued index DDL deadlocks a build at its very end). Without `pg_read_all_stats`,
+Postgres hides other roles' sessions from that view, and the service cannot tell
+a running build from autovacuum.
+
+The consequence is concrete. A long autovacuum of `ai.embeddings` then reads as an
+unknown holder of the table. The pending build is deferred through its counted
+retries, about half an hour, and then gives up with `PerKbVectorIndexTableWaitExhausted`;
+the next indexed source or restart tries again. With the grant, autovacuum is
+recognised and ignored, and the build proceeds as it always has. The worker logs a
+WARNING naming the grant the first time it meets a holder it cannot see.
+
 ## Docker
 
 The image is **published automatically to `ghcr.io/powabase-ai/powabase-ai`**

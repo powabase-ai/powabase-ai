@@ -101,6 +101,19 @@ The start-up sweep is not free for a small project either: it runs one grouped
 count over ``ai.embeddings`` on every boot, bounded by ``SWEEP_TIMEOUT_MS``,
 even when it then dispatches nothing.
 
+**One build or drop at a time per project, decided here and never in Postgres'
+lock queue.** Every index this module creates is on the one shared table, and a
+second ``CREATE``/``DROP INDEX CONCURRENTLY`` queued on that table while a build
+runs is not merely slow: it holds a snapshot while it waits, the build's last
+phase waits for that snapshot, and the deadlock detector kills the build after
+all of its work -- observed on a production project as seven deadlocks in about
+36 hours, the largest build killed at its end twice after about eight hours of work, with
+a third earlier death consistent with it (issue #95 and its follow-up comment of
+the same week). ``_TableGate`` carries the
+mechanism, the evidence and the operator rule that follows from it; the short
+form is that a reconcile which cannot take the table issues nothing, returns
+``table_busy``, and its task comes back on a clock of its own.
+
 Nothing here touches the shared per-dimension index. Replacing it with a
 residual one is what turns the transitional write cost of maintaining two graphs
 into a large write *gain*, and it is deliberately a follow-up (**#88**). Two
@@ -268,6 +281,12 @@ MAX_CONSECUTIVE_BUILD_FAILURES = 3
 # attempts, and a single episode must not turn the index off until an operator
 # drops it by hand. 25 is more than three such episodes back to back, and still a
 # bound.
+#
+# The largest source of these on a project with several large knowledge bases was
+# this module fighting itself: a ``deadlock detected`` at the end of every build
+# that another knowledge base's DDL had queued behind (issue #95), each one counted
+# here. ``_TableGate`` removes that source; a table another build owns is now a
+# ``table_busy`` outcome, which is not an attempt and is counted nowhere.
 #
 # **What this does not cover:** a build whose backend does not come back -- an OOM
 # kill, a server restart -- cannot write anything, because the write needs the
@@ -478,6 +497,54 @@ class PerKbVectorIndexBuildInProgress(RuntimeError):
     """Another caller holds the build lock for this index."""
 
 
+class PerKbVectorIndexTableBusy(PerKbVectorIndexBuildInProgress):
+    """Another build or drop owns ``ai.embeddings`` right now; nothing was issued.
+
+    ``holders`` is the evidence (``table_ddl_holders``): the other backends holding
+    a lock on the table that a ``CREATE``/``DROP INDEX CONCURRENTLY`` would queue
+    behind. ``build_alive`` is whether there is any -- the one thing the task spends
+    its uncounted wait on. ``lock_held`` says which way the gate was refused: this
+    module's own table lock held by another caller, or free and the table held by
+    something that does not take it (a manual ``DROP INDEX CONCURRENTLY``, a worker
+    from before the gate existed).
+
+    A subclass of the per-index one so that every caller already retrying a held
+    lock retries this too; the ones that can wait longer tell them apart.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        holders=(),
+        lock_held: bool = True,
+        evidence_error: str | None = None,
+    ):
+        super().__init__(message)
+        self.holders = list(holders or ())
+        self.lock_held = lock_held
+        self.evidence_error = evidence_error
+
+    @property
+    def build_alive(self) -> bool:
+        """Is any holder demonstrably *running* (``_holder_kind``)?
+
+        Not "is there any holder": a session idle in a transaction that happens to
+        hold the table, or one this role cannot see, refuses the gate just the same
+        but is not evidence that anything will finish, so it does not buy the long
+        uncounted wait.
+        """
+        return any(holder.get("kind") == "running" for holder in self.holders)
+
+
+class PerKbVectorIndexTableWaitExhausted(RuntimeError):
+    """A task gave up waiting for ``ai.embeddings`` after its whole wait budget.
+
+    Raised by the task after its ERROR rather than returned, so the task ends in
+    failure and a failure-rate alert sees it: a returned dict is a SUCCESS to every
+    monitor that reads task states, which is what the give-up used to be.
+    """
+
+
 class PerKbVectorIndexDropFailed(RuntimeError):
     """An index could not be dropped for a reason a retry cannot get past.
 
@@ -588,6 +655,22 @@ def _like_prefix(prefix: str) -> str:
 def index_lock_relation(knowledge_base_id: Any, dims: Any) -> str:
     """Advisory-lock subject for building or dropping one of these indexes."""
     return f"{AI_SCHEMA}.{per_kb_index_name(knowledge_base_id, dims)}"
+
+
+def table_lock_relation() -> str:
+    """Advisory-lock subject for *any* of these builds or drops: one per table.
+
+    Every index this module creates lives on ``ai.embeddings``, so this is one
+    subject for the whole project, taken on top of ``index_lock_relation`` before
+    each ``CREATE``/``DROP INDEX CONCURRENTLY`` -- see ``_TableGate`` for why.
+
+    Suffixed rather than the bare table name, the convention the BM25 path's move
+    gate (``ai.chunks#move``) set: its per-item-table build lock *is* the bare
+    name, and a gate that only means "one index DDL at a time" must not share a
+    key with a lock that means something else if ``embeddings`` ever becomes a
+    table that path manages.
+    """
+    return f"{AI_SCHEMA}.embeddings#index-ddl"
 
 
 # ---------------------------------------------------------------------------
@@ -1119,7 +1202,7 @@ def _try_lock(conn, relation: str) -> bool:
     return bool(conn.execute(text(partition_build_lock_sql()), {"relation": relation}).scalar())
 
 
-def _discard_connection(conn) -> None:
+def _discard_connection(conn, holding: str | None = None) -> None:
     """Throw this connection's backend away, and leave the handle usable.
 
     ``invalidate()`` on its own is only half of it. Every caller here shares one
@@ -1152,7 +1235,20 @@ def _discard_connection(conn) -> None:
     try:
         conn.invalidate()
     except Exception:
-        logger.debug("Could not invalidate the connection", exc_info=True)
+        if holding is None:
+            logger.debug("Could not invalidate the connection", exc_info=True)
+        else:
+            # The one case where this is not housekeeping: the backend being thrown
+            # away holds a session advisory lock, and it goes back to the pool still
+            # holding it. For ``table_lock_relation()`` that gates every index build
+            # and drop in the project until the backend ends.
+            logger.error(
+                "Could not discard the connection holding the advisory lock on %s; the "
+                "lock stays held until that backend ends, and every build or drop it "
+                "guards waits for it (pg_terminate_backend on its pid releases it)",
+                holding,
+                exc_info=True,
+            )
     try:
         conn.rollback()
     except Exception:
@@ -1178,9 +1274,16 @@ def _release_lock(conn, relation: str) -> None:
     The lock outlives a transaction on purpose (a concurrent build is not one),
     so a pooled connection handed back still holding it would make every later
     build of this index skip. Ending the backend releases it for certain.
+
+    ``pg_advisory_unlock`` answering False is read, not ignored: it means this
+    session did not hold the lock, and on these connections the only way that
+    happens is a discard in between (``_discard_connection``) -- the lock went with
+    the old backend, so whatever it guarded after that ran on the new one without
+    it. The table gate re-takes itself when that happens (``_TableGate.hold``);
+    this is what says so when nothing did.
     """
     try:
-        conn.execute(text(partition_build_unlock_sql()), {"relation": relation})
+        released = conn.execute(text(partition_build_unlock_sql()), {"relation": relation}).scalar()
     except Exception:
         logger.warning(
             "Could not release the advisory lock on %s; discarding the connection so the "
@@ -1188,7 +1291,15 @@ def _release_lock(conn, relation: str) -> None:
             relation,
             exc_info=True,
         )
-        _discard_connection(conn)
+        _discard_connection(conn, holding=relation)
+        return
+    if released is False:
+        logger.warning(
+            "The advisory lock on %s was not held by this session when it was given back: "
+            "its connection was replaced after the lock was taken, and the lock ended with "
+            "the old backend",
+            relation,
+        )
 
 
 def _reset_session_setting(conn, name: str) -> None:
@@ -1614,6 +1725,13 @@ def _counted_attempt(
 
     Split from the two writes below because the *classification* is common to both
     and the *definition each one records* is not.
+
+    A reconcile refused by ``_TableGate`` is never an attempt and never reaches
+    this: the gate is taken before the first statement a dimension would issue
+    -- before the definition-rebuild count too -- so ``table_busy`` writes no
+    comment and moves neither bound. Charging it would have spent one of these
+    counts per look at a table another build owns, which is up to
+    ``PER_KB_TABLE_MAX_WAITS`` looks in the task.
     """
     if is_transient_db_error(exc):
         return prior_failures, prior_interrupted + 1
@@ -1700,9 +1818,11 @@ def _build_in_progress(conn, kb_id: str, dims: int) -> bool:
     knowledge base there; here every index is on the one shared table, so the
     same shape would report *any* concurrent build on it -- another knowledge
     base's, or ``ensure_embedding_index`` creating a shared per-dimension one.
-    That matters because the start-up sweep dispatches every out-of-step
-    knowledge base at once, so with two large ones the builds overlap by
-    construction, at exactly the boot meant to clear an INVALID index.
+    That question is a different one, about the table, and it has its own
+    answer: ``table_ddl_holders``, asked by ``_TableGate`` before any DDL. This
+    one decides only whether *this* INVALID index belongs to a build still
+    running -- in which case it must not be dropped at all -- and it is asked
+    before the gate, because leaving the index alone issues nothing.
 
     ``pg_stat_progress_create_index.index_relid`` is populated for
     ``CREATE INDEX CONCURRENTLY`` from the moment the catalog entry exists
@@ -1718,6 +1838,410 @@ def _build_in_progress(conn, kb_id: str, dims: int) -> bool:
         {"index": f'"{AI_SCHEMA}".{per_kb_index_name(kb_id, dims)}'},
     ).first()
     return row is not None
+
+
+# ---------------------------------------------------------------------------
+# One build or drop at a time on the table
+# ---------------------------------------------------------------------------
+
+# The lock modes a ``CREATE``/``DROP INDEX CONCURRENTLY`` on the table would queue
+# behind: its own ``ShareUpdateExclusiveLock`` conflicts with itself and with every
+# stronger mode. A plain ``CREATE INDEX`` (``ShareLock``) is in the list on purpose
+# -- ``base_vector_store.ensure_embedding_index`` issues one, inside an indexing
+# transaction, the first time a dimension appears.
+#
+# A manual ``VACUUM`` or ``ANALYZE`` of the table takes ``ShareUpdateExclusiveLock``
+# too, so it now defers even a single knowledge base's build until it finishes,
+# where before the build simply queued behind it (a plain wait, no cycle). That is
+# the price of not being able to tell, from the lock alone, a statement that will
+# never wait on the build from one that will; autovacuum is the exception the
+# holder query can make, because it yields to lock waiters on its own.
+_TABLE_DDL_LOCK_MODES = (
+    "ShareUpdateExclusiveLock",
+    "ShareLock",
+    "ShareRowExclusiveLock",
+    "ExclusiveLock",
+    "AccessExclusiveLock",
+)
+
+# How long the backend holding this module's table gate may sit idle between two
+# statements and still count as a caller in the middle of its work. The gate is
+# taken immediately before a dimension's first DDL and given back after its last
+# write, so the windows in which it is held with no table lock to show for it are
+# the ones between statements of one reconcile -- the lock try and the build's
+# grant, a repair DROP and the CREATE after it, the build and the comment and
+# RESETs that follow -- all of them round trips from a worker that is running.
+# A holder idle longer than this is not in the middle of anything and does not
+# buy the long uncounted wait (``_holder_kind``).
+_GATE_HOLDER_IDLE_GRACE_S = 60
+
+# The three ages every holder is reported with, in seconds: its current (or last)
+# statement, its transaction, and its last state change -- which, for a session
+# idle in a transaction, is how long it has been idle. ``query_start`` alone said
+# 0 for a session that had held the table idle for hours.
+_HOLDER_AGES_SQL = (
+    "floor(extract(epoch FROM clock_timestamp() - a.query_start))::bigint, "
+    "floor(extract(epoch FROM clock_timestamp() - a.xact_start))::bigint, "
+    "floor(extract(epoch FROM clock_timestamp() - a.state_change))::bigint, "
+    "left(a.query, 200) "
+)
+
+_THIS_DATABASE_SQL = "(SELECT oid FROM pg_database WHERE datname = current_database())"
+
+# Read from ``pg_locks`` rather than by matching ``CONCURRENTLY`` in query text:
+# a concurrent build or drop holds its table lock as a *session* lock across all
+# of its internal transactions, so it is here, granted, from its first phase to
+# its last -- including the final wait, when ``pg_stat_activity.query`` of a
+# pooled caller may already say something else. ``pg_locks`` is readable by every
+# role; the ``pg_stat_activity`` half of the join is not: for another role's
+# backend a role without ``pg_read_all_stats`` (or ``pg_monitor``) sees NULL
+# ``backend_type`` and ``state`` and a query of ``<insufficient privilege>``.
+# Such a holder is kept and classified *unknown* rather than dropped, because it
+# may be a build (see ``_holder_kind``). ``granted`` because a backend still
+# queued is not a build that is running; autovacuum is left out -- where it can be
+# seen -- because it cancels itself for a lock waiter (anti-wraparound excepted,
+# which is a plain wait with no cycle), so queueing behind it costs about a second.
+_TABLE_HOLDERS_SQL = (
+    "SELECT a.pid, a.backend_type, 'relation', l.mode, a.state, "
+    + _HOLDER_AGES_SQL
+    + "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+    "WHERE l.locktype = 'relation' "
+    f"AND l.database = {_THIS_DATABASE_SQL} "
+    "AND l.relation = to_regclass(:table) "
+    "AND l.granted AND l.pid <> pg_backend_pid() "
+    "AND l.mode IN (" + ", ".join(f"'{mode}'" for mode in _TABLE_DDL_LOCK_MODES) + ") "
+    "AND a.backend_type IS DISTINCT FROM 'autovacuum worker' "
+    "ORDER BY a.query_start NULLS LAST, a.pid"
+)
+
+# The backend holding this module's own table gate. ``pg_try_advisory_lock(bigint)``
+# files its key as ``classid`` (high 32 bits) and ``objid`` (low 32 bits) with
+# ``objsubid = 1``, so the key is put back together and compared with the same
+# ``hashtextextended`` the lock was taken with. Asked only when the gate is
+# refused by its lock: that is when the holder may be between two statements and
+# show no table lock at all.
+_GATE_HOLDER_SQL = (
+    "SELECT a.pid, a.backend_type, 'advisory', l.mode, a.state, "
+    + _HOLDER_AGES_SQL
+    + "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+    "WHERE l.locktype = 'advisory' "
+    f"AND l.database = {_THIS_DATABASE_SQL} "
+    "AND l.granted AND l.objsubid = 1 AND l.pid <> pg_backend_pid() "
+    "AND ((l.classid::bigint << 32) | l.objid::bigint) = hashtextextended(:subject, 0)"
+)
+
+# What a backend this role may not inspect shows as its query.
+_HIDDEN_QUERY = "<insufficient privilege>"
+
+# Warned about once per process: the evidence cannot tell a build from autovacuum
+# without the privilege, and every refusal after the first would say the same thing.
+_warned_invisible_holders = False
+
+
+def _age(value) -> int | None:
+    return None if value is None else int(value)
+
+
+def _holder_kind(lock: str, state: str | None, idle_s: int | None) -> str:
+    """``running``, ``stalled`` or ``unknown`` -- and only ``running`` is a live build.
+
+    * A holder of the table's own lock is *running* while its state is ``active``.
+      A concurrent build is ``active`` from its first phase to its last, its waits
+      included. ``idle in transaction`` -- a ``LOCK TABLE``, a plain ``CREATE INDEX``
+      or an ``ANALYZE`` someone left open -- is *stalled*: it refuses the gate,
+      because queueing behind it would hold a snapshot too, but nothing about it
+      will finish on its own, so it gets the counted retry and a WARNING instead of
+      48 hours of uncounted waits.
+    * The holder of this module's gate is *running* while ``active`` or idle for at
+      most ``_GATE_HOLDER_IDLE_GRACE_S`` -- a worker between two statements of its
+      reconcile.
+    * A holder whose state this role cannot see is *unknown*, and gets the counted
+      path: it may be a build, and it may be autovacuum, which the query can only
+      leave out when it can see ``backend_type``.
+    """
+    if state is None:
+        return "unknown"
+    if state == "active":
+        return "running"
+    if lock == "advisory" and state == "idle" and idle_s is not None:
+        return "running" if idle_s <= _GATE_HOLDER_IDLE_GRACE_S else "stalled"
+    return "stalled"
+
+
+def _holder_evidence(row) -> dict:
+    """One holder row as the outcome and the logs report it."""
+    pid, backend_type, lock, mode, state, running_s, xact_s, idle_s, query = row
+    idle = _age(idle_s)
+    return {
+        "pid": int(pid),
+        "backend_type": backend_type,
+        "lock": lock,
+        "mode": mode,
+        "state": state,
+        "running_s": _age(running_s),
+        "xact_s": _age(xact_s),
+        "idle_s": idle,
+        "query": None if query in (None, "", _HIDDEN_QUERY) else query,
+        "kind": _holder_kind(lock, state, idle),
+    }
+
+
+def table_ddl_holders(conn, include_gate_holder: bool = False) -> list[dict]:
+    """The other backends holding ``ai.embeddings`` against an index build or drop.
+
+    Per *table*, where ``_build_in_progress`` is per index, and the difference is
+    what issue #95 turned on: during the fight it described below, the repair path
+    logged that no build was running on ``ai.embeddings`` -- true of the one index it
+    had asked about -- while another knowledge base's ``CREATE INDEX CONCURRENTLY``
+    had been running on that table for hours. This is the question the gate needs
+    answered, and it is the evidence the task spends its uncounted wait on
+    (``PerKbVectorIndexTableBusy.build_alive``): each holder carries a ``kind``
+    (``_holder_kind``), and only a ``running`` one is a live build.
+
+    ``include_gate_holder`` adds the backend holding this module's own gate
+    (``_GATE_HOLDER_SQL``), for the refusal where the table lock is not what
+    refused it.
+
+    Plain reads of two statistics views: they take no lock that can wait, so they
+    are safe to ask on the gate's AUTOCOMMIT connection with the table busy.
+
+    **Needs ``pg_read_all_stats`` (or ``pg_monitor``) to be exact** when the service
+    connects as a role other than the one other backends run as: without it every
+    other role's holder is ``unknown``, autovacuum included, so each look during a
+    vacuum of the table costs a counted retry where it would have cost nothing -- and
+    a vacuum longer than the counted budget (about half an hour) ends the task with
+    ``PerKbVectorIndexTableWaitExhausted``, where before the gate the build simply
+    queued behind it and autovacuum yielded. Warned once per process; the README's
+    "Database role permissions" section carries the grant.
+    """
+    global _warned_invisible_holders
+    rows = list(
+        conn.execute(text(_TABLE_HOLDERS_SQL), {"table": f'"{AI_SCHEMA}".embeddings'}).all()
+    )
+    if include_gate_holder:
+        rows += conn.execute(text(_GATE_HOLDER_SQL), {"subject": table_lock_relation()}).all()
+    holders: dict[int, dict] = {}
+    for row in rows:
+        evidence = _holder_evidence(row)
+        holders.setdefault(evidence["pid"], evidence)
+    if not _warned_invisible_holders and any(h["kind"] == "unknown" for h in holders.values()):
+        _warned_invisible_holders = True
+        logger.warning(
+            "This database role cannot see what the backends holding %s.embeddings are "
+            "doing (pg_stat_activity shows another role's state as NULL without "
+            "pg_read_all_stats or pg_monitor), so it cannot tell an index build from "
+            "autovacuum: every such holder is treated as unknown and costs a counted "
+            "retry. Grant pg_read_all_stats to the service's role to make the per-table "
+            "index gate exact",
+            AI_SCHEMA,
+        )
+    return list(holders.values())
+
+
+def _backend_pid(conn):
+    return conn.execute(text("SELECT pg_backend_pid()")).scalar()
+
+
+class _TableGate:
+    """One ``CREATE``/``DROP INDEX CONCURRENTLY`` on ``ai.embeddings`` at a time, per project.
+
+    **Why any DDL queued on the table while a build runs kills that build, at its
+    end.** Every concurrent build and drop on the table takes its
+    ``ShareUpdateExclusiveLock``, which conflicts with itself. The per-index lock
+    (``index_lock_relation``) keeps two callers off *one* index and nothing more,
+    so a second knowledge base's build or drop used to go straight to Postgres and
+    queue there on the table lock -- with ``lock_timeout = 0``, for as long as the
+    running build took, and with a snapshot already taken (its ``backend_xmin`` is
+    set while it waits). The running build's last step, ``WaitForOlderSnapshots``,
+    waits for every backend whose snapshot is older than its reference snapshot:
+    the queued one among them. The queued one waits for the table lock the build
+    holds. That is a cycle, the build is the later waiter, and the deadlock
+    detector kills it -- after its catalog entry, its whole graph build and its
+    validation scan, leaving an INVALID index behind. Observed on a production
+    project with three qualifying knowledge bases (2.85M, 1.09M and 73k chunk rows
+    at 1536 dimensions, all dispatched together): seven ``deadlock detected`` in
+    about 36 hours, every build that reached its end killed. The 2.85M-row build
+    was lost twice within the incident, each time after about eight hours and
+    about 20 GB of index, and a third, earlier death of the same build is
+    consistent with it though its log did not survive (issue #95 and its follow-up
+    comment). The retries livelocked, because a retry of a killed build begins
+    with a repair drop, which is DDL that queues in turn and kills whichever build
+    is finishing next. Revoking the other tasks by hand let each one build alone
+    without incident: 25 s, 63 min and 9.6 h. Zero deadlocks after that.
+
+    **Why the gate is here, and not in the lock queue.** No build or drop can
+    wait for that lock inside Postgres safely: it has taken its snapshot before it
+    queues and holds it while it waits, and an older snapshot is exactly what the
+    running build's last phase waits on. ``lock_timeout`` does not
+    help either -- the build's own is 0 for the reasons ``_create_index`` gives, and
+    a bounded one on the *waiter* only changes which of the two dies. So the waiting
+    moves out of the database: a session advisory lock on ``table_lock_relation``,
+    only ever *tried*, on the same AUTOCOMMIT connection as the DDL and held until
+    that dimension's last statement, so a caller that does not get it has issued
+    nothing, holds no transaction and leaves nothing for a running build to wait
+    on. It reports ``PerKbVectorIndexTableBusy`` and the task comes back later on
+    a clock of its own -- ``PER_KB_TABLE_WAIT_COUNTDOWN_S`` apart, up to
+    ``PER_KB_TABLE_MAX_WAITS`` times, uncounted while ``table_ddl_holders`` shows a
+    build alive and counted like any retry when it does not (both in
+    ``tasks.indexing``, which owns the retry budget). The gate is what removes the
+    only waiter that could form the cycle, so the DDL itself keeps
+    ``lock_timeout = 0``.
+
+    Not every holder is a build, and only a build is worth a long wait:
+    ``_holder_kind`` sorts holders into *running* (the uncounted wait),
+    *stalled* (a session idle in a transaction that happens to hold the table) and
+    *unknown* (a backend this role cannot see without ``pg_read_all_stats``) -- the
+    last two refuse the gate just the same, and cost the task a counted retry.
+
+    The advisory lock only stops callers of this module, so a free lock is not
+    taken as a free table: ``table_ddl_holders`` is asked as well, and anything
+    holding the table against a build -- an operator's ``DROP INDEX
+    CONCURRENTLY``, a worker still running a version from before this gate during a
+    rolling deploy, the shared per-dimension index being created -- refuses the gate
+    exactly as a held lock does, with the lock given straight back. There is a
+    window between that check and the DDL that nothing can close from here; it is
+    the width of two round trips rather than the length of a build.
+
+    **Operator rule: never run a manual ``CREATE`` or ``DROP INDEX CONCURRENTLY``
+    on ``ai.embeddings`` while a build is running** (``table_ddl_holders``, or
+    ``pg_stat_progress_create_index`` on the table) -- it queues, it holds a
+    snapshot while it queues, and it kills the build at its very end, by the
+    mechanism above. Wait for the build, or cancel it deliberately.
+
+    A long read is different and is not gated: ``pg_dump``'s ``COPY`` of the table,
+    or any transaction holding an old snapshot, makes the build's last phase wait
+    for it too, but that is a plain wait -- the reader never waits on the build --
+    so the build finishes when the reader does.
+
+    Taken only where a dimension reaches DDL, not at the top of every reconcile: a
+    knowledge base whose index is already right (a settle pass, a between-thresholds
+    no-op) reads the catalog and writes at most a comment on its own index, which
+    no running build waits on, and must not sit out a nine-hour build to do it. It
+    is taken *after* the per-index lock and given back before it; both are only
+    ever tried, so the order cannot deadlock, and it is the order that lets two
+    tasks for one knowledge base still see ``build_lock_held`` rather than both
+    queueing on the table.
+
+    Released on every exit through ``_release_lock``, which discards the
+    connection if the unlock fails: a pooled connection that kept this lock would
+    gate the whole table until its backend ended.
+    """
+
+    def __init__(self, conn, index_lock: str | None = None):
+        self._conn = conn
+        self._index_lock = index_lock
+        self.held = False
+        self._pid = None
+
+    def _evidence(self, include_gate_holder: bool) -> tuple[list[dict], str | None]:
+        """The holders, or none and why: an unreadable answer refuses the gate too."""
+        try:
+            return table_ddl_holders(self._conn, include_gate_holder), None
+        except Exception as exc:
+            reason = first_error_line(exc)
+            logger.warning(
+                "Could not read which backends hold %s.embeddings (%s); not issuing any "
+                "index DDL on it this time, because the answer is what tells a free table "
+                "from a running build",
+                AI_SCHEMA,
+                reason,
+            )
+            return [], reason
+
+    def hold(self) -> None:
+        """Take the table, or raise ``PerKbVectorIndexTableBusy`` having issued nothing.
+
+        Idempotent for as long as the backend it was taken on is the one behind the
+        handle. It may not be: a ``RESET`` that fails after a repair or drift ``DROP``
+        makes ``_discard_connection`` reconnect, the session lock ends with the old
+        backend, and a ``held`` flag that outlived it let the build that follows --
+        hours of ``CREATE INDEX CONCURRENTLY`` -- run with no gate at all, while
+        ``release`` unlocked nothing. So the pid it was taken on is kept and checked,
+        and a replaced connection takes the gate again, holder check included, before
+        the next statement.
+
+        The caller's per-index lock (``index_lock``) went with the same backend, and is
+        taken again first, in the order the two were taken in the first place.
+        Without it a second task for the same knowledge base found this index's lock
+        free during the rebuilt build, read the running build as an orphan ("its
+        backend outlived whatever started it") and spent its counted retries on a
+        repair it must not attempt. A per-index lock someone else took in the gap
+        raises ``PerKbVectorIndexBuildInProgress``: that caller now owns this index's
+        work.
+        """
+        if self.held:
+            if _backend_pid(self._conn) == self._pid:
+                return
+            logger.warning(
+                "The connection holding the %s index-build gate was replaced (backend %s "
+                "is gone, and its session locks with it); taking %s again before the next "
+                "statement",
+                AI_SCHEMA + ".embeddings",
+                self._pid,
+                "this index's lock and the gate" if self._index_lock else "the gate",
+            )
+            self.held = False
+            if self._index_lock is not None and not _try_lock(self._conn, self._index_lock):
+                raise PerKbVectorIndexBuildInProgress(
+                    f"{self._index_lock} was taken by another caller while this one's "
+                    "connection was being replaced"
+                )
+        subject = table_lock_relation()
+        if not _try_lock(self._conn, subject):
+            holders, error = self._evidence(include_gate_holder=True)
+            raise PerKbVectorIndexTableBusy(
+                f"another index build or drop owns {AI_SCHEMA}.embeddings "
+                f"({describe_table_holders(holders, error)})",
+                holders=holders,
+                lock_held=True,
+                evidence_error=error,
+            )
+        # Held from here, so a failure in anything below still gives it back.
+        self.held = True
+        self._pid = _backend_pid(self._conn)
+        holders, error = self._evidence(include_gate_holder=False)
+        if holders or error:
+            self.release()
+            raise PerKbVectorIndexTableBusy(
+                f"{AI_SCHEMA}.embeddings is held against an index build by a backend that "
+                f"does not take this module's table lock ({describe_table_holders(holders, error)})",
+                holders=holders,
+                lock_held=False,
+                evidence_error=error,
+            )
+
+    def release(self) -> None:
+        if not self.held:
+            return
+        self.held = False
+        _release_lock(self._conn, table_lock_relation())
+
+
+def _describe_holder(holder: dict) -> str:
+    ages = []
+    if holder.get("running_s") is not None:
+        ages.append(f"statement {holder['running_s']} s")
+    if holder.get("xact_s") is not None:
+        ages.append(f"transaction {holder['xact_s']} s")
+    if holder.get("state") not in (None, "active") and holder.get("idle_s") is not None:
+        ages.append(f"{holder['state']} for {holder['idle_s']} s")
+    return (
+        f"pid {holder['pid']} ({holder.get('kind', 'unknown')}: "
+        f"{holder.get('backend_type') or 'backend type not visible'}, "
+        f"{holder.get('lock', 'relation')} {holder.get('mode')}, "
+        f"{holder.get('state') or 'state not visible'}"
+        + (f", {', '.join(ages)}" if ages else "")
+        + f"): {holder.get('query') or '(query not visible)'}"
+    )
+
+
+def describe_table_holders(holders, evidence_error: str | None = None) -> str:
+    """The holders as one log fragment: pid, what kind, which lock, how long, and what."""
+    if evidence_error:
+        return f"which backends hold the table could not be read: {evidence_error}"
+    if not holders:
+        return "no backend holding the table or its index-build lock could be found"
+    return "; ".join(_describe_holder(holder) for holder in holders)
 
 
 # ---------------------------------------------------------------------------
@@ -1762,6 +2286,15 @@ def _create_index(
     role-level ``lock_timeout`` of 2 s and one open write transaction, the build
     failed in 2.02 s, five attempts out of five, leaving the INVALID index this
     function then has to count.
+
+    Unbounded is safe only because nothing of this module's can be *queued* on
+    the table while it runs: the caller holds ``_TableGate``, so a second build or
+    drop never reaches Postgres to wait with a snapshot the build's last phase
+    would wait on. What the build can still wait for is a plain wait -- an open
+    transaction, or ``pg_dump``'s long ``COPY`` of the table holding its snapshot
+    -- which ends when the reader does. What it cannot survive is a statement run
+    by hand on the table while it builds (see the operator rule on ``_TableGate``);
+    a bound here would not change that, only which of the two dies.
 
     A build that runs out of disk leaves an INVALID index behind, and the next
     ensure drops and rebuilds it rather than reporting it as built (see
@@ -1889,13 +2422,22 @@ def _repair_invalid(
     ``_count_a_failed_build``, because the index the count lands on is the one that
     was already there: the drop is what failed, so its recorded definition has to be
     read back rather than assumed to be today's.
+
+    The caller holds ``_TableGate`` before this runs. This drop is DDL on the shared
+    table like any build, and during issue #95 it was the statement that turned one
+    killed build into a livelock: each retry began here, queued on the table behind
+    whichever build was running, and killed that one at its end in turn.
     """
+    # "No build *of it*": this caller asked ``_build_in_progress`` about this one
+    # index. It used to say "no build is running on ai.embeddings", which read as a
+    # claim about the table and was logged, during issue #95, while another
+    # knowledge base's build had been running on the table for hours. What makes
+    # this drop safe against *those* is the table gate its caller holds.
     logger.warning(
-        "Partial HNSW index %s.%s is INVALID and no build is running on %s.embeddings (an "
-        "earlier CREATE INDEX CONCURRENTLY failed or was cancelled); dropping it",
+        "Partial HNSW index %s.%s is INVALID and no build of it is running (an earlier "
+        "CREATE INDEX CONCURRENTLY failed or was cancelled); dropping it",
         AI_SCHEMA,
         per_kb_index_name(kb_id, dims),
-        AI_SCHEMA,
     )
     try:
         _drop_index(conn, kb_id, dims)
@@ -1980,6 +2522,20 @@ def _drop_a_drifted_index(conn, kb_id: str, dims: int) -> None:
     _drop_index(conn, kb_id, dims)
 
 
+def outcome_waits_for_the_table(outcome: dict) -> bool:
+    """Did this ensure stop short because another build or drop owns the table?
+
+    Its own question rather than a case of ``outcome_needs_another_attempt``,
+    because the answer is on a different clock: that one is a counted, backed-off
+    retry of this index's own repair, and this one can legitimately wait for a
+    nine-hour build of another knowledge base's index. Nothing was issued and
+    nothing counted (``_TableGate``), so the whole reconcile is simply run again
+    later; ``outcome["build_alive"]`` says whether the evidence justified the long
+    wait or the lock was held with nothing running on the table.
+    """
+    return outcome.get("status") == "table_busy"
+
+
 def outcome_needs_another_attempt(outcome: dict) -> bool:
     """Did this ensure leave work only a later run can finish?
 
@@ -2041,6 +2597,19 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
       INVALID index stays until it is dropped by hand, which is also what lets a
       later reconcile try again. ``building`` outranks all three, because it is
       the one that is still moving.
+    * ``table_busy`` -- at least one dimension needed DDL and another build or
+      drop owns ``ai.embeddings`` (``_TableGate``), so nothing was issued for it and
+      nothing was counted. ``table_busy`` lists those indexes, ``table_holders`` the
+      evidence (``table_ddl_holders``, merged by pid across dimensions) and
+      ``build_alive`` whether any holder is demonstrably running
+      (``_holder_kind``). ``reason`` is ``table_ddl_in_progress`` for a running
+      holder, ``table_held_without_a_build`` for holders that are stalled or that
+      this role cannot see, ``table_holders_unreadable`` when the evidence could
+      not be read (``evidence_error`` says why), and ``table_lock_held`` when the
+      gate is held by nobody that could be found.
+      Outranks everything, ``building`` included: it is the one outcome with work
+      left that only this knowledge base's task will come back for
+      (``outcome_waits_for_the_table``).
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
@@ -2080,6 +2649,32 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     reschedule: str | None = None
     cap_reached: int | None = None
     above_limit: list[int] = []
+    # Dimensions that reached DDL and found the table owned by another build or
+    # drop (``_TableGate``), and the evidence every refusal came with, merged by pid:
+    # a later dimension that happened to look in a window with nothing to see must
+    # not turn the earlier one's live build into "nothing is running".
+    table_busy: list[str] = []
+    table_holders: dict[int, dict] = {}
+    evidence_error: str | None = None
+    # Indexes this reconcile dropped (a repair or a definition drift) and then could
+    # not rebuild, because re-taking the locks after a replaced connection failed.
+    rebuild_deferred: list[str] = []
+
+    def defer_the_rebuild(name: str, why: str, counts: tuple[int, int, int]) -> None:
+        """Say so when the dimension had already dropped its index. No-op otherwise."""
+        if name not in repaired and name not in rebuilt:
+            return
+        rebuild_deferred.append(name)
+        logger.warning(
+            "Partial HNSW index %s.%s was dropped by this reconcile but its rebuild is "
+            "deferred: %s. The build history the drop took with it -- %d failed, %d "
+            "interrupted, %d unsettled rebuilds, carried in memory for the rebuild -- is "
+            "lost with this attempt, so the next reconcile counts from zero",
+            AI_SCHEMA,
+            name,
+            why,
+            *counts,
+        )
 
     with _autocommit_connection(engine) as conn:
         existing = per_kb_index_states(conn, kb_id)
@@ -2095,6 +2690,11 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                 # will finish it. The other dimensions are still ours.
                 blocked.append(name)
                 continue
+            # Taken only where this dimension reaches DDL -- ``gate.hold()`` before
+            # each of the four statements below that can issue one -- and given
+            # back before the per-index lock -- which it also takes again if the
+            # connection is replaced under it.
+            gate = _TableGate(conn, index_lock=lock)
             try:
                 # Re-read under the lock: another caller may have finished
                 # between the survey above and this point.
@@ -2186,12 +2786,14 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         )
                         doomed.append(dims)
                         continue
+                    gate.hold()
                     _repair_invalid(conn, kb_id, dims, prior_failures, prior_interrupted)
                     repaired.append(name)
                     valid = None
 
                 if valid is True:
                     if rows <= drop_below:
+                        gate.hold()
                         progress("dropping", dims=dims, rows=rows, rows_are_a_floor=floored)
                         logger.info(
                             "Dropping partial HNSW index %s.%s: knowledge base %s now has "
@@ -2299,6 +2901,12 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         stale_kept.append(name)
                         cap_reached = total
                         continue
+                    # Before the count, not just before the drop: the count spends one
+                    # of ``MAX_CONSECUTIVE_DEFINITION_REBUILDS``, and a busy table
+                    # refusing the drop after it would spend it on a rebuild that
+                    # never started -- three busy passes and the index is frozen on
+                    # its old definition.
+                    gate.hold()
                     if not _count_a_definition_rebuild(conn, kb_id, dims, comment):
                         # The attempt could not be put on record, so the bound above
                         # cannot advance and nothing would stop the next reconcile
@@ -2385,6 +2993,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         )
                         cap_reached = total
                         continue
+                gate.hold()
                 progress("building", dims=dims, rows=rows, rows_are_a_floor=floored)
                 floor = "at least " if floored else ""
                 logger.info(
@@ -2418,7 +3027,48 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                     prior_rebuilds=prior_rebuilds,
                 )
                 built.append(name)
+            except PerKbVectorIndexTableBusy as busy:
+                # Refused before the statement it guards: no DDL for it, no session
+                # setting lifted, no count written -- so neither build bound moves,
+                # which is right, because nothing was attempted. The one exception is a
+                # re-take after a replaced connection, where this dimension's repair or
+                # drift DROP has already run; that is said, not hidden
+                # (``defer_the_rebuild``). The task comes back on a clock of its own
+                # (``outcome_waits_for_the_table``) and logs the wait with the
+                # evidence, so the line below is only for a debug trace.
+                defer_the_rebuild(
+                    name,
+                    "the table is owned by another build or drop",
+                    (prior_failures, prior_interrupted, prior_rebuilds),
+                )
+                logger.debug(
+                    "Not touching partial HNSW index %s.%s yet: %s",
+                    AI_SCHEMA,
+                    name,
+                    busy,
+                )
+                progress(
+                    "waiting_for_table",
+                    dims=dims,
+                    holder_pids=[holder["pid"] for holder in busy.holders],
+                )
+                table_busy.append(name)
+                for holder in busy.holders:
+                    table_holders.setdefault(holder["pid"], holder)
+                evidence_error = evidence_error or busy.evidence_error
+                continue
+            except PerKbVectorIndexBuildInProgress:
+                # Only from a re-take after a replaced connection: another caller
+                # took this index's lock in the gap, and this index is its work now.
+                defer_the_rebuild(
+                    name,
+                    "another caller took this index's lock while the connection was replaced",
+                    (prior_failures, prior_interrupted, prior_rebuilds),
+                )
+                blocked.append(name)
+                continue
             finally:
+                gate.release()
                 _release_lock(conn, lock)
 
     outcome: dict = {"status": "ready", "built": built, "dropped": dropped}
@@ -2426,6 +3076,8 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
         outcome["repaired_invalid_indexes"] = repaired
     if rebuilt:
         outcome["rebuilt_stale_definitions"] = rebuilt
+    if rebuild_deferred:
+        outcome["rebuild_deferred"] = rebuild_deferred
     if stale_kept:
         outcome["stale_definitions_kept"] = stale_kept
     if above_limit:
@@ -2456,6 +3108,34 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
         outcome["reason"] = "invalid_index_build_in_progress" if reschedule else "build_lock_held"
         if reschedule:
             outcome["reschedule"] = True
+    if table_busy:
+        # Outranks even ``building``: it is the one outcome that has work left
+        # which only this knowledge base's own task will come back for, and it
+        # comes back on a clock of its own. ``build_alive`` is what the task spends
+        # its uncounted wait on, so the evidence travels with it; the skip lists
+        # set above stay in the dict for the task's summary line.
+        holders = list(table_holders.values())
+        alive = any(holder["kind"] == "running" for holder in holders)
+        if alive:
+            reason = "table_ddl_in_progress"
+        elif holders:
+            reason = "table_held_without_a_build"
+        elif evidence_error:
+            reason = "table_holders_unreadable"
+        else:
+            reason = "table_lock_held"
+        outcome.update(
+            {
+                "status": "table_busy",
+                "reason": reason,
+                "index": table_busy[0],
+                "table_busy": table_busy,
+                "table_holders": holders,
+                "build_alive": alive,
+            }
+        )
+        if evidence_error:
+            outcome["evidence_error"] = evidence_error
     return outcome
 
 
@@ -2480,7 +3160,9 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
     ``PerKbVectorIndexBuildInProgress`` where it happens. That is deliberate and
     the opposite case: another caller is working on this index right now, so the
     whole drop is worth retrying rather than partly completing, and the retry
-    reaches the dimensions this attempt did not.
+    reaches the dimensions this attempt did not. A table owned by another build
+    raises its subclass, ``PerKbVectorIndexTableBusy``, having issued nothing, and
+    the task waits for that build on the longer clock the reconcile's task uses.
 
     "Permanent" here means only "not on ``is_transient_db_error``'s list", and that
     list is about a *statement* failing. Some whole-server conditions are not on it
@@ -2503,9 +3185,19 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
                 raise PerKbVectorIndexBuildInProgress(
                     f"{AI_SCHEMA}.{name} is being built or dropped by another caller"
                 )
+            # The same DDL on the same table as the reconcile's, so the same gate:
+            # a deleted knowledge base's drop queued behind another knowledge base's
+            # build kills it at its end exactly as a repair drop does (``_TableGate``).
+            gate = _TableGate(conn, index_lock=lock)
             try:
+                gate.hold()
                 _drop_index(conn, kb_id, dims)
                 dropped.append(name)
+            except PerKbVectorIndexTableBusy:
+                # Nothing issued. Stops the loop like a held index lock does, and for
+                # the same reason: the whole drop is worth retrying, and the retry
+                # reaches the dimensions this attempt did not.
+                raise
             except Exception as exc:
                 if is_transient_db_error(exc):
                     raise
@@ -2514,6 +3206,7 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
                     "Could not drop partial HNSW index %s.%s", AI_SCHEMA, name, exc_info=True
                 )
             finally:
+                gate.release()
                 _release_lock(conn, lock)
 
     if failed:
@@ -2569,6 +3262,13 @@ SWEEP_TIMEOUT_MS = 5_000
 # 1.3 GB of build memory at the default setting even if the queue runs them all
 # in parallel, and is more than a project crosses the threshold with between two
 # boots in practice.
+#
+# The queue no longer runs them in parallel against the database, and nothing
+# here has to arrange that: every dispatched reconcile that needs DDL takes the
+# table gate (``_TableGate``) first, so one builds and the others return
+# ``table_busy`` at once and wait in the task queue, not in Postgres' lock queue.
+# The dispatch stays plain -- no stagger, no countdown -- because the gate is the
+# only serialiser, and a second one here would be a second place to get it wrong.
 #
 # Nothing is dropped by the cap: the next source to finish indexing in each
 # knowledge base dispatches the same reconcile, and so does the next start-up.

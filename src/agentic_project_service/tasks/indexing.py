@@ -13,7 +13,7 @@ import re
 import traceback
 
 from ..celery import celery_app
-from celery.exceptions import SoftTimeLimitExceeded
+from celery.exceptions import Reject, Retry, SoftTimeLimitExceeded
 from sqlalchemy import text
 
 from agentic.llm.cost_accumulator import init_accumulator, install
@@ -3197,6 +3197,326 @@ def dispatch_per_kb_vector_indexes_at_start(engine) -> list[str]:
     return dispatched
 
 
+# How long a per-knowledge-base index task waits between looks at a table that
+# another build or drop owns (``pg_vector_index.outcome_waits_for_the_table``), and
+# how many such looks it takes before giving up.
+#
+# A fixed countdown rather than ``_pg_bm25_retry_countdown``'s backoff, because
+# what is being waited for is not contention that clears in seconds but a build
+# that measured 25 s, 63 min and 9.6 h on one production project's three
+# knowledge bases. Ten minutes is a poll, not a spin, and the task holds no worker
+# slot and no connection between looks. A look is not free, though: it is a whole
+# reconcile survey -- a settings read, the knowledge base's index catalog, its
+# candidate dimensions and a bounded row count per dimension -- before the one
+# advisory lock try and ``pg_locks`` read that refuse it. That is why there is one
+# waiter per knowledge base and not one per dispatch (``_claim_waiter``).
+#
+# Not charged to ``PG_BM25_TASK_MAX_RETRIES``. That budget is seven attempts over
+# about half an hour, and a knowledge base queued behind the 9.6-hour build would
+# spend it in the first half hour and be dropped until the next indexed source or
+# start-up. The waits are counted separately (the task's ``table_waits``) and
+# bounded on their own: 288 looks is 48 hours, five times the longest build
+# measured and room for a queue of several large ones -- the boot sweep dispatches
+# up to ``MAX_SWEEP_DISPATCH`` at once, and they build one at a time. Past it the
+# task gives up at ERROR and fails (``PerKbVectorIndexTableWaitExhausted``), and
+# the next indexed source or start-up dispatches it again. A wait is spent only
+# while ``build_alive`` is true -- a holder that is demonstrably *running*
+# (``pg_vector_index._holder_kind``); a table held by a session idle in a
+# transaction, by one this role cannot see, or by nobody that can be found falls
+# back to the counted, backed-off retry, so neither a leaked lock nor a forgotten
+# ``LOCK TABLE`` can keep a task polling for two days.
+PER_KB_TABLE_WAIT_COUNTDOWN_S = 600
+PER_KB_TABLE_MAX_WAITS = 288
+
+# A build still running after this long is logged at WARNING rather than INFO on
+# every look: twelve hours is past the longest build measured, so it is either a
+# very large knowledge base or a build stuck in a wait -- an open transaction, or
+# a snapshot like a long ``pg_dump`` -- that an operator should look at.
+PER_KB_TABLE_WAIT_WARN_AFTER_S = 12 * 3600
+
+# How long the one-waiter marker lives without being renewed: two looks. The
+# waiter renews it on every look; a waiter that died stops renewing it, and after
+# this the next dispatch for the knowledge base becomes the waiter instead.
+PER_KB_TABLE_WAITER_TTL_S = 2 * PER_KB_TABLE_WAIT_COUNTDOWN_S
+
+# Short, because the marker is an optimisation: a Redis that does not answer
+# costs the de-duplication, never the reconcile.
+_WAITER_REDIS_TIMEOUT_S = 2.0
+
+_waiter_client = None
+
+
+def _waiter_redis():
+    """The broker's Redis, which is where the one-waiter marker lives."""
+    global _waiter_client
+    if _waiter_client is None:
+        import redis
+
+        _waiter_client = redis.from_url(
+            os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"),
+            socket_timeout=_WAITER_REDIS_TIMEOUT_S,
+            socket_connect_timeout=_WAITER_REDIS_TIMEOUT_S,
+        )
+    return _waiter_client
+
+
+def _waiter_key(kb_id: str) -> str:
+    """The marker's key, from the canonical id: one knowledge base, one key, however spelt."""
+    canonical = pg_vector_index._validated_kb_id(kb_id)
+    return f"per_kb_vector_index:table_waiter:{os.getenv('PROJECT_REF', 'default')}:{canonical}"
+
+
+def _waiter_pending_key(kb_id: str) -> str:
+    """Set by a dispatch the waiter superseded: "run once more when you are done"."""
+    return _waiter_key(kb_id) + ":pending"
+
+
+def _mark_pending(kb_id: str) -> None:
+    try:
+        _waiter_redis().set(_waiter_pending_key(kb_id), "1", ex=PER_KB_TABLE_WAITER_TTL_S)
+    except Exception:
+        logger.debug("Could not mark KB %s's reconcile as pending", kb_id, exc_info=True)
+
+
+def _clear_pending(kb_id: str) -> None:
+    try:
+        _waiter_redis().delete(_waiter_pending_key(kb_id))
+    except Exception:
+        logger.debug("Could not clear KB %s's pending reconcile", kb_id, exc_info=True)
+
+
+def _decoded(value) -> str | None:
+    if value is None:
+        return None
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def _current_waiter(kb_id: str) -> str | None:
+    """The task id waiting for the table on this knowledge base's behalf, if any.
+
+    One waiter per knowledge base, because every source that finishes indexing
+    dispatches a reconcile: during a nine-hour build of another knowledge base's
+    index, a catalogue import into this one would otherwise turn every one of those
+    dispatches into its own ten-minute poller for up to 48 hours, each running the
+    whole survey. The marker makes every dispatch after the first a couple of Redis
+    round trips that end ``superseded``.
+
+    A superseded dispatch also leaves ``_waiter_pending_key`` behind, and the waiter
+    that gives the marker back re-dispatches the reconcile once if it finds it
+    (``_release_waiter``). That closes the window a look-based waiter otherwise has:
+    a dispatch sent for something that arrived after the waiter's last survey --
+    during the final look, say -- used to be dropped with nothing coming back for it.
+    What it does not close is a waiter that dies: the marker then stays until it
+    expires, at most ``PER_KB_TABLE_WAITER_TTL_S`` after its last renewal, every
+    dispatch until then is superseded, and nobody re-runs them -- the next indexed
+    source or start-up does.
+    """
+    try:
+        return _decoded(_waiter_redis().get(_waiter_key(kb_id)))
+    except Exception as exc:
+        logger.warning(
+            "Could not read the vector index waiter of KB %s (%s); reconciling without "
+            "the one-waiter check",
+            kb_id,
+            pg_vector_index.first_error_line(exc),
+        )
+        return None
+
+
+def _claim_waiter(kb_id: str, task_id: str) -> str:
+    """Become this knowledge base's waiter, or learn who is. Renews the owner's claim.
+
+    Answers the waiter's task id: ``task_id`` when this task is (or already was)
+    the waiter. A Redis that does not answer makes every task its own waiter, which
+    is where this started.
+    """
+    key = _waiter_key(kb_id)
+    try:
+        client = _waiter_redis()
+        if client.set(key, task_id, nx=True, ex=PER_KB_TABLE_WAITER_TTL_S):
+            return task_id
+        current = _decoded(client.get(key))
+        if current == task_id:
+            client.expire(key, PER_KB_TABLE_WAITER_TTL_S)
+            return task_id
+        if current is None and client.set(key, task_id, nx=True, ex=PER_KB_TABLE_WAITER_TTL_S):
+            return task_id
+        return current or task_id
+    except Exception as exc:
+        logger.warning(
+            "Could not claim the vector index waiter of KB %s (%s); waiting without the "
+            "one-waiter marker",
+            kb_id,
+            pg_vector_index.first_error_line(exc),
+        )
+        return task_id
+
+
+def _release_waiter(kb_id: str, task_id: str) -> None:
+    """Give the marker back, if it is still this task's, and re-run what it superseded.
+
+    Compare-and-delete under ``WATCH``, so a marker that expired and was claimed by
+    another task in between is left to that task. The pending flag is read and
+    cleared in the same transaction, and a set one dispatches the reconcile once,
+    however many dispatches were superseded -- the one it dispatches surveys afresh.
+    Never raises.
+    """
+    try:
+        key = _waiter_key(kb_id)
+        pending_key = _waiter_pending_key(kb_id)
+        pending = None
+        with _waiter_redis().pipeline() as pipe:
+            pipe.watch(key)
+            if _decoded(pipe.get(key)) != task_id:
+                pipe.unwatch()
+                return
+            pipe.multi()
+            pipe.delete(key)
+            pipe.get(pending_key)
+            pipe.delete(pending_key)
+            pending = pipe.execute()[1]
+    except Exception:
+        logger.debug("Could not release the vector index waiter of KB %s", kb_id, exc_info=True)
+        return
+    if pending is None:
+        return
+    try:
+        ensure_per_kb_vector_index.delay(kb_id)
+        logger.info(
+            "Re-dispatched KB %s's vector index reconcile: dispatches arrived while this "
+            "task was waiting for the embeddings table on its behalf",
+            kb_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not re-dispatch KB %s's vector index reconcile for the dispatches it "
+            "superseded (%s); the next indexed source or start-up picks it up",
+            kb_id,
+            pg_vector_index.first_error_line(exc),
+        )
+
+
+def _counted_retries(task, table_waits: int) -> int:
+    """Celery's retry counter, less the table waits it also counts.
+
+    Every ``self.retry`` advances ``request.retries`` -- the waits included -- so
+    the counted budget is what is left once they are taken out.
+    """
+    return max(0, task.request.retries - max(0, table_waits))
+
+
+def _reschedule(task, kb_id: str, what: str, *, orphans: bool = False, **retry_kwargs):
+    """``task.retry(..., throw=False)``, and an ERROR naming the KB when even that fails.
+
+    ``throw=False`` does not make it safe: a publish the broker refuses comes back
+    as ``Reject`` whatever ``throw`` says, and every log line that says a retry was
+    scheduled is written after this returns. So a refused retry used to leave
+    nothing behind at all -- and for a deleted knowledge base's drop, which nothing
+    else ever dispatches again, an orphaned index nobody was told about.
+    """
+    try:
+        return task.retry(throw=False, **retry_kwargs)
+    except Retry:
+        raise
+    except Exception as exc:
+        # Celery hands a refused publish back as ``Reject(<the broker's error>, False)``,
+        # whose text is that tuple; the cause is what an operator needs to read.
+        cause = (
+            exc.reason if isinstance(exc, Reject) and isinstance(exc.reason, BaseException) else exc
+        )
+        orphaned = ""
+        if orphans:
+            orphaned = (
+                ". Its index(es) are orphaned — named after a knowledge base that no "
+                "longer exists — and have to be dropped by hand: "
+                + (", ".join(_orphaned_vector_index_names(kb_id)) or "(names unavailable)")
+            )
+        logger.error(
+            "Could not reschedule the vector index %s for KB %s: the retry itself failed "
+            "(%s); nothing will come back to it until it is dispatched again%s",
+            what,
+            kb_id,
+            pg_vector_index.first_error_line(cause),
+            orphaned,
+        )
+        raise
+
+
+def _wait_for_the_table(task, kb_id: str, table_waits: int, holders, what: str, *, orphans=False):
+    """Reschedule a task for when the table is free, uncounted.
+
+    Raises ``PerKbVectorIndexTableWaitExhausted`` after an ERROR past the bound, so
+    the task ends in failure rather than a SUCCESS carrying a give-up.
+
+    ``max_retries`` is passed because Celery refuses a retry once
+    ``request.retries + 1`` exceeds it, and the waits advance that counter: the
+    ceiling moves by exactly the waits the counted budget does not charge. The
+    count rides in the task's ``table_waits`` keyword, which is the one piece of a
+    retry Celery carries across re-deliveries unchanged.
+    """
+    holder_text = pg_vector_index.describe_table_holders(holders)
+    if table_waits >= PER_KB_TABLE_MAX_WAITS:
+        orphaned = ""
+        if orphans:
+            orphaned = (
+                " Its index(es) are orphaned — named after a knowledge base that no longer "
+                "exists — and have to be dropped by hand once the table is free: "
+                + (", ".join(_orphaned_vector_index_names(kb_id)) or "(names unavailable)")
+            )
+        else:
+            orphaned = (
+                " Nothing was issued; the next indexed source or start-up dispatches this again."
+            )
+        logger.error(
+            "Giving up waiting to %s for KB %s after %d looks %d s apart, each of which "
+            "found another build or drop owning the embeddings table (at the last one: %s).%s",
+            what,
+            kb_id,
+            table_waits,
+            PER_KB_TABLE_WAIT_COUNTDOWN_S,
+            holder_text,
+            orphaned,
+        )
+        raise pg_vector_index.PerKbVectorIndexTableWaitExhausted(
+            f"gave up waiting to {what} for KB {kb_id} after {table_waits} looks"
+        )
+    kwargs = {**(task.request.kwargs or {}), "table_waits": table_waits + 1}
+    retry = _reschedule(
+        task,
+        kb_id,
+        what,
+        orphans=orphans,
+        kwargs=kwargs,
+        countdown=PER_KB_TABLE_WAIT_COUNTDOWN_S,
+        max_retries=task.max_retries + table_waits + 1,
+    )
+    oldest = max(
+        (h.get("running_s") or 0 for h in holders if h.get("kind") == "running"), default=0
+    )
+    logger.log(
+        logging.WARNING if oldest >= PER_KB_TABLE_WAIT_WARN_AFTER_S else logging.INFO,
+        "Waiting to %s for KB %s: another build or drop owns the embeddings table (%s). "
+        "Looking again in %d s (wait %d of %d, not counted against the retry budget)",
+        what,
+        kb_id,
+        holder_text,
+        PER_KB_TABLE_WAIT_COUNTDOWN_S,
+        table_waits + 1,
+        PER_KB_TABLE_MAX_WAITS,
+    )
+    return retry
+
+
+# The skip lists an ensure outcome can carry alongside a status that outranks
+# them, kept on the task's summary line (``ensure_per_kb_vector_index``).
+_SUMMARISED_SKIPS = (
+    "build_repeatedly_failed",
+    "dims_above_hnsw_limit",
+    "definition_rebuilds_not_settling",
+    "index_count",
+)
+
+
 def _vector_index_log_fields(fields: dict) -> str:
     """Render ``key=value`` pairs for one of the log lines below.
 
@@ -3231,7 +3551,7 @@ def _vector_index_dims(*name_lists) -> str:
 
 @celery_app.task(bind=True, max_retries=PG_BM25_TASK_MAX_RETRIES)
 @billing.no_billing_context
-def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
+def ensure_per_kb_vector_index(self, kb_id: str, table_waits: int = 0) -> dict:
     """Build, repair or drop this knowledge base's own partial HNSW index.
 
     Idempotent, and a no-op for a knowledge base that is between the two
@@ -3251,6 +3571,19 @@ def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
     index's build lock held by another caller is **not** that case and does not
     retry -- that caller is doing this index's work.
 
+    And it waits, on a clock of its own, when another knowledge base's build or
+    drop owns the table (``outcome_waits_for_the_table``): every
+    ``PER_KB_TABLE_WAIT_COUNTDOWN_S``, up to ``PER_KB_TABLE_MAX_WAITS`` times, and
+    without charging the counted budget while that build is demonstrably alive.
+    ``table_waits`` is how many such waits came before this run; the counted
+    attempts are Celery's ``request.retries`` less those (``_counted_retries``).
+    One task waits per knowledge base (``_current_waiter``), on either path: a
+    dispatch that finds another task waiting ends ``superseded`` before surveying
+    anything, and the waiter re-dispatches the reconcile once when it is done. A
+    dispatch superseded by a waiter that then dies is the one that is lost: the
+    marker blocks new ones for at most ``PER_KB_TABLE_WAITER_TTL_S`` after the
+    waiter's last look, and the next indexed source or start-up re-runs it.
+
     Every run leaves two kinds of ``per_kb_vector_index`` line: one per state the
     service enters, as it enters it, and one summary with the outcome and how
     long it took. The first is why the service's ``on_progress`` hook is passed
@@ -3260,10 +3593,45 @@ def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
     There is deliberately no builds table and no status field on the knowledge
     base yet; these lines are the whole of it.
     """
+    task_id = self.request.id
+    if task_id:
+        waiter = _current_waiter(kb_id)
+        if waiter and waiter != task_id:
+            # Pending first, then look again: a waiter that gave the marker back
+            # between the two reads found no pending flag, so nobody would re-run
+            # this dispatch -- in that case it runs itself.
+            _mark_pending(kb_id)
+            waiter = _current_waiter(kb_id)
+            if waiter and waiter != task_id:
+                logger.info(
+                    "per_kb_vector_index kb=%s outcome=superseded waiter=%s: another task "
+                    "is already waiting for the embeddings table on this knowledge base's "
+                    "behalf, and re-dispatches this once it is done",
+                    kb_id,
+                    waiter,
+                )
+                return {"status": "superseded", "waiter": waiter, "built": [], "dropped": []}
+            _clear_pending(kb_id)
+    waiting = {"kept": False}
+    try:
+        return _ensure_per_kb_vector_index(self, kb_id, table_waits, waiting)
+    finally:
+        # The marker goes with the wait: anything but a rescheduled table_busy -- a
+        # result, any other retry, a give-up, a failure -- gives it back, so the next
+        # dispatch for this knowledge base surveys instead of being superseded by a
+        # task that is no longer waiting; and whatever was superseded meanwhile is
+        # re-dispatched once (``_release_waiter``).
+        if task_id and not waiting["kept"]:
+            _release_waiter(kb_id, task_id)
+
+
+def _ensure_per_kb_vector_index(self, kb_id: str, table_waits: int, waiting: dict) -> dict:
+    """The body of ``ensure_per_kb_vector_index``, inside its one-waiter marker."""
     import time
 
     started = time.monotonic()
-    attempt = self.request.retries + 1
+    counted = _counted_retries(self, table_waits)
+    attempt = counted + 1
     events: list[str] = []
     progress_fields: dict = {}
 
@@ -3307,21 +3675,28 @@ def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
             )
             raise
         reason = pg_vector_index.first_error_line(exc)
-        if self.request.retries >= self.max_retries:
+        if counted >= self.max_retries:
             logger.error(
                 "Giving up on the vector index build for KB %s after %d attempts: %s",
                 kb_id,
-                self.request.retries + 1,
+                attempt,
                 reason,
             )
             raise
-        countdown = _pg_bm25_retry_countdown(self.request.retries)
-        retry = self.retry(exc=exc, countdown=countdown, throw=False)
+        countdown = _pg_bm25_retry_countdown(counted)
+        retry = _reschedule(
+            self,
+            kb_id,
+            "build",
+            exc=exc,
+            countdown=countdown,
+            max_retries=self.max_retries + table_waits,
+        )
         logger.info(
             "Retrying the vector index build for KB %s in %d s (attempt %d of %d): %s",
             kb_id,
             countdown,
-            self.request.retries + 2,
+            attempt + 1,
             self.max_retries + 1,
             reason,
         )
@@ -3346,7 +3721,85 @@ def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
         **({"rebuilt_stale": rebuilt_stale} if rebuilt_stale else {}),
         **({"stale_kept": stale_kept} if stale_kept else {}),
         **({"reason": outcome["reason"]} if outcome.get("reason") else {}),
+        **({"table_waits": table_waits} if table_waits else {}),
+        # A ``table_busy`` outcome overwrites the status and reason a skip set,
+        # and the skip is still true -- so its list is kept on the summary line.
+        **{key: outcome[key] for key in _SUMMARISED_SKIPS if outcome.get(key)},
     )
+
+    # Another knowledge base's build or drop owns the table, and this reconcile
+    # issued nothing (``pg_vector_index._TableGate``). Checked first: it can wait
+    # for hours where the reschedule below is counted and backed off, and the next
+    # run redoes everything below anyway.
+    if pg_vector_index.outcome_waits_for_the_table(outcome):
+        index = outcome.get("index") or "(index unnamed)"
+        holders = outcome.get("table_holders") or []
+        # One waiter per knowledge base whichever way it waits: the counted path too,
+        # or N dispatches during a stalled holder became N×7 counted surveys.
+        task_id = self.request.id
+        if task_id:
+            waiter = _claim_waiter(kb_id, task_id)
+            if waiter != task_id:
+                # Another task became the waiter while this one surveyed.
+                _mark_pending(kb_id)
+                logger.info(
+                    "per_kb_vector_index kb=%s outcome=superseded waiter=%s: another task "
+                    "is already waiting for the embeddings table on this knowledge base's "
+                    "behalf",
+                    kb_id,
+                    waiter,
+                )
+                return {**outcome, "status": "superseded", "waiter": waiter}
+        if outcome.get("build_alive"):
+            retry = _wait_for_the_table(
+                self, kb_id, table_waits, holders, f"reconcile vector index {index}"
+            )
+            waiting["kept"] = True
+            raise retry
+        # Refused, and nothing demonstrably running: a session idle in a transaction
+        # holding the table, holders this role cannot see, unreadable evidence, or a
+        # gate held by nobody that can be found. None of them is worth the long
+        # uncounted wait, so the ordinary counted, backed-off retry -- at WARNING
+        # when there is someone or something to name.
+        holder_text = pg_vector_index.describe_table_holders(holders, outcome.get("evidence_error"))
+        noteworthy = bool(holders or outcome.get("evidence_error"))
+        if counted >= self.max_retries:
+            logger.error(
+                "Giving up on KB %s's vector index reconcile after %d attempts: the "
+                "embeddings table was held against index builds each time with no build "
+                "demonstrably running (%s). Nothing was issued for %s; the next indexed "
+                "source or start-up dispatches this again",
+                kb_id,
+                attempt,
+                holder_text,
+                index,
+            )
+            raise pg_vector_index.PerKbVectorIndexTableWaitExhausted(
+                f"gave up on KB {kb_id}'s vector index reconcile after {attempt} attempts"
+            )
+        countdown = _pg_bm25_retry_countdown(counted)
+        retry = _reschedule(
+            self,
+            kb_id,
+            "reconcile",
+            countdown=countdown,
+            max_retries=self.max_retries + table_waits,
+        )
+        logger.log(
+            logging.WARNING if noteworthy else logging.INFO,
+            "Rescheduling KB %s's vector index reconcile in %d s (attempt %d of %d): the "
+            "embeddings table is held against index builds and nothing is demonstrably "
+            "running a build (%s)",
+            kb_id,
+            countdown,
+            attempt + 1,
+            self.max_retries + 1,
+            holder_text,
+        )
+        # The counted countdown is at most 750 s, inside the marker's TTL, so the
+        # marker outlives the gap and this task stays the one that comes back.
+        waiting["kept"] = True
+        raise retry
 
     # An INVALID index the ensure had to leave alone, because a build of it was
     # still running, is the one outcome nothing comes back to: the index answers
@@ -3355,7 +3808,7 @@ def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
     # has to come back -- ordinary lock contention deliberately does not, because
     # whoever holds the lock is doing the work right now.
     if pg_vector_index.outcome_needs_another_attempt(outcome):
-        if self.request.retries >= self.max_retries:
+        if counted >= self.max_retries:
             logger.error(
                 "Giving up on repairing KB %s's INVALID vector index after %d attempts: a "
                 "build of it was still running each time. It answers no query and is "
@@ -3366,8 +3819,14 @@ def ensure_per_kb_vector_index(self, kb_id: str) -> dict:
                 outcome.get("index") or outcome.get("indexes") or "(index unnamed)",
             )
             return outcome
-        countdown = _pg_bm25_retry_countdown(self.request.retries)
-        retry = self.retry(countdown=countdown, throw=False)
+        countdown = _pg_bm25_retry_countdown(counted)
+        retry = _reschedule(
+            self,
+            kb_id,
+            "repair",
+            countdown=countdown,
+            max_retries=self.max_retries + table_waits,
+        )
         logger.info(
             "Rescheduling KB %s's vector index reconcile in %d s (attempt %d of %d): %s",
             kb_id,
@@ -3398,15 +3857,28 @@ def _orphaned_vector_index_names(kb_id: str) -> list[str]:
 
 @celery_app.task(bind=True, max_retries=PG_BM25_TASK_MAX_RETRIES)
 @billing.no_billing_context
-def drop_per_kb_vector_index(self, kb_id: str) -> dict:
+def drop_per_kb_vector_index(self, kb_id: str, table_waits: int = 0) -> dict:
     """Drop every partial HNSW index a deleted knowledge base owned.
 
     KB delete dispatches this: the row is gone, so nothing will reconcile the
     index again, and Postgres would keep maintaining an index named after a
     knowledge base that no longer exists on every write to ai.embeddings.
     Retries on contention so an index is not orphaned by a build that happened
-    to be running.
+    to be running -- and waits, uncounted, while another knowledge base's build owns
+    the table, on the same clock as ``ensure_per_kb_vector_index``: nothing else
+    ever comes back to a deleted knowledge base, so it matters more here than there
+    that seven counted attempts are not spent in the first half hour of a nine-hour
+    build.
+
+    **Nothing re-dispatches this.** A give-up, a broker that refuses the retry, or
+    a message a worker cannot run (one carrying ``table_waits``, delivered to a
+    worker from before that keyword existed during a rolling deploy) leaves the
+    index orphaned for good. Every such path logs the names at ERROR where it can;
+    the operator's check for the ones it could not is any ``hnsw_kb_<hex>_<dims>``
+    index on ``ai.embeddings`` whose ``<hex>`` is no ``ai.knowledge_bases`` id --
+    drop those by hand, once no build is running on the table.
     """
+    counted = _counted_retries(self, table_waits)
     try:
         return pg_vector_index.drop_per_kb_vector_indexes(kb_id)
     except Exception as exc:
@@ -3415,8 +3887,20 @@ def drop_per_kb_vector_index(self, kb_id: str) -> dict:
             or pg_vector_index.is_transient_db_error(exc)
         ):
             raise
+        if isinstance(exc, pg_vector_index.PerKbVectorIndexTableBusy) and exc.build_alive:
+            retry = _wait_for_the_table(
+                self,
+                kb_id,
+                table_waits,
+                exc.holders,
+                "drop the deleted knowledge base's index",
+                orphans=True,
+            )
+            raise retry from exc
+        # For a refused gate the exception's own text names who holds the table (or
+        # that nobody could be found), so the lines below say what happened.
         reason = pg_vector_index.first_error_line(exc)
-        if self.request.retries >= self.max_retries:
+        if counted >= self.max_retries:
             # Nothing comes back to this: the knowledge base row is already gone,
             # so neither the indexing dispatch nor the start-up sweep will ever
             # see it again. Name the indexes so an operator can drop them by
@@ -3427,13 +3911,21 @@ def drop_per_kb_vector_index(self, kb_id: str) -> dict:
                 "and maintained on every write to the embeddings table — and have to be "
                 "dropped by hand: %s",
                 kb_id,
-                self.request.retries + 1,
+                counted + 1,
                 reason,
                 ", ".join(_orphaned_vector_index_names(kb_id)) or "(names unavailable)",
             )
             raise
-        countdown = _pg_bm25_retry_countdown(self.request.retries)
-        retry = self.retry(exc=exc, countdown=countdown, throw=False)
+        countdown = _pg_bm25_retry_countdown(counted)
+        retry = _reschedule(
+            self,
+            kb_id,
+            "drop",
+            orphans=True,
+            exc=exc,
+            countdown=countdown,
+            max_retries=self.max_retries + table_waits,
+        )
         logger.info(
             "Retrying the vector index drop for KB %s in %d s: %s", kb_id, countdown, reason
         )
