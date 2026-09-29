@@ -414,7 +414,7 @@ def test_a_document_level_store_is_exact_below_the_cap(engine, schema, query_vec
         found, recorder = _search(engine, KB_SMALL, vector, store=_DocumentStore)
         _assert_exact_kb_btree_plan(recorder.plans[0])
         assert found == _truth(engine, KB_SMALL, vector, item_table="full_documents")
-    assert not [s for s in recorder.statements if "pg_class" in s], (
+    assert not [s for s in recorder.statements if "pg_class" in s or "to_regclass" in s], (
         "a store the per-KB index never covers must not ask the catalog"
     )
 

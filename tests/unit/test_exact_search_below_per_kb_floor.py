@@ -146,6 +146,8 @@ class _Session:
             self.settings[guc] = params[raw[1:]] if raw.startswith(":") else raw.strip("'")
             return _Result([(self.settings[guc],)])
         if "FROMpg_class" in flat:
+            # Answered like the real catalog would, so that a search which did
+            # read it is caught by ``_catalog_probes`` rather than by a crash.
             name = pvi.per_kb_index_name(_KB_ID, _DIMS)
             return _Result([(name, True, None)] if self.own_index else [])
         if "count(*)" in flat:
@@ -198,7 +200,8 @@ def _counts(session: _Session) -> list[str]:
 
 
 def _catalog_probes(session: _Session) -> list[str]:
-    return [sql for sql, _ in session.statements if "pg_class" in sql]
+    """Every statement that asks the catalog about a per-KB index, by either route."""
+    return [sql for sql, _ in session.statements if "pg_class" in sql or "to_regclass" in sql]
 
 
 # ---------------------------------------------------------------------------
@@ -263,12 +266,35 @@ def test_an_unindexed_knowledge_base_over_the_cap_keeps_todays_behaviour():
 
 
 def test_the_setting_at_zero_turns_it_off(_setting):
+    """Off costs nothing beyond the one catalog probe every unrestricted chunks
+    search already made before this existed."""
     _setting[SETTING] = 0
     session = _run(own_index=False, kb_rows=1)
     assert not _is_exact_shape(_search_sql(session))
     assert not _counts(session), "off must cost nothing"
-    assert not _catalog_probes(session), "off must cost nothing"
+    assert len(_catalog_probes(session)) == 1, session.statements
     assert "enable_seqscan" not in "".join(sql for sql, _ in session.statements)
+
+
+def test_the_catalog_is_asked_once_and_by_the_probe_the_index_path_already_makes():
+    """Whether a knowledge base has its own index is the question
+    ``_preferring_this_kbs_partial_index`` already asks on every unrestricted
+    chunks search. Asking it a second time, through a different reader, cost an
+    indexed knowledge base a savepointed catalog read on every search -- measured
+    +1.8 ms end to end, three round trips -- for an answer it already had."""
+    for own_index in (True, False):
+        session = _run(own_index=own_index, kb_rows=300)
+        probes = _catalog_probes(session)
+        assert len(probes) == 1, session.statements
+        assert "to_regclass" in probes[0] and "indisvalid" in probes[0], probes
+
+
+def test_an_indexed_knowledge_base_runs_exactly_the_statements_it_ran_before(_setting):
+    """Not one statement more than with the feature off."""
+    with_it = [sql for sql, _ in _run(own_index=True, kb_rows=300).statements]
+    _setting[SETTING] = 0
+    without = [sql for sql, _ in _run(own_index=True, kb_rows=300).statements]
+    assert with_it == without
 
 
 def test_the_cap_is_the_setting_and_the_count_stops_one_past_it():
@@ -392,7 +418,7 @@ def test_a_restricted_search_keeps_its_own_exact_path_and_pays_for_nothing_new(r
 
 
 def test_a_catalog_probe_that_fails_keeps_todays_path_on_a_usable_transaction():
-    session = _run(own_index=False, kb_rows=300, fail_at="FROMpg_class")
+    session = _run(own_index=False, kb_rows=300, fail_at="to_regclass")
     assert not _is_exact_shape(_search_sql(session))
     assert not _counts(session), session.statements
 
