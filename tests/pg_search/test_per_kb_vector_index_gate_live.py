@@ -411,25 +411,59 @@ def _hold_the_gate(raw_dsn: str) -> psycopg.Connection:
     return conn
 
 
-def test_a_held_gate_with_no_build_running_is_reported_as_a_dead_holder(schema, engine, raw_dsn):
-    """What the brief calls "held but nothing running": the counted, backed-off case."""
+def _nothing_waits_on_a_lock(engine) -> None:
+    with engine.connect() as conn:
+        waiting = conn.execute(
+            text(
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                "AND datname = current_database()"
+            )
+        ).scalar()
+        conn.rollback()
+    assert waiting == 0, "no backend of the refused reconcile may be waiting on a lock"
+
+
+def test_the_gate_holder_between_two_statements_is_found_and_counts_as_running(
+    schema, engine, raw_dsn
+):
+    """The advisory holder is looked up by its key, which only a real server can check.
+
+    ``pg_try_advisory_lock(bigint)`` files the key as ``classid``/``objid``; the lookup
+    puts it back together. A holder that took the gate a moment ago and has shown no
+    table lock yet is a caller mid-reconcile, and is waited for like a build.
+    """
     holder = _hold_the_gate(raw_dsn)
     try:
+        holder_pid = holder.info.backend_pid
         outcome = pvi.ensure_per_kb_vector_index(KB_B, engine=engine)
         assert outcome["status"] == "table_busy", outcome
-        assert outcome["reason"] == "table_lock_held", outcome
-        assert outcome["build_alive"] is False, outcome
+        assert outcome["build_alive"] is True, outcome
+        found = outcome["table_holders"]
+        assert [(h["pid"], h["lock"], h["kind"]) for h in found] == [
+            (holder_pid, "advisory", "running")
+        ], found
         assert _queued_on_the_table(raw_dsn) == []
         assert _index_state(raw_dsn, KB_B) is None
-        with engine.connect() as conn:
-            waiting = conn.execute(
-                text(
-                    "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-                    "AND datname = current_database()"
-                )
-            ).scalar()
-            conn.rollback()
-        assert waiting == 0, "no backend of the refused reconcile may be waiting on a lock"
+        _nothing_waits_on_a_lock(engine)
+    finally:
+        holder.close()
+
+
+def test_a_gate_held_by_an_idle_session_is_not_a_build(schema, engine, raw_dsn, monkeypatch):
+    """What the brief calls "held but nothing running": the counted, backed-off case."""
+    monkeypatch.setattr(pvi, "_GATE_HOLDER_IDLE_GRACE_S", 0)
+    holder = _hold_the_gate(raw_dsn)
+    try:
+        time.sleep(1.2)
+        outcome = pvi.ensure_per_kb_vector_index(KB_B, engine=engine)
+        assert outcome["status"] == "table_busy", outcome
+        assert outcome["reason"] == "table_held_without_a_build", outcome
+        assert outcome["build_alive"] is False, outcome
+        assert outcome["table_holders"][0]["kind"] == "stalled", outcome
+        assert outcome["table_holders"][0]["idle_s"] >= 1, outcome
+        assert _queued_on_the_table(raw_dsn) == []
+        assert _index_state(raw_dsn, KB_B) is None
+        _nothing_waits_on_a_lock(engine)
     finally:
         holder.close()
 
@@ -437,6 +471,218 @@ def test_a_held_gate_with_no_build_running_is_reported_as_a_dead_holder(schema, 
     outcome = pvi.ensure_per_kb_vector_index(KB_B, engine=engine)
     assert outcome["status"] == "ready", outcome
     assert _index_state(raw_dsn, KB_B) is True
+
+
+def test_a_table_held_idle_in_transaction_refuses_the_gate_but_is_not_a_build(
+    schema, engine, raw_dsn
+):
+    """A forgotten ``LOCK TABLE`` is not something that finishes; it must not buy 48 h of waits."""
+    idle = psycopg.connect(raw_dsn)
+    idle.execute(f"LOCK TABLE {SCHEMA}.embeddings IN SHARE MODE")
+    try:
+        time.sleep(1.1)
+        outcome = pvi.ensure_per_kb_vector_index(KB_B, engine=engine)
+        assert outcome["status"] == "table_busy", outcome
+        assert outcome["build_alive"] is False, outcome
+        assert outcome["reason"] == "table_held_without_a_build", outcome
+        (holder,) = outcome["table_holders"]
+        assert holder["pid"] == idle.info.backend_pid, holder
+        assert (holder["state"], holder["kind"], holder["mode"]) == (
+            "idle in transaction",
+            "stalled",
+            "ShareLock",
+        ), holder
+        # The ages that tell an operator how long it has sat there -- the statement's
+        # own age says almost nothing about that.
+        assert holder["xact_s"] >= 1 and holder["idle_s"] >= 1, holder
+        assert _queued_on_the_table(raw_dsn) == []
+    finally:
+        idle.rollback()
+        idle.close()
+
+
+# ---------------------------------------------------------------------------
+# A role that cannot see other roles' backends
+# ---------------------------------------------------------------------------
+
+_READER_ROLE = "per_kb_gate_live_reader"
+
+
+@pytest.fixture
+def unprivileged_engine(raw_dsn, engine, schema):
+    """The gate's own reads, as a role without pg_read_all_stats."""
+    with psycopg.connect(raw_dsn, autocommit=True) as conn:
+        conn.execute(f"DROP ROLE IF EXISTS {_READER_ROLE}")
+        conn.execute(f"CREATE ROLE {_READER_ROLE} LOGIN PASSWORD 'reader'")
+        conn.execute(f"GRANT USAGE ON SCHEMA {SCHEMA} TO {_READER_ROLE}")
+    url = engine.url.set(username=_READER_ROLE, password="reader")
+    eng = create_engine(url)
+    yield eng
+    eng.dispose()
+    with psycopg.connect(raw_dsn, autocommit=True) as conn:
+        conn.execute(f"DROP OWNED BY {_READER_ROLE}")
+        conn.execute(f"DROP ROLE IF EXISTS {_READER_ROLE}")
+
+
+@pytest.mark.timeout(90)
+def test_a_holder_another_role_runs_is_unknown_without_pg_read_all_stats(
+    schema, engine, raw_dsn, unprivileged_engine, monkeypatch
+):
+    """Without the privilege, a build and autovacuum look the same: all NULLs.
+
+    So neither may buy the uncounted wait -- and the one warning says which grant
+    makes the gate exact, which the second half of this spec then proves.
+    """
+    monkeypatch.setattr(pvi, "_warned_invisible_holders", False)
+    writer = _open_write_transaction(raw_dsn)
+    try:
+        build = _InThread(_raw_ddl(raw_dsn, pvi.per_kb_index_ddl(KB_A, DIMS)))
+        pid_a = _pid_building(raw_dsn, KB_A)
+
+        with unprivileged_engine.connect() as conn:
+            conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+            holders = pvi.table_ddl_holders(conn)
+        (holder,) = [h for h in holders if h["pid"] == pid_a]
+        assert holder["kind"] == "unknown", holder
+        assert holder["state"] is None and holder["backend_type"] is None, holder
+        assert holder["query"] is None, "'<insufficient privilege>' is not a query"
+        assert "query not visible" in pvi.describe_table_holders([holder])
+
+        with psycopg.connect(raw_dsn, autocommit=True) as admin:
+            admin.execute(f"GRANT pg_read_all_stats TO {_READER_ROLE}")
+        with unprivileged_engine.connect() as conn:
+            conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+            holders = pvi.table_ddl_holders(conn)
+        (holder,) = [h for h in holders if h["pid"] == pid_a]
+        assert holder["kind"] == "running", holder
+        _advance_the_xid_horizon(raw_dsn)
+    finally:
+        writer.rollback()
+        writer.close()
+    build.join()
+    assert build.error is None, build.error
+
+
+# ---------------------------------------------------------------------------
+# A gate whose connection was replaced mid-dimension
+# ---------------------------------------------------------------------------
+
+
+def _invalidate(raw_dsn: str, kb_id: str) -> None:
+    with psycopg.connect(raw_dsn, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE pg_index SET indisvalid = false WHERE indexrelid = to_regclass(%s)::oid",
+            (f'"{SCHEMA}".{pvi.per_kb_index_name(kb_id, DIMS)}',),
+        )
+
+
+def _gate_holder_pids(raw_dsn: str) -> list[int]:
+    with psycopg.connect(raw_dsn, autocommit=True) as conn:
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted "
+                "AND objsubid = 1 "
+                "AND ((classid::bigint << 32) | objid::bigint) = hashtextextended(%s, 0)",
+                (pvi.table_lock_relation(),),
+            ).fetchall()
+        ]
+
+
+@pytest.mark.timeout(90)
+def test_a_build_after_a_lost_connection_runs_under_a_gate_taken_again(
+    schema, engine, raw_dsn, monkeypatch
+):
+    """The repair DROP succeeds, its RESET finds the backend gone, and the build follows.
+
+    Before the fix the gate's ``held`` flag outlived the backend its lock died with,
+    so the build that followed -- hours of it, in production -- ran with no gate at
+    all. Here the backend is terminated between the DROP and its RESET, and while
+    the build is parked the gate must be held by the backend that is building.
+    """
+    assert pvi.ensure_per_kb_vector_index(KB_A, engine=engine)["status"] == "ready"
+    _invalidate(raw_dsn, KB_A)
+
+    real_drop = pvi._drop_index
+    real_reset = pvi._reset_session_setting
+    state: dict = {"in_drop": False, "terminated": None, "writer": None}
+
+    def drop(conn, kb_id, dims):
+        state["in_drop"] = True
+        try:
+            return real_drop(conn, kb_id, dims)
+        finally:
+            state["in_drop"] = False
+
+    def reset(conn, name):
+        if state["in_drop"] and state["terminated"] is None:
+            # The DROP has finished. Lose the backend, and only now open the write
+            # transaction that parks the build which follows -- opened earlier it
+            # would have parked the DROP instead.
+            pid = conn.execute(text("SELECT pg_backend_pid()")).scalar()
+            with psycopg.connect(raw_dsn, autocommit=True) as admin:
+                admin.execute("SELECT pg_terminate_backend(%s)", (pid,))
+            state["terminated"] = pid
+            state["writer"] = _open_write_transaction(raw_dsn)
+        return real_reset(conn, name)
+
+    monkeypatch.setattr(pvi, "_drop_index", drop)
+    monkeypatch.setattr(pvi, "_reset_session_setting", reset)
+
+    repair = _InThread(lambda: pvi.ensure_per_kb_vector_index(KB_A, engine=engine))
+    try:
+        building = _pid_building(raw_dsn, KB_A)
+        assert state["terminated"] is not None and building != state["terminated"]
+        assert _gate_holder_pids(raw_dsn) == [building], (
+            "the build must run under the gate, taken again on the new backend"
+        )
+        _advance_the_xid_horizon(raw_dsn)
+    finally:
+        if state["writer"] is not None:
+            state["writer"].rollback()
+            state["writer"].close()
+    repair.join()
+    assert repair.error is None, repair.error
+    assert repair.result["repaired_invalid_indexes"] == [pvi.per_kb_index_name(KB_A, DIMS)]
+    assert _index_state(raw_dsn, KB_A) is True
+    assert _gate_holder_pids(raw_dsn) == [], "and given back afterwards"
+
+
+# ---------------------------------------------------------------------------
+# The repair drop, choreographed against a running build
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(90)
+def test_a_repair_drop_waits_for_another_kbs_build_instead_of_queueing(schema, engine, raw_dsn):
+    """The statement that turned one killed build into a livelock in #95."""
+    assert pvi.ensure_per_kb_vector_index(KB_A, engine=engine)["status"] == "ready"
+    _invalidate(raw_dsn, KB_A)
+
+    writer = _open_write_transaction(raw_dsn)
+    try:
+        build_b = _InThread(lambda: pvi.ensure_per_kb_vector_index(KB_B, engine=engine))
+        pid_b = _pid_building(raw_dsn, KB_B)
+        outcome_a = pvi.ensure_per_kb_vector_index(KB_A, engine=engine)
+        assert outcome_a["status"] == "table_busy", outcome_a
+        assert outcome_a["build_alive"] is True, outcome_a
+        assert pid_b in [h["pid"] for h in outcome_a["table_holders"]], outcome_a
+        assert "repaired_invalid_indexes" not in outcome_a, outcome_a
+        assert _index_state(raw_dsn, KB_A) is False, "the INVALID index is left for later"
+        assert _queued_on_the_table(raw_dsn) == []
+        # Give a queued DROP -- if there were one -- time to be detected as the cycle.
+        time.sleep(1.5 * _deadlock_timeout_s(raw_dsn))
+        _advance_the_xid_horizon(raw_dsn)
+    finally:
+        writer.rollback()
+        writer.close()
+    build_b.join()
+    assert build_b.error is None, build_b.error
+    assert _index_state(raw_dsn, KB_B) is True
+
+    outcome_a = pvi.ensure_per_kb_vector_index(KB_A, engine=engine)
+    assert outcome_a["repaired_invalid_indexes"] == [pvi.per_kb_index_name(KB_A, DIMS)]
+    assert _index_state(raw_dsn, KB_A) is True
 
 
 def test_the_deleted_kbs_drop_is_refused_by_a_held_gate_and_leaves_the_index(
