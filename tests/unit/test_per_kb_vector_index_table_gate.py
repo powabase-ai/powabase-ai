@@ -754,21 +754,91 @@ def test_a_gate_whose_connection_was_replaced_is_taken_again_before_the_build(mo
     assert tries[0] < drop < tries[1] < create, conn.statements
 
 
-def test_a_gate_that_cannot_be_taken_again_after_a_reconnect_stops_before_the_build(
-    monkeypatch,
-):
-    conn = _gated("repair", fail_on="RESET lock_timeout")
-
+def _after_the_discard(conn, change):
+    """Run ``change(conn)`` on every statement once the handle has a new backend."""
     original = conn.execute
 
-    def table_taken_by_someone_else_after_the_discard(clause, params=None):
+    def execute(clause, params=None):
         if conn.pid > 100:
-            conn.table_free = False
+            change(conn)
         return original(clause, params)
 
-    conn.execute = table_taken_by_someone_else_after_the_discard
+    conn.execute = execute
+
+
+def _invalid_with_history():
+    return _ensure_conn(
+        cls=_GatedConn,
+        existing=(_index_row(KB, 1536, valid=False, failures=1, interrupted=2),),
+        rows_by_dims={1536: 20_000},
+        fail_on="RESET lock_timeout",
+    )
+
+
+def test_a_gate_that_cannot_be_taken_again_after_a_repair_drop_says_what_it_did(
+    monkeypatch, caplog
+):
+    """The DROP happened, so "refused before this dimension issued anything" is false.
+
+    The outcome says both halves -- repaired, and its rebuild deferred -- and the
+    WARNING says the build history the drop took away is gone with this attempt.
+    """
+    conn = _invalid_with_history()
+    _after_the_discard(conn, lambda c: setattr(c, "table_free", False))
+    with caplog.at_level(logging.WARNING):
+        outcome = _ensure(monkeypatch, conn)
+    name = pvi.per_kb_index_name(KB, 1536)
+    assert outcome["status"] == "table_busy", outcome
+    assert outcome["repaired_invalid_indexes"] == [name], outcome
+    assert outcome["rebuild_deferred"] == [name], outcome
+    assert conn._positions("CREATE INDEX CONCURRENTLY") == [], conn.statements
+    deferred = [r.getMessage() for r in caplog.records if "deferred" in r.getMessage()]
+    assert deferred, [r.getMessage() for r in caplog.records]
+    assert "1 failed" in deferred[0] and "2 interrupted" in deferred[0], deferred
+
+
+def test_the_per_index_lock_is_taken_again_with_the_gate_after_a_reconnect(monkeypatch):
+    """Otherwise a same-KB task finds the index lock free during the rebuilt build.
+
+    It then misreads the running build as an orphan -- "its backend outlived whatever
+    started it" -- and spends its counted retries on a repair it must not attempt.
+    """
+    conn = _gated("repair", fail_on="RESET lock_timeout")
+    _ensure(monkeypatch, conn)
+    index_tries = conn._positions(_LOCK_TRY, pvi.index_lock_relation(KB, 1536))
+    drop = conn._positions("DROP INDEX CONCURRENTLY")[0]
+    create = conn._positions("CREATE INDEX CONCURRENTLY")[0]
+    assert len(index_tries) == 2, conn.statements
+    assert index_tries[0] < drop < index_tries[1] < create, conn.statements
+
+
+def test_a_per_index_lock_taken_by_another_task_after_a_reconnect_leaves_it_the_build(
+    monkeypatch,
+):
+    conn = _invalid_with_history()
+    _after_the_discard(
+        conn, lambda c: c.busy_index_relations.add(pvi.index_lock_relation(KB, 1536))
+    )
+    outcome = _ensure(monkeypatch, conn)
+    name = pvi.per_kb_index_name(KB, 1536)
+    assert outcome["status"] == "building", outcome
+    assert outcome["reason"] == "build_lock_held", outcome
+    assert outcome["rebuild_deferred"] == [name], outcome
+    assert conn._positions("CREATE INDEX CONCURRENTLY") == [], conn.statements
+
+
+def test_taking_the_gate_again_checks_the_holders_again(monkeypatch):
+    """The re-take is a full take: a build that started in the gap refuses it."""
+    conn = _ensure_conn(
+        cls=_GatedConn,
+        existing=(_index_row(KB, 1536, valid=False),),
+        rows_by_dims={1536: 20_000},
+        fail_on="RESET lock_timeout",
+        holders_seq=[[], [_LIVE_BUILD]],
+    )
     outcome = _ensure(monkeypatch, conn)
     assert outcome["status"] == "table_busy", outcome
+    assert outcome["build_alive"] is True, outcome
     assert conn._positions("CREATE INDEX CONCURRENTLY") == [], conn.statements
 
 
@@ -1177,3 +1247,110 @@ def test_the_marker_is_claimed_once_renewed_by_its_owner_and_released_only_by_it
     assert idx._current_waiter(KB) == "a", "only the owner gives it back"
     idx._release_waiter(KB, "a")
     assert idx._current_waiter(KB) is None
+
+
+# ---------------------------------------------------------------------------
+# Round 2 review: the marker's loose ends
+# ---------------------------------------------------------------------------
+
+
+def _busy_task(monkeypatch, outcome_or_exc, retry=None):
+    task = idx.ensure_per_kb_vector_index
+    monkeypatch.setattr(
+        task, "retry", retry or MagicMock(side_effect=lambda *a, **k: Retry("retry"))
+    )
+    if isinstance(outcome_or_exc, BaseException):
+        service = MagicMock(side_effect=outcome_or_exc)
+    else:
+        service = MagicMock(return_value=outcome_or_exc)
+    monkeypatch.setattr(pvi, "ensure_per_kb_vector_index", service)
+    return task, service
+
+
+def test_the_marker_is_given_back_when_the_wait_gives_up(monkeypatch, waiter_store):
+    task, _ = _busy_task(monkeypatch, _busy())
+    with pytest.raises(Retry):
+        _run_as(task, "waiter-1")
+    bound = idx.PER_KB_TABLE_MAX_WAITS
+    with pytest.raises(pvi.PerKbVectorIndexTableWaitExhausted):
+        _run_as(task, "waiter-1", table_waits=bound, retries=bound)
+    assert waiter_store.get(idx._waiter_key(KB)) is None
+
+
+def test_the_marker_is_given_back_when_the_broker_refuses_the_wait(monkeypatch, waiter_store):
+    task, _ = _busy_task(
+        monkeypatch,
+        _busy(),
+        retry=MagicMock(side_effect=Reject(ConnectionError("broker down"), requeue=False)),
+    )
+    with pytest.raises(Reject):
+        _run_as(task, "waiter-1")
+    assert waiter_store.get(idx._waiter_key(KB)) is None
+
+
+def test_a_refused_retry_is_logged_as_its_cause_not_a_tuple(monkeypatch, caplog):
+    task, _ = _busy_task(
+        monkeypatch,
+        _busy(),
+        retry=MagicMock(side_effect=Reject(ConnectionError("broker down"), requeue=False)),
+    )
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(Reject):
+            _run_as(task, "waiter-1")
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("broker down" in e for e in errors), errors
+    assert not any("False)" in e for e in errors), errors
+
+
+def test_a_superseded_dispatch_is_run_again_when_the_waiter_finishes(monkeypatch, waiter_store):
+    """What a dispatch was sent for may have arrived after the waiter's last survey."""
+    task, service = _busy_task(monkeypatch, _busy())
+    redispatched: list[str] = []
+    monkeypatch.setattr(task, "delay", lambda kb_id, *a, **k: redispatched.append(kb_id))
+    with pytest.raises(Retry):
+        _run_as(task, "waiter-1")
+    assert _run_as(task, "dispatch-2")["status"] == "superseded"
+    assert _run_as(task, "dispatch-3")["status"] == "superseded"
+    assert redispatched == []
+
+    service.return_value = {"status": "ready", "built": [], "dropped": []}
+    _run_as(task, "waiter-1", table_waits=1, retries=1)
+    assert redispatched == [KB], "once, however many were superseded"
+    assert waiter_store.get(idx._waiter_pending_key(KB)) is None
+
+
+def test_a_waiter_with_nothing_superseded_dispatches_nothing(monkeypatch, waiter_store):
+    task, service = _busy_task(monkeypatch, _busy())
+    redispatched: list[str] = []
+    monkeypatch.setattr(task, "delay", lambda kb_id, *a, **k: redispatched.append(kb_id))
+    with pytest.raises(Retry):
+        _run_as(task, "waiter-1")
+    service.return_value = {"status": "ready", "built": [], "dropped": []}
+    _run_as(task, "waiter-1", table_waits=1, retries=1)
+    assert redispatched == []
+
+
+def test_a_dispatch_that_sees_the_waiter_leave_runs_itself(monkeypatch, waiter_store):
+    """The waiter released between this dispatch's two reads: nobody else will come back."""
+    task, service = _busy_task(monkeypatch, {"status": "ready", "built": [], "dropped": []})
+    answers = iter(["waiter-1", None])
+    monkeypatch.setattr(idx, "_current_waiter", lambda kb_id: next(answers))
+    outcome = _run_as(task, "dispatch-2")
+    assert outcome["status"] == "ready", outcome
+    assert service.call_count == 1
+    assert waiter_store.get(idx._waiter_pending_key(KB)) is None
+
+
+def test_a_table_held_without_a_build_keeps_one_waiter_too(monkeypatch, waiter_store):
+    """A stall is counted, not waited out -- but N dispatches must not become N×7 surveys."""
+    task, service = _busy_task(monkeypatch, _busy_with(_IDLE_IN_TRANSACTION))
+    with pytest.raises(Retry):
+        _run_as(task, "waiter-1")
+    assert idx._current_waiter(KB) == "waiter-1"
+    assert _run_as(task, "dispatch-2")["status"] == "superseded"
+    assert service.call_count == 1
+
+
+def test_the_marker_key_is_canonical_whatever_the_id_looks_like():
+    assert idx._waiter_key(KB.upper()) == idx._waiter_key(KB)
+    assert idx._waiter_key("{" + KB + "}") == idx._waiter_key(KB)
