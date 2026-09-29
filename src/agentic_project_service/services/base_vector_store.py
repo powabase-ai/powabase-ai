@@ -991,7 +991,7 @@ class BasePgVectorStore:
     """
 
     @contextmanager
-    def _preferring_this_kbs_partial_index(self, dims: int) -> Iterator[None]:
+    def _preferring_this_kbs_partial_index(self, dims: int) -> Iterator[bool | None]:
         """Price an exact sort out of the search, when there is an index to fall on.
 
         Everything else in this class makes the partial HNSW index *reachable*.
@@ -1253,6 +1253,17 @@ class BasePgVectorStore:
         This cannot make the common case worse: the failure a restore usually meets
         is a transaction the search itself aborted, and there the savepoint cannot
         be taken either, so the handler logs exactly what it logged before.
+
+        **It yields what the probe found**, so the catalog is asked once per
+        search: ``True`` when this knowledge base has a valid partial index at
+        ``dims`` (whether or not the settings could then be made), ``False`` when
+        it has none, and ``None`` when the probe itself failed. On ``False``
+        nothing has been set and nothing will be restored, so a caller may run a
+        different statement inside the block -- which is what
+        ``_searching_exactly_below_the_floor`` does, rather than paying for a
+        second catalog read of its own: that measured +1.8 ms per search on an
+        indexed knowledge base, three round trips with the savepoint, for an
+        answer this probe already had.
         """
         # Not inside the try below: both arguments have already been validated by
         # the caller, so a failure here is a programming error and should not be
@@ -1260,10 +1271,12 @@ class BasePgVectorStore:
         index = f'"{self.schema}".{pg_vector_index.per_kb_index_name(self.kb_id, dims)}'
         prior: str | None = None
         prior_ef_search: str | None = None
+        found: bool | None = None
         try:
             with self.session.begin_nested():
                 rows = list(self.session.execute(text(self._PARTIAL_INDEX_PROBE), {"index": index}))
-            if rows and rows[0][2]:
+            found = bool(rows and rows[0][2])
+            if found:
                 prior = str(rows[0][0])
                 prior_ef_search = None if rows[0][1] is None else str(rows[0][1])
         except Exception as e:  # pragma: no cover - needs a live catalog
@@ -1275,7 +1288,7 @@ class BasePgVectorStore:
                 e,
             )
         if prior is None:
-            yield
+            yield found
             return
         try:
             # In a savepoint, like the probe above and for the same reason: a
@@ -1303,7 +1316,7 @@ class BasePgVectorStore:
                 self.kb_id,
                 e,
             )
-            yield
+            yield True
             return
         # Set unconditionally, and NOT gated on the probe having read a value.
         # pgvector registers its GUCs in ``_PG_init``, which runs on the first
@@ -1356,7 +1369,7 @@ class BasePgVectorStore:
             )
             prior_ef_search = None
         try:
-            yield
+            yield True
         finally:
             # One statement per setting, each naming its own GUC, so the restore
             # is as readable in a captured statement list as the set was.
@@ -1388,35 +1401,6 @@ class BasePgVectorStore:
                     self.kb_id,
                     e,
                 )
-
-    def _has_its_own_per_kb_index(self, dims: int) -> bool | None:
-        """Does this knowledge base have a *valid* partial HNSW index at ``dims``?
-
-        ``None`` when the catalog could not be read, which the caller treats as
-        "keep today's plan". Read through ``pg_vector_index.existing_per_kb_indexes``
-        -- the reader the index lifecycle itself uses -- so the search and the
-        builder cannot disagree about what counts as this knowledge base's index;
-        that reader looks in ``pg_vector_index.AI_SCHEMA``, the schema the builder
-        builds in, which is this store's schema everywhere the service runs. An
-        INVALID index, or one still being built, is in the catalog and cannot
-        answer a query, so it counts as no index here.
-
-        In a savepoint for the reason every probe in this class is: a statement
-        that fails outside one aborts the caller's transaction, and the search
-        that follows would raise instead of degrading.
-        """
-        try:
-            with self.session.begin_nested():
-                states = pg_vector_index.existing_per_kb_indexes(self.session, self.kb_id)
-        except Exception as e:
-            logger.warning(
-                "Could not read KB %s's partial HNSW indexes: %s; this vector search "
-                "keeps the planner's own plan",
-                self.kb_id,
-                e,
-            )
-            return None
-        return states.get(dims) is True
 
     def _capped_row_count(self, dims: int, cap: int) -> int | None:
         """This knowledge base's embeddings for this store at ``dims``, counted to ``cap + 1``.
@@ -1553,19 +1537,25 @@ class BasePgVectorStore:
         index; this path answers it from the knowledge-base btree with the exact
         top-k.
 
-        **What deciding costs.** Up to two statements before the search, and one
-        penalty around it:
+        **Only called once the knowledge base is known to have no index of its
+        own.** For the chunks store that is the answer
+        ``_preferring_this_kbs_partial_index``'s catalog probe already gives on
+        every unrestricted search, so this runs inside that block on a "no" and
+        asks nothing twice; a knowledge base *with* an index never gets here and
+        runs exactly the statements it ran before. The other three stores never
+        have one -- the index covers ``item_table = 'chunks'`` only -- so they come
+        straight here without asking.
 
-        - the catalog probe, for the chunks store only -- the per-KB index covers
-          ``item_table = 'chunks'`` and nothing else, so for the other three stores
-          the answer is always "no index" and is not asked. A knowledge base that
-          *has* an index stops here, and this probe is all it pays; its search then
-          goes through ``_preferring_this_kbs_partial_index`` exactly as before,
-          whose own probe is the second catalog read that knowledge base makes;
-        - ``enable_seqscan = off``, read-set-restore, three statements;
-        - the capped count, under that penalty -- see ``_capped_row_count``.
-
-        The setting itself is read through ``get_setting``, cached for the request.
+        **What deciding costs** a knowledge base without an index: the penalty
+        below (read and set in one savepoint, restored in another) and the capped
+        count in a savepoint of its own -- five statements and six savepoint
+        commands around the search. Measured through the real store on the live
+        fixture, where a bare round trip was 0.31 ms and a savepointed statement
+        0.91 ms: the capped count 1.5 ms at 300 rows and 6.0 ms when it stops at
+        5,001 of a 6,000-row knowledge base, and the penalty's read, set and
+        restore 2.4 ms together. That is round trips, not work, and it is paid by
+        searches that take 300-600 ms cold on the shared index they replace. The
+        setting itself is read through ``get_setting``, cached for the request.
         Nothing is cached across requests: an index can be built or dropped
         between two searches, and a stale "no index" would put a knowledge base
         with a fresh index back on an exact read of all its rows.
@@ -1589,22 +1579,16 @@ class BasePgVectorStore:
         through ``_insisting_on_an_exact_search``, and asking the catalog and
         counting could not change its plan, so it pays for neither.
 
-        **When something fails.** A catalog read or a count that fails returns
-        ``None`` -- today's plan, on a transaction the savepoints kept usable. A
-        penalty that cannot be set leaves the search exact, because the fence is
-        what makes it exact, and loses only the bound on a large-share table.
+        **When something fails.** A catalog probe that fails never gets here, and a
+        count that fails returns ``None`` -- today's plan either way, on a
+        transaction the savepoints kept usable. A penalty that cannot be set leaves
+        the search exact, because the fence is what makes it exact, and loses only
+        the bound on a large-share table.
 
         One ``DEBUG`` line per exact search, none per row.
         """
         max_rows = exact_search_max_rows()
         if max_rows <= 0:
-            return None
-        # An index of its own -- or a catalog that could not say -- keeps the
-        # plan this knowledge base had before, and skips the count.
-        if (
-            self.TABLE == PER_KB_INDEX_ITEM_TABLE
-            and self._has_its_own_per_kb_index(dims) is not False
-        ):
             return None
         with self._scan_method_priced_out(
             "enable_seqscan",
@@ -1958,6 +1942,9 @@ class BasePgVectorStore:
         # returns the same answer. Exactness is structural here instead.
         restricted = item_ids is not None or source_ids is not None or bool(filter_metadata)
 
+        def run_exactly() -> list[RetrievedItem]:
+            return run_the_search(self._exact_search_query(effective_dims, effective_top_k))
+
         try:
             self._apply_iterative_scan()
             # Both blocks wrap the execution rather than preceding it, because a
@@ -1968,18 +1955,21 @@ class BasePgVectorStore:
             if restricted:
                 with self._insisting_on_an_exact_search():
                     items = run_the_search()
+            elif self.TABLE == PER_KB_INDEX_ITEM_TABLE:
+                with self._preferring_this_kbs_partial_index(effective_dims) as has_its_own:
+                    # Only on a definite "no index": with one, the block above has
+                    # already steered the plan onto it; with a probe that failed,
+                    # today's plan is the one to keep.
+                    exact = (
+                        self._searching_exactly_below_the_floor(effective_dims, run_exactly)
+                        if has_its_own is False
+                        else None
+                    )
+                    items = exact if exact is not None else run_the_search()
             elif (
-                exact := self._searching_exactly_below_the_floor(
-                    effective_dims,
-                    lambda: run_the_search(
-                        self._exact_search_query(effective_dims, effective_top_k)
-                    ),
-                )
+                exact := self._searching_exactly_below_the_floor(effective_dims, run_exactly)
             ) is not None:
                 items = exact
-            elif self.TABLE == PER_KB_INDEX_ITEM_TABLE:
-                with self._preferring_this_kbs_partial_index(effective_dims):
-                    items = run_the_search()
             else:
                 # An unrestricted search from one of the other item tables. The
                 # index is named after the knowledge base and the dimension, so
@@ -1991,8 +1981,9 @@ class BasePgVectorStore:
                 # ms, recall 1.00 -> 0.33.
                 #
                 # This and a chunks search over the exact-search ceiling with no
-                # index of its own are the only searches left on the planner's own
-                # plan, and this one only above ``VECTOR_EXACT_SEARCH_MAX_ROWS``:
+                # index of its own (or whose catalog probe failed) are the only
+                # searches left on the planner's own plan, and this one only above
+                # ``VECTOR_EXACT_SEARCH_MAX_ROWS``:
                 # below it the branch above searched exactly. A restricted search
                 # from this same store took the first branch, because exactness is
                 # not a chunks-only concern.
