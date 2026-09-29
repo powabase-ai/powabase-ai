@@ -101,6 +101,17 @@ The start-up sweep is not free for a small project either: it runs one grouped
 count over ``ai.embeddings`` on every boot, bounded by ``SWEEP_TIMEOUT_MS``,
 even when it then dispatches nothing.
 
+**One build or drop at a time per project, decided here and never in Postgres'
+lock queue.** Every index this module creates is on the one shared table, and a
+second ``CREATE``/``DROP INDEX CONCURRENTLY`` queued on that table while a build
+runs is not merely slow: it holds a snapshot while it waits, the build's last
+phase waits for that snapshot, and the deadlock detector kills the build after
+all of its work -- observed on a production project as four killed builds in 30
+hours, one 8-hour build three times over (issue #95). ``_TableGate`` carries the
+mechanism, the evidence and the operator rule that follows from it; the short
+form is that a reconcile which cannot take the table issues nothing, returns
+``table_busy``, and its task comes back on a clock of its own.
+
 Nothing here touches the shared per-dimension index. Replacing it with a
 residual one is what turns the transitional write cost of maintaining two graphs
 into a large write *gain*, and it is deliberately a follow-up (**#88**). Two
@@ -268,6 +279,12 @@ MAX_CONSECUTIVE_BUILD_FAILURES = 3
 # attempts, and a single episode must not turn the index off until an operator
 # drops it by hand. 25 is more than three such episodes back to back, and still a
 # bound.
+#
+# The largest source of these on a project with several large knowledge bases was
+# this module fighting itself: a ``deadlock detected`` at the end of every build
+# that another knowledge base's DDL had queued behind (issue #95), each one counted
+# here. ``_TableGate`` removes that source; a table another build owns is now a
+# ``table_busy`` outcome, which is not an attempt and is counted nowhere.
 #
 # **What this does not cover:** a build whose backend does not come back -- an OOM
 # kill, a server restart -- cannot write anything, because the write needs the
@@ -1655,6 +1672,13 @@ def _counted_attempt(
 
     Split from the two writes below because the *classification* is common to both
     and the *definition each one records* is not.
+
+    A reconcile refused by ``_TableGate`` is never an attempt and never reaches
+    this: the gate is taken before the first statement a dimension would issue
+    -- before the definition-rebuild count too -- so ``table_busy`` writes no
+    comment and moves neither bound. Charging it would have spent one of these
+    counts per look at a table another build owns, which is up to
+    ``PER_KB_TABLE_MAX_WAITS`` looks in the task.
     """
     if is_transient_db_error(exc):
         return prior_failures, prior_interrupted + 1
@@ -1741,9 +1765,11 @@ def _build_in_progress(conn, kb_id: str, dims: int) -> bool:
     knowledge base there; here every index is on the one shared table, so the
     same shape would report *any* concurrent build on it -- another knowledge
     base's, or ``ensure_embedding_index`` creating a shared per-dimension one.
-    That matters because the start-up sweep dispatches every out-of-step
-    knowledge base at once, so with two large ones the builds overlap by
-    construction, at exactly the boot meant to clear an INVALID index.
+    That question is a different one, about the table, and it has its own
+    answer: ``table_ddl_holders``, asked by ``_TableGate`` before any DDL. This
+    one decides only whether *this* INVALID index belongs to a build still
+    running -- in which case it must not be dropped at all -- and it is asked
+    before the gate, because leaving the index alone issues nothing.
 
     ``pg_stat_progress_create_index.index_relid`` is populated for
     ``CREATE INDEX CONCURRENTLY`` from the moment the catalog entry exists
@@ -1872,8 +1898,12 @@ class _TableGate:
     that dimension's last statement, so a caller that does not get it has issued
     nothing, holds no transaction and leaves nothing for a running build to wait
     on. It reports ``PerKbVectorIndexTableBusy`` and the task comes back later on
-    a clock of its own; the gate is what removes the only waiter that could form
-    the cycle, so the DDL itself keeps ``lock_timeout = 0``.
+    a clock of its own -- ``PER_KB_TABLE_WAIT_COUNTDOWN_S`` apart, up to
+    ``PER_KB_TABLE_MAX_WAITS`` times, uncounted while ``table_ddl_holders`` shows a
+    build alive and counted like any retry when it does not (both in
+    ``tasks.indexing``, which owns the retry budget). The gate is what removes the
+    only waiter that could form the cycle, so the DDL itself keeps
+    ``lock_timeout = 0``.
 
     The advisory lock only stops callers of this module, so a free lock is not
     taken as a free table: ``table_ddl_holders`` is asked as well, and anything
@@ -1998,6 +2028,15 @@ def _create_index(
     role-level ``lock_timeout`` of 2 s and one open write transaction, the build
     failed in 2.02 s, five attempts out of five, leaving the INVALID index this
     function then has to count.
+
+    Unbounded is safe only because nothing of this module's can be *queued* on
+    the table while it runs: the caller holds ``_TableGate``, so a second build or
+    drop never reaches Postgres to wait with a snapshot the build's last phase
+    would wait on. What the build can still wait for is a plain wait -- an open
+    transaction, or ``pg_dump``'s long ``COPY`` of the table holding its snapshot
+    -- which ends when the reader does. What it cannot survive is a statement run
+    by hand on the table while it builds (see the operator rule on ``_TableGate``);
+    a bound here would not change that, only which of the two dies.
 
     A build that runs out of disk leaves an INVALID index behind, and the next
     ensure drops and rebuilds it rather than reporting it as built (see
@@ -2125,6 +2164,11 @@ def _repair_invalid(
     ``_count_a_failed_build``, because the index the count lands on is the one that
     was already there: the drop is what failed, so its recorded definition has to be
     read back rather than assumed to be today's.
+
+    The caller holds ``_TableGate`` before this runs. This drop is DDL on the shared
+    table like any build, and during issue #95 it was the statement that turned one
+    killed build into a livelock: each retry began here, queued on the table behind
+    whichever build was running, and killed that one at its end in turn.
     """
     # "No build *of it*": this caller asked ``_build_in_progress`` about this one
     # index. It used to say "no build is running on ai.embeddings", which read as a
@@ -2295,6 +2339,14 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
       INVALID index stays until it is dropped by hand, which is also what lets a
       later reconcile try again. ``building`` outranks all three, because it is
       the one that is still moving.
+    * ``table_busy`` -- at least one dimension needed DDL and another build or
+      drop owns ``ai.embeddings`` (``_TableGate``), so nothing was issued for it and
+      nothing was counted. ``table_busy`` lists those indexes, ``table_holders`` the
+      evidence (``table_ddl_holders``) and ``build_alive`` whether there is any;
+      ``reason`` is ``table_ddl_in_progress`` or, with no evidence, ``table_lock_held``.
+      Outranks everything, ``building`` included: it is the one outcome with work
+      left that only this knowledge base's task will come back for
+      (``outcome_waits_for_the_table``).
     """
     kb_id = _validated_kb_id(knowledge_base_id)
     engine = _engine(engine)
@@ -2890,6 +2942,13 @@ SWEEP_TIMEOUT_MS = 5_000
 # 1.3 GB of build memory at the default setting even if the queue runs them all
 # in parallel, and is more than a project crosses the threshold with between two
 # boots in practice.
+#
+# The queue no longer runs them in parallel against the database, and nothing
+# here has to arrange that: every dispatched reconcile that needs DDL takes the
+# table gate (``_TableGate``) first, so one builds and the others return
+# ``table_busy`` at once and wait in the task queue, not in Postgres' lock queue.
+# The dispatch stays plain -- no stagger, no countdown -- because the gate is the
+# only serialiser, and a second one here would be a second place to get it wrong.
 #
 # Nothing is dropped by the cap: the next source to finish indexing in each
 # knowledge base dispatches the same reconcile, and so does the next start-up.
