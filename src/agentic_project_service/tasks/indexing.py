@@ -3245,9 +3245,9 @@ def _wait_for_the_table(task, kb_id: str, table_waits: int, holders, what: str):
     holder_text = pg_vector_index.describe_table_holders(holders)
     if table_waits >= PER_KB_TABLE_MAX_WAITS:
         logger.error(
-            "Giving up waiting to %s for KB %s after %d looks %d s apart: another build or "
-            "drop has owned the embeddings table the whole time (%s). Nothing was issued; "
-            "the next indexed source or start-up dispatches this again",
+            "Giving up waiting to %s for KB %s after %d looks %d s apart, each of which "
+            "found another build or drop owning the embeddings table (at the last one: %s). "
+            "Nothing was issued; the next indexed source or start-up dispatches this again",
             what,
             kb_id,
             table_waits,
