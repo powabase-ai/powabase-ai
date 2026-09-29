@@ -2,9 +2,11 @@
 caller that needs to must be able to tell "no override" from "could not read".
 
 The read now sits on every unrestricted vector search (``VECTOR_EXACT_SEARCH_MAX_ROWS``),
-on the same session as the search. A SELECT that fails outside a savepoint aborts
-that transaction, and the search that follows raises ``InFailedSqlTransaction``
-instead of degrading to the registry default.
+and on the single-session paths it shares a transaction with the search. A SELECT
+that fails outside a savepoint aborts that transaction, and the search that
+follows raises ``InFailedSqlTransaction`` instead of degrading to the registry
+default. (The multi-KB and agent-tool paths search on a private session; the
+parent request has filled the settings cache before they start.)
 """
 
 from __future__ import annotations

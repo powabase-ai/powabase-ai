@@ -603,9 +603,12 @@ def exact_search_max_rows() -> int:
 # search 36,188 in 168 ms, on every search. So the decision stops reading at this
 # budget, and a knowledge base whose rows run past it keeps today's plan whatever
 # its searched population is. On the live suite's 100,200-row knowledge base (200
-# document rows beside 100,000 others) the decision's count now reads 20,001 rows
-# in 516 buffer accesses and 3.1 ms, where the count it replaced read all of them
-# to find the 200: 2,581 buffer accesses and 16.3 ms.
+# document rows at 384 dimensions beside 100,000 others at 16 dimensions, kept
+# small so the fixture loads quickly) the decision's count now reads 20,001 rows in
+# 516 buffer accesses and 3.1 ms, where the count it replaced read all of them to
+# find the 200: 2,581 buffer accesses and 16.3 ms. The rows are wider in a real
+# table: with the 100,000 replaced by 300,000 rows at 384 dimensions, review
+# measured the same 20,001-row read at about 6,100 buffer accesses and 5.6-7.3 ms.
 #
 # **Why four.** What the budget adds over a knowledge base of only the searched
 # population is the rows of the others, and those are cheap: they are filtered
@@ -1688,8 +1691,9 @@ class BasePgVectorStore:
         description) or the ceiling is raised. What this path fixes on its own is
         the same defect below the ceiling: on the live fixture a 5,000-row
         knowledge base at 9 % of the table went to the shared index unaided and
-        got a mean recall under 0.5 there (0.00-0.15 per query when measured), and
-        is answered here with the exact top-k.
+        got a mean recall under 0.5 there (0.03-0.28 across HNSW builds, and
+        anything from 0.00 to 0.80 for a single query), and is answered here with
+        the exact top-k.
 
         **What an exact search reads.** The knowledge base's own rows -- *every*
         one of them, of every item table and dimension, because the only btree
@@ -1706,6 +1710,14 @@ class BasePgVectorStore:
         a knowledge base should have an index of its own, and with the build
         threshold at or below the ceiling it does (see the setting's description
         for the gap when it is not).
+
+        **The bounds hold for the count, and for the search only as of the
+        count.** The fenced search has no ``LIMIT`` on what it reads; it is
+        bounded by the count taken one statement earlier. A bulk ingest that
+        commits between the two can make one search read more than the budget --
+        the search sees the new rows, the decision did not -- and the next search
+        counts again and keeps today's plan. Transient by construction, and not
+        worth a second count.
 
         **Only called once the knowledge base is known to have no index of its
         own.** For the chunks store that is the answer

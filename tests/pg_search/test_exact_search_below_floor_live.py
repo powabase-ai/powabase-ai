@@ -558,8 +558,9 @@ def test_the_fixture_reproduces_the_shared_index_plan_this_replaces(
         items, _ = _search(engine, KB_EDGE, vector)
         truth = _truth(engine, KB_EDGE, vector)
         recall.append(len(set(_ids(items)) & set(truth)) / len(truth))
-    # Measured 0.00-0.15 per query when this was written; half is a loose bound
-    # that still says "mostly wrong".
+    # Mean recall under 0.5: measured 0.03-0.28 across HNSW builds (a single
+    # query anything from 0.00 to 0.80), so half is a bound with headroom that
+    # still says "mostly wrong".
     assert sum(recall) / len(recall) < 0.5, recall
 
 
