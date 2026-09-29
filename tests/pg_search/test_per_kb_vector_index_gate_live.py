@@ -411,6 +411,13 @@ def _hold_the_gate(raw_dsn: str) -> psycopg.Connection:
     return conn
 
 
+# How long the idle-holder specs sleep before looking. The ages are whole seconds
+# computed by the server, and on a virtualised clock a 1.2 s client-side sleep has
+# measured as 0 s there (2 failures in about 40 runs on Postgres 15), which reads the
+# idle holder as one that has just finished a statement.
+_IDLE_LONG_ENOUGH_S = 2.5
+
+
 def _nothing_waits_on_a_lock(engine) -> None:
     with engine.connect() as conn:
         waiting = conn.execute(
@@ -454,13 +461,19 @@ def test_a_gate_held_by_an_idle_session_is_not_a_build(schema, engine, raw_dsn, 
     monkeypatch.setattr(pvi, "_GATE_HOLDER_IDLE_GRACE_S", 0)
     holder = _hold_the_gate(raw_dsn)
     try:
-        time.sleep(1.2)
+        time.sleep(_IDLE_LONG_ENOUGH_S)
         outcome = pvi.ensure_per_kb_vector_index(KB_B, engine=engine)
         assert outcome["status"] == "table_busy", outcome
-        assert outcome["reason"] == "table_held_without_a_build", outcome
-        assert outcome["build_alive"] is False, outcome
-        assert outcome["table_holders"][0]["kind"] == "stalled", outcome
-        assert outcome["table_holders"][0]["idle_s"] >= 1, outcome
+        assert outcome["reason"] == "table_held_without_a_build", pvi.describe_table_holders(
+            outcome["table_holders"]
+        )
+        assert outcome["build_alive"] is False, pvi.describe_table_holders(outcome["table_holders"])
+        assert outcome["table_holders"][0]["kind"] == "stalled", pvi.describe_table_holders(
+            outcome["table_holders"]
+        )
+        assert outcome["table_holders"][0]["idle_s"] >= 1, pvi.describe_table_holders(
+            outcome["table_holders"]
+        )
         assert _queued_on_the_table(raw_dsn) == []
         assert _index_state(raw_dsn, KB_B) is None
         _nothing_waits_on_a_lock(engine)
@@ -480,7 +493,7 @@ def test_a_table_held_idle_in_transaction_refuses_the_gate_but_is_not_a_build(
     idle = psycopg.connect(raw_dsn)
     idle.execute(f"LOCK TABLE {SCHEMA}.embeddings IN SHARE MODE")
     try:
-        time.sleep(1.1)
+        time.sleep(_IDLE_LONG_ENOUGH_S)
         outcome = pvi.ensure_per_kb_vector_index(KB_B, engine=engine)
         assert outcome["status"] == "table_busy", outcome
         assert outcome["build_alive"] is False, outcome
@@ -576,7 +589,7 @@ def _invalidate(raw_dsn: str, kb_id: str) -> None:
         )
 
 
-def _gate_holder_pids(raw_dsn: str) -> list[int]:
+def _advisory_holder_pids(raw_dsn: str, subject: str) -> list[int]:
     with psycopg.connect(raw_dsn, autocommit=True) as conn:
         return [
             row[0]
@@ -584,9 +597,13 @@ def _gate_holder_pids(raw_dsn: str) -> list[int]:
                 "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted "
                 "AND objsubid = 1 "
                 "AND ((classid::bigint << 32) | objid::bigint) = hashtextextended(%s, 0)",
-                (pvi.table_lock_relation(),),
+                (subject,),
             ).fetchall()
         ]
+
+
+def _gate_holder_pids(raw_dsn: str) -> list[int]:
+    return _advisory_holder_pids(raw_dsn, pvi.table_lock_relation())
 
 
 @pytest.mark.timeout(90)
@@ -636,6 +653,9 @@ def test_a_build_after_a_lost_connection_runs_under_a_gate_taken_again(
         assert _gate_holder_pids(raw_dsn) == [building], (
             "the build must run under the gate, taken again on the new backend"
         )
+        # And under this index's own lock, or a second task for the same knowledge
+        # base would find it free and take the running build for an orphan.
+        assert _advisory_holder_pids(raw_dsn, pvi.index_lock_relation(KB_A, DIMS)) == [building]
         _advance_the_xid_horizon(raw_dsn)
     finally:
         if state["writer"] is not None:
