@@ -107,7 +107,7 @@ second ``CREATE``/``DROP INDEX CONCURRENTLY`` queued on that table while a build
 runs is not merely slow: it holds a snapshot while it waits, the build's last
 phase waits for that snapshot, and the deadlock detector kills the build after
 all of its work -- observed on a production project as seven deadlocks in about
-36 hours, the largest build killed at its end twice after eight hours of work, with
+36 hours, the largest build killed at its end twice after about eight hours of work, with
 a third earlier death consistent with it (issue #95 and its follow-up comment of
 the same week). ``_TableGate`` carries the
 mechanism, the evidence and the operator rule that follows from it; the short
@@ -2007,9 +2007,12 @@ def table_ddl_holders(conn, include_gate_holder: bool = False) -> list[dict]:
 
     **Needs ``pg_read_all_stats`` (or ``pg_monitor``) to be exact** when the service
     connects as a role other than the one other backends run as: without it every
-    other role's holder is ``unknown``, autovacuum included, so each vacuum of the
-    table costs a counted retry where it would have cost nothing. Warned once per
-    process.
+    other role's holder is ``unknown``, autovacuum included, so each look during a
+    vacuum of the table costs a counted retry where it would have cost nothing -- and
+    a vacuum longer than the counted budget (about half an hour) ends the task with
+    ``PerKbVectorIndexTableWaitExhausted``, where before the gate the build simply
+    queued behind it and autovacuum yielded. Warned once per process; the README's
+    "Database role permissions" section carries the grant.
     """
     global _warned_invisible_holders
     rows = list(
@@ -2058,7 +2061,7 @@ class _TableGate:
     project with three qualifying knowledge bases (2.85M, 1.09M and 73k chunk rows
     at 1536 dimensions, all dispatched together): seven ``deadlock detected`` in
     about 36 hours, every build that reached its end killed. The 2.85M-row build
-    was lost twice within the incident, each time after eight hours or more and
+    was lost twice within the incident, each time after about eight hours and
     about 20 GB of index, and a third, earlier death of the same build is
     consistent with it though its log did not survive (issue #95 and its follow-up
     comment). The retries livelocked, because a retry of a killed build begins
