@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.12.0](https://github.com/powabase-ai/powabase-ai/compare/v0.11.0...v0.12.0) (2026-09-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* **auth:** end-user JWTs may call only the 16 conversation routes: their own agent and orchestration sessions, runs and approvals. Every other /api route except inbound webhooks and docs search now requires the service role key. End-user tokens need a UUID `sub` and an `exp`. Session ids must be strings of at most 255 characters, and an end user's run may continue only an existing session of their own: it can no longer name a new session id. An end user's run can no longer set knowledge bases or stored context. Agent database tools act as the caller: end-user runs get the user's grants and RLS on the configured tables; service runs get the agent's own login with exactly its configured tables, and only agents with database tools get a login. database_query accepts only allowlisted built-in functions (matched case-sensitively), operators and casts, plus installed extensions' own operators in a configured schema, and agents with no table list reach nothing. Tool queries time out after 30 seconds. Agents may be configured only with tables and security_invoker views. Storage tools act as the end user on end-user runs, require bucket names matching ^[A-Za-z0-9_-]+$ and paths without empty, `.` or `..` segments, `%`, `\`, `?`, `#` or control characters, and never reach the internal bucket. SERVICE_ROLE_KEY must be set. New dependency: pglast.
+
+### Features
+
+* exact vector search for knowledge bases below the per-KB index floor ([#98](https://github.com/powabase-ai/powabase-ai/issues/98)) ([17d6d0a](https://github.com/powabase-ai/powabase-ai/commit/17d6d0a9e476aa58e1f9cb328fcf7773f30d9b1f))
+
+
+### Bug Fixes
+
+* **auth:** lock the API to the service role, and run agent data tools as the caller ([#96](https://github.com/powabase-ai/powabase-ai/issues/96)) ([f9d5661](https://github.com/powabase-ai/powabase-ai/commit/f9d56613053c82dedfa8d451fe36505d3d60cc52))
+
 ## [0.11.0](https://github.com/powabase-ai/powabase-ai/compare/v0.10.1...v0.11.0) (2026-09-24)
 
 
