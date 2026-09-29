@@ -106,8 +106,10 @@ lock queue.** Every index this module creates is on the one shared table, and a
 second ``CREATE``/``DROP INDEX CONCURRENTLY`` queued on that table while a build
 runs is not merely slow: it holds a snapshot while it waits, the build's last
 phase waits for that snapshot, and the deadlock detector kills the build after
-all of its work -- observed on a production project as four killed builds in 30
-hours, one 8-hour build three times over (issue #95). ``_TableGate`` carries the
+all of its work -- observed on a production project as seven deadlocks in about
+36 hours, the largest build killed at its end twice after eight hours of work, with
+a third earlier death consistent with it (issue #95 and its follow-up comment of
+the same week). ``_TableGate`` carries the
 mechanism, the evidence and the operator rule that follows from it; the short
 form is that a reconcile which cannot take the table issues nothing, returns
 ``table_busy``, and its task comes back on a clock of its own.
@@ -1847,6 +1849,13 @@ def _build_in_progress(conn, kb_id: str, dims: int) -> bool:
 # stronger mode. A plain ``CREATE INDEX`` (``ShareLock``) is in the list on purpose
 # -- ``base_vector_store.ensure_embedding_index`` issues one, inside an indexing
 # transaction, the first time a dimension appears.
+#
+# A manual ``VACUUM`` or ``ANALYZE`` of the table takes ``ShareUpdateExclusiveLock``
+# too, so it now defers even a single knowledge base's build until it finishes,
+# where before the build simply queued behind it (a plain wait, no cycle). That is
+# the price of not being able to tell, from the lock alone, a statement that will
+# never wait on the build from one that will; autovacuum is the exception the
+# holder query can make, because it yields to lock waiters on its own.
 _TABLE_DDL_LOCK_MODES = (
     "ShareUpdateExclusiveLock",
     "ShareLock",
@@ -2047,12 +2056,15 @@ class _TableGate:
     detector kills it -- after its catalog entry, its whole graph build and its
     validation scan, leaving an INVALID index behind. Observed on a production
     project with three qualifying knowledge bases (2.85M, 1.09M and 73k chunk rows
-    at 1536 dimensions, all dispatched together): every build that reached its end
-    was killed, four times in 30 hours, one 8-hour 20 GB build three times over;
-    the retries then livelocked, because a retry of a killed build begins with a
-    repair drop, which is DDL that queues in turn and kills whichever build is
-    finishing next. Revoking the other tasks by hand let each one build alone
-    without incident: 25 s, 63 min and 9.6 h.
+    at 1536 dimensions, all dispatched together): seven ``deadlock detected`` in
+    about 36 hours, every build that reached its end killed. The 2.85M-row build
+    was lost twice within the incident, each time after eight hours or more and
+    about 20 GB of index, and a third, earlier death of the same build is
+    consistent with it though its log did not survive (issue #95 and its follow-up
+    comment). The retries livelocked, because a retry of a killed build begins
+    with a repair drop, which is DDL that queues in turn and kills whichever build
+    is finishing next. Revoking the other tasks by hand let each one build alone
+    without incident: 25 s, 63 min and 9.6 h. Zero deadlocks after that.
 
     **Why the gate is here, and not in the lock queue.** No build or drop can
     wait for that lock inside Postgres safely: it has taken its snapshot before it
@@ -2071,6 +2083,12 @@ class _TableGate:
     ``tasks.indexing``, which owns the retry budget). The gate is what removes the
     only waiter that could form the cycle, so the DDL itself keeps
     ``lock_timeout = 0``.
+
+    Not every holder is a build, and only a build is worth a long wait:
+    ``_holder_kind`` sorts holders into *running* (the uncounted wait),
+    *stalled* (a session idle in a transaction that happens to hold the table) and
+    *unknown* (a backend this role cannot see without ``pg_read_all_stats``) -- the
+    last two refuse the gate just the same, and cost the task a counted retry.
 
     The advisory lock only stops callers of this module, so a free lock is not
     taken as a free table: ``table_ddl_holders`` is asked as well, and anything
@@ -2563,8 +2581,13 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     * ``table_busy`` -- at least one dimension needed DDL and another build or
       drop owns ``ai.embeddings`` (``_TableGate``), so nothing was issued for it and
       nothing was counted. ``table_busy`` lists those indexes, ``table_holders`` the
-      evidence (``table_ddl_holders``) and ``build_alive`` whether there is any;
-      ``reason`` is ``table_ddl_in_progress`` or, with no evidence, ``table_lock_held``.
+      evidence (``table_ddl_holders``, merged by pid across dimensions) and
+      ``build_alive`` whether any holder is demonstrably running
+      (``_holder_kind``). ``reason`` is ``table_ddl_in_progress`` for a running
+      holder, ``table_held_without_a_build`` for holders that are stalled or that
+      this role cannot see, ``table_holders_unreadable`` when the evidence could
+      not be read (``evidence_error`` says why), and ``table_lock_held`` when the
+      gate is held by nobody that could be found.
       Outranks everything, ``building`` included: it is the one outcome with work
       left that only this knowledge base's task will come back for
       (``outcome_waits_for_the_table``).

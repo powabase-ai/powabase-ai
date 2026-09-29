@@ -3794,6 +3794,14 @@ def drop_per_kb_vector_index(self, kb_id: str, table_waits: int = 0) -> dict:
     ever comes back to a deleted knowledge base, so it matters more here than there
     that seven counted attempts are not spent in the first half hour of a nine-hour
     build.
+
+    **Nothing re-dispatches this.** A give-up, a broker that refuses the retry, or
+    a message a worker cannot run (one carrying ``table_waits``, delivered to a
+    worker from before that keyword existed during a rolling deploy) leaves the
+    index orphaned for good. Every such path logs the names at ERROR where it can;
+    the operator's check for the ones it could not is any ``hnsw_kb_<hex>_<dims>``
+    index on ``ai.embeddings`` whose ``<hex>`` is no ``ai.knowledge_bases`` id --
+    drop those by hand, once no build is running on the table.
     """
     counted = _counted_retries(self, table_waits)
     try:
