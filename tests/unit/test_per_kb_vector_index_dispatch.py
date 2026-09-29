@@ -360,7 +360,7 @@ def test_deleting_a_knowledge_base_drops_its_vector_index(monkeypatch, kb_route_
     monkeypatch.setattr(idx.drop_pg_bm25_index, "delay", lambda kb_id, *a, **k: None)
 
     with (
-        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role"}),
+        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role", "is_service_role": True}),
         _kb_route_app().test_client() as client,
     ):
         resp = client.delete(
@@ -393,7 +393,7 @@ def test_removing_a_source_from_a_knowledge_base_dispatches_a_reconcile(monkeypa
     )
 
     with (
-        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role"}),
+        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role", "is_service_role": True}),
         _kb_route_app().test_client() as client,
     ):
         resp = client.delete(
@@ -443,7 +443,7 @@ def test_deleting_a_source_reconciles_every_knowledge_base_it_was_indexed_in(mon
     app = Flask(__name__)
     app.register_blueprint(src_routes.sources_bp)
     with (
-        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role"}),
+        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role", "is_service_role": True}),
         app.test_client() as client,
     ):
         resp = client.delete(

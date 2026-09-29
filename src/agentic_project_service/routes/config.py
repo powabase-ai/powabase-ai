@@ -15,7 +15,7 @@ from agentic.knowledge.model_config import (
     RERANKER_DEFAULT_MODEL,
 )
 
-from ..auth import require_auth
+from ..auth import require_service_role
 from ..strategies import RETRIEVER_LABELS, STRATEGY_REGISTRY
 
 config_bp = Blueprint("config", __name__, url_prefix="/api/config")
@@ -55,7 +55,7 @@ RERANKER_OPTIONS = [
 
 
 @config_bp.route("/kb-defaults", methods=["GET"])
-@require_auth
+@require_service_role
 def kb_defaults():
     """Return KB configuration defaults for the frontend."""
     strategies = {}

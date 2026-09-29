@@ -55,6 +55,7 @@ dependencies = [
     # ignore; the worker detects that at runtime and logs a WARNING rather than
     # this floor naming a version that is not yet published.
     "powabase-agentic[rerankers]>=0.3.0",
+    "pglast>=8.4",
 ]
 
 # Development dependencies. Declared as a PEP 735 dependency-group rather than a

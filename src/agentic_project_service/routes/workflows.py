@@ -10,7 +10,7 @@ from typing import Any
 from flask import Blueprint, Response, jsonify, request, stream_with_context
 from sqlalchemy import text
 
-from ..auth import require_auth
+from ..auth import require_service_role
 from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
 from ..services.llm_availability import check_model_available
@@ -96,7 +96,7 @@ def _workflow_pre_check(workflow_id: str) -> None:
 
 
 @workflows_bp.route("", methods=["GET"])
-@require_auth
+@require_service_role
 def list_workflows():
     """List all workflows, paginated, with execution aggregates."""
     from ..services.list_params import parse_list_params, escape_like, ListParamsError
@@ -169,7 +169,7 @@ def list_workflows():
 
 
 @workflows_bp.route("", methods=["POST"])
-@require_auth
+@require_service_role
 def create_workflow():
     """Create a new workflow."""
     data = request.get_json() or {}
@@ -195,7 +195,7 @@ def create_workflow():
 
 
 @workflows_bp.route("/<workflow_id>", methods=["GET"])
-@require_auth
+@require_service_role
 def get_workflow(workflow_id: str):
     """Get a workflow with its blocks and edges."""
     row = db.session.execute(
@@ -232,7 +232,7 @@ def get_workflow(workflow_id: str):
 
 
 @workflows_bp.route("/<workflow_id>", methods=["PATCH"])
-@require_auth
+@require_service_role
 def update_workflow(workflow_id: str):
     """Update workflow metadata."""
     data = request.get_json() or {}
@@ -259,7 +259,7 @@ def update_workflow(workflow_id: str):
 
 
 @workflows_bp.route("/<workflow_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_workflow(workflow_id: str):
     """Delete a workflow and its blocks/edges (cascade)."""
     db.session.execute(
@@ -276,7 +276,7 @@ def delete_workflow(workflow_id: str):
 
 
 @workflows_bp.route("/<workflow_id>/deploy", methods=["POST"])
-@require_auth
+@require_service_role
 def deploy_workflow(workflow_id: str):
     """Set workflow state to deployed (webhooks always listening)."""
     # Extract schedule config from the starter block
@@ -342,7 +342,7 @@ def deploy_workflow(workflow_id: str):
 
 
 @workflows_bp.route("/<workflow_id>/undeploy", methods=["POST"])
-@require_auth
+@require_service_role
 def undeploy_workflow(workflow_id: str):
     """Set workflow state back to internal (webhooks dormant)."""
     result = db.session.execute(
@@ -362,7 +362,7 @@ def undeploy_workflow(workflow_id: str):
 
 
 @workflows_bp.route("/<workflow_id>/arm", methods=["POST"])
-@require_auth
+@require_service_role
 def arm_webhook(workflow_id: str):
     """Arm the webhook for a single execution (10-minute TTL)."""
     result = db.session.execute(
@@ -387,7 +387,7 @@ def arm_webhook(workflow_id: str):
 
 
 @workflows_bp.route("/<workflow_id>/graph", methods=["PUT"])
-@require_auth
+@require_service_role
 def save_graph(workflow_id: str):
     """Save the full graph (blocks + edges) for a workflow."""
     data = request.get_json() or {}
@@ -507,7 +507,7 @@ def save_graph(workflow_id: str):
 
 
 @workflows_bp.route("/<workflow_id>/execute", methods=["POST"])
-@require_auth
+@require_service_role
 @rate_limit_executions
 def execute_workflow(workflow_id: str):
     """Execute a workflow synchronously and return the result."""
@@ -698,7 +698,7 @@ def execute_workflow(workflow_id: str):
 
 
 @workflows_bp.route("/<workflow_id>/execute/stream", methods=["POST"])
-@require_auth
+@require_service_role
 @rate_limit_executions
 def execute_workflow_stream(workflow_id: str):
     """Execute a workflow with streaming (SSE)."""
@@ -903,7 +903,7 @@ def execute_workflow_stream(workflow_id: str):
 
 
 @workflows_bp.route("/<workflow_id>/executions", methods=["GET"])
-@require_auth
+@require_service_role
 def list_executions(workflow_id: str):
     """List execution history for a workflow (lightweight — no block_outputs)."""
     try:
@@ -941,7 +941,7 @@ def list_executions(workflow_id: str):
 
 
 @workflows_bp.route("/<workflow_id>/executions/<execution_id>/logs", methods=["GET"])
-@require_auth
+@require_service_role
 def get_execution_logs(workflow_id: str, execution_id: str):
     """Get per-block execution logs for a specific workflow execution."""
     # Verify execution belongs to this workflow

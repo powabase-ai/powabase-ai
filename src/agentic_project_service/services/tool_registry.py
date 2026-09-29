@@ -13,6 +13,7 @@ from agentic.agent.tools import BuiltinTool, CustomTool, KnowledgeSearchTool, To
 from ..models.tenant import AgentKnowledgeBase, AgentMcpServer, AgentTool, KnowledgeBase, Tool
 from ..services.context_handler import create_and_execute
 from ..tools.builtin import BUILTIN_HANDLERS, BUILTIN_TOOL_DEFINITIONS
+from . import agent_sql
 from . import billing_port as billing
 from .run_context import (
     get_run_id,
@@ -20,6 +21,7 @@ from .run_context import (
     next_call_seq,
 )
 from .settings_registry import get_setting
+from .tool_caller import ToolCaller
 
 
 def _derive_tool_idempotency_inputs(action: str, arguments: dict | None) -> tuple[str, str]:
@@ -667,12 +669,56 @@ def _introspect_table_metadata(db_session, schemas_config: dict[str, list[str]])
     return "\n".join(lines)
 
 
+# Built-in tools (other than the database tools) that reach project data and
+# so must act as the run's caller.
+_CALLER_SCOPED_TOOLS = frozenset({"storage_read", "storage_write"})
+
+
+def _with_caller(handler, caller: ToolCaller | None, agent_id: str):
+    """Always set the caller the loader was given, over anything the model sent."""
+
+    def with_caller(arguments, context):
+        arguments["_caller"] = caller
+        arguments["_agent_id"] = agent_id
+        return handler(arguments, context)
+
+    return with_caller
+
+
+def _database_tables(assignments) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    """The tables an agent's database_query and database_write tools are configured with."""
+    tables: dict[str, dict[str, list[str]]] = {"database_query": {}, "database_write": {}}
+    for assignment in assignments:
+        if assignment.tool_type == "builtin" and assignment.tool_name in tables:
+            schemas = (assignment.config_override or {}).get("schemas", {})
+            tables[assignment.tool_name] = {s: list(t) for s, t in schemas.items() if t}
+    return tables["database_query"], tables["database_write"]
+
+
+def sync_agent_database_role(agent_id: str) -> None:
+    """Bring the agent's database login in line with its database tools' tables.
+
+    A service-role run's database tools act as that login, so it must hold
+    exactly the configured tables. Called when a run's tools load and when
+    the agent's tool assignments change. Raises on failure.
+    """
+    read_tables, write_tables = _database_tables(AgentTool.query.filter_by(agent_id=agent_id).all())
+    agent_sql.sync_agent_role(agent_id, read_tables=read_tables, write_tables=write_tables)
+
+
+_DATABASE_TOOLS_UNAVAILABLE = (
+    "Database tools are unavailable for this run: their permissions could not be prepared"
+)
+
+
 def load_all_tools_for_agent(
     agent_id: str,
     db_session,
     max_tool_output_length: int | None = None,
     default_max_result_chars: int | None = None,
     runtime_kb_configs: list[dict] | None = None,
+    *,
+    caller: ToolCaller | None,
 ) -> dict[str, ToolDefinition]:
     """Load all tools assigned to an agent: built-in + custom.
 
@@ -681,11 +727,30 @@ def load_all_tools_for_agent(
         default_max_result_chars: Override for ToolDefinition.max_result_chars.
         runtime_kb_configs: Per-request KB configs merged into the agent's
             knowledge_search tool for this run only.
+        caller: Who the run acts for, and required so no call site can forget
+            it. The database and storage tools act as this caller; with None
+            they refuse to run.
     """
     tools: dict[str, ToolDefinition] = {}
     app = _get_flask_app()
 
     assignments = AgentTool.query.filter_by(agent_id=agent_id).all()
+
+    # A service-role run's database tools act as the agent's own login, which
+    # must hold exactly the configured tables first. If that fails they refuse
+    # rather than run with whatever grants the login had before.
+    database_tools_error: str | None = None
+    has_database_tools = any(
+        a.tool_type == "builtin" and a.tool_name in ("database_query", "database_write")
+        for a in assignments
+    )
+    if caller is not None and not caller.is_end_user and has_database_tools:
+        try:
+            read_tables, write_tables = _database_tables(assignments)
+            agent_sql.sync_agent_role(agent_id, read_tables=read_tables, write_tables=write_tables)
+        except Exception:
+            logger.exception("Could not sync the database login for agent %s", agent_id)
+            database_tools_error = _DATABASE_TOOLS_UNAVAILABLE
 
     for assignment in assignments:
         if assignment.tool_type == "builtin":
@@ -738,11 +803,19 @@ def load_all_tools_for_agent(
                         "- delete: where = filter (required, no mass deletes)"
                     )
 
-                def make_restricted_handler(h, schemas, tables, sc):
+                def make_restricted_handler(h, schemas, tables, sc, name=tool_name):
                     def restricted(arguments, context):
+                        if database_tools_error:
+                            if name == "database_write":
+                                return json.dumps(
+                                    {"success": False, "message": database_tools_error}
+                                )
+                            return json.dumps({"error": database_tools_error})
                         arguments["_allowed_schemas"] = schemas
                         arguments["_allowed_tables"] = tables
                         arguments["_schemas_config"] = sc
+                        arguments["_caller"] = caller
+                        arguments["_agent_id"] = agent_id
                         return h(arguments, context)
 
                     return restricted
@@ -779,6 +852,8 @@ def load_all_tools_for_agent(
             # = deep) is present in `arguments` when the billing wrapper
             # resolves the action. Wrapping the other way bills the standard
             # rate while running the pricier deep search.
+            if tool_name in _CALLER_SCOPED_TOOLS:
+                handler = _with_caller(handler, caller, agent_id)
             tool_handler = _wrap_handler_with_billing(
                 _ensure_app_context(handler, app), defn["name"]
             )

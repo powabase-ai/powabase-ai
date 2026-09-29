@@ -707,7 +707,7 @@ class TestSSEStreamingFlow:
     @patch("agentic_project_service.routes.copilot.db")
     @patch(
         "agentic_project_service.auth.decode_jwt",
-        return_value={"sub": "user-1", "role": "authenticated"},
+        return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
     )
     def test_successful_chat_emits_status_and_complete(self, _mock_jwt, mock_db, mock_chat):
         """A happy-path chat should emit status events then a complete event."""
@@ -772,7 +772,7 @@ class TestSSEStreamingFlow:
     @patch("agentic_project_service.routes.copilot.db")
     @patch(
         "agentic_project_service.auth.decode_jwt",
-        return_value={"sub": "user-1", "role": "authenticated"},
+        return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
     )
     def test_agent_error_emits_error_event(self, _mock_jwt, mock_db, mock_chat):
         """If run_copilot_chat raises, an error SSE event should be emitted with a

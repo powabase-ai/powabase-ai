@@ -202,7 +202,9 @@ class TestSeedRoundTrip:
                 ).scalar()
             )
 
-    def test_ten_pairs_round_trip_in_order(self, client, mock_auth, auth_headers, test_agent, app):
+    def test_ten_pairs_round_trip_in_order(
+        self, client, mock_auth, auth_headers, test_agent, mock_user_auth, app
+    ):
         """The endpoint's central claim: what goes in as `initial_messages`
         comes back out of `load_session_history` as the same conversation, in
         the same order. `load_session_history` orders by `created_at ASC`, so
@@ -237,7 +239,7 @@ class TestSeedRoundTrip:
         assert len(set(stamps)) == 10
 
     def test_citation_markers_are_stripped_from_seeded_assistant_content(
-        self, client, mock_auth, auth_headers, test_agent, app
+        self, client, mock_auth, auth_headers, test_agent, mock_user_auth, app
     ):
         """`load_session_history` runs `strip_citation_markers` over assistant
         content. Seeded text that happens to contain `[n]` is rewritten by it
@@ -257,7 +259,7 @@ class TestSeedRoundTrip:
         assert history[1].content == "The report says X and Y."
 
     def test_seeded_runs_are_completed_and_scoped_to_the_session(
-        self, client, mock_auth, auth_headers, test_agent, app
+        self, client, mock_auth, auth_headers, test_agent, mock_user_auth, app
     ):
         messages = [
             {"role": "user", "content": "Q1"},
@@ -289,7 +291,7 @@ class TestSeedRoundTrip:
         assert rows[0][3] < rows[1][3]
 
     def test_session_delete_cascades_to_seeded_runs(
-        self, client, mock_auth, auth_headers, test_agent, app
+        self, client, mock_auth, auth_headers, test_agent, mock_user_auth, app
     ):
         """`agent_runs.session_id` is `ON DELETE CASCADE`, so deleting the
         session is enough — the route does not delete runs itself.

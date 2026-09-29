@@ -169,7 +169,7 @@ class TestTheRoutesCallIt:
     def _post(self, body):
         with patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ):
             return self._client().post(
                 "/api/knowledge-bases",
@@ -180,7 +180,7 @@ class TestTheRoutesCallIt:
     def _patch(self, body):
         with patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ):
             return self._client().patch(
                 "/api/knowledge-bases/11111111-1111-1111-1111-111111111111",

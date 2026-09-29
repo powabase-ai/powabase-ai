@@ -139,6 +139,26 @@ jobs:
       # tests/test_run_usage_cache_creation_store.py pins the run usage columns
       # through their hand-written INSERT/UPDATE/SELECT lists, one of which is
       # read back by position.
+      #
+      # tests/test_agent_sql_store.py pins that agent database tools run as the
+      # caller: tool logins that are not superusers, an end user's run held to
+      # their RLS policies, a service-role run held to its agent's own login.
+      # The route tests pin that agent and orchestration runs load their tools
+      # for the request's caller, register paused runs under that caller, and
+      # bind a session only to its owner even when two requests race. The
+      # session-bind store tests pin the same at the database, and the tool
+      # error store tests pin what a real database error shows the model. The
+      # route tests boot the app, whose migrations grant to the Supabase roles,
+      # so those roles are created first.
+      - name: Create the Supabase roles the migrations grant to
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U supabase_admin -d postgres_test -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE anon NOLOGIN" \
+            -c "CREATE ROLE authenticated NOLOGIN" \
+            -c "CREATE ROLE service_role NOLOGIN BYPASSRLS"
+
       - name: Run store tests
         run: |
           set -o pipefail
@@ -149,6 +169,16 @@ jobs:
             tests/test_extraction_redelivery_store.py \
             tests/test_index_source_retry.py \
             tests/test_run_usage_cache_creation_store.py \
+            tests/test_agent_sql_store.py \
+            "tests/route/test_agent_streaming.py::TestToolsActAsTheCaller" \
+            "tests/route/test_orchestration_streaming.py::TestSubAgentToolsActAsTheCaller" \
+            "tests/route/test_agent_streaming.py::TestPausedRunsAreRegisteredUnderTheCaller" \
+            tests/route/test_run_session_bind.py \
+            tests/route/test_orchestration_session_access.py \
+            tests/test_session_bind_store.py \
+            tests/test_tool_error_messages_store.py \
+            tests/test_agent_tool_writes_store.py \
+            tests/test_agent_tool_logins_boot_store.py \
             -q -rs | tee pytest-store.log
           if grep -Eq "[0-9]+ (skipped|deselected|xfailed|xpassed)" pytest-store.log; then
             echo "::error::the store tier did not run every test; this job must run all of them"

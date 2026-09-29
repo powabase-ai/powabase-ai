@@ -263,7 +263,7 @@ def test_run_agent_fail_fast_when_model_byok_only_and_no_key(billing_env, no_pla
     with (
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
         patch.object(agents_route.db.session, "execute") as mock_exec,
     ):
@@ -299,7 +299,7 @@ def test_run_agent_stream_fail_fast_when_model_byok_only(billing_env, no_platfor
     with (
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
         patch.object(agents_route.db.session, "execute") as mock_exec,
     ):
@@ -338,7 +338,7 @@ def test_run_agent_proceeds_when_provider_is_platform_supported(billing_env, mon
     with (
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
         patch.object(
             agents_route, "check_model_available", wraps=check_model_available
@@ -391,7 +391,7 @@ def test_run_orchestration_stream_fail_fast_when_sub_agent_byok_only(billing_env
     with (
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
         patch.object(orchestrations_route.db.session, "get", return_value=fake_orch_row),
         patch.object(
@@ -437,7 +437,7 @@ def test_run_orchestration_stream_proceeds_when_all_sub_agents_have_keys(billing
     with (
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
         patch.object(orchestrations_route.db.session, "get", return_value=fake_orch_row),
         patch.object(
@@ -517,7 +517,7 @@ def test_run_workflow_fail_fast_when_block_byok_only(
         patch.object(llm_availability, "list_byok_providers", return_value=frozenset()),
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
         patch.object(workflows_route, "build_workflow_from_db", return_value=fake_wf),
         patch.object(workflows_route, "load_blocks", return_value=blocks_data),

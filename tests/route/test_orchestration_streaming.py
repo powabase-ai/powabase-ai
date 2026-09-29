@@ -455,14 +455,14 @@ class TestPreResponseReconciliation:
 
 
 class TestEmptyRedactionReachesTheWire:
-    """R6-C1 layer 2: a full redaction (`modified_output: ""`) must be emitted.
+    """A full redaction (`modified_output: ""`) must be emitted.
 
-    Round 5 fixed `hooks.py` so an empty-string redaction propagates into
-    `output.content`. The route then dropped it again: `if final_content:` is
+    `hooks.py` propagates an empty-string redaction into `output.content`.
+    The route used to drop it again: `if final_content:` is
     falsy for `""`, so the terminal correction chunk was never sent. A consumer
-    reading the SSE stream (the downstream backend this feature exists for) sees
+    reading the SSE stream (the downstream backend this feature exists for) saw
     the raw streamed answer and no correction — while the DB row and the audit
-    record both say the answer was redacted.
+    record both said the answer was redacted.
     """
 
     def test_empty_redaction_emits_terminal_chunk(
@@ -521,7 +521,7 @@ class TestEmptyRedactionReachesTheWire:
 
 
 class TestHooksReachTheEngine:
-    """R6-C2: the route must actually hand the DB's hooks to the engine.
+    """The route must actually hand the DB's hooks to the engine.
 
     `test_supervisor_hooks.py` proves `Orchestration.run(hooks=...)` forwards
     correctly, but constructs the Orchestration directly. The streaming route
@@ -599,3 +599,48 @@ class TestHooksReachTheEngine:
                 buffered=True,
             )
         assert captured["hooks"] is None
+
+
+class TestSubAgentToolsActAsTheCaller:
+    """Each sub-agent's tools are loaded for whoever called run/stream."""
+
+    def _captured_callers(self, client, orch_id, auth_headers, monkeypatch):
+        from agentic_project_service.services import orchestration as orchestration_service
+
+        callers = []
+        real_loader = orchestration_service.load_all_tools_for_agent
+
+        def spy(*args, **kwargs):
+            callers.append(kwargs.get("caller"))
+            return real_loader(*args, **kwargs)
+
+        monkeypatch.setattr(orchestration_service, "load_all_tools_for_agent", spy)
+        # Only the tool loading is under test, not whether an LLM key is configured.
+        monkeypatch.setattr(
+            "agentic_project_service.routes.orchestrations.check_model_available",
+            lambda model: None,
+        )
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        with patch(
+            "agentic.orchestration.orchestration.Orchestration.run",
+            side_effect=lambda input, context=None, **kw: _make_completed_output(
+                context.execution_id
+            ),
+        ):
+            resp = client.post(
+                f"/api/orchestrations/{orch_id}/run/stream",
+                json={"message": "go"},
+                headers=auth_headers,
+                buffered=True,
+            )
+        assert resp.status_code == 200
+        assert callers, "no sub-agent tools were loaded"
+        return callers
+
+    def test_end_user_run(self, client, mock_user_auth, auth_headers, orch_with_agent, monkeypatch):
+        callers = self._captured_callers(client, orch_with_agent, auth_headers, monkeypatch)
+        assert all(c.is_end_user and c.claims["sub"] == mock_user_auth for c in callers)
+
+    def test_service_role_run(self, client, mock_auth, auth_headers, orch_with_agent, monkeypatch):
+        callers = self._captured_callers(client, orch_with_agent, auth_headers, monkeypatch)
+        assert all(c is not None and not c.is_end_user for c in callers)

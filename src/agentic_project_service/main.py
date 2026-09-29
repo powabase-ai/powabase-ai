@@ -47,6 +47,25 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def set_up_agent_tool_logins() -> None:
+    """Create the end-user tool login and reconcile the agents' logins.
+
+    Neither failure is fatal: without the logins the database tools refuse,
+    and everything else works. The reconcile drops logins of agents that are
+    gone or have no database tools, and follows a password rotation.
+    """
+    from .services import agent_sql
+
+    try:
+        agent_sql.ensure_login_roles()
+    except Exception:
+        logger.exception("Could not set up the agent tool database logins")
+    try:
+        agent_sql.reconcile_agent_roles()
+    except Exception:
+        logger.exception("Could not reconcile the agent tool database logins")
+
+
 def create_app(testing: bool = False):
     """Create and configure the Flask application.
 
@@ -474,6 +493,19 @@ def create_app(testing: bool = False):
             logger.error(f"Database migration failed: {e}")
             db.session.rollback()
             raise SystemExit(1)
+
+    # The logins agent database tools run on, so their SQL never runs as this
+    # service's own (superuser) login. Refreshed every boot so a database
+    # password rotation follows. Not fatal: without them the database tools
+    # refuse, and everything else works.
+    with app.app_context():
+        set_up_agent_tool_logins()
+
+    if not os.getenv("SERVICE_ROLE_KEY"):
+        logger.warning(
+            "SERVICE_ROLE_KEY is not set: no request can authenticate as the service role, "
+            "so every management route is unreachable"
+        )
 
     return app
 

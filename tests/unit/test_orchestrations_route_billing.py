@@ -56,7 +56,7 @@ def test_run_orchestration_stream_balance_check_fires_pre_stream():
 
     with patch(
         "agentic_project_service.auth.decode_jwt",
-        return_value={"sub": "user-1", "role": "authenticated"},
+        return_value={"sub": "11111111-1111-4111-8111-111111111111", "role": "authenticated"},
     ):
         with app.test_client() as client:
             resp = client.post(
@@ -79,7 +79,7 @@ def test_run_orchestration_stream_propagates_503():
 
     with patch(
         "agentic_project_service.auth.decode_jwt",
-        return_value={"sub": "user-1", "role": "authenticated"},
+        return_value={"sub": "11111111-1111-4111-8111-111111111111", "role": "authenticated"},
     ):
         with app.test_client() as client:
             resp = client.post(
@@ -99,7 +99,7 @@ def test_run_orchestration_stream_short_circuits_before_billing_when_no_message(
     app = _make_test_app()
     with patch(
         "agentic_project_service.auth.decode_jwt",
-        return_value={"sub": "user-1", "role": "authenticated"},
+        return_value={"sub": "11111111-1111-4111-8111-111111111111", "role": "authenticated"},
     ):
         with app.test_client() as client:
             resp = client.post(

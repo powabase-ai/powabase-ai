@@ -17,7 +17,7 @@ from flask import Blueprint, Response, jsonify, request
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
-from ..auth import require_auth
+from ..auth import require_service_role
 from ..celery import celery_app
 from ..db import db, AI_SCHEMA
 from ..services.ai_provider_keys_resolver import get_all_user_provider_keys
@@ -224,7 +224,7 @@ def _duplicate_response(content_hash: str):
 
 
 @sources_bp.route("", methods=["GET"])
-@require_auth
+@require_service_role
 def list_sources():
     """List sources, paginated, with optional status filter and name search."""
     from ..services.list_params import parse_list_params, escape_like, ListParamsError
@@ -289,7 +289,7 @@ def list_sources():
 
 
 @sources_bp.route("/upload", methods=["POST"])
-@require_auth
+@require_service_role
 def upload_source():
     """Upload a new source file."""
     if "file" not in request.files:
@@ -647,7 +647,7 @@ def _discover_urls_sitemap(url: str, max_pages: int) -> list[str]:
 
 
 @sources_bp.route("/import-url", methods=["POST"])
-@require_auth
+@require_service_role
 def import_url():
     """Import sources from URLs (list, crawl, or sitemap)."""
     data = request.get_json()
@@ -739,7 +739,7 @@ def import_url():
 
 
 @sources_bp.route("/import-from-storage", methods=["POST"])
-@require_auth
+@require_service_role
 def import_from_storage():
     """Create a source record from a file already in storage (no re-upload)."""
     data = request.get_json()
@@ -909,7 +909,7 @@ def import_from_storage():
 
 
 @sources_bp.route("/<source_id>", methods=["GET"])
-@require_auth
+@require_service_role
 def get_source(source_id: str):
     """Get a specific source."""
     result = db.session.execute(
@@ -947,7 +947,7 @@ def get_source(source_id: str):
 
 
 @sources_bp.route("/<source_id>", methods=["PATCH"])
-@require_auth
+@require_service_role
 def update_source(source_id: str):
     """Update source metadata."""
     data = request.get_json()
@@ -990,7 +990,7 @@ def update_source(source_id: str):
 
 
 @sources_bp.route("/<source_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_source(source_id: str):
     """Delete a source and its files."""
     # Get source info
@@ -1083,7 +1083,7 @@ def delete_source(source_id: str):
 
 
 @sources_bp.route("/<source_id>/download", methods=["GET"])
-@require_auth
+@require_service_role
 def download_source(source_id: str):
     """Download the source file."""
     result = db.session.execute(
@@ -1119,7 +1119,7 @@ def download_source(source_id: str):
 
 
 @sources_bp.route("/<source_id>/page-texts", methods=["GET"])
-@require_auth
+@require_service_role
 def get_page_texts(source_id: str):
     """Get per-page texts for a source.
 
@@ -1195,7 +1195,7 @@ def get_page_texts(source_id: str):
 
 
 @sources_bp.route("/<source_id>/cancel", methods=["POST"])
-@require_auth
+@require_service_role
 def cancel_extraction(source_id: str):
     """Cancel an in-progress extraction."""
     result = db.session.execute(
@@ -1235,7 +1235,7 @@ def cancel_extraction(source_id: str):
 
 
 @sources_bp.route("/<source_id>/reextract", methods=["POST"])
-@require_auth
+@require_service_role
 def reextract_source(source_id: str):
     """Re-trigger extraction for a source."""
     result = db.session.execute(
@@ -1342,7 +1342,7 @@ def reextract_source(source_id: str):
 
 
 @sources_bp.route("/<source_id>/derivatives/<deriv_type>/download", methods=["GET"])
-@require_auth
+@require_service_role
 def download_derivative(source_id: str, deriv_type: str):
     """Download derivative content directly."""
     try:

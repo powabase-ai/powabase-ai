@@ -13,7 +13,7 @@ import redis
 from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from sqlalchemy import text
 
-from ..auth import require_auth
+from ..auth import require_service_role
 from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
 from ..services.ai_provider_keys_resolver import project_has_byok_for_model
@@ -128,7 +128,7 @@ def _release_turn_lock(session_id: str, token: str) -> None:
 
 
 @copilot_bp.route("/sessions", methods=["POST"])
-@require_auth
+@require_service_role
 def create_session():
     """Create a new copilot session for a workflow."""
     data = request.get_json() or {}
@@ -158,7 +158,7 @@ def create_session():
 
 
 @copilot_bp.route("/sessions", methods=["GET"])
-@require_auth
+@require_service_role
 def get_session():
     """Get existing copilot session for a workflow."""
     workflow_id = request.args.get("workflow_id")
@@ -192,7 +192,7 @@ def get_session():
 
 
 @copilot_bp.route("/sessions/<session_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_session(session_id: str):
     """Delete a copilot session (cascade deletes messages)."""
     db.session.execute(
@@ -209,7 +209,7 @@ def delete_session(session_id: str):
 
 
 @copilot_bp.route("/sessions/<session_id>/messages", methods=["GET"])
-@require_auth
+@require_service_role
 def get_messages(session_id: str):
     """Get conversation history for a session."""
     rows = db.session.execute(
@@ -239,7 +239,7 @@ def get_messages(session_id: str):
 
 
 @copilot_bp.route("/sessions/<session_id>/messages/<message_id>/snapshot", methods=["POST"])
-@require_auth
+@require_service_role
 def save_snapshot(session_id: str, message_id: str):
     """Store the pre-application snapshot on an assistant message."""
     data = request.get_json() or {}
@@ -266,7 +266,7 @@ def save_snapshot(session_id: str, message_id: str):
 
 
 @copilot_bp.route("/sessions/<session_id>/chat", methods=["POST"])
-@require_auth
+@require_service_role
 def chat(session_id: str):
     """Send a user message and stream the assistant response (SSE)."""
     data = request.get_json() or {}
@@ -605,7 +605,7 @@ def chat(session_id: str):
 
 
 @copilot_bp.route("/settings/model", methods=["GET"])
-@require_auth
+@require_service_role
 def get_model_setting():
     """Get the configured copilot model for this project."""
     return jsonify(
@@ -618,7 +618,7 @@ def get_model_setting():
 
 
 @copilot_bp.route("/settings/model", methods=["PUT"])
-@require_auth
+@require_service_role
 def set_copilot_model():
     """Set the copilot model for this project."""
     data = request.get_json() or {}

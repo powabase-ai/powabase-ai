@@ -23,7 +23,9 @@ from ..services.ai_provider_keys_resolver import (
     get_user_provider_keys_with_dropped,
     resolve_api_key_or_raise_for_drop_using,
 )
+from ..services.session import SessionNotAccessible, same_uuid
 from ..services.settings_registry import get_setting
+from ..services.tool_caller import ToolCaller
 from ..services.tool_registry import load_all_tools_for_agent
 
 logger = logging.getLogger(__name__)
@@ -32,8 +34,13 @@ logger = logging.getLogger(__name__)
 def build_orchestration(
     orch_id: str,
     runtime_kb_configs: list[dict] | None = None,
+    *,
+    caller: ToolCaller,
 ) -> tuple[OrchestrationModel, Orchestration]:
     """Build a core Orchestration object from DB models.
+
+    ``caller`` is who the run acts for; sub-agents' data tools act as it.
+    Required, so a new call site cannot leave the tools acting for nobody.
 
     Returns (orm_model, core_orchestration).
     """
@@ -114,6 +121,7 @@ def build_orchestration(
                 max_tool_output_length=get_setting("MAX_TOOL_OUTPUT_LENGTH"),
                 default_max_result_chars=get_setting("DEFAULT_MAX_RESULT_CHARS"),
                 runtime_kb_configs=runtime_kb_configs,
+                caller=caller,
             )
 
             entity_config = entity.config or {}
@@ -139,11 +147,27 @@ def get_or_create_orchestration_session(
     orchestration_id: str,
     session_id: str | None = None,
     user_id: str | None = None,
+    *,
+    end_user_id: str | None = None,
 ) -> tuple[str, str, bool]:
     """Get or create an orchestration session.
 
+    ``end_user_id`` is the end user a run acts for, or None for the service
+    role. When set, a named session must already exist and be this user's own
+    session of this orchestration, and without a name a new one is created
+    owned by this user; anything else raises :class:`SessionNotAccessible`.
+    End users never name a new session (see ``session_accessible_to`` in
+    services/session.py for why).
+
     Returns (db_session_uuid, session_id, is_new).
     """
+    if end_user_id is not None:
+        if session_id:
+            return _end_user_existing_session(orchestration_id, session_id, end_user_id)
+        return _bind_end_user_session(
+            orchestration_id, f"orch_sess_{uuid.uuid4().hex[:12]}", end_user_id
+        )
+
     if session_id:
         existing = OrchestrationSessionModel.query.filter_by(session_id=session_id).first()
         if existing:
@@ -158,6 +182,77 @@ def get_or_create_orchestration_session(
     db.session.add(session)
     db.session.flush()
     return str(session.id), new_session_id, True
+
+
+def _end_user_existing_session(
+    orchestration_id: str, session_id: str, end_user_id: str
+) -> tuple[str, str, bool]:
+    """The end user's own existing session of this orchestration, or SessionNotAccessible."""
+    existing = db.session.execute(
+        text(
+            f"""
+            SELECT id, orchestration_id, user_id FROM "{AI_SCHEMA}".orchestration_sessions
+            WHERE session_id = :session_id
+            """
+        ),
+        {"session_id": session_id},
+    ).fetchone()
+    if (
+        existing is None
+        or not same_uuid(existing[2], end_user_id)
+        or not same_uuid(existing[1], orchestration_id)
+    ):
+        raise SessionNotAccessible(session_id)
+    return str(existing[0]), session_id, False
+
+
+def _bind_end_user_session(
+    orchestration_id: str, session_id: str, end_user_id: str
+) -> tuple[str, str, bool]:
+    """Create ``session_id`` for the end user, or return it if it is theirs.
+
+    Atomic for the same reason as the agent sessions' bind in
+    services/session.py: the route's ownership check runs before the
+    orchestration is built, and another caller can create the id meanwhile.
+    ``session_id`` is unique, so of two concurrent creators exactly one
+    inserts, and the other is refused unless it is the same user and
+    orchestration.
+    """
+    inserted = db.session.execute(
+        text(
+            f"""
+            INSERT INTO "{AI_SCHEMA}".orchestration_sessions
+                (session_id, orchestration_id, user_id)
+            VALUES (:session_id, :orchestration_id, :user_id)
+            ON CONFLICT (session_id) DO NOTHING
+            RETURNING id
+            """
+        ),
+        {
+            "session_id": session_id,
+            "orchestration_id": orchestration_id,
+            "user_id": end_user_id,
+        },
+    ).fetchone()
+    if inserted is not None:
+        return str(inserted[0]), session_id, True
+
+    existing = db.session.execute(
+        text(
+            f"""
+            SELECT id, orchestration_id, user_id FROM "{AI_SCHEMA}".orchestration_sessions
+            WHERE session_id = :session_id
+            """
+        ),
+        {"session_id": session_id},
+    ).fetchone()
+    if (
+        existing is None
+        or not same_uuid(existing[2], end_user_id)
+        or not same_uuid(existing[1], orchestration_id)
+    ):
+        raise SessionNotAccessible(session_id)
+    return str(existing[0]), session_id, False
 
 
 def create_orchestration_run(

@@ -25,7 +25,7 @@ S = "agentic_project_service.services.pg_bm25_index"
 
 _AUTH = patch(
     "agentic_project_service.auth.decode_jwt",
-    return_value={"sub": "user-1", "role": "service_role"},
+    return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
 )
 
 

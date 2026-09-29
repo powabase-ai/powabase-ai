@@ -23,7 +23,7 @@ _FAKE_JWT = "fake.jwt.token"
 
 _AUTH_PATCH = patch(
     "agentic_project_service.auth.decode_jwt",
-    return_value={"role": "service_role"},
+    return_value={"role": "service_role", "is_service_role": True},
 )
 
 

@@ -26,7 +26,7 @@ R = "agentic_project_service.routes.knowledge_bases"
 def _error(kb, *, status=None, backend="pg_search", auto_indexing=True, request_method="full_text"):
     kb_id = str(uuid.uuid4())
     with (
-        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role"}),
+        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role", "is_service_role": True}),
         patch(f"{R}.db"),
         patch(
             f"{R}.get_setting",

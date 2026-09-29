@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, request
 
-from ..auth import require_auth
+from ..auth import require_service_role
 from ..db import db
 from ..models.tenant import AIProviderKey
 from ..services.ai_provider_keys_resolver import (
@@ -64,7 +64,7 @@ def _upsert_key(provider: str, api_key: str) -> tuple[AIProviderKey, bool]:
 
 
 @ai_provider_keys_bp.route("", methods=["GET"])
-@require_auth
+@require_service_role
 def list_keys():
     """Return all stored provider keys (masked).
 
@@ -81,7 +81,7 @@ def list_keys():
 
 
 @ai_provider_keys_bp.route("/platform_supported", methods=["GET"])
-@require_auth
+@require_service_role
 def platform_supported():
     """Return providers AI-on-us is available for at this pod.
 
@@ -114,7 +114,7 @@ def platform_supported():
 
 
 @ai_provider_keys_bp.route("", methods=["POST"])
-@require_auth
+@require_service_role
 def upsert_key():
     """Upsert a single provider key. Body: {provider, api_key}."""
     data = request.get_json(silent=True) or {}
@@ -140,7 +140,7 @@ def upsert_key():
 
 
 @ai_provider_keys_bp.route("", methods=["PUT"])
-@require_auth
+@require_service_role
 def batch_upsert_keys():
     """Batch upsert. Body: {openai?, anthropic?, google?, openrouter?}.
 
@@ -180,7 +180,7 @@ def batch_upsert_keys():
 
 
 @ai_provider_keys_bp.route("/<provider>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_key(provider: str):
     """Delete a provider key. Returns 204."""
     provider = provider.strip().lower()
@@ -193,7 +193,7 @@ def delete_key(provider: str):
 
 
 @ai_provider_keys_bp.route("/validate", methods=["POST"])
-@require_auth
+@require_service_role
 def validate_key():
     """Validate a key without storing it. Body: {provider, api_key}."""
     data = request.get_json(silent=True) or {}

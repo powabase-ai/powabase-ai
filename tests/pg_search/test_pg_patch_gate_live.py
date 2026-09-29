@@ -52,7 +52,7 @@ def client(engine, monkeypatch):
     with (
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "service_role"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
         # The detail response reads tables the scratch schema does not have;
         # the PATCH's own decision is what is under test.

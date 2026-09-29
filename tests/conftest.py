@@ -121,9 +121,27 @@ def auth_headers():
 
 @pytest.fixture
 def mock_auth(mocker):
-    """Mock JWT auth so every request authenticates as a test user.
+    """Mock JWT auth so every request authenticates with the service role key.
 
-    Returns the generated ``user_id`` so tests can assert ownership.
+    That is how the dashboard and trusted backends call every management
+    route. Returns a generated ``user_id`` (carried as ``sub``) for tests that
+    need one; use ``mock_user_auth`` to act as an end user instead.
+    """
+    test_user_id = str(uuid.uuid4())
+    mocker.patch(
+        "agentic_project_service.auth.decode_jwt",
+        return_value={"sub": test_user_id, "role": "service_role", "is_service_role": True},
+    )
+    return test_user_id
+
+
+@pytest.fixture
+def mock_user_auth(mocker):
+    """Mock JWT auth so every request authenticates as an end user.
+
+    End users may only call the conversation routes, scoped to their own
+    sessions and runs. Returns the generated ``user_id`` so tests can assert
+    ownership.
     """
     test_user_id = str(uuid.uuid4())
     mocker.patch(

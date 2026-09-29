@@ -60,7 +60,7 @@ def test_execute_workflow_balance_check_fires_first():
         patch.object(workflows_route, "build_workflow_from_db") as mock_build,
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
     ):
         with app.test_client() as client:
@@ -98,7 +98,7 @@ def test_execute_workflow_propagates_503():
         patch.object(workflows_route, "build_workflow_from_db"),
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
     ):
         with app.test_client() as client:
@@ -133,7 +133,7 @@ def test_execute_workflow_stream_balance_check_fires_first():
         patch.object(workflows_route, "build_workflow_from_db") as mock_build,
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
     ):
         with app.test_client() as client:
@@ -197,7 +197,7 @@ def test_execute_workflow_posts_charge_on_success(recording_billing):
         ),
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
     ):
         with app.test_client() as client:
@@ -243,7 +243,7 @@ def test_execute_workflow_skips_charge_on_failure(recording_billing):
         ),
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
     ):
         with app.test_client() as client:
@@ -283,7 +283,7 @@ def test_execute_workflow_uses_run_id_in_idempotency_key(recording_billing):
         ),
         patch(
             "agentic_project_service.auth.decode_jwt",
-            return_value={"sub": "user-1", "role": "authenticated"},
+            return_value={"sub": "user-1", "role": "service_role", "is_service_role": True},
         ),
     ):
         with app.test_client() as client:

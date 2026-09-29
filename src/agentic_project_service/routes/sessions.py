@@ -2,9 +2,9 @@
 
 import logging
 
-from flask import Blueprint, g, jsonify, request
+from flask import Blueprint, jsonify, request
 
-from ..auth import get_current_user_id, require_auth
+from ..auth import get_current_user_id, is_service_role_request, require_user_auth
 from ..db import db
 from ..services.context_handler import resolve_tool_call_image_refs
 from ..services.session import (
@@ -14,6 +14,7 @@ from ..services.session import (
     get_session_by_id,
     get_session_owner,
     list_runs_for_session,
+    session_id_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -22,14 +23,17 @@ sessions_bp = Blueprint("sessions", __name__, url_prefix="/api/sessions")
 
 
 def _verify_session_access(session_id: str):
-    """Return None if caller may access session, else a (response, 404) tuple.
+    """Return None if caller may access session, else a (response, status) tuple.
 
-    Service-role callers bypass the check. For user-scoped callers, return 404
-    (not 403) on both "not found" and "owned by someone else" to avoid leaking
-    session existence.
+    An id no session can have is 400 for every caller. Service-role callers
+    bypass the ownership check. For user-scoped callers, return 404 (not 403)
+    on both "not found" and "owned by someone else" to avoid leaking session
+    existence.
     """
-    jwt_payload = getattr(g, "jwt_payload", None) or {}
-    if jwt_payload.get("is_service_role", False):
+    shape_error = session_id_error(session_id)
+    if shape_error:
+        return jsonify({"error": shape_error}), 400
+    if is_service_role_request():
         return None
 
     owner = get_session_owner(db.session, session_id)
@@ -40,7 +44,7 @@ def _verify_session_access(session_id: str):
 
 
 @sessions_bp.route("/<session_id>", methods=["GET"])
-@require_auth
+@require_user_auth
 def get_session(session_id: str):
     """Get a session by its session_id."""
     denial = _verify_session_access(session_id)
@@ -55,7 +59,7 @@ def get_session(session_id: str):
 
 
 @sessions_bp.route("/<session_id>/messages", methods=["GET"])
-@require_auth
+@require_user_auth
 def get_messages(session_id: str):
     """
     Get chat messages for a session.
@@ -93,7 +97,7 @@ def get_messages(session_id: str):
 
 
 @sessions_bp.route("/<session_id>/runs", methods=["GET"])
-@require_auth
+@require_user_auth
 def get_runs(session_id: str):
     """
     Get all runs for a session.
@@ -139,7 +143,7 @@ def get_runs(session_id: str):
 
 
 @sessions_bp.route("/<session_id>/runs/<run_id>/retrieved-context", methods=["GET"])
-@require_auth
+@require_user_auth
 def get_run_retrieved_context_route(session_id: str, run_id: str):
     """Get retrieved context for a single run in a session."""
     denial = _verify_session_access(session_id)
@@ -159,7 +163,7 @@ def get_run_retrieved_context_route(session_id: str, run_id: str):
 
 
 @sessions_bp.route("/<session_id>", methods=["DELETE"])
-@require_auth
+@require_user_auth
 def delete_session_route(session_id: str):
     """
     Delete a session and all its runs.

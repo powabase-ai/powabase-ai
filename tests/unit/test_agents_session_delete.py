@@ -20,7 +20,7 @@ from agentic_project_service.routes import agents as agents_route
 AGENT_ID = "3f9a1c2e-5b7d-4e11-9a3c-8d2f6b4e1a70"
 OTHER_AGENT_ID = "9c1e7d40-2a55-4f8b-b0d3-6e5a1c9f8b22"
 SESSION_ID = "sess_abc123"
-USER_ID = "user-1"
+USER_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def _make_test_app():

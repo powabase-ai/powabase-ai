@@ -372,15 +372,15 @@ def test_failed_agent_block_persists_with_failed_status_and_error(
 
 
 @pytest.mark.integration
-def test_single_agent_run_endpoint_denies_cross_user(client, app, mock_auth, auth_headers):
+def test_single_agent_run_endpoint_denies_cross_user(client, app, mock_user_auth, auth_headers):
     """GET /api/agents/runs/<run_id> returns 404 when a run belongs to a session
     owned by a different user (404 not 403, to avoid leaking existence).
 
-    mock_auth fixture authenticates the caller as some user U. We create a
+    mock_user_auth fixture authenticates the caller as some user U. We create a
     session owned by a DIFFERENT user, put a run in it, and expect 404.
     """
     other_user_id = str(uuid.uuid4())
-    assert other_user_id != mock_auth  # sanity: fixture users differ
+    assert other_user_id != mock_user_auth  # sanity: fixture users differ
 
     agent_id = str(uuid.uuid4())
     session_db_id = str(uuid.uuid4())
@@ -414,7 +414,7 @@ def test_single_agent_run_endpoint_denies_cross_user(client, app, mock_auth, aut
 
 
 @pytest.mark.integration
-def test_single_agent_run_endpoint_allows_session_owner(client, app, mock_auth, auth_headers):
+def test_single_agent_run_endpoint_allows_session_owner(client, app, mock_user_auth, auth_headers):
     """Conversely, a session owned by the calling user IS accessible.
 
     Guards against over-scoping: the ownership check must not false-positive
@@ -435,7 +435,7 @@ def test_single_agent_run_endpoint_allows_session_owner(client, app, mock_auth, 
                 'INSERT INTO "ai".agent_sessions (id, session_id, agent_id, user_id) '
                 "VALUES (:id, :sid, :aid, :uid)"
             ),
-            {"id": session_db_id, "sid": session_id, "aid": agent_id, "uid": mock_auth},
+            {"id": session_db_id, "sid": session_id, "aid": agent_id, "uid": mock_user_auth},
         )
         db.session.execute(
             text(

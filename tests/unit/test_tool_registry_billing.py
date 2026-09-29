@@ -155,7 +155,7 @@ def test_load_all_tools_for_agent_bills_override_deep_search_as_deep(
 
     monkeypatch.setitem(tool_registry.BUILTIN_HANDLERS, "web_search", fake_web_search)
 
-    tools = tool_registry.load_all_tools_for_agent("agent-x", db_session=None)
+    tools = tool_registry.load_all_tools_for_agent("agent-x", db_session=None, caller=None)
     handler = tools["web_search"].handler
 
     # No search_type in the call args — only the config_override forces it.

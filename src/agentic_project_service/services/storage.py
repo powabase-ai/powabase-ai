@@ -8,6 +8,7 @@ import hashlib
 import logging
 import os
 import re
+from urllib.parse import quote
 
 from anyascii import anyascii
 import httpx
@@ -15,10 +16,74 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
-class StorageError(Exception):
-    """Raised when a storage operation fails."""
+def _reported_status(response: httpx.Response) -> int:
+    """The status an error answer stands for.
 
-    pass
+    storage-api answers some errors, such as a missing object or bucket, or an
+    object the caller's storage policies deny, with HTTP 400 and the real
+    status as a string in the JSON body's ``statusCode``.
+    """
+    if response.status_code == 400:
+        try:
+            code = response.json().get("statusCode")
+        except Exception:
+            code = None
+        if isinstance(code, str) and code.isdigit():
+            return int(code)
+    return response.status_code
+
+
+class StorageError(Exception):
+    """Raised when a storage operation fails.
+
+    ``status_code`` is the HTTP status Storage answered with, or None when no
+    answer came back (a transport error) or the request was never sent.
+    ``reported_status`` is the status the answer stands for (see
+    :func:`_reported_status`); it is ``status_code`` unless the body says
+    otherwise.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        status_code: int | None = None,
+        *,
+        reported_status: int | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.reported_status = reported_status if reported_status is not None else status_code
+
+    @classmethod
+    def from_response(cls, message: str, response: httpx.Response) -> "StorageError":
+        """An error for Storage's ``response``; ``message`` should say what failed."""
+        return cls(
+            f"{message}: {response.text}",
+            response.status_code,
+            reported_status=_reported_status(response),
+        )
+
+
+def _object_url_path(bucket_id: str, path: str = "") -> str:
+    """``bucket/path`` for an object URL, refusing anything that would name
+    another bucket once the URL is resolved.
+
+    httpx removes ``.``/``..`` segments before sending, so ``../other/x`` or a
+    bucket of ``x/../other`` would reach a different bucket; both are refused.
+    The bucket is percent-encoded. The path is passed through as given, so
+    existing object keys, and callers that pass an already-escaped key, keep
+    the request form they have always had: httpx then percent-encodes only
+    what a URL path cannot hold (a space, a non-ASCII letter, ``"``, ``<``),
+    refuses control characters, and leaves ``%`` escapes, sub-delimiters such
+    as ``+``/``&``, and ``;`` as they are. A caller that takes object names
+    from elsewhere must refuse or encode ``?``, ``#`` and ``%`` itself (the
+    agent storage tools do).
+    """
+    if not bucket_id or bucket_id in (".", "..") or "/" in bucket_id:
+        raise StorageError(f"Invalid bucket name: {bucket_id!r}")
+    if any(segment in (".", "..") for segment in path.split("/")):
+        raise StorageError(f"Invalid object path: {path!r}")
+    return f"{quote(bucket_id, safe='')}/{path}" if path else quote(bucket_id, safe="")
 
 
 class SupabaseStorage:
@@ -29,8 +94,15 @@ class SupabaseStorage:
         url: str | None = None,
         service_key: str | None = None,
         public_url: str | None = None,
+        bearer: str | None = None,
     ):
-        """Initialize the storage client."""
+        """Initialize the storage client.
+
+        ``bearer`` makes Storage authorize as that JWT (an end user, whose
+        storage policies then apply) instead of the service role. The service
+        key still goes in ``apikey`` for the gateway, which only checks that a
+        project key is present.
+        """
         self.service_key = service_key or os.getenv("SERVICE_ROLE_KEY")
 
         if not self.service_key:
@@ -44,8 +116,11 @@ class SupabaseStorage:
         else:
             self.url = (url or os.getenv("SUPABASE_URL", "http://kong:8000")).rstrip("/")
             self.storage_url = f"{self.url}/storage/v1"
+        if bearer == "":
+            # An end user with no token must never fall back to the service key.
+            raise ValueError("bearer must be a token, or None for the service role")
         self.headers = {
-            "Authorization": f"Bearer {self.service_key}",
+            "Authorization": f"Bearer {bearer if bearer is not None else self.service_key}",
             "apikey": self.service_key,
         }
 
@@ -71,27 +146,24 @@ class SupabaseStorage:
         """List all buckets."""
         response = self._request("GET", "/bucket")
         if response.status_code != 200:
-            raise StorageError(f"Failed to list buckets: {response.text}")
+            raise StorageError(f"Failed to list buckets: {response.text}", response.status_code)
         return response.json()
 
     def get_bucket(self, bucket_id: str) -> dict | None:
         """Get bucket info, or None if not found."""
-        response = self._request("GET", f"/bucket/{bucket_id}")
+        response = self._request("GET", f"/bucket/{_object_url_path(bucket_id)}")
         if response.status_code == 404:
             return None
         if response.status_code == 400:
+            if _reported_status(response) == 404:
+                return None
             try:
-                data = response.json()
-                if (
-                    data.get("statusCode") == "404"
-                    or "not found" in data.get("message", "").lower()
-                ):
+                if "not found" in response.json().get("message", "").lower():
                     return None
             except Exception:
                 pass
-            raise StorageError(f"Failed to get bucket: {response.text}")
         if response.status_code != 200:
-            raise StorageError(f"Failed to get bucket: {response.text}")
+            raise StorageError.from_response("Failed to get bucket", response)
         return response.json()
 
     def create_bucket(
@@ -114,7 +186,7 @@ class SupabaseStorage:
             return self.get_bucket(bucket_id)
 
         if response.status_code not in (200, 201):
-            raise StorageError(f"Failed to create bucket: {response.text}")
+            raise StorageError(f"Failed to create bucket: {response.text}", response.status_code)
 
         return response.json()
 
@@ -142,13 +214,13 @@ class SupabaseStorage:
 
         response = self._request(
             "POST",
-            f"/object/{bucket_id}/{path}",
+            f"/object/{_object_url_path(bucket_id, path)}",
             content=file_data,
             headers=headers,
         )
 
         if response.status_code not in (200, 201):
-            raise StorageError(f"Failed to upload file: {response.text}")
+            raise StorageError.from_response("Failed to upload file", response)
 
         return f"{bucket_id}/{path}"
 
@@ -165,15 +237,17 @@ class SupabaseStorage:
         garbage-collected.
         """
         path = path.lstrip("/")
-        url = f"{self.storage_url}/object/{bucket_id}/{path}"
+        url = f"{self.storage_url}/object/{_object_url_path(bucket_id, path)}"
         headers = {**self.headers}
 
         try:
             with httpx.stream("GET", url, headers=headers, timeout=30) as response:
                 if response.status_code == 404:
-                    raise StorageError(f"File not found: {bucket_id}/{path}")
+                    raise StorageError(f"File not found: {bucket_id}/{path}", 404)
                 if response.status_code != 200:
-                    raise StorageError(f"Failed to download file: {response.status_code}")
+                    raise StorageError(
+                        f"Failed to download file: {response.status_code}", response.status_code
+                    )
                 yield response.headers.get("content-length")  # metadata sentinel
                 yield from response.iter_bytes(chunk_size=chunk_size)
         except StorageError:
@@ -193,12 +267,12 @@ class SupabaseStorage:
     def download(self, bucket_id: str, path: str) -> bytes:
         """Download a file from storage."""
         path = path.lstrip("/")
-        response = self._request("GET", f"/object/{bucket_id}/{path}")
+        response = self._request("GET", f"/object/{_object_url_path(bucket_id, path)}")
 
         if response.status_code == 404:
-            raise StorageError(f"File not found: {bucket_id}/{path}")
+            raise StorageError(f"File not found: {bucket_id}/{path}", 404)
         if response.status_code != 200:
-            raise StorageError(f"Failed to download file: {response.text}")
+            raise StorageError.from_response("Failed to download file", response)
 
         return response.content
 
@@ -238,10 +312,10 @@ class SupabaseStorage:
         if len(parts) != 2:
             raise StorageError(f"Invalid storage path: {storage_path}")
         bucket_id, path = parts
-        response = self._request("HEAD", f"/object/{bucket_id}/{path.lstrip('/')}")
+        response = self._request("HEAD", f"/object/{_object_url_path(bucket_id, path.lstrip('/'))}")
         if response.status_code in (400, 404):
             # storage-api answers a HEAD for a missing object with 400.
-            raise StorageError(f"File not found: {storage_path}")
+            raise StorageError(f"File not found: {storage_path}", 404)
         if response.status_code == 200:
             length = response.headers.get("content-length")
         else:
@@ -259,11 +333,11 @@ class SupabaseStorage:
         """Delete files from storage."""
         response = self._request(
             "DELETE",
-            f"/object/{bucket_id}",
+            f"/object/{_object_url_path(bucket_id)}",
             json={"prefixes": paths},
         )
         if response.status_code not in (200, 204):
-            raise StorageError(f"Failed to delete files: {response.text}")
+            raise StorageError(f"Failed to delete files: {response.text}", response.status_code)
 
     def has_public_url(self) -> bool:
         """Return True if a public storage URL is configured."""
@@ -289,12 +363,12 @@ class SupabaseStorage:
         path = path.lstrip("/")
         response = self._request(
             "POST",
-            f"/object/sign/{bucket_id}/{path}",
+            f"/object/sign/{_object_url_path(bucket_id, path)}",
             json={"expiresIn": expires_in},
         )
 
         if response.status_code != 200:
-            raise StorageError(f"Failed to create signed URL: {response.text}")
+            raise StorageError.from_response("Failed to create signed URL", response)
 
         data = response.json()
         signed_url_path = data.get("signedURL")
@@ -353,3 +427,10 @@ def get_storage() -> SupabaseStorage:
     if _storage_client is None:
         _storage_client = SupabaseStorage()
     return _storage_client
+
+
+def get_storage_for_user(token: str) -> SupabaseStorage:
+    """A storage client that acts as the end user holding ``token``."""
+    if not token:
+        raise ValueError("An end user's storage client needs their token")
+    return SupabaseStorage(bearer=token)

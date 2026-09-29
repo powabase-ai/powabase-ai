@@ -148,7 +148,7 @@ def _search(kb_id: str, body: dict, *, top_k_guard: bool = True):
         return []
 
     with (
-        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role"}),
+        patch("agentic_project_service.auth.decode_jwt", return_value={"role": "service_role", "is_service_role": True}),
         patch.object(kb_route, "db"),
         patch(
             "agentic_project_service.services.knowledge_search.search_knowledge_base",

@@ -7,7 +7,7 @@ import re
 import httpx
 from flask import Blueprint, Response, jsonify, request
 
-from ..auth import require_auth
+from ..auth import require_service_role
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ def _validate_schema(schema: str) -> str | None:
 
 
 @database_bp.route("/tables", methods=["GET"])
-@require_auth
+@require_service_role
 def list_tables():
     """List tables in the given schema (read-only SQL on information_schema)."""
     from ..db import db
@@ -110,7 +110,7 @@ def list_tables():
 
 
 @database_bp.route("/tables/<table>", methods=["GET"])
-@require_auth
+@require_service_role
 def list_rows(table: str):
     """List rows from a table via PostgREST (supports ?limit=&offset=&schema=)."""
     err = _validate_table(table)
@@ -146,7 +146,7 @@ def list_rows(table: str):
 
 
 @database_bp.route("/tables/<table>/<row_id>", methods=["GET"])
-@require_auth
+@require_service_role
 def get_row(table: str, row_id: str):
     """Get a single row by id."""
     err = _validate_table(table)
@@ -170,7 +170,7 @@ def get_row(table: str, row_id: str):
 
 
 @database_bp.route("/tables/<table>", methods=["POST"])
-@require_auth
+@require_service_role
 def create_row(table: str):
     """Create a row via PostgREST."""
     err = _validate_table(table)
@@ -198,7 +198,7 @@ def create_row(table: str):
 
 
 @database_bp.route("/tables/<table>/<row_id>", methods=["PATCH"])
-@require_auth
+@require_service_role
 def update_row(table: str, row_id: str):
     """Update a row by id via PostgREST."""
     err = _validate_table(table)
@@ -227,7 +227,7 @@ def update_row(table: str, row_id: str):
 
 
 @database_bp.route("/tables/<table>/<row_id>", methods=["DELETE"])
-@require_auth
+@require_service_role
 def delete_row(table: str, row_id: str):
     """Delete a row by id via PostgREST."""
     err = _validate_table(table)
@@ -254,7 +254,7 @@ def delete_row(table: str, row_id: str):
 
 
 @database_bp.route("/openapi", methods=["GET"])
-@require_auth
+@require_service_role
 def get_openapi_spec():
     """Return the project's PostgREST OpenAPI/Swagger spec.
 
