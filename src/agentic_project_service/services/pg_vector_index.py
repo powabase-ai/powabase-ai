@@ -2124,8 +2124,9 @@ class _TableGate:
     gate the whole table until its backend ended.
     """
 
-    def __init__(self, conn):
+    def __init__(self, conn, index_lock: str | None = None):
         self._conn = conn
+        self._index_lock = index_lock
         self.held = False
         self._pid = None
 
@@ -2155,18 +2156,33 @@ class _TableGate:
         ``release`` unlocked nothing. So the pid it was taken on is kept and checked,
         and a replaced connection takes the gate again, holder check included, before
         the next statement.
+
+        The caller's per-index lock (``index_lock``) went with the same backend, and is
+        taken again first, in the order the two were taken in the first place.
+        Without it a second task for the same knowledge base found this index's lock
+        free during the rebuilt build, read the running build as an orphan ("its
+        backend outlived whatever started it") and spent its counted retries on a
+        repair it must not attempt. A per-index lock someone else took in the gap
+        raises ``PerKbVectorIndexBuildInProgress``: that caller now owns this index's
+        work.
         """
         if self.held:
             if _backend_pid(self._conn) == self._pid:
                 return
             logger.warning(
                 "The connection holding the %s index-build gate was replaced (backend %s "
-                "is gone, and its session lock with it); taking the gate again before the "
-                "next statement",
+                "is gone, and its session locks with it); taking %s again before the next "
+                "statement",
                 AI_SCHEMA + ".embeddings",
                 self._pid,
+                "this index's lock and the gate" if self._index_lock else "the gate",
             )
             self.held = False
+            if self._index_lock is not None and not _try_lock(self._conn, self._index_lock):
+                raise PerKbVectorIndexBuildInProgress(
+                    f"{self._index_lock} was taken by another caller while this one's "
+                    "connection was being replaced"
+                )
         subject = table_lock_relation()
         if not _try_lock(self._conn, subject):
             holders, error = self._evidence(include_gate_holder=True)
@@ -2637,6 +2653,25 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     table_busy: list[str] = []
     table_holders: dict[int, dict] = {}
     evidence_error: str | None = None
+    # Indexes this reconcile dropped (a repair or a definition drift) and then could
+    # not rebuild, because re-taking the locks after a replaced connection failed.
+    rebuild_deferred: list[str] = []
+
+    def defer_the_rebuild(name: str, why: str, counts: tuple[int, int, int]) -> None:
+        """Say so when the dimension had already dropped its index. No-op otherwise."""
+        if name not in repaired and name not in rebuilt:
+            return
+        rebuild_deferred.append(name)
+        logger.warning(
+            "Partial HNSW index %s.%s was dropped by this reconcile but its rebuild is "
+            "deferred: %s. The build history the drop took with it -- %d failed, %d "
+            "interrupted, %d unsettled rebuilds, carried in memory for the rebuild -- is "
+            "lost with this attempt, so the next reconcile counts from zero",
+            AI_SCHEMA,
+            name,
+            why,
+            *counts,
+        )
 
     with _autocommit_connection(engine) as conn:
         existing = per_kb_index_states(conn, kb_id)
@@ -2654,8 +2689,9 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                 continue
             # Taken only where this dimension reaches DDL -- ``gate.hold()`` before
             # each of the four statements below that can issue one -- and given
-            # back before the per-index lock.
-            gate = _TableGate(conn)
+            # back before the per-index lock -- which it also takes again if the
+            # connection is replaced under it.
+            gate = _TableGate(conn, index_lock=lock)
             try:
                 # Re-read under the lock: another caller may have finished
                 # between the survey above and this point.
@@ -2989,11 +3025,19 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                 )
                 built.append(name)
             except PerKbVectorIndexTableBusy as busy:
-                # Refused before this dimension issued anything: no DDL, no session
+                # Refused before the statement it guards: no DDL for it, no session
                 # setting lifted, no count written -- so neither build bound moves,
-                # which is right, because nothing was attempted. The task comes back
-                # on a clock of its own (``outcome_waits_for_the_table``) and logs the
-                # wait with the evidence, so this line is only for a debug trace.
+                # which is right, because nothing was attempted. The one exception is a
+                # re-take after a replaced connection, where this dimension's repair or
+                # drift DROP has already run; that is said, not hidden
+                # (``defer_the_rebuild``). The task comes back on a clock of its own
+                # (``outcome_waits_for_the_table``) and logs the wait with the
+                # evidence, so the line below is only for a debug trace.
+                defer_the_rebuild(
+                    name,
+                    "the table is owned by another build or drop",
+                    (prior_failures, prior_interrupted, prior_rebuilds),
+                )
                 logger.debug(
                     "Not touching partial HNSW index %s.%s yet: %s",
                     AI_SCHEMA,
@@ -3010,6 +3054,16 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                     table_holders.setdefault(holder["pid"], holder)
                 evidence_error = evidence_error or busy.evidence_error
                 continue
+            except PerKbVectorIndexBuildInProgress:
+                # Only from a re-take after a replaced connection: another caller
+                # took this index's lock in the gap, and this index is its work now.
+                defer_the_rebuild(
+                    name,
+                    "another caller took this index's lock while the connection was replaced",
+                    (prior_failures, prior_interrupted, prior_rebuilds),
+                )
+                blocked.append(name)
+                continue
             finally:
                 gate.release()
                 _release_lock(conn, lock)
@@ -3019,6 +3073,8 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
         outcome["repaired_invalid_indexes"] = repaired
     if rebuilt:
         outcome["rebuilt_stale_definitions"] = rebuilt
+    if rebuild_deferred:
+        outcome["rebuild_deferred"] = rebuild_deferred
     if stale_kept:
         outcome["stale_definitions_kept"] = stale_kept
     if above_limit:
@@ -3129,7 +3185,7 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
             # The same DDL on the same table as the reconcile's, so the same gate:
             # a deleted knowledge base's drop queued behind another knowledge base's
             # build kills it at its end exactly as a repair drop does (``_TableGate``).
-            gate = _TableGate(conn)
+            gate = _TableGate(conn, index_lock=lock)
             try:
                 gate.hold()
                 _drop_index(conn, kb_id, dims)
