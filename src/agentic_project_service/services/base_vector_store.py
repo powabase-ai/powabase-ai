@@ -1492,7 +1492,10 @@ class BasePgVectorStore:
         Same columns in the same order as the statement ``vector_search`` builds,
         the same item-table join and the same literals -- the knowledge base on
         both sides, ``item_table``, ``dims`` and the ``LIMIT`` -- so the rows it
-        returns are the rows an exact scan of that statement returns.
+        returns are the rows an exact scan of that statement returns. The inner
+        relation is aliased ``e`` as well, so the predicates read
+        ``e.knowledge_base_id = ...`` exactly as they do there, and anything that
+        checks a captured statement for them finds them in either shape.
         """
         kb_literal = kb_sql_literal(self.kb_id)
         item_table_literal = item_table_sql_literal(self.TABLE)
@@ -1504,10 +1507,10 @@ class BasePgVectorStore:
                 c.source_id,
                 c.meta
             FROM (
-                SELECT item_id, embedding FROM "{self.schema}".embeddings
-                WHERE knowledge_base_id = {kb_literal}
-                  AND item_table = {item_table_literal}
-                  AND dims = {dims}
+                SELECT e.item_id, e.embedding FROM "{self.schema}".embeddings e
+                WHERE e.knowledge_base_id = {kb_literal}
+                  AND e.item_table = {item_table_literal}
+                  AND e.dims = {dims}
                 OFFSET 0
             ) e
             JOIN "{self.schema}".{self.TABLE} c ON c.id = e.item_id

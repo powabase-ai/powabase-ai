@@ -1966,7 +1966,7 @@ def _recall_against_an_exact_scan(session, sql: str, params: dict, vectors) -> f
 
 
 def test_the_new_shape_answers_exactly_where_the_old_one_was_approximate(
-    engine, schema, settings, query_vectors
+    engine, schema, settings, query_vectors, monkeypatch
 ):
     """The trade this PR actually makes, for a knowledge base that is a small share.
 
@@ -1980,7 +1980,21 @@ def test_the_new_shape_answers_exactly_where_the_old_one_was_approximate(
     "Slower and correct, where it was fast and quietly wrong" is a real argument
     for this change. It is not the argument the PR body makes, and nothing else
     here pins it.
+
+    Run with ``VECTOR_EXACT_SEARCH_MAX_ROWS`` at 0. KB_MID is below that ceiling
+    and has no index, so the store now answers it with the fenced exact statement
+    rather than the one this spec compares against its predecessor -- and taking
+    the embeddings-side predicate out of *that* statement leaves a subquery that
+    reads every knowledge base's rows, exact as well, so there would be no trade
+    left to show. The fenced path's own exactness and plan are pinned in
+    ``test_exact_search_below_floor_live.py``.
     """
+    shipped = bvs.get_setting
+    monkeypatch.setattr(
+        bvs,
+        "get_setting",
+        lambda key: 0 if key == bvs.EXACT_SEARCH_MAX_ROWS_SETTING else shipped(key),
+    )
     sql, params = _capture_search_sql(engine, KB_MID, query_vectors[0])
     old_sql = _without_the_embeddings_predicate(sql)
     with Session(engine) as session:
