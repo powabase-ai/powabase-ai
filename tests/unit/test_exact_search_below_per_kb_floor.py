@@ -25,8 +25,11 @@ import pytest
 
 from agentic_project_service.services import base_vector_store as bvs
 from agentic_project_service.services import pg_vector_index as pvi
+from agentic_project_service.services import settings_registry
 from agentic_project_service.services.base_vector_store import (
+    EXACT_SEARCH_READ_BUDGET_MULTIPLE,
     BasePgVectorStore,
+    exact_search_read_budget,
     takes_the_exact_path,
 )
 from agentic_project_service.services.settings_registry import SETTINGS_REGISTRY
@@ -40,7 +43,14 @@ _CAP = 4_321
 # What the fake reports for the settings the store reads back and restores. Not
 # the server defaults, so a restore that hardcodes "on" is caught.
 _SEQSCAN_WAS = "maybe"
+_BITMAPSCAN_WAS = "sometimes"
 _INDEXSCAN_WAS = "perhaps"
+_PRIORS = {
+    "enable_seqscan": _SEQSCAN_WAS,
+    "enable_bitmapscan": _BITMAPSCAN_WAS,
+    "enable_indexscan": _INDEXSCAN_WAS,
+}
+_BUDGET = EXACT_SEARCH_READ_BUDGET_MULTIPLE * _CAP
 
 
 class _ChunkStore(BasePgVectorStore):
@@ -86,13 +96,31 @@ class _Result:
         return self._rows[0][0] if self._rows else None
 
 
+class _Orig:
+    def __init__(self, sqlstate: str):
+        self.sqlstate = sqlstate
+
+
+class _ServerError(Exception):
+    """What SQLAlchemy raises for a server-side error: the driver's error is ``.orig``."""
+
+    def __init__(self, message: str, sqlstate: str):
+        super().__init__(message)
+        self.orig = _Orig(sqlstate)
+
+
+_IN_FAILED_SQL_TRANSACTION = "25P02"
+
+
 class _Savepoint:
     def __init__(self, session: _Session):
         self._session = session
 
     def __enter__(self):
         if self._session.aborted:
-            raise RuntimeError("current transaction is aborted; SAVEPOINT refused")
+            raise _ServerError(
+                "current transaction is aborted; SAVEPOINT refused", _IN_FAILED_SQL_TRANSACTION
+            )
         self._session.levels.append(dict(self._session.settings))
         return self
 
@@ -111,15 +139,29 @@ class _Session:
 
     ``own_index`` is what the catalog says about this knowledge base's partial
     index at this dimension, ``kb_rows`` how many embeddings it holds for the
-    store's item table -- the count answers ``min(kb_rows, LIMIT)`` the way the real
-    one does. ``fail_at`` names a fragment of one statement to fail server-side;
-    outside a savepoint that leaves the transaction aborted and every later
-    statement refused, which is the consequence a ``MagicMock`` cannot express.
+    store's item table and dimension, ``other_rows`` how many it holds besides --
+    other item tables, other dimensions. The count answers the way the real one
+    does: it reads at most ``LIMIT`` of the knowledge base's rows and reports how
+    many of those were the searched population and how many it read.
+    ``count_row`` overrides that answer outright. ``fail_at`` names a fragment of
+    one statement to fail server-side; outside a savepoint that leaves the
+    transaction aborted and every later statement refused, which is the
+    consequence a ``MagicMock`` cannot express.
     """
 
-    def __init__(self, *, own_index: bool = False, kb_rows: int = 300, fail_at: str | None = None):
+    def __init__(
+        self,
+        *,
+        own_index: bool = False,
+        kb_rows: int = 300,
+        other_rows: int = 0,
+        count_row: tuple | None = None,
+        fail_at: str | None = None,
+    ):
         self.own_index = own_index
         self.kb_rows = kb_rows
+        self.other_rows = other_rows
+        self.count_row = count_row
         self.fail_at = fail_at
         self.statements: list[tuple[str, dict]] = []
         self.settings: dict[str, str] = {}
@@ -136,27 +178,31 @@ class _Session:
         self.statements.append((sql, params))
         flat = "".join(sql.split())
         if self.aborted:
-            raise RuntimeError(f"current transaction is aborted; refused: {flat[:60]}")
+            raise _ServerError(
+                f"current transaction is aborted; refused: {flat[:60]}", _IN_FAILED_SQL_TRANSACTION
+            )
         if self.fail_at and self.fail_at in flat:
             self.aborted = True
-            raise RuntimeError(f"injected server-side failure at {flat[:60]}")
-        match = re.search(r"set_config\('([^']+)',(:?\w+|'[^']*')", flat)
-        if match:
-            guc, raw = match.group(1), match.group(2)
-            self.settings[guc] = params[raw[1:]] if raw.startswith(":") else raw.strip("'")
-            return _Result([(self.settings[guc],)])
+            raise _ServerError(f"injected server-side failure at {flat[:60]}", "XX000")
+        sets = re.findall(r"set_config\('([^']+)',(:?\w+|'[^']*')", flat)
+        if sets:
+            for guc, raw in sets:
+                self.settings[guc] = params[raw[1:]] if raw.startswith(":") else raw.strip("'")
+            return _Result([tuple(self.settings[guc] for guc, _ in sets)])
+        reads = re.findall(r"current_setting\('(enable_\w+)'\)", flat)
+        if reads and "to_regclass" not in flat:
+            return _Result([tuple(_PRIORS[guc] for guc in reads)])
         if "FROMpg_class" in flat:
             # Answered like the real catalog would, so that a search which did
             # read it is caught by ``_catalog_probes`` rather than by a crash.
             name = pvi.per_kb_index_name(_KB_ID, _DIMS)
             return _Result([(name, True, None)] if self.own_index else [])
         if "count(*)" in flat:
+            if self.count_row is not None:
+                return _Result([self.count_row] if self.count_row != () else [])
             limit = int(re.search(r"LIMIT(\d+)", flat).group(1))
-            return _Result([(min(self.kb_rows, limit),)])
-        if "current_setting('enable_seqscan')" in flat:
-            return _Result([(_SEQSCAN_WAS,)])
-        if "current_setting('enable_indexscan')" in flat:
-            return _Result([(_INDEXSCAN_WAS,)])
+            read = min(self.kb_rows + self.other_rows, limit)
+            return _Result([(min(self.kb_rows, read), read)])
         if "to_regclass" in flat:
             return _Result([("on", "40", self.own_index)])
         if "ORDER BY" in sql:
@@ -167,12 +213,16 @@ class _Session:
 @pytest.fixture(autouse=True)
 def _setting(monkeypatch):
     values = {SETTING: _CAP}
-    monkeypatch.setattr(bvs, "get_setting", lambda key: values[key])
+    monkeypatch.setattr(bvs, "get_setting_strict", lambda key: values[key])
     return values
 
 
 def _run(store=_ChunkStore, **kwargs) -> _Session:
-    session_kwargs = {k: kwargs.pop(k) for k in ("own_index", "kb_rows", "fail_at") if k in kwargs}
+    session_kwargs = {
+        k: kwargs.pop(k)
+        for k in ("own_index", "kb_rows", "other_rows", "count_row", "fail_at")
+        if k in kwargs
+    }
     session = _Session(**session_kwargs)
     kwargs.setdefault("embedding", [0.0] * _DIMS)
     kwargs.setdefault("top_k", 10)
@@ -210,22 +260,36 @@ def _catalog_probes(session: _Session) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    ("max_rows", "has_its_own_index", "rows", "exact"),
+    ("max_rows", "has_its_own_index", "rows", "kb_rows_read", "exact"),
     [
-        (5000, True, 300, False),  # its own index answers; the HNSW path is kept
-        (5000, False, 300, True),  # small and unindexed: exact
-        (5000, False, 5000, True),  # the cap is inclusive
-        (5000, False, 5001, False),  # over the cap: today's behaviour
-        (5000, False, None, False),  # the count could not be read: today's behaviour
-        (0, False, 0, False),  # 0 turns the feature off
-        (0, False, 300, False),
+        (5000, True, 300, 300, False),  # its own index answers; the HNSW path is kept
+        (5000, False, 300, 300, True),  # small and unindexed: exact
+        (5000, False, 5000, 5000, True),  # the cap is inclusive
+        (5000, False, 5001, 5001, False),  # over the cap: today's behaviour
+        (5000, False, 300, 20_000, True),  # other populations, inside the read budget
+        (5000, False, 300, 20_001, False),  # the read budget ran out: today's behaviour
+        (5000, False, None, None, False),  # the count could not be read
+        (5000, False, 300, None, False),
+        (0, False, 0, 0, False),  # 0 turns the feature off
+        (0, False, 300, 300, False),
     ],
 )
-def test_the_decision(max_rows, has_its_own_index, rows, exact):
+def test_the_decision(max_rows, has_its_own_index, rows, kb_rows_read, exact):
     assert (
-        takes_the_exact_path(max_rows=max_rows, has_its_own_index=has_its_own_index, rows=rows)
+        takes_the_exact_path(
+            max_rows=max_rows,
+            has_its_own_index=has_its_own_index,
+            rows=rows,
+            kb_rows_read=kb_rows_read,
+        )
         is exact
     )
+
+
+def test_the_read_budget_is_a_fixed_multiple_of_the_ceiling():
+    assert EXACT_SEARCH_READ_BUDGET_MULTIPLE == 4
+    assert exact_search_read_budget(5000) == 20_000
+    assert exact_search_read_budget(0) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -297,11 +361,18 @@ def test_an_indexed_knowledge_base_runs_exactly_the_statements_it_ran_before(_se
     assert with_it == without
 
 
-def test_the_cap_is_the_setting_and_the_count_stops_one_past_it():
+def test_the_count_reads_no_more_than_the_read_budget_of_the_knowledge_base():
+    """What bounds the decision is how many rows it READS, not how many it returns.
+    The only btree is on ``knowledge_base_id``, so a count filtered on the item
+    table and the dimension walks every row of the knowledge base to find the few
+    it wants; this one stops after the budget, whatever the rows are."""
     session = _run(own_index=False, kb_rows=10**7)
     (count,) = _counts(session)
-    assert f"LIMIT {_CAP + 1}" in _flat(count), (
-        f"the count must stop at the cap + 1, or it walks a big knowledge base:\n{count}"
+    flat = _flat(count)
+    assert f"LIMIT {_BUDGET + 1}" in flat, flat
+    inner = re.search(r"FROM \( ?(SELECT .*?)\) s", flat).group(1)
+    assert "item_table =" not in inner and "dims =" not in inner, (
+        f"a filter inside the limited scan bounds rows returned, not rows read:\n{flat}"
     )
 
 
@@ -312,9 +383,35 @@ def test_the_count_names_the_population_with_literals():
     (count,) = _counts(session)
     flat = _flat(count)
     assert f"knowledge_base_id = '{_KB_ID}'" in flat, flat
-    assert "item_table = 'chunks'" in flat, flat
+    assert "FILTER (WHERE item_table = 'chunks'" in flat, flat
     assert f"dims = {_DIMS}" in flat, flat
     assert ":" not in flat.replace("::", ""), f"nothing in the count may be bound:\n{flat}"
+
+
+def test_a_small_population_in_a_large_knowledge_base_keeps_todays_path():
+    """Two hundred document rows beside a hundred thousand chunk rows: the exact
+    search would read all of them through the knowledge-base btree, on every search."""
+    session = _run(store=_DocumentStore, kb_rows=200, other_rows=100_000)
+    assert not _is_exact_shape(_search_sql(session))
+
+
+def test_other_populations_inside_the_read_budget_still_search_exactly():
+    session = _run(own_index=False, kb_rows=300, other_rows=_BUDGET - 300)
+    assert _is_exact_shape(_search_sql(session))
+
+
+@pytest.mark.parametrize(
+    "count_row", [(None, None), (300, None), ()], ids=["nulls", "no-read", "no-row"]
+)
+def test_a_count_it_cannot_read_keeps_todays_path_and_says_so(caplog, count_row):
+    """Never 0: an unreadable count read as "empty" is the exact path by default."""
+    caplog.set_level(logging.DEBUG, logger=bvs.logger.name)
+    session = _run(own_index=False, count_row=count_row)
+    assert not _is_exact_shape(_search_sql(session))
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings and "count" in warnings[0].getMessage().lower(), [
+        r.getMessage() for r in caplog.records
+    ]
 
 
 def test_the_exact_search_carries_every_value_as_a_literal():
@@ -341,21 +438,37 @@ def test_the_fence_is_around_the_embeddings_and_the_order_is_outside_it():
     assert "ORDER BY (e.embedding::vector(1536)) <=>" in outer, flat
 
 
-def test_the_whole_table_scan_is_priced_out_for_the_count_and_the_search_and_put_back():
+@pytest.mark.parametrize("guc", ["enable_seqscan", "enable_bitmapscan"])
+def test_sequential_and_bitmap_scans_are_priced_out_for_the_count_and_the_search_and_put_back(
+    guc,
+):
     session = _run(own_index=False, kb_rows=300)
     statements = [sql for sql, _ in session.statements]
-    sets = [i for i, sql in enumerate(statements) if "set_config('enable_seqscan'" in sql]
+    sets = [i for i, sql in enumerate(statements) if f"set_config('{guc}'" in sql]
     count_at = next(i for i, sql in enumerate(statements) if "count(*)" in sql)
     search_at = next(i for i, sql in enumerate(statements) if "ORDER BY" in sql)
     assert len(sets) == 2, statements
     assert sets[0] < count_at < search_at < sets[1], statements
-    assert session.settings_at_the_search["enable_seqscan"] == "off"
-    # Only the sequential scan: pricing out index scans *and* bitmap scans is the
-    # combination that leaves a parallel scan of the whole heap as the only plan.
-    assert "enable_bitmapscan" not in "".join(statements), statements
-    assert "enable_indexscan" not in session.settings_at_the_search
+    assert session.settings_at_the_search[guc] == "off"
     # Put back to what was read, not to a hardcoded default.
-    assert session.settings["enable_seqscan"] == _SEQSCAN_WAS
+    assert session.settings[guc] == _PRIORS[guc]
+
+
+def test_index_scans_are_never_priced_out_on_the_exact_path():
+    """Index scans are what is left: with bitmap scans priced out, pricing index
+    scans out too leaves a (parallel) sequential scan of the whole heap as the only
+    plan for a knowledge-base lookup."""
+    session = _run(own_index=False, kb_rows=300)
+    assert "enable_indexscan" not in "".join(sql for sql, _ in session.statements)
+
+
+def test_the_helper_refuses_the_pair_that_leaves_only_a_sequential_scan():
+    store = _ChunkStore(db_session=_Session(), knowledge_base_id=_KB_ID)
+    with pytest.raises(ValueError):
+        with store._scan_methods_priced_out(
+            "enable_indexscan", "enable_bitmapscan", not_applied="%s %s"
+        ):
+            pass
 
 
 def test_the_setting_is_transaction_scoped():
@@ -366,7 +479,7 @@ def test_the_setting_is_transaction_scoped():
         if "set_config('enable_seqscan'" in sql
     ]
     assert sets, session.statements
-    assert all(s.endswith(",true)") for s in sets), (
+    assert all(s.count("set_config(") == s.count(",true)") for s in sets), (
         f"without the third argument the penalty would ride the connection into the pool: {sets}"
     )
 
@@ -427,6 +540,7 @@ def test_a_count_that_fails_keeps_todays_path_on_a_usable_transaction():
     session = _run(own_index=False, kb_rows=300, fail_at="count(*)")
     assert not _is_exact_shape(_search_sql(session))
     assert session.settings_at_the_search.get("enable_seqscan") == _SEQSCAN_WAS
+    assert session.settings_at_the_search.get("enable_bitmapscan") == _BITMAPSCAN_WAS
 
 
 def test_a_scan_penalty_that_cannot_be_set_still_searches_exactly():
@@ -436,6 +550,31 @@ def test_a_scan_penalty_that_cannot_be_set_still_searches_exactly():
     session = _run(own_index=False, kb_rows=300, fail_at="set_config('enable_seqscan','off'")
     assert _is_exact_shape(_search_sql(session))
     assert "enable_seqscan" not in session.settings_at_the_search
+    assert "enable_bitmapscan" not in session.settings_at_the_search
+
+
+def test_a_restore_that_fails_on_a_live_transaction_is_a_warning_naming_the_setting(caplog):
+    """A failed restore leaves the penalty in force for the rest of the
+    transaction -- a keyword leg that follows on the same session is planned with
+    it -- so it is worth more than a DEBUG line."""
+    caplog.set_level(logging.DEBUG, logger=bvs.logger.name)
+    session = _run(own_index=False, kb_rows=300, fail_at="set_config('enable_seqscan',:prior")
+    assert _is_exact_shape(_search_sql(session))
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("enable_seqscan" in w and "restore" in w.lower() for w in warnings), warnings
+
+
+def test_a_restore_on_an_already_failed_transaction_stays_at_debug(caplog):
+    """There the transaction is going to be rolled back anyway, and the error that
+    aborted it is the one worth reading."""
+    caplog.set_level(logging.DEBUG, logger=bvs.logger.name)
+    store = _ChunkStore(db_session=_Session(), knowledge_base_id=_KB_ID)
+    with store._scan_methods_priced_out("enable_seqscan", not_applied="%s %s"):
+        store.session.aborted = True
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], [
+        r.getMessage() for r in caplog.records
+    ]
+    assert any("enable_seqscan" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -494,3 +633,20 @@ def test_the_cap_never_exceeds_the_default_build_threshold():
 def test_a_stored_value_is_clamped_to_the_registry_range(_setting, stored, used):
     _setting[SETTING] = stored
     assert bvs.exact_search_max_rows() == used
+
+
+def test_unreadable_settings_turn_exact_search_off_and_name_the_key(monkeypatch, caplog):
+    """Not the default: an operator who set 0 must not get the feature back
+    because ``ai.project_settings`` could not be read on this request."""
+
+    def unreadable(key):
+        raise settings_registry.SettingsUnreadable("project settings could not be read")
+
+    monkeypatch.setattr(bvs, "get_setting_strict", unreadable)
+    caplog.set_level(logging.DEBUG, logger=bvs.logger.name)
+    assert bvs.exact_search_max_rows() == 0
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(SETTING in w for w in warnings), warnings
+    session = _run(own_index=False, kb_rows=300)
+    assert not _is_exact_shape(_search_sql(session))
+    assert not _counts(session)
