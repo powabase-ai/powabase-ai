@@ -131,6 +131,9 @@ from sqlalchemy.orm import Session
 
 from agentic_project_service.services import base_vector_store as bvs
 from agentic_project_service.services import pg_vector_index as pvi
+from agentic_project_service.services.settings_registry import SETTINGS_REGISTRY
+
+SETTINGS_REGISTRY_DEFAULT_CEILING = SETTINGS_REGISTRY["VECTOR_EXACT_SEARCH_MAX_ROWS"].default
 
 SCHEMA = "vector_perkb_live_test"
 DIMS = 384
@@ -345,6 +348,29 @@ def fixture_schema(engine):
     yield
     with psycopg.connect(raw_dsn, autocommit=True) as conn:
         conn.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+
+
+@pytest.fixture(autouse=True)
+def exact_search_ceiling(monkeypatch):
+    """``VECTOR_EXACT_SEARCH_MAX_ROWS`` at its shipped default, set explicitly.
+
+    These specs run outside a Flask app context, where ``ai.project_settings``
+    cannot be read -- and an unreadable ceiling turns the exact path *off*. Left
+    to that, which path each spec below ran on would be an accident of how it is
+    invoked. Specs that pin #79's own statement for a knowledge base below the
+    ceiling turn it off with ``_exact_search_off``; the rest run as a project on
+    the shipped default would.
+    """
+    values = {bvs.EXACT_SEARCH_MAX_ROWS_SETTING: SETTINGS_REGISTRY_DEFAULT_CEILING}
+    monkeypatch.setattr(bvs, "get_setting_strict", lambda key: values[key])
+    return values
+
+
+def _exact_search_off(ceiling: dict) -> None:
+    """For a spec about the statement #79 emits, on a knowledge base below the
+    ceiling: the fenced exact statement replaces it there, and is pinned in
+    ``test_exact_search_below_floor_live.py``."""
+    ceiling[bvs.EXACT_SEARCH_MAX_ROWS_SETTING] = 0
 
 
 @pytest.fixture
@@ -1966,7 +1992,7 @@ def _recall_against_an_exact_scan(session, sql: str, params: dict, vectors) -> f
 
 
 def test_the_new_shape_answers_exactly_where_the_old_one_was_approximate(
-    engine, schema, settings, query_vectors
+    engine, schema, settings, query_vectors, exact_search_ceiling
 ):
     """The trade this PR actually makes, for a knowledge base that is a small share.
 
@@ -1980,7 +2006,16 @@ def test_the_new_shape_answers_exactly_where_the_old_one_was_approximate(
     "Slower and correct, where it was fast and quietly wrong" is a real argument
     for this change. It is not the argument the PR body makes, and nothing else
     here pins it.
+
+    Run with ``VECTOR_EXACT_SEARCH_MAX_ROWS`` at 0. KB_MID is below that ceiling
+    and has no index, so the store now answers it with the fenced exact statement
+    rather than the one this spec compares against its predecessor -- and taking
+    the embeddings-side predicate out of *that* statement leaves a subquery that
+    reads every knowledge base's rows, exact as well, so there would be no trade
+    left to show. The fenced path's own exactness and plan are pinned in
+    ``test_exact_search_below_floor_live.py``.
     """
+    _exact_search_off(exact_search_ceiling)
     sql, params = _capture_search_sql(engine, KB_MID, query_vectors[0])
     old_sql = _without_the_embeddings_predicate(sql)
     with Session(engine) as session:
@@ -2341,7 +2376,7 @@ def _assert_the_unrestricted_search_still_reaches_the_index(engine, vectors, nam
 
 
 def test_a_knowledge_base_with_no_index_of_its_own_keeps_the_answer_it_has_today(
-    engine, schema, settings, query_vectors
+    engine, schema, settings, query_vectors, exact_search_ceiling
 ):
     """The gate, from the outside: no index, so nothing changes.
 
@@ -2349,7 +2384,13 @@ def test_a_knowledge_base_with_no_index_of_its_own_keeps_the_answer_it_has_today
     never gives it an index and its search is an exact scan. Ungated, the sort
     penalty would move it onto the shared index and throw most of the answer
     away.
+
+    With ``VECTOR_EXACT_SEARCH_MAX_ROWS`` off: KB_MID's 2,000 rows are below the
+    shipped ceiling, where the fenced exact statement would answer it and the
+    ``enable_sort`` gate this spec is about would never be reached. Off, it is the
+    gate's evidence for an unindexed knowledge base above the ceiling.
     """
+    _exact_search_off(exact_search_ceiling)
     exact = _exact_answers(engine, KB_MID, query_vectors)
     shared = f"idx_ai_embeddings_hnsw_{DIMS}"
     scans, answers = _drive_and_collect(engine, KB_MID, query_vectors, shared)
@@ -2363,7 +2404,9 @@ def test_a_knowledge_base_with_no_index_of_its_own_keeps_the_answer_it_has_today
     )
 
 
-def test_an_index_that_is_invalid_is_not_steered_at_either(engine, schema, settings, query_vectors):
+def test_an_index_that_is_invalid_is_not_steered_at_either(
+    engine, schema, settings, query_vectors, exact_search_ceiling
+):
     """An INVALID index is in the catalog and cannot answer a query.
 
     A build that was interrupted or ran out of disk leaves one behind, and
@@ -2372,7 +2415,12 @@ def test_an_index_that_is_invalid_is_not_steered_at_either(engine, schema, setti
     probe's ``indisvalid`` is for. Without it the sort would be priced out for a
     knowledge base with nothing to fall on, and the shared index would take the
     search.
+
+    With ``VECTOR_EXACT_SEARCH_MAX_ROWS`` off, for the reason given in the spec
+    above: below the ceiling this knowledge base would be answered by the fenced
+    exact statement, not by the gate under test.
     """
+    _exact_search_off(exact_search_ceiling)
     name = _build_index_ignoring_thresholds(engine, KB_MID)
     _invalidate(engine, name)
     with engine.connect() as conn:

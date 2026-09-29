@@ -1225,6 +1225,63 @@ def _build_registry() -> dict[str, SettingDef]:
             ),
         ),
         SettingDef(
+            key="VECTOR_EXACT_SEARCH_MAX_ROWS",
+            category=cat,
+            label="Exact Vector Search Ceiling (rows)",
+            type="int",
+            default=5000,
+            min=0,
+            max=50000,
+            advanced=True,
+            description=(
+                "A knowledge base with no vector index of its own and at most this "
+                "many embeddings is searched exactly: its rows are read through the "
+                "knowledge-base lookup and ranked, so the answer is the true top-k "
+                "and the cost follows the knowledge base's size rather than the "
+                "whole table's. Without this, such a knowledge base searches the "
+                "project-wide index, which ranks every knowledge base's vectors and "
+                "discards the others' afterwards: measured on a production project "
+                "with an embeddings table of about 5 million rows, 300 to 600 ms "
+                "cold, and 0 of 20 requested rows returned for a knowledge base of "
+                "about 24,000 rows whose nearest vectors lay in other knowledge "
+                "bases. That knowledge base is above this setting's default, so it "
+                "is fixed by lowering the index threshold below, not by this alone. "
+                "An exact search reads EVERY embedding the knowledge base holds, of "
+                "every kind, not only the ones it ranks, so it stays exact only "
+                "while the knowledge base holds at most four times this many "
+                "embeddings in total; one past that keeps the project-wide index, "
+                "whatever the size of the part being searched. Each ranked "
+                "embedding costs a few page reads at 1536 dimensions, so exact "
+                "search suits small knowledge bases: about 120 to 140 ms warm at "
+                "about 24,000 embeddings and 360 to 450 ms at about 73,000 on that "
+                "project (slower than the test-fixture figure quoted for the index "
+                "threshold, which is measured on data that fits in memory), which "
+                "is why this stops at 50,000 — above it a knowledge base should "
+                "have an index of its own. Deciding costs a knowledge base without "
+                "an index about ten extra database round trips per search, paid "
+                "also by one over this limit before it goes to the project-wide "
+                "index; one with its own index pays nothing extra. 0 turns exact "
+                "search off, and so does a project whose settings cannot be read. "
+                "HOW IT MEETS THE INDEX THRESHOLDS: a knowledge base gets its own "
+                "index at VECTOR_PER_KB_INDEX_MIN_ROWS text chunks and keeps it "
+                "until it is at or below VECTOR_PER_KB_INDEX_DROP_ROWS, so with this "
+                "setting at or above VECTOR_PER_KB_INDEX_MIN_ROWS no size of "
+                "text-chunk knowledge base is left on the project-wide index — for "
+                "example 5,000 here with 5,000 and 2,500 there — apart from one "
+                "whose index is still being built, has failed to build, or is over "
+                "the 200-index limit, or one holding more than four times this many "
+                "embeddings in total. With the shipped 50,000 build "
+                "threshold, knowledge bases between this limit and 50,000 "
+                "embeddings stay on the project-wide index, as before this setting "
+                "existed. A knowledge base that has its own index keeps searching "
+                "it, even at or below this limit. The index covers text chunks "
+                "only, so document-level, graph and structured-document searches "
+                "never have one and use exact search whenever they are under this "
+                "limit. Searches restricted to named sources, items or metadata are "
+                "exact already and are unaffected."
+            ),
+        ),
+        SettingDef(
             key="VECTOR_INDEX_MAINTENANCE_WORK_MEM_MB",
             category=cat,
             label="Vector Index Build Memory (MB)",
@@ -1351,12 +1408,38 @@ def _has_g_context() -> bool:
     return has_app_context()
 
 
+class SettingsUnreadable(RuntimeError):
+    """``ai.project_settings`` could not be read, so an override may exist unseen."""
+
+
+class _UnreadableOverrides(dict):
+    """An empty override map that remembers the read behind it failed.
+
+    Empty, so ``get_setting`` answers the registry default exactly as it always
+    has; distinguishable, so ``get_setting_strict`` can refuse to. Cached like any
+    other result, so one failed read answers the same way for the whole app
+    context rather than being retried per setting.
+    """
+
+
 def _load_overrides() -> dict[str, str]:
     """Load all overrides from ai.project_settings into a dict.
 
-    Cached in flask.g for the duration of the request.  When called
-    outside a request context (e.g. Celery tasks, background threads)
-    the query runs uncached — still a single lightweight SELECT.
+    Cached in flask.g for the life of the app context -- a request, or a whole
+    Celery task, since the task base class pushes one per task. Outside any app
+    context (a bare thread) the query runs uncached -- still a single lightweight
+    SELECT.
+
+    The SELECT runs in a savepoint. It is on the vector search path, and on the
+    single-session paths -- a route or task searching through ``db.session`` --
+    it shares a transaction with the search: a read that failed outside a
+    savepoint -- a cancelled statement, a table that does not exist yet -- would
+    leave that transaction aborted, and the search that follows would raise
+    ``InFailedSqlTransaction`` rather than run on the registry default. Rolling
+    back to the savepoint keeps the caller's transaction usable. (The multi-KB
+    and agent-tool paths search on a private ``Session`` while this reads
+    ``db.session``; they are safe because the parent request fills the cache
+    before fanning out.) A failed read returns an empty ``_UnreadableOverrides``.
     """
     use_cache = _has_g_context()
 
@@ -1366,13 +1449,20 @@ def _load_overrides() -> dict[str, str]:
             return cache
 
     try:
-        rows = db.session.execute(
-            text(f'SELECT key, value FROM "{AI_SCHEMA}".project_settings')
-        ).fetchall()
-        result = {row[0]: row[1] for row in rows if row[1] is not None}
+        # A savepoint on the session's *connection*, not ``Session.begin_nested()``:
+        # the ORM one flushes pending objects first, so an unrelated object whose
+        # flush fails would surface here as an unreadable settings table -- the
+        # defaults returned, "unreadable" cached for the app context, and the
+        # caller's session left needing a rollback. This read flushes nothing.
+        connection = db.session.connection()
+        with connection.begin_nested():
+            rows = connection.execute(
+                text(f'SELECT key, value FROM "{AI_SCHEMA}".project_settings')
+            ).fetchall()
+        result: dict[str, str] = {row[0]: row[1] for row in rows if row[1] is not None}
     except Exception:
         logger.warning("Failed to load project_settings overrides", exc_info=True)
-        result = {}
+        result = _UnreadableOverrides()
 
     if use_cache:
         g._settings_cache = result
@@ -1387,8 +1477,30 @@ def get_setting(key: str) -> Any:
     defn = SETTINGS_REGISTRY.get(key)
     if defn is None:
         raise KeyError(f"Unknown setting: {key}")
+    return _resolve(key, defn, _load_overrides())
 
+
+def get_setting_strict(key: str) -> Any:
+    """``get_setting``, except that an unreadable ``ai.project_settings`` raises.
+
+    For a setting whose registry default is the wrong answer when an override
+    might exist unseen -- one an operator sets to turn something *off*.
+    ``get_setting`` answers the default in that case, which turns it back on.
+
+    Raises:
+        SettingsUnreadable: the overrides could not be read this app context.
+    """
+    defn = SETTINGS_REGISTRY.get(key)
+    if defn is None:
+        raise KeyError(f"Unknown setting: {key}")
     overrides = _load_overrides()
+    if isinstance(overrides, _UnreadableOverrides):
+        raise SettingsUnreadable(f"ai.project_settings could not be read, so {key} is unknown")
+    return _resolve(key, defn, overrides)
+
+
+def _resolve(key: str, defn: SettingDef, overrides: dict[str, str]) -> Any:
+    """The stored override, coerced, or the registry default."""
     raw = overrides.get(key)
     if raw is not None:
         try:

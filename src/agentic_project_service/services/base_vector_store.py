@@ -9,7 +9,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -23,7 +23,12 @@ from sqlalchemy.orm import Session
 from ..db import AI_SCHEMA
 from . import pg_bm25_index, pg_vector_index
 from .kb_search_config import HNSW_ITERATIVE_SCAN_MODE
-from .settings_registry import SETTINGS_REGISTRY, get_setting
+from .settings_registry import (
+    SETTINGS_REGISTRY,
+    SettingsUnreadable,
+    get_setting,
+    get_setting_strict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +110,13 @@ MAX_TOP_K = 10_000
 # tests the store, so a search from any of them that carries ``item_ids``,
 # ``source_ids`` or a metadata filter has the approximate index priced out like
 # any other restricted search -- deliberately, because that is the half that makes
-# an answer exact and exactness is not a chunks-only concern. It is only the
-# *unrestricted* search from those stores that is left on the planner's own plan.
+# an answer exact and exactness is not a chunks-only concern. Their *unrestricted*
+# search is exact too while the knowledge base holds at most
+# ``VECTOR_EXACT_SEARCH_MAX_ROWS`` of their rows and no more than the read budget
+# of rows in all -- they can never have an index of their own, so that is the only
+# alternative to the shared one -- and is left on the planner's own plan otherwise:
+# above either bound, with the setting at 0 or unreadable, or when the count
+# cannot be read.
 #
 # The string itself is ``pg_vector_index``'s, because that module builds the index
 # whose predicate names it: the literal in this module's query and the literal in
@@ -426,6 +436,9 @@ def metadata_filter_clause(filter_metadata: dict | None) -> tuple[str, dict[str,
 
 
 _QUERY_CANCELED = "57014"
+# SQLSTATE for "current transaction is aborted, commands ignored until end of
+# transaction block".
+_IN_FAILED_SQL_TRANSACTION = "25P02"
 
 
 class KeywordSearchTimeout(RuntimeError):
@@ -522,6 +535,140 @@ def _bm25_fallback_timeout_ms() -> int:
             clamped,
         )
     return clamped
+
+
+EXACT_SEARCH_MAX_ROWS_SETTING = "VECTOR_EXACT_SEARCH_MAX_ROWS"
+
+
+def exact_search_max_rows() -> int:
+    """How many rows a knowledge base with no index of its own may have and still
+    be searched exactly -- ``VECTOR_EXACT_SEARCH_MAX_ROWS``, clamped to its range.
+
+    Clamped for the same reason ``_bm25_fallback_timeout_ms`` is: a stored override
+    is coerced but range-checked only on the settings PUT path, and here an
+    out-of-range value is not merely odd. The exact search ranks every row it
+    reads, so a stored 500,000 would turn a search into a multi-second read of one
+    knowledge base, which is what the ceiling exists to rule out. A negative value
+    is read as 0, which is off.
+
+    **Unreadable settings mean off, not the default.** Read through
+    ``get_setting_strict``: when ``ai.project_settings`` cannot be read this app
+    context, an operator's 0 cannot be seen, and answering the default would turn
+    the feature back on for exactly the project that turned it off. So the answer
+    is 0 and a WARNING names the setting. The overrides are cached in ``flask.g``
+    for the app context -- one read per request, or per Celery task -- and read
+    uncached outside one.
+    """
+    defn = SETTINGS_REGISTRY[EXACT_SEARCH_MAX_ROWS_SETTING]
+    try:
+        value = int(get_setting_strict(EXACT_SEARCH_MAX_ROWS_SETTING))
+    except SettingsUnreadable as e:
+        logger.warning(
+            "%s could not be read (%s); exact vector search is off for this search",
+            EXACT_SEARCH_MAX_ROWS_SETTING,
+            e,
+        )
+        return 0
+    clamped = value
+    if defn.min is not None:
+        clamped = max(clamped, int(defn.min))
+    if defn.max is not None:
+        clamped = min(clamped, int(defn.max))
+    if clamped != value:
+        _warn_once_per_bad_value(
+            f"{EXACT_SEARCH_MAX_ROWS_SETTING}:range:{value}",
+            "%s=%d is outside the allowed range %s-%s; using %d instead",
+            EXACT_SEARCH_MAX_ROWS_SETTING,
+            value,
+            defn.min,
+            defn.max,
+            clamped,
+        )
+    return clamped
+
+
+# How many of a knowledge base's rows, of any item table and any dimension, the
+# exact-path decision may read -- and so the most the exact search itself will
+# read -- as a multiple of ``VECTOR_EXACT_SEARCH_MAX_ROWS``.
+#
+# The ceiling counts one *population*: this store's item table at this dimension.
+# But the only btree ``ai.embeddings`` has for a knowledge base is on
+# ``knowledge_base_id`` alone, so reaching that population means reading every
+# row of the knowledge base and filtering on the heap -- and a knowledge base can
+# hold far more of another population than of the searched one: chunks beside
+# documents when its sources were indexed with more than one strategy, or rows at
+# two dimensions after an embedding-model change. Measured by review on a
+# 2M-row fixture, 1.5M chunk rows and 2,000 document rows: the document search
+# took the exact path, and its count read 35,875 buffers in 214 ms and the
+# search 36,188 in 168 ms, on every search. So the decision stops reading at this
+# budget, and a knowledge base whose rows run past it keeps today's plan whatever
+# its searched population is. On the live suite's 100,200-row knowledge base (200
+# document rows at 384 dimensions beside 100,000 others at 16 dimensions, kept
+# small so the fixture loads quickly) the decision's count now reads 20,001 rows in
+# 516 buffer accesses and 3.1 ms, where the count it replaced read all of them to
+# find the 200: 2,581 buffer accesses and 16.3 ms. The rows are wider in a real
+# table: with the 100,000 replaced by 300,000 rows at 384 dimensions, review
+# measured the same 20,001-row read at about 6,100 buffer accesses and 5.6-7.3 ms.
+#
+# **Why four.** What the budget adds over a knowledge base of only the searched
+# population is the rows of the others, and those are cheap: they are filtered
+# out on the heap tuple, so their vectors are never detoasted and never ranked.
+# Measured at 1536 dimensions, where a heap tuple holds only a TOAST pointer:
+# 2,000 ranked rows beside 6,000 of another population cost 12,428 buffer
+# accesses and 10.5 ms, against 12,423 and 9.8 ms for the 2,000 alone -- the
+# other rows shared heap pages with the ranked ones. At 384 dimensions a vector
+# is stored in line and a row costs a fifth of a heap page either way, so there
+# the budget allows at most three times the heap reads of a knowledge base at the
+# ceiling, all of them hits once warm. Four keeps a document-level search working
+# on a knowledge base whose chunks outnumber its documents a few times over --
+# the common mixed shape -- while a knowledge base several times the ceiling,
+# whatever its populations, is never read in full on every search.
+#
+# **The eventual fix is a btree on ``(knowledge_base_id, item_table, dims)``**,
+# which would make both the count and the fenced search read only the searched
+# population. ``pg_vector_index.bounded_row_count`` documents the same caveat for
+# the per-KB index lifecycle's count; no migration in this repository creates
+# ``ai.embeddings``, so the index belongs with whatever owns that table.
+EXACT_SEARCH_READ_BUDGET_MULTIPLE = 4
+
+
+def exact_search_read_budget(max_rows: int) -> int:
+    """The most of a knowledge base's rows the exact path reads; see the multiple above."""
+    return EXACT_SEARCH_READ_BUDGET_MULTIPLE * max(0, int(max_rows))
+
+
+def takes_the_exact_path(
+    *,
+    max_rows: int,
+    has_its_own_index: bool,
+    rows: int | None,
+    kb_rows_read: int | None,
+) -> bool:
+    """Whether an unrestricted vector search is run exactly rather than left to the planner.
+
+    Exact when the feature is on (``max_rows`` > 0), the knowledge base has no
+    valid partial HNSW index of its own at this dimension, it holds at most
+    ``max_rows`` embeddings for the searching store's item table and dimension
+    (``rows``), and reading the knowledge base to find them did not run past the
+    read budget (``kb_rows_read``, counted to one row past it). Either count is
+    ``None`` when it could not be read, and then the answer is no: in doubt the
+    search keeps the plan it had before this existed.
+
+    An index of its own keeps the index path at any size, including at or below
+    ``max_rows`` -- which happens whenever ``VECTOR_PER_KB_INDEX_DROP_ROWS`` is
+    below this ceiling, since an index built at the build threshold is kept until
+    the knowledge base falls to the drop threshold. The index was built for
+    exactly that knowledge base, and the exact path is for the knowledge bases
+    that have nothing better than the shared index.
+    """
+    return (
+        max_rows > 0
+        and not has_its_own_index
+        and rows is not None
+        and kb_rows_read is not None
+        and rows <= max_rows
+        and kb_rows_read <= exact_search_read_budget(max_rows)
+    )
 
 
 # Reasons a retrieval answered with less than it was asked for.
@@ -635,11 +782,17 @@ class BasePgVectorStore:
         KB without a partial index of its own the vector query filters
         `knowledge_base_id` AFTER the approximate scan. Without iterative
         scanning, pgvector emits only ~ef_search global candidates before that
-        filter, starving KB-scoped queries (often 0 rows). A KB that has its own
-        partial index (`pg_vector_index`) does not need this -- its index holds
-        only its own rows, so nothing is filtered away after the scan -- but it
-        costs that KB nothing either, so the GUC is set unconditionally rather
-        than made to depend on a catalog lookup per search.
+        filter, starving KB-scoped queries (often 0 rows). It narrows that
+        starvation rather than ending it: pgvector stops an iterative scan at
+        ``hnsw.max_scan_tuples`` (20,000 by default), and on a production project a
+        knowledge base of about 24,000 rows whose neighbours lay in other knowledge
+        bases still got 0 of 20 with this set -- which is what
+        ``_searching_exactly_below_the_floor`` exists for, for the small ones. A KB
+        that has its own partial index (`pg_vector_index`) does not need this --
+        its index holds only its own rows, so nothing is filtered away after the
+        scan -- and neither does a search on the exact path, which walks no HNSW
+        index at all; but it costs them nothing either, so the GUC is set
+        unconditionally rather than made to depend on a catalog lookup per search.
 
         SET LOCAL keeps this scoped to the current transaction so it
         can't leak across pooled connections. The mode is a validated constant,
@@ -659,14 +812,118 @@ class BasePgVectorStore:
                 e,
             )
 
+    # The planner settings ``_scan_methods_priced_out`` may touch. Interpolated
+    # into the statement, because ``current_setting`` and ``set_config`` take the
+    # name as a value but the statement text is what the specs and a captured
+    # statement list read -- so each name is checked against this set first.
+    _PRICEABLE_SCAN_METHODS = frozenset({"enable_indexscan", "enable_seqscan", "enable_bitmapscan"})
+    # The one combination refused outright: with index scans *and* bitmap scans
+    # priced out, a knowledge-base lookup has no plan left but a (parallel)
+    # sequential scan of the whole ``embeddings`` heap -- measured at 3-6 s on a
+    # production project's heap of about a gigabyte.
+    _ONLY_A_SEQUENTIAL_SCAN_LEFT = frozenset({"enable_indexscan", "enable_bitmapscan"})
+
+    @contextmanager
+    def _scan_methods_priced_out(self, *gucs: str, not_applied: str) -> Iterator[bool]:
+        """Turn ``enable_*`` scan methods off for the statements inside, then put them back.
+
+        What ``_insisting_on_an_exact_search`` (``enable_indexscan``) and
+        ``_searching_exactly_below_the_floor`` (``enable_seqscan`` and
+        ``enable_bitmapscan``) share: read the prior values, set them off
+        transaction-locally, and restore the values that were read. Three
+        statements -- the read, the set, the restore, each naming every setting --
+        in two savepoints: one around the read and the set, one around the restore.
+        Yields whether the penalty is in force, so a caller can say what its plan
+        rests on.
+
+        ``not_applied`` is the warning logged, with the knowledge base id and the
+        error, when the settings cannot be made; it is the caller's because only
+        the caller knows what its search loses without them.
+        """
+        unknown = [guc for guc in gucs if guc not in self._PRICEABLE_SCAN_METHODS]
+        if not gucs or unknown:
+            raise ValueError(f"not scan methods this store prices out: {gucs!r}")
+        if self._ONLY_A_SEQUENTIAL_SCAN_LEFT <= set(gucs):
+            raise ValueError(
+                "pricing out index scans and bitmap scans together leaves a sequential "
+                "scan of the whole table as the only plan"
+            )
+        # One bind per setting on the restore; a single setting keeps the name
+        # ``prior`` it has always had in a captured statement.
+        binds = ["prior"] if len(gucs) == 1 else [f"prior_{i}" for i in range(len(gucs))]
+        priors: list[str] | None = None
+        try:
+            # In a savepoint, the same way the mirrored block's probe is, and for
+            # the same reason: either of these statements can be cancelled like
+            # any other, and without a savepoint that failure leaves the caller's
+            # transaction aborted -- so the search below would raise
+            # ``InFailedSqlTransaction`` while this line claimed it had merely
+            # degraded. Rolling back to the savepoint is what makes the warning
+            # true. Verified on a live server all three ways: a released savepoint
+            # keeps a transaction-local ``set_config`` in force, a rolled-back one
+            # undoes it and leaves the transaction usable, and without one the next
+            # statement in the transaction is refused.
+            with self.session.begin_nested():
+                reads = ", ".join(f"current_setting('{guc}')" for guc in gucs)
+                row = next(iter(self.session.execute(text(f"SELECT {reads}"))))
+                priors = [str(value) for value in row]
+                sets = ", ".join(f"set_config('{guc}', 'off', true)" for guc in gucs)
+                self.session.execute(text(f"SELECT {sets}"))
+        except Exception as e:
+            logger.warning(not_applied, self.kb_id, e)
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            try:
+                # Savepointed like the read and the set, and for the caller's sake
+                # rather than this block's: the rows are already off the cursor
+                # when this runs, so a bare failure here would hand back a search
+                # that answered and a transaction that no longer works, and the
+                # error would surface on whatever the caller did next.
+                with self.session.begin_nested():
+                    restores = ", ".join(
+                        f"set_config('{guc}', :{bind}, true)" for guc, bind in zip(gucs, binds)
+                    )
+                    self.session.execute(
+                        text(f"SELECT {restores}"), dict(zip(binds, priors, strict=True))
+                    )
+            except Exception as e:
+                # Two different failures, and only one is news. On a transaction
+                # that is already aborted -- the search itself failed, the usual
+                # reason to be here at all -- the savepoint cannot be taken, the
+                # transaction is going to be rolled back with the setting in it,
+                # and the error worth reading is the one that aborted it. On a
+                # live transaction the setting stays off for everything else it
+                # runs: a keyword leg that follows on this session is planned
+                # with a scan method priced out it never asked for.
+                failed_already = (
+                    getattr(getattr(e, "orig", None), "sqlstate", None)
+                    == _IN_FAILED_SQL_TRANSACTION
+                )
+                (logger.debug if failed_already else logger.warning)(
+                    "Could not restore %s after a vector search on KB %s: %s; %s",
+                    ", ".join(f"{guc}={prior}" for guc, prior in zip(gucs, priors, strict=True)),
+                    self.kb_id,
+                    e,
+                    "the transaction had already failed"
+                    if failed_already
+                    else "the setting stays off for the rest of this transaction",
+                )
+
     @contextmanager
     def _insisting_on_an_exact_search(self) -> Iterator[None]:
         """Price the approximate index out, for a search the caller restricted.
 
         The mirror of ``_preferring_this_kbs_partial_index``, and the reason the
-        pair is symmetric: an unrestricted search wants the index and cannot be
-        starved by anything, a restricted one must be exact and an ordered ANN
-        scan cannot promise that.
+        pair is symmetric: an unrestricted search on a knowledge base's *own*
+        index wants that index -- nothing is filtered away after the scan, so
+        nothing can starve it -- while a restricted one must be exact and an
+        ordered ANN scan cannot promise that. An unrestricted search with no index
+        of its own *can* be starved, on the shared index; that is the case
+        ``_searching_exactly_below_the_floor`` answers exactly when the knowledge
+        base is small.
 
         **Why not simply leave the planner alone.** Because the planner's own
         choice is a cost race, and on some shapes of the table it comes out for the
@@ -810,7 +1067,9 @@ class BasePgVectorStore:
         ``similarity_threshold``.** It is not a clause -- callers pass it to the
         search layer, which drops rows below it in Python *after* these rows are
         off the cursor -- so no predicate the planner sees mentions it, and an
-        unrestricted search with a threshold still goes to the index. A row the
+        unrestricted search with a threshold still goes to the index, unless the
+        knowledge base is small enough for ``_searching_exactly_below_the_floor``,
+        where the answer is exact whatever the threshold. A row the
         approximate scan missed cannot be recovered by a filter applied to what it
         returned, so a caller who sets a threshold and passes no other restriction
         gets an approximate answer filtered exactly, not an exact answer. That is
@@ -830,67 +1089,23 @@ class BasePgVectorStore:
         same connection was 14 of 14 on the partial index, which is what makes that
         a result rather than an absence.
         """
-        prior: str | None = None
-        try:
-            # In a savepoint, the same way the mirrored block's probe is, and for
-            # the same reason: either of these statements can be cancelled like
-            # any other, and without a savepoint that failure leaves the caller's
-            # transaction aborted -- so the search below would raise
-            # ``InFailedSqlTransaction`` while this line claimed it had merely
-            # degraded. Rolling back to the savepoint is what makes the warning
-            # true. Verified on a live server all three ways: a released savepoint
-            # keeps a transaction-local ``set_config`` in force, a rolled-back one
-            # undoes it and leaves the transaction usable, and without one the next
-            # statement in the transaction is refused.
-            with self.session.begin_nested():
-                prior = str(
-                    self.session.execute(
-                        text("SELECT current_setting('enable_indexscan')")
-                    ).scalar()
-                )
-                self.session.execute(text("SELECT set_config('enable_indexscan', 'off', true)"))
-        except Exception as e:  # pragma: no cover - needs a live server
-            # What actually happens now: the setting is back where it was, the
-            # transaction is usable, and the search runs on the plan the planner
-            # picks for itself. Whether that plan is the exact one depends on the
-            # shape of the table rather than on the vector width -- see the sweep
-            # in the docstring -- so the honest statement is that this search may
-            # come back with a full page of rows that are not the nearest ones
-            # among those the caller named.
-            logger.warning(
+        # What happens when the setting cannot be made: it is back where it was,
+        # the transaction is usable, and the search runs on the plan the planner
+        # picks for itself. Whether that plan is the exact one depends on the
+        # shape of the table rather than on the vector width -- see the sweep in
+        # the docstring -- so the honest statement is that this search may come
+        # back with a full page of rows that are not the nearest ones among those
+        # the caller named.
+        with self._scan_methods_priced_out(
+            "enable_indexscan",
+            not_applied=(
                 "Could not price the approximate index out for KB %s: %s; this "
                 "restricted vector search will run on the planner's own plan, which "
                 "on some tables is an approximate index scan returning a full page "
-                "of rows that are not the nearest matching ones",
-                self.kb_id,
-                e,
-            )
+                "of rows that are not the nearest matching ones"
+            ),
+        ):
             yield
-            return
-        try:
-            yield
-        finally:
-            try:
-                # Savepointed like the two above, and for the caller's sake rather
-                # than this block's: the rows are already off the cursor when this
-                # runs, so a bare failure here would hand back a search that
-                # answered and a transaction that no longer works, and the error
-                # would surface on whatever the caller did next. When the
-                # transaction is already aborted -- the usual reason to be here at
-                # all -- the savepoint cannot be taken either and this logs exactly
-                # as it did before.
-                with self.session.begin_nested():
-                    self.session.execute(
-                        text("SELECT set_config('enable_indexscan', :prior, true)"),
-                        {"prior": prior},
-                    )
-            except Exception as e:
-                logger.debug(
-                    "Could not restore enable_indexscan=%s after a vector search on KB %s: %s",
-                    prior,
-                    self.kb_id,
-                    e,
-                )
 
     _PARTIAL_INDEX_PROBE = """
         SELECT
@@ -903,7 +1118,7 @@ class BasePgVectorStore:
     """
 
     @contextmanager
-    def _preferring_this_kbs_partial_index(self, dims: int) -> Iterator[None]:
+    def _preferring_this_kbs_partial_index(self, dims: int) -> Iterator[bool | None]:
         """Price an exact sort out of the search, when there is an index to fall on.
 
         Everything else in this class makes the partial HNSW index *reachable*.
@@ -1003,11 +1218,14 @@ class BasePgVectorStore:
 
         That is what the catalog probe buys: a knowledge base below the build
         threshold, one whose index is INVALID, and one whose index is still being
-        built all keep the plan they have today -- measured, 0 of 12 executions on
-        the index and recall 1.00 in each case. The probe costs a round trip,
-        which for a knowledge base that has no index is the whole of what this
-        adds: +0.3 ms, measured over 120 searches each at 400, 2,000 and 8,400
-        rows.
+        built are not steered onto an index -- measured, 0 of 12 executions on the
+        index and recall 1.00 in each case. The probe costs a round trip: +0.3 ms,
+        measured over 120 searches each at 400, 2,000 and 8,400 rows. What such a
+        knowledge base runs next is no longer simply "the plan it had": at or below
+        ``VECTOR_EXACT_SEARCH_MAX_ROWS`` it is searched exactly, inside this block
+        on the probe's "no" (``_searching_exactly_below_the_floor``, which prices
+        its own cost), and only above that ceiling -- or with it off -- is it left
+        to the planner.
 
         **What the probe cannot buy, and this is a standing limitation rather than
         a fixed bug: a sort penalty cannot break a tie between two index plans, so
@@ -1165,6 +1383,17 @@ class BasePgVectorStore:
         This cannot make the common case worse: the failure a restore usually meets
         is a transaction the search itself aborted, and there the savepoint cannot
         be taken either, so the handler logs exactly what it logged before.
+
+        **It yields what the probe found**, so the catalog is asked once per
+        search: ``True`` when this knowledge base has a valid partial index at
+        ``dims`` (whether or not the settings could then be made), ``False`` when
+        it has none, and ``None`` when the probe itself failed. On ``False``
+        nothing has been set and nothing will be restored, so a caller may run a
+        different statement inside the block -- which is what
+        ``_searching_exactly_below_the_floor`` does, rather than paying for a
+        second catalog read of its own: that measured +1.8 ms per search on an
+        indexed knowledge base, three round trips with the savepoint, for an
+        answer this probe already had.
         """
         # Not inside the try below: both arguments have already been validated by
         # the caller, so a failure here is a programming error and should not be
@@ -1172,10 +1401,12 @@ class BasePgVectorStore:
         index = f'"{self.schema}".{pg_vector_index.per_kb_index_name(self.kb_id, dims)}'
         prior: str | None = None
         prior_ef_search: str | None = None
+        found: bool | None = None
         try:
             with self.session.begin_nested():
                 rows = list(self.session.execute(text(self._PARTIAL_INDEX_PROBE), {"index": index}))
-            if rows and rows[0][2]:
+            found = bool(rows and rows[0][2])
+            if found:
                 prior = str(rows[0][0])
                 prior_ef_search = None if rows[0][1] is None else str(rows[0][1])
         except Exception as e:  # pragma: no cover - needs a live catalog
@@ -1187,7 +1418,7 @@ class BasePgVectorStore:
                 e,
             )
         if prior is None:
-            yield
+            yield found
             return
         try:
             # In a savepoint, like the probe above and for the same reason: a
@@ -1215,7 +1446,7 @@ class BasePgVectorStore:
                 self.kb_id,
                 e,
             )
-            yield
+            yield True
             return
         # Set unconditionally, and NOT gated on the probe having read a value.
         # pgvector registers its GUCs in ``_PG_init``, which runs on the first
@@ -1268,7 +1499,7 @@ class BasePgVectorStore:
             )
             prior_ef_search = None
         try:
-            yield
+            yield True
         finally:
             # One statement per setting, each naming its own GUC, so the restore
             # is as readable in a captured statement list as the set was.
@@ -1300,6 +1531,276 @@ class BasePgVectorStore:
                     self.kb_id,
                     e,
                 )
+
+    def _population_within_the_read_budget(
+        self, dims: int, max_rows: int
+    ) -> tuple[int | None, int | None]:
+        """``(rows of this store's population at dims, rows of the knowledge base read)``.
+
+        Reads at most the read budget of the knowledge base's rows, plus one, and
+        counts both how many it read and how many of those are the searched
+        population. The ``LIMIT`` is on the knowledge base alone, deliberately:
+        with the item-table and dimension filters *inside* the limited scan it
+        would bound the rows it returns and not the rows it reads, which is what
+        ``pg_vector_index.bounded_row_count``'s docstring found for its own count
+        and what review measured here -- 214 ms to find 2,000 document rows
+        among 1.5M chunk rows. The filters are applied to what was read instead.
+
+        Not ``bounded_row_count`` itself: it is fixed to the chunks population,
+        and it binds the knowledge base id where this interpolates it -- a generic
+        plan on a bound id has no estimate but 1/n_distinct. All three values are
+        validated literals, the same three the search carries.
+
+        Run under ``_searching_exactly_below_the_floor``'s penalty on sequential
+        and bitmap scans, and that is what makes the read *bounded*: the plan is
+        a plain ``Index Scan`` on the knowledge-base btree that stops after the
+        budget. Without the penalty a knowledge base that is a large share of a
+        small table is read by a sequential scan of the whole table, and a bitmap
+        scan reads every one of the knowledge base's btree entries before its heap
+        walk can stop -- 100,200 entries for a 100,200-row knowledge base, and the
+        part of the read that grows with a knowledge base the budget has already
+        ruled out.
+
+        ``(None, None)`` when the count could not be read -- never 0, which would
+        read as "nothing here" and take the exact path. Logged at WARNING.
+        """
+        budget = exact_search_read_budget(max_rows)
+        kb_literal = kb_sql_literal(self.kb_id)
+        item_table_literal = item_table_sql_literal(self.TABLE)
+        try:
+            with self.session.begin_nested():
+                row = next(
+                    iter(
+                        self.session.execute(
+                            text(
+                                "SELECT count(*) FILTER (WHERE item_table = "
+                                f"{item_table_literal} AND dims = {int(dims)}), count(*) "
+                                "FROM (SELECT item_table, dims FROM "
+                                f'"{self.schema}".embeddings '
+                                f"WHERE knowledge_base_id = {kb_literal} "
+                                f"LIMIT {budget + 1}) s"
+                            )
+                        )
+                    ),
+                    None,
+                )
+        except Exception as e:
+            logger.warning(
+                "Could not count KB %s's embeddings for an exact search: %s; this "
+                "vector search keeps the planner's own plan",
+                self.kb_id,
+                e,
+            )
+            return None, None
+        if row is None or row[0] is None or row[1] is None:
+            logger.warning(
+                "The count of KB %s's embeddings for an exact search answered %r; this "
+                "vector search keeps the planner's own plan",
+                self.kb_id,
+                row,
+            )
+            return None, None
+        return int(row[0]), int(row[1])
+
+    def _exact_search_query(self, dims: int, top_k: int) -> str:
+        """The unrestricted search, fenced so that no HNSW index can serve it.
+
+        The embeddings are read in a subquery with ``OFFSET 0``, which PostgreSQL
+        will not pull up into the outer query; the ``ORDER BY ... LIMIT`` sits
+        outside it, so the ordered index scan an HNSW index provides is never on
+        offer for the embeddings relation -- the subquery is planned on its own,
+        with no ordering to satisfy, and the only way to its rows is the
+        knowledge-base btree or the heap. That makes the search exact *by
+        construction*: no setting has to be in force for it to be exact, and a
+        cached generic plan cannot be anything else, because the shape is in the
+        statement text rather than in a planner setting made before it.
+
+        Measured against pricing the index out with ``enable_indexscan = off`` on
+        the same statement, at 384 dimensions on a 55,000-row table: the same plan
+        on every shape tried -- a bitmap lookup on the knowledge-base btree and a
+        top-N heapsort -- under ``plan_cache_mode`` ``auto`` and
+        ``force_generic_plan``. They differ in what happens when a setting cannot
+        be made: with the fence the answer stays exact; with the setting alone it
+        would not. (Run as it ships, under ``_searching_exactly_below_the_floor``'s
+        penalty on sequential and bitmap scans, the lookup is a plain index scan
+        on the same btree.) Checked again at 1536 dimensions, where a vector is
+        one out-of-line TOAST value in four chunks, on a knowledge base of 2,000
+        rows in a 14,000-row table: the same lookup in both cache modes, 6.0 ms and
+        6,265 shared buffer accesses for the embeddings side -- about three a row,
+        in line with the about four measured on the production project -- and
+        17-19 ms end to end through this store across 14 executions on one
+        connection, the prepared statement's parameter typed ``vector`` so a
+        generic plan casts the query once and not once per row. The live suite
+        pins the 1536-dimension plan shape and exactness
+        (``test_at_1536_dimensions_the_exact_path_is_the_same_lookup_and_exact``).
+
+        Same columns in the same order as the statement ``vector_search`` builds,
+        the same item-table join and the same literals -- the knowledge base on
+        both sides, ``item_table``, ``dims`` and the ``LIMIT`` -- so the rows it
+        returns are the rows an exact scan of that statement returns. The inner
+        relation is aliased ``e`` as well, so the predicates read
+        ``e.knowledge_base_id = ...`` exactly as they do there, and anything that
+        checks a captured statement for them finds them in either shape.
+        """
+        kb_literal = kb_sql_literal(self.kb_id)
+        item_table_literal = item_table_sql_literal(self.TABLE)
+        return f"""
+            SELECT
+                c.id,
+                c.{self.TEXT_COL},
+                1 - ((e.embedding::vector({dims})) <=> CAST(:embedding AS vector({dims}))) AS similarity,
+                c.source_id,
+                c.meta
+            FROM (
+                SELECT e.item_id, e.embedding FROM "{self.schema}".embeddings e
+                WHERE e.knowledge_base_id = {kb_literal}
+                  AND e.item_table = {item_table_literal}
+                  AND e.dims = {dims}
+                OFFSET 0
+            ) e
+            JOIN "{self.schema}".{self.TABLE} c ON c.id = e.item_id
+            WHERE c.knowledge_base_id = {kb_literal}
+            ORDER BY (e.embedding::vector({dims})) <=> CAST(:embedding AS vector({dims}))
+            LIMIT {top_k}
+        """
+
+    def _searching_exactly_below_the_floor(
+        self, dims: int, run_exact: Callable[[], list[RetrievedItem]]
+    ) -> list[RetrievedItem] | None:
+        """Run an unrestricted search exactly, if this knowledge base is small and has no index.
+
+        Returns the rows, or ``None`` when the search is not for this path and the
+        caller should run the plan it ran before this existed.
+
+        **Why.** A knowledge base below the build threshold has no partial HNSW
+        index, and its unrestricted search used to be left to the planner. On a
+        table where other knowledge bases hold most of the rows the planner takes
+        the *shared* per-dimension index, which walks the nearest vectors of the
+        whole table and only then applies the knowledge-base filter. Measured on a
+        production project with an embeddings table of about 5M rows and a shared
+        index of tens of GB: 300-600 ms cold for a small knowledge base, because
+        the walk pays for everyone else's data and the graph does not fit the page
+        cache; and for a knowledge base of about 24,000 rows whose nearest vectors
+        lay in other knowledge bases, **0 of 20** requested rows. That is
+        backwards -- a hundred small workspaces must not be slowed or starved by
+        one with a million rows.
+
+        **That 24,000-row example is not fixed by this path at its default.** It
+        is above the 5,000-row ceiling, so it keeps the shared index until the
+        per-KB build threshold is lowered to cover it (see the setting's
+        description) or the ceiling is raised. What this path fixes on its own is
+        the same defect below the ceiling: on the live fixture a 5,000-row
+        knowledge base at 9 % of the table went to the shared index unaided and
+        got a mean recall under 0.5 there (0.03-0.28 across HNSW builds, and
+        anything from 0.00 to 0.80 for a single query), and is answered here with
+        the exact top-k.
+
+        **What an exact search reads.** The knowledge base's own rows -- *every*
+        one of them, of every item table and dimension, because the only btree
+        ``ai.embeddings`` has for a knowledge base is on ``knowledge_base_id`` and
+        the rest is filtered on the heap -- and the vectors of the searched
+        population, which it ranks. So its cost follows the knowledge base's size
+        and not the table's, and it is bounded twice: the ceiling bounds the rows
+        ranked, and the read budget (``EXACT_SEARCH_READ_BUDGET_MULTIPLE``) bounds
+        the rows read. At 1536 dimensions a vector is about 6 KB and stored out of
+        line as one TOAST value in four chunks, so a ranked row costs a few buffer
+        accesses -- the heap tuple, the TOAST index, the chunks: on that project
+        about 24,000 rows took 120-140 ms warm, about 97,000 buffer accesses, and
+        about 73,000 rows 360-450 ms. Hence the ceiling, 5,000 by default; above it
+        a knowledge base should have an index of its own, and with the build
+        threshold at or below the ceiling it does (see the setting's description
+        for the gap when it is not).
+
+        **The bounds hold for the count, and for the search only as of the
+        count.** The fenced search has no ``LIMIT`` on what it reads; it is
+        bounded by the count taken one statement earlier. A bulk ingest that
+        commits between the two can make one search read more than the budget --
+        the search sees the new rows, the decision did not -- and the next search
+        counts again and keeps today's plan. Transient by construction, and not
+        worth a second count.
+
+        **Only called once the knowledge base is known to have no index of its
+        own.** For the chunks store that is the answer
+        ``_preferring_this_kbs_partial_index``'s catalog probe already gives on
+        every unrestricted search, so this runs inside that block on a "no" and
+        asks nothing twice; a knowledge base *with* an index never gets here and
+        runs exactly the statements it ran before. The other three stores never
+        have one -- the index covers ``item_table = 'chunks'`` only -- so they come
+        straight here without asking.
+
+        **What deciding costs** a knowledge base without an index: four
+        statements -- the penalty's read and set, the count, the restore -- in
+        three savepoints, which is six more commands: ten round trips before and
+        after the search. An unindexed knowledge base over the ceiling or the
+        budget pays them too, and then runs today's plan anyway. Measured through
+        the real store on the live fixture, where a bare round trip was 0.32 ms and
+        a savepointed statement 0.96 ms: the count 1.4 ms at 300 rows and 3.3-3.7
+        ms at 5,000-6,000, the penalty's read, set and restore 2.8 ms together; end
+        to end 3.5 -> 8.1 ms for a 300-row knowledge base the planner already
+        answered exactly, and 10.7 -> 19.0 ms for a 6,000-row one over the ceiling.
+        That is round trips, not work -- folding them into one savepoint is the
+        follow-up -- and it buys an exact answer where the shared index gave a
+        mostly wrong one. The setting itself is read once per app context (see
+        ``exact_search_max_rows``). The decision is not cached: an index can be
+        built or dropped between two searches, and a stale "no index" would put a
+        knowledge base with a fresh index back on an exact read of all its rows.
+
+        **Why sequential and bitmap scans are priced out.** The fence already keeps
+        HNSW out, so this is not about exactness -- it bounds what the count and the
+        search read. Where a knowledge base is a large share of a small table the
+        planner prefers to read the whole table, fence or not (measured on the live
+        fixture's ``SHARE_SCHEMA``, 3,000 of 9,000 rows: ``Seq Scan on embeddings``,
+        ``Rows Removed by Filter: 6000``); and a bitmap scan reads every one of the
+        knowledge base's btree entries before its heap walk can stop, which is the
+        read the budget exists to bound. Priced out, both statements are a plain
+        ``Index Scan`` on the knowledge-base btree, in ``auto`` and
+        ``force_generic_plan`` alike, at the same cost as the bitmap plan (12,423
+        buffer accesses either way for 2,000 rows at 1536 dimensions). Penalties,
+        not bans, so a database without a btree on ``knowledge_base_id`` still
+        answers, by the scan. Index scans stay on -- see
+        ``_scan_methods_priced_out`` for why they must.
+
+        **Composing with the restricted path.** A search carrying ``item_ids``,
+        ``source_ids`` or a metadata filter never reaches here: it is exact already
+        through ``_insisting_on_an_exact_search``, and asking the catalog and
+        counting could not change its plan, so it pays for neither.
+
+        **When something fails.** A catalog probe that fails never gets here; a
+        count that fails, or answers nothing, keeps today's plan with a WARNING --
+        never read as 0 rows -- on a transaction the savepoints kept usable; an
+        unreadable setting turns the path off. A penalty that cannot be set leaves
+        the search exact, because the fence is what makes it exact, and loses only
+        the bounds on what it reads.
+
+        One ``DEBUG`` line per exact search, none per row.
+        """
+        max_rows = exact_search_max_rows()
+        if max_rows <= 0:
+            return None
+        with self._scan_methods_priced_out(
+            "enable_seqscan",
+            "enable_bitmapscan",
+            not_applied=(
+                "Could not price sequential and bitmap scans out for KB %s: %s; the "
+                "exact-path decision and search may read more than the read budget, "
+                "or the whole embeddings table where the knowledge base is a large "
+                "share of it"
+            ),
+        ):
+            rows, kb_rows_read = self._population_within_the_read_budget(dims, max_rows)
+            if not takes_the_exact_path(
+                max_rows=max_rows, has_its_own_index=False, rows=rows, kb_rows_read=kb_rows_read
+            ):
+                return None
+            logger.debug(
+                "Exact vector search for KB %s: %s of %s rows at %d dimensions, at most %d",
+                self.kb_id,
+                rows,
+                self.TABLE,
+                dims,
+                max_rows,
+            )
+            return run_exact()
 
     def _fetch_with_timeout(
         self, sql: str, params: dict[str, Any], timeout_ms: int, *, query: str
@@ -1496,8 +1997,9 @@ class BasePgVectorStore:
         #
         # `e.item_table` is the third literal in the predicate, and it is here
         # because the index is single-population by construction: `ai.embeddings`
-        # is polymorphic, a knowledge base crosses the build threshold on the SUM
-        # over its item tables, and an index mixing populations is walked for
+        # is polymorphic, a knowledge base once crossed the build threshold on the
+        # sum over its item tables (``pg_vector_index.bounded_row_count`` now counts
+        # chunks alone), and an index mixing populations is walked for
         # entries that cannot join. Measured on the same 1,000 chunk rows, an
         # index over chunks alone against chunks plus 9,000 document rows: recall
         # 0.858 -> 0.383; and on 6,000 chunk rows with and without 6,000
@@ -1596,8 +2098,8 @@ class BasePgVectorStore:
             LIMIT {effective_top_k}
         """
 
-        def run_the_search() -> list[RetrievedItem]:
-            result = self.session.execute(text(query), params)
+        def run_the_search(sql: str = query) -> list[RetrievedItem]:
+            result = self.session.execute(text(sql), params)
             return [
                 RetrievedItem(
                     item_id=str(row[0]),
@@ -1610,9 +2112,11 @@ class BasePgVectorStore:
                 for row in result
             ]
 
-        # Which of the two blocks below this search gets, and it is deliberately
+        # Which of the blocks below this search gets, and it is deliberately
         # symmetric: a search the caller restricted must be exact, and one it did
-        # not restrict should use the index if there is one.
+        # not restrict should use the index if there is one -- or, with no index
+        # of its own and few enough rows, be exact too, because the alternative
+        # is the shared index over every knowledge base.
         #
         # Keyed on the arguments, not on the clauses built above: how a restriction
         # is compiled may change, the reason a restricted search must be exact does
@@ -1630,6 +2134,9 @@ class BasePgVectorStore:
         # returns the same answer. Exactness is structural here instead.
         restricted = item_ids is not None or source_ids is not None or bool(filter_metadata)
 
+        def run_exactly() -> list[RetrievedItem]:
+            return run_the_search(self._exact_search_query(effective_dims, effective_top_k))
+
         try:
             self._apply_iterative_scan()
             # Both blocks wrap the execution rather than preceding it, because a
@@ -1641,8 +2148,20 @@ class BasePgVectorStore:
                 with self._insisting_on_an_exact_search():
                     items = run_the_search()
             elif self.TABLE == PER_KB_INDEX_ITEM_TABLE:
-                with self._preferring_this_kbs_partial_index(effective_dims):
-                    items = run_the_search()
+                with self._preferring_this_kbs_partial_index(effective_dims) as has_its_own:
+                    # Only on a definite "no index": with one, the block above has
+                    # already steered the plan onto it; with a probe that failed,
+                    # today's plan is the one to keep.
+                    exact = (
+                        self._searching_exactly_below_the_floor(effective_dims, run_exactly)
+                        if has_its_own is False
+                        else None
+                    )
+                    items = exact if exact is not None else run_the_search()
+            elif (
+                exact := self._searching_exactly_below_the_floor(effective_dims, run_exactly)
+            ) is not None:
+                items = exact
             else:
                 # An unrestricted search from one of the other item tables. The
                 # index is named after the knowledge base and the dimension, so
@@ -1653,9 +2172,14 @@ class BasePgVectorStore:
                 # store, before the predicate was restricted at all: 2.2 -> 25.9
                 # ms, recall 1.00 -> 0.33.
                 #
-                # This is the ONLY branch left on the planner's own plan. A
-                # restricted search from this same store took the branch above it,
-                # because exactness is not a chunks-only concern.
+                # The unrestricted searches left on the planner's own plan are this
+                # branch and the chunks search with no index of its own that did not
+                # go exact, and for the same reasons: the knowledge base is over
+                # ``VECTOR_EXACT_SEARCH_MAX_ROWS`` or past the read budget, the
+                # setting is 0 or could not be read, or the count could not be --
+                # plus, for chunks, a catalog probe that failed. A restricted search
+                # from this same store took the first branch, because exactness is
+                # not a chunks-only concern.
                 items = run_the_search()
             return self._resolve_results(items) if _resolve else items
         except Exception as e:
