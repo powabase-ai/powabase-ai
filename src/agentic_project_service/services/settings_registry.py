@@ -1396,12 +1396,35 @@ def _has_g_context() -> bool:
     return has_app_context()
 
 
+class SettingsUnreadable(RuntimeError):
+    """``ai.project_settings`` could not be read, so an override may exist unseen."""
+
+
+class _UnreadableOverrides(dict):
+    """An empty override map that remembers the read behind it failed.
+
+    Empty, so ``get_setting`` answers the registry default exactly as it always
+    has; distinguishable, so ``get_setting_strict`` can refuse to. Cached like any
+    other result, so one failed read answers the same way for the whole app
+    context rather than being retried per setting.
+    """
+
+
 def _load_overrides() -> dict[str, str]:
     """Load all overrides from ai.project_settings into a dict.
 
-    Cached in flask.g for the duration of the request.  When called
-    outside a request context (e.g. Celery tasks, background threads)
-    the query runs uncached — still a single lightweight SELECT.
+    Cached in flask.g for the life of the app context -- a request, or a whole
+    Celery task, since the task base class pushes one per task. Outside any app
+    context (a bare thread) the query runs uncached -- still a single lightweight
+    SELECT.
+
+    The SELECT runs in a savepoint. It is on the vector search path, on the same
+    session as the search, and a read that fails outside a savepoint -- a
+    cancelled statement, a table that does not exist yet -- would leave that
+    transaction aborted: the search that follows would raise
+    ``InFailedSqlTransaction`` rather than run on the registry default. Rolling
+    back to the savepoint keeps the caller's transaction usable. A failed read
+    returns an empty ``_UnreadableOverrides``.
     """
     use_cache = _has_g_context()
 
@@ -1411,13 +1434,14 @@ def _load_overrides() -> dict[str, str]:
             return cache
 
     try:
-        rows = db.session.execute(
-            text(f'SELECT key, value FROM "{AI_SCHEMA}".project_settings')
-        ).fetchall()
-        result = {row[0]: row[1] for row in rows if row[1] is not None}
+        with db.session.begin_nested():
+            rows = db.session.execute(
+                text(f'SELECT key, value FROM "{AI_SCHEMA}".project_settings')
+            ).fetchall()
+        result: dict[str, str] = {row[0]: row[1] for row in rows if row[1] is not None}
     except Exception:
         logger.warning("Failed to load project_settings overrides", exc_info=True)
-        result = {}
+        result = _UnreadableOverrides()
 
     if use_cache:
         g._settings_cache = result
@@ -1432,8 +1456,30 @@ def get_setting(key: str) -> Any:
     defn = SETTINGS_REGISTRY.get(key)
     if defn is None:
         raise KeyError(f"Unknown setting: {key}")
+    return _resolve(key, defn, _load_overrides())
 
+
+def get_setting_strict(key: str) -> Any:
+    """``get_setting``, except that an unreadable ``ai.project_settings`` raises.
+
+    For a setting whose registry default is the wrong answer when an override
+    might exist unseen -- one an operator sets to turn something *off*.
+    ``get_setting`` answers the default in that case, which turns it back on.
+
+    Raises:
+        SettingsUnreadable: the overrides could not be read this app context.
+    """
+    defn = SETTINGS_REGISTRY.get(key)
+    if defn is None:
+        raise KeyError(f"Unknown setting: {key}")
     overrides = _load_overrides()
+    if isinstance(overrides, _UnreadableOverrides):
+        raise SettingsUnreadable(f"ai.project_settings could not be read, so {key} is unknown")
+    return _resolve(key, defn, overrides)
+
+
+def _resolve(key: str, defn: SettingDef, overrides: dict[str, str]) -> Any:
+    """The stored override, coerced, or the registry default."""
     raw = overrides.get(key)
     if raw is not None:
         try:
