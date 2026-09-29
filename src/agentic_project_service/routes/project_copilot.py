@@ -414,7 +414,9 @@ def chat(session_id: str):
                     q.put(("DONE", content, guide_sequence_id, None, docs_notice))
                 except Exception as e:
                     logger.error("Project copilot worker error: %s", e, exc_info=True)
-                    error_content = "Sorry — something went wrong while answering. Please try again."
+                    error_content = (
+                        "Sorry — something went wrong while answering. Please try again."
+                    )
                     try:
                         db.session.execute(
                             text(f"""

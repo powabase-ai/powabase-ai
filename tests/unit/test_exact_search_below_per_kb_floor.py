@@ -4,8 +4,8 @@ Below ``VECTOR_PER_KB_INDEX_MIN_ROWS`` a knowledge base has no partial HNSW inde
 and its unrestricted search used to be left to the planner -- which, on a table
 where other knowledge bases hold most of the rows, walks the *shared* index over
 every knowledge base and filters afterwards. Measured on a production project with
-a 4.97M-row embeddings table: 300-600 ms cold for a knowledge base of a few
-thousand rows, and **0 of 20** requested rows for a 24,118-row one whose
+an embeddings table of about 5M rows: 300-600 ms cold for a knowledge base of a few
+thousand rows, and **0 of 20** requested rows for one of about 24,000 rows whose
 neighbours lay in other knowledge bases. An exact search reads only the knowledge
 base's own rows, so its cost does not depend on anyone else's data.
 
@@ -623,7 +623,7 @@ def test_the_setting_describes_how_it_meets_the_per_kb_thresholds():
 
 def test_the_cap_never_exceeds_the_default_build_threshold():
     """Above the build threshold the per-KB index is the designed answer; an exact
-    search there costs hundreds of milliseconds (360-450 ms warm at 73,288 rows)."""
+    search there costs hundreds of milliseconds (360-450 ms warm at about 73,000 rows on a production project)."""
     assert (
         SETTINGS_REGISTRY[SETTING].max <= SETTINGS_REGISTRY["VECTOR_PER_KB_INDEX_MIN_ROWS"].default
     )

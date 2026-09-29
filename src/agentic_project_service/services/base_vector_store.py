@@ -112,9 +112,11 @@ MAX_TOP_K = 10_000
 # any other restricted search -- deliberately, because that is the half that makes
 # an answer exact and exactness is not a chunks-only concern. Their *unrestricted*
 # search is exact too while the knowledge base holds at most
-# ``VECTOR_EXACT_SEARCH_MAX_ROWS`` of their rows -- they can never have an index of
-# their own, so that is the only alternative to the shared one -- and is left on
-# the planner's own plan above it.
+# ``VECTOR_EXACT_SEARCH_MAX_ROWS`` of their rows and no more than the read budget
+# of rows in all -- they can never have an index of their own, so that is the only
+# alternative to the shared one -- and is left on the planner's own plan otherwise:
+# above either bound, with the setting at 0 or unreadable, or when the count
+# cannot be read.
 #
 # The string itself is ``pg_vector_index``'s, because that module builds the index
 # whose predicate names it: the literal in this module's query and the literal in
@@ -600,7 +602,10 @@ def exact_search_max_rows() -> int:
 # took the exact path, and its count read 35,875 buffers in 214 ms and the
 # search 36,188 in 168 ms, on every search. So the decision stops reading at this
 # budget, and a knowledge base whose rows run past it keeps today's plan whatever
-# its searched population is.
+# its searched population is. On the live suite's 100,200-row knowledge base (200
+# document rows beside 100,000 others) the decision's count now reads 20,001 rows
+# in 516 buffer accesses and 3.1 ms, where the count it replaced read all of them
+# to find the 200: 2,581 buffer accesses and 16.3 ms.
 #
 # **Why four.** What the budget adds over a knowledge base of only the searched
 # population is the rows of the others, and those are cheap: they are filtered
@@ -774,11 +779,17 @@ class BasePgVectorStore:
         KB without a partial index of its own the vector query filters
         `knowledge_base_id` AFTER the approximate scan. Without iterative
         scanning, pgvector emits only ~ef_search global candidates before that
-        filter, starving KB-scoped queries (often 0 rows). A KB that has its own
-        partial index (`pg_vector_index`) does not need this -- its index holds
-        only its own rows, so nothing is filtered away after the scan -- but it
-        costs that KB nothing either, so the GUC is set unconditionally rather
-        than made to depend on a catalog lookup per search.
+        filter, starving KB-scoped queries (often 0 rows). It narrows that
+        starvation rather than ending it: pgvector stops an iterative scan at
+        ``hnsw.max_scan_tuples`` (20,000 by default), and on a production project a
+        knowledge base of about 24,000 rows whose neighbours lay in other knowledge
+        bases still got 0 of 20 with this set -- which is what
+        ``_searching_exactly_below_the_floor`` exists for, for the small ones. A KB
+        that has its own partial index (`pg_vector_index`) does not need this --
+        its index holds only its own rows, so nothing is filtered away after the
+        scan -- and neither does a search on the exact path, which walks no HNSW
+        index at all; but it costs them nothing either, so the GUC is set
+        unconditionally rather than made to depend on a catalog lookup per search.
 
         SET LOCAL keeps this scoped to the current transaction so it
         can't leak across pooled connections. The mode is a validated constant,
@@ -903,9 +914,13 @@ class BasePgVectorStore:
         """Price the approximate index out, for a search the caller restricted.
 
         The mirror of ``_preferring_this_kbs_partial_index``, and the reason the
-        pair is symmetric: an unrestricted search wants the index and cannot be
-        starved by anything, a restricted one must be exact and an ordered ANN
-        scan cannot promise that.
+        pair is symmetric: an unrestricted search on a knowledge base's *own*
+        index wants that index -- nothing is filtered away after the scan, so
+        nothing can starve it -- while a restricted one must be exact and an
+        ordered ANN scan cannot promise that. An unrestricted search with no index
+        of its own *can* be starved, on the shared index; that is the case
+        ``_searching_exactly_below_the_floor`` answers exactly when the knowledge
+        base is small.
 
         **Why not simply leave the planner alone.** Because the planner's own
         choice is a cost race, and on some shapes of the table it comes out for the
@@ -1049,7 +1064,9 @@ class BasePgVectorStore:
         ``similarity_threshold``.** It is not a clause -- callers pass it to the
         search layer, which drops rows below it in Python *after* these rows are
         off the cursor -- so no predicate the planner sees mentions it, and an
-        unrestricted search with a threshold still goes to the index. A row the
+        unrestricted search with a threshold still goes to the index, unless the
+        knowledge base is small enough for ``_searching_exactly_below_the_floor``,
+        where the answer is exact whatever the threshold. A row the
         approximate scan missed cannot be recovered by a filter applied to what it
         returned, so a caller who sets a threshold and passes no other restriction
         gets an approximate answer filtered exactly, not an exact answer. That is
@@ -1198,11 +1215,14 @@ class BasePgVectorStore:
 
         That is what the catalog probe buys: a knowledge base below the build
         threshold, one whose index is INVALID, and one whose index is still being
-        built all keep the plan they have today -- measured, 0 of 12 executions on
-        the index and recall 1.00 in each case. The probe costs a round trip,
-        which for a knowledge base that has no index is the whole of what this
-        adds: +0.3 ms, measured over 120 searches each at 400, 2,000 and 8,400
-        rows.
+        built are not steered onto an index -- measured, 0 of 12 executions on the
+        index and recall 1.00 in each case. The probe costs a round trip: +0.3 ms,
+        measured over 120 searches each at 400, 2,000 and 8,400 rows. What such a
+        knowledge base runs next is no longer simply "the plan it had": at or below
+        ``VECTOR_EXACT_SEARCH_MAX_ROWS`` it is searched exactly, inside this block
+        on the probe's "no" (``_searching_exactly_below_the_floor``, which prices
+        its own cost), and only above that ceiling -- or with it off -- is it left
+        to the planner.
 
         **What the probe cannot buy, and this is a standing limitation rather than
         a fixed bug: a sort penalty cannot break a tie between two index plans, so
@@ -1594,18 +1614,22 @@ class BasePgVectorStore:
 
         Measured against pricing the index out with ``enable_indexscan = off`` on
         the same statement, at 384 dimensions on a 55,000-row table: the same plan
-        on every shape tried -- ``Bitmap Index Scan on`` the knowledge-base btree,
-        ``Bitmap Heap Scan``, top-N heapsort -- under ``plan_cache_mode`` ``auto``
-        and ``force_generic_plan``. They differ in what happens when a setting
-        cannot be made: with the fence the answer stays exact; with the setting
-        alone it would not. Checked again at 1536 dimensions, where the vector is
-        stored out of line, on a knowledge base of 2,000 rows in a 14,000-row
-        table: the same bitmap lookup in both cache modes, 6.0 ms and 6,265 shared
-        buffers for the embeddings side -- about three pages a row, in line with
-        the four measured on the production project -- and 17-19 ms end to end
-        through this store across 14 executions on one connection, the prepared
-        statement's parameter typed ``vector`` so a generic plan casts the query
-        once and not once per row.
+        on every shape tried -- a bitmap lookup on the knowledge-base btree and a
+        top-N heapsort -- under ``plan_cache_mode`` ``auto`` and
+        ``force_generic_plan``. They differ in what happens when a setting cannot
+        be made: with the fence the answer stays exact; with the setting alone it
+        would not. (Run as it ships, under ``_searching_exactly_below_the_floor``'s
+        penalty on sequential and bitmap scans, the lookup is a plain index scan
+        on the same btree.) Checked again at 1536 dimensions, where a vector is
+        one out-of-line TOAST value in four chunks, on a knowledge base of 2,000
+        rows in a 14,000-row table: the same lookup in both cache modes, 6.0 ms and
+        6,265 shared buffer accesses for the embeddings side -- about three a row,
+        in line with the about four measured on the production project -- and
+        17-19 ms end to end through this store across 14 executions on one
+        connection, the prepared statement's parameter typed ``vector`` so a
+        generic plan casts the query once and not once per row. The live suite
+        pins the 1536-dimension plan shape and exactness
+        (``test_at_1536_dimensions_the_exact_path_is_the_same_lookup_and_exact``).
 
         Same columns in the same order as the statement ``vector_search`` builds,
         the same item-table join and the same literals -- the knowledge base on
@@ -1650,26 +1674,38 @@ class BasePgVectorStore:
         table where other knowledge bases hold most of the rows the planner takes
         the *shared* per-dimension index, which walks the nearest vectors of the
         whole table and only then applies the knowledge-base filter. Measured on a
-        production project with a 4.97M-row, 39 GB shared index: 300-600 ms cold
-        for a small knowledge base, because the walk pays for everyone else's data
-        and the graph does not fit the page cache; and for a 24,118-row knowledge
-        base whose nearest vectors lay in other knowledge bases, **0 of 20**
-        requested rows. That is backwards -- a hundred small workspaces must not be
-        slowed or starved by one with a million rows. An exact search reads only
-        the knowledge base's own rows and does not depend on the table's size.
+        production project with an embeddings table of about 5M rows and a shared
+        index of tens of GB: 300-600 ms cold for a small knowledge base, because
+        the walk pays for everyone else's data and the graph does not fit the page
+        cache; and for a knowledge base of about 24,000 rows whose nearest vectors
+        lay in other knowledge bases, **0 of 20** requested rows. That is
+        backwards -- a hundred small workspaces must not be slowed or starved by
+        one with a million rows.
 
-        **Why only small ones.** It reads every row it ranks. At 1536 dimensions a
-        vector is about 6 KB, stored out of line in three or four pages, so the
-        read is about four pages per row: on that project 24,118 rows took 117-143
-        ms warm (~97,000 pages) and 73,288 rows 360-450 ms. Hence
-        ``VECTOR_EXACT_SEARCH_MAX_ROWS``, 5,000 by default; above it a knowledge
-        base should have an index of its own, and with the build threshold at or
-        below the ceiling it does (see the setting's description for the gap when
-        it is not). On the regime-matching fixture in
-        ``tests/pg_search/test_exact_search_below_floor_live.py`` the planner,
-        unaided, sent a 4,000-row knowledge base at 7 % of the table to the shared
-        index; this path answers it from the knowledge-base btree with the exact
-        top-k.
+        **That 24,000-row example is not fixed by this path at its default.** It
+        is above the 5,000-row ceiling, so it keeps the shared index until the
+        per-KB build threshold is lowered to cover it (see the setting's
+        description) or the ceiling is raised. What this path fixes on its own is
+        the same defect below the ceiling: on the live fixture a 5,000-row
+        knowledge base at 9 % of the table went to the shared index unaided and
+        got a mean recall under 0.5 there (0.00-0.15 per query when measured), and
+        is answered here with the exact top-k.
+
+        **What an exact search reads.** The knowledge base's own rows -- *every*
+        one of them, of every item table and dimension, because the only btree
+        ``ai.embeddings`` has for a knowledge base is on ``knowledge_base_id`` and
+        the rest is filtered on the heap -- and the vectors of the searched
+        population, which it ranks. So its cost follows the knowledge base's size
+        and not the table's, and it is bounded twice: the ceiling bounds the rows
+        ranked, and the read budget (``EXACT_SEARCH_READ_BUDGET_MULTIPLE``) bounds
+        the rows read. At 1536 dimensions a vector is about 6 KB and stored out of
+        line as one TOAST value in four chunks, so a ranked row costs a few buffer
+        accesses -- the heap tuple, the TOAST index, the chunks: on that project
+        about 24,000 rows took 120-140 ms warm, about 97,000 buffer accesses, and
+        about 73,000 rows 360-450 ms. Hence the ceiling, 5,000 by default; above it
+        a knowledge base should have an index of its own, and with the build
+        threshold at or below the ceiling it does (see the setting's description
+        for the gap when it is not).
 
         **Only called once the knowledge base is known to have no index of its
         own.** For the chunks store that is the answer
@@ -1680,44 +1716,49 @@ class BasePgVectorStore:
         have one -- the index covers ``item_table = 'chunks'`` only -- so they come
         straight here without asking.
 
-        **What deciding costs** a knowledge base without an index: the penalty
-        below (read and set in one savepoint, restored in another) and the capped
-        count in a savepoint of its own -- five statements and six savepoint
-        commands around the search. Measured through the real store on the live
-        fixture, where a bare round trip was 0.31 ms and a savepointed statement
-        0.91 ms: the capped count 1.5 ms at 300 rows and 6.0 ms when it stops at
-        5,001 of a 6,000-row knowledge base, and the penalty's read, set and
-        restore 2.4 ms together. That is round trips, not work, and it is paid by
-        searches that take 300-600 ms cold on the shared index they replace. The
-        setting itself is read through ``get_setting``, cached for the request.
-        Nothing is cached across requests: an index can be built or dropped
-        between two searches, and a stale "no index" would put a knowledge base
-        with a fresh index back on an exact read of all its rows.
+        **What deciding costs** a knowledge base without an index: four
+        statements -- the penalty's read and set, the count, the restore -- in
+        three savepoints, which is six more commands: ten round trips before and
+        after the search. An unindexed knowledge base over the ceiling or the
+        budget pays them too, and then runs today's plan anyway. Measured through
+        the real store on the live fixture, where a bare round trip was 0.32 ms and
+        a savepointed statement 0.96 ms: the count 1.4 ms at 300 rows and 3.3-3.7
+        ms at 5,000-6,000, the penalty's read, set and restore 2.8 ms together; end
+        to end 3.5 -> 8.1 ms for a 300-row knowledge base the planner already
+        answered exactly, and 10.7 -> 19.0 ms for a 6,000-row one over the ceiling.
+        That is round trips, not work -- folding them into one savepoint is the
+        follow-up -- and it buys an exact answer where the shared index gave a
+        mostly wrong one. The setting itself is read once per app context (see
+        ``exact_search_max_rows``). The decision is not cached: an index can be
+        built or dropped between two searches, and a stale "no index" would put a
+        knowledge base with a fresh index back on an exact read of all its rows.
 
-        **Why ``enable_seqscan`` and nothing else.** The fence already keeps HNSW
-        out, so this is not about exactness -- it bounds the cost. Where a
-        knowledge base is a large share of a small table the planner prefers to
-        read the whole table rather than look the rows up, fence or not: measured
-        at 384 dimensions with 4,000 of 11,000 rows, ``Seq Scan on embeddings``
-        for the search and for the count. Priced out, both become a bitmap lookup
-        on the knowledge-base btree, in ``auto`` and ``force_generic_plan`` alike.
-        A penalty rather than a ban, so a database without a btree on
-        ``knowledge_base_id`` still answers, by the scan. And never together with
-        ``enable_bitmapscan = off``: pricing out index scans *and* bitmap scans
-        leaves a parallel sequential scan of the whole heap as the only plan, which
-        measured 3-6 s on a production project's 930 MB heap. Index scans stay on
-        as well, so the item-table side keeps its primary key.
+        **Why sequential and bitmap scans are priced out.** The fence already keeps
+        HNSW out, so this is not about exactness -- it bounds what the count and the
+        search read. Where a knowledge base is a large share of a small table the
+        planner prefers to read the whole table, fence or not (measured on the live
+        fixture's ``SHARE_SCHEMA``, 3,000 of 9,000 rows: ``Seq Scan on embeddings``,
+        ``Rows Removed by Filter: 6000``); and a bitmap scan reads every one of the
+        knowledge base's btree entries before its heap walk can stop, which is the
+        read the budget exists to bound. Priced out, both statements are a plain
+        ``Index Scan`` on the knowledge-base btree, in ``auto`` and
+        ``force_generic_plan`` alike, at the same cost as the bitmap plan (12,423
+        buffer accesses either way for 2,000 rows at 1536 dimensions). Penalties,
+        not bans, so a database without a btree on ``knowledge_base_id`` still
+        answers, by the scan. Index scans stay on -- see
+        ``_scan_methods_priced_out`` for why they must.
 
         **Composing with the restricted path.** A search carrying ``item_ids``,
         ``source_ids`` or a metadata filter never reaches here: it is exact already
         through ``_insisting_on_an_exact_search``, and asking the catalog and
         counting could not change its plan, so it pays for neither.
 
-        **When something fails.** A catalog probe that fails never gets here, and a
-        count that fails returns ``None`` -- today's plan either way, on a
-        transaction the savepoints kept usable. A penalty that cannot be set leaves
+        **When something fails.** A catalog probe that fails never gets here; a
+        count that fails, or answers nothing, keeps today's plan with a WARNING --
+        never read as 0 rows -- on a transaction the savepoints kept usable; an
+        unreadable setting turns the path off. A penalty that cannot be set leaves
         the search exact, because the fence is what makes it exact, and loses only
-        the bound on a large-share table.
+        the bounds on what it reads.
 
         One ``DEBUG`` line per exact search, none per row.
         """
@@ -1944,8 +1985,9 @@ class BasePgVectorStore:
         #
         # `e.item_table` is the third literal in the predicate, and it is here
         # because the index is single-population by construction: `ai.embeddings`
-        # is polymorphic, a knowledge base crosses the build threshold on the SUM
-        # over its item tables, and an index mixing populations is walked for
+        # is polymorphic, a knowledge base once crossed the build threshold on the
+        # sum over its item tables (``pg_vector_index.bounded_row_count`` now counts
+        # chunks alone), and an index mixing populations is walked for
         # entries that cannot join. Measured on the same 1,000 chunk rows, an
         # index over chunks alone against chunks plus 9,000 document rows: recall
         # 0.858 -> 0.383; and on 6,000 chunk rows with and without 6,000
@@ -2118,11 +2160,12 @@ class BasePgVectorStore:
                 # store, before the predicate was restricted at all: 2.2 -> 25.9
                 # ms, recall 1.00 -> 0.33.
                 #
-                # This and a chunks search over the exact-search ceiling with no
-                # index of its own (or whose catalog probe failed) are the only
-                # searches left on the planner's own plan, and this one only above
-                # ``VECTOR_EXACT_SEARCH_MAX_ROWS``:
-                # below it the branch above searched exactly. A restricted search
+                # The unrestricted searches left on the planner's own plan are this
+                # branch and the chunks search with no index of its own that did not
+                # go exact, and for the same reasons: the knowledge base is over
+                # ``VECTOR_EXACT_SEARCH_MAX_ROWS`` or past the read budget, the
+                # setting is 0 or could not be read, or the count could not be --
+                # plus, for chunks, a catalog probe that failed. A restricted search
                 # from this same store took the first branch, because exactness is
                 # not a chunks-only concern.
                 items = run_the_search()
