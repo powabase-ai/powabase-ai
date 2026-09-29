@@ -510,14 +510,37 @@ class PerKbVectorIndexTableBusy(PerKbVectorIndexBuildInProgress):
     lock retries this too; the ones that can wait longer tell them apart.
     """
 
-    def __init__(self, message: str, holders=(), lock_held: bool = True):
+    def __init__(
+        self,
+        message: str,
+        holders=(),
+        lock_held: bool = True,
+        evidence_error: str | None = None,
+    ):
         super().__init__(message)
-        self.holders = list(holders)
+        self.holders = list(holders or ())
         self.lock_held = lock_held
+        self.evidence_error = evidence_error
 
     @property
     def build_alive(self) -> bool:
-        return bool(self.holders)
+        """Is any holder demonstrably *running* (``_holder_kind``)?
+
+        Not "is there any holder": a session idle in a transaction that happens to
+        hold the table, or one this role cannot see, refuses the gate just the same
+        but is not evidence that anything will finish, so it does not buy the long
+        uncounted wait.
+        """
+        return any(holder.get("kind") == "running" for holder in self.holders)
+
+
+class PerKbVectorIndexTableWaitExhausted(RuntimeError):
+    """A task gave up waiting for ``ai.embeddings`` after its whole wait budget.
+
+    Raised by the task after its ERROR rather than returned, so the task ends in
+    failure and a failure-rate alert sees it: a returned dict is a SUCCESS to every
+    monitor that reads task states, which is what the give-up used to be.
+    """
 
 
 class PerKbVectorIndexDropFailed(RuntimeError):
@@ -1177,7 +1200,7 @@ def _try_lock(conn, relation: str) -> bool:
     return bool(conn.execute(text(partition_build_lock_sql()), {"relation": relation}).scalar())
 
 
-def _discard_connection(conn) -> None:
+def _discard_connection(conn, holding: str | None = None) -> None:
     """Throw this connection's backend away, and leave the handle usable.
 
     ``invalidate()`` on its own is only half of it. Every caller here shares one
@@ -1210,7 +1233,20 @@ def _discard_connection(conn) -> None:
     try:
         conn.invalidate()
     except Exception:
-        logger.debug("Could not invalidate the connection", exc_info=True)
+        if holding is None:
+            logger.debug("Could not invalidate the connection", exc_info=True)
+        else:
+            # The one case where this is not housekeeping: the backend being thrown
+            # away holds a session advisory lock, and it goes back to the pool still
+            # holding it. For ``table_lock_relation()`` that gates every index build
+            # and drop in the project until the backend ends.
+            logger.error(
+                "Could not discard the connection holding the advisory lock on %s; the "
+                "lock stays held until that backend ends, and every build or drop it "
+                "guards waits for it (pg_terminate_backend on its pid releases it)",
+                holding,
+                exc_info=True,
+            )
     try:
         conn.rollback()
     except Exception:
@@ -1236,9 +1272,16 @@ def _release_lock(conn, relation: str) -> None:
     The lock outlives a transaction on purpose (a concurrent build is not one),
     so a pooled connection handed back still holding it would make every later
     build of this index skip. Ending the backend releases it for certain.
+
+    ``pg_advisory_unlock`` answering False is read, not ignored: it means this
+    session did not hold the lock, and on these connections the only way that
+    happens is a discard in between (``_discard_connection``) -- the lock went with
+    the old backend, so whatever it guarded after that ran on the new one without
+    it. The table gate re-takes itself when that happens (``_TableGate.hold``);
+    this is what says so when nothing did.
     """
     try:
-        conn.execute(text(partition_build_unlock_sql()), {"relation": relation})
+        released = conn.execute(text(partition_build_unlock_sql()), {"relation": relation}).scalar()
     except Exception:
         logger.warning(
             "Could not release the advisory lock on %s; discarding the connection so the "
@@ -1246,7 +1289,15 @@ def _release_lock(conn, relation: str) -> None:
             relation,
             exc_info=True,
         )
-        _discard_connection(conn)
+        _discard_connection(conn, holding=relation)
+        return
+    if released is False:
+        logger.warning(
+            "The advisory lock on %s was not held by this session when it was given back: "
+            "its connection was replaced after the lock was taken, and the lock ended with "
+            "the old backend",
+            relation,
+        )
 
 
 def _reset_session_setting(conn, name: str) -> None:
@@ -1804,22 +1855,49 @@ _TABLE_DDL_LOCK_MODES = (
     "AccessExclusiveLock",
 )
 
+# How long the backend holding this module's table gate may sit idle between two
+# statements and still count as a caller in the middle of its work. The gate is
+# taken immediately before a dimension's first DDL and given back after its last
+# write, so the windows in which it is held with no table lock to show for it are
+# the ones between statements of one reconcile -- the lock try and the build's
+# grant, a repair DROP and the CREATE after it, the build and the comment and
+# RESETs that follow -- all of them round trips from a worker that is running.
+# A holder idle longer than this is not in the middle of anything and does not
+# buy the long uncounted wait (``_holder_kind``).
+_GATE_HOLDER_IDLE_GRACE_S = 60
+
+# The three ages every holder is reported with, in seconds: its current (or last)
+# statement, its transaction, and its last state change -- which, for a session
+# idle in a transaction, is how long it has been idle. ``query_start`` alone said
+# 0 for a session that had held the table idle for hours.
+_HOLDER_AGES_SQL = (
+    "floor(extract(epoch FROM clock_timestamp() - a.query_start))::bigint, "
+    "floor(extract(epoch FROM clock_timestamp() - a.xact_start))::bigint, "
+    "floor(extract(epoch FROM clock_timestamp() - a.state_change))::bigint, "
+    "left(a.query, 200) "
+)
+
+_THIS_DATABASE_SQL = "(SELECT oid FROM pg_database WHERE datname = current_database())"
+
 # Read from ``pg_locks`` rather than by matching ``CONCURRENTLY`` in query text:
 # a concurrent build or drop holds its table lock as a *session* lock across all
 # of its internal transactions, so it is here, granted, from its first phase to
 # its last -- including the final wait, when ``pg_stat_activity.query`` of a
-# pooled caller may already say something else -- and ``pg_locks`` is readable by
-# every role, where another role's query text is not. ``granted`` because a
-# backend still queued is not a build that is running; autovacuum is left out
-# because it cancels itself for a lock waiter (anti-wraparound excepted, which is
-# a plain wait with no cycle), so queueing behind it costs about a second.
+# pooled caller may already say something else. ``pg_locks`` is readable by every
+# role; the ``pg_stat_activity`` half of the join is not: for another role's
+# backend a role without ``pg_read_all_stats`` (or ``pg_monitor``) sees NULL
+# ``backend_type`` and ``state`` and a query of ``<insufficient privilege>``.
+# Such a holder is kept and classified *unknown* rather than dropped, because it
+# may be a build (see ``_holder_kind``). ``granted`` because a backend still
+# queued is not a build that is running; autovacuum is left out -- where it can be
+# seen -- because it cancels itself for a lock waiter (anti-wraparound excepted,
+# which is a plain wait with no cycle), so queueing behind it costs about a second.
 _TABLE_HOLDERS_SQL = (
-    "SELECT a.pid, a.backend_type, l.mode, a.state, "
-    "floor(extract(epoch FROM clock_timestamp() - a.query_start))::bigint, "
-    "left(a.query, 200) "
-    "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+    "SELECT a.pid, a.backend_type, 'relation', l.mode, a.state, "
+    + _HOLDER_AGES_SQL
+    + "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
     "WHERE l.locktype = 'relation' "
-    "AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) "
+    f"AND l.database = {_THIS_DATABASE_SQL} "
     "AND l.relation = to_regclass(:table) "
     "AND l.granted AND l.pid <> pg_backend_pid() "
     "AND l.mode IN (" + ", ".join(f"'{mode}'" for mode in _TABLE_DDL_LOCK_MODES) + ") "
@@ -1827,21 +1905,79 @@ _TABLE_HOLDERS_SQL = (
     "ORDER BY a.query_start NULLS LAST, a.pid"
 )
 
+# The backend holding this module's own table gate. ``pg_try_advisory_lock(bigint)``
+# files its key as ``classid`` (high 32 bits) and ``objid`` (low 32 bits) with
+# ``objsubid = 1``, so the key is put back together and compared with the same
+# ``hashtextextended`` the lock was taken with. Asked only when the gate is
+# refused by its lock: that is when the holder may be between two statements and
+# show no table lock at all.
+_GATE_HOLDER_SQL = (
+    "SELECT a.pid, a.backend_type, 'advisory', l.mode, a.state, "
+    + _HOLDER_AGES_SQL
+    + "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+    "WHERE l.locktype = 'advisory' "
+    f"AND l.database = {_THIS_DATABASE_SQL} "
+    "AND l.granted AND l.objsubid = 1 AND l.pid <> pg_backend_pid() "
+    "AND ((l.classid::bigint << 32) | l.objid::bigint) = hashtextextended(:subject, 0)"
+)
+
+# What a backend this role may not inspect shows as its query.
+_HIDDEN_QUERY = "<insufficient privilege>"
+
+# Warned about once per process: the evidence cannot tell a build from autovacuum
+# without the privilege, and every refusal after the first would say the same thing.
+_warned_invisible_holders = False
+
+
+def _age(value) -> int | None:
+    return None if value is None else int(value)
+
+
+def _holder_kind(lock: str, state: str | None, idle_s: int | None) -> str:
+    """``running``, ``stalled`` or ``unknown`` -- and only ``running`` is a live build.
+
+    * A holder of the table's own lock is *running* while its state is ``active``.
+      A concurrent build is ``active`` from its first phase to its last, its waits
+      included. ``idle in transaction`` -- a ``LOCK TABLE``, a plain ``CREATE INDEX``
+      or an ``ANALYZE`` someone left open -- is *stalled*: it refuses the gate,
+      because queueing behind it would hold a snapshot too, but nothing about it
+      will finish on its own, so it gets the counted retry and a WARNING instead of
+      48 hours of uncounted waits.
+    * The holder of this module's gate is *running* while ``active`` or idle for at
+      most ``_GATE_HOLDER_IDLE_GRACE_S`` -- a worker between two statements of its
+      reconcile.
+    * A holder whose state this role cannot see is *unknown*, and gets the counted
+      path: it may be a build, and it may be autovacuum, which the query can only
+      leave out when it can see ``backend_type``.
+    """
+    if state is None:
+        return "unknown"
+    if state == "active":
+        return "running"
+    if lock == "advisory" and state == "idle" and idle_s is not None:
+        return "running" if idle_s <= _GATE_HOLDER_IDLE_GRACE_S else "stalled"
+    return "stalled"
+
 
 def _holder_evidence(row) -> dict:
-    """One ``_TABLE_HOLDERS_SQL`` row as the outcome and the logs report it."""
-    pid, backend_type, mode, state, running_s, query = row
+    """One holder row as the outcome and the logs report it."""
+    pid, backend_type, lock, mode, state, running_s, xact_s, idle_s, query = row
+    idle = _age(idle_s)
     return {
         "pid": int(pid),
         "backend_type": backend_type,
+        "lock": lock,
         "mode": mode,
         "state": state,
-        "running_s": None if running_s is None else int(running_s),
-        "query": query,
+        "running_s": _age(running_s),
+        "xact_s": _age(xact_s),
+        "idle_s": idle,
+        "query": None if query in (None, "", _HIDDEN_QUERY) else query,
+        "kind": _holder_kind(lock, state, idle),
     }
 
 
-def table_ddl_holders(conn) -> list[dict]:
+def table_ddl_holders(conn, include_gate_holder: bool = False) -> list[dict]:
     """The other backends holding ``ai.embeddings`` against an index build or drop.
 
     Per *table*, where ``_build_in_progress`` is per index, and the difference is
@@ -1850,17 +1986,48 @@ def table_ddl_holders(conn) -> list[dict]:
     had asked about -- while another knowledge base's ``CREATE INDEX CONCURRENTLY``
     had been running on that table for hours. This is the question the gate needs
     answered, and it is the evidence the task spends its uncounted wait on
-    (``PerKbVectorIndexTableBusy.build_alive``).
+    (``PerKbVectorIndexTableBusy.build_alive``): each holder carries a ``kind``
+    (``_holder_kind``), and only a ``running`` one is a live build.
 
-    A plain read of two statistics views: it takes no lock that can wait, so it is
-    safe to ask on the gate's AUTOCOMMIT connection with the table busy.
+    ``include_gate_holder`` adds the backend holding this module's own gate
+    (``_GATE_HOLDER_SQL``), for the refusal where the table lock is not what
+    refused it.
+
+    Plain reads of two statistics views: they take no lock that can wait, so they
+    are safe to ask on the gate's AUTOCOMMIT connection with the table busy.
+
+    **Needs ``pg_read_all_stats`` (or ``pg_monitor``) to be exact** when the service
+    connects as a role other than the one other backends run as: without it every
+    other role's holder is ``unknown``, autovacuum included, so each vacuum of the
+    table costs a counted retry where it would have cost nothing. Warned once per
+    process.
     """
-    rows = conn.execute(text(_TABLE_HOLDERS_SQL), {"table": f'"{AI_SCHEMA}".embeddings'}).all()
+    global _warned_invisible_holders
+    rows = list(
+        conn.execute(text(_TABLE_HOLDERS_SQL), {"table": f'"{AI_SCHEMA}".embeddings'}).all()
+    )
+    if include_gate_holder:
+        rows += conn.execute(text(_GATE_HOLDER_SQL), {"subject": table_lock_relation()}).all()
     holders: dict[int, dict] = {}
     for row in rows:
         evidence = _holder_evidence(row)
         holders.setdefault(evidence["pid"], evidence)
+    if not _warned_invisible_holders and any(h["kind"] == "unknown" for h in holders.values()):
+        _warned_invisible_holders = True
+        logger.warning(
+            "This database role cannot see what the backends holding %s.embeddings are "
+            "doing (pg_stat_activity shows another role's state as NULL without "
+            "pg_read_all_stats or pg_monitor), so it cannot tell an index build from "
+            "autovacuum: every such holder is treated as unknown and costs a counted "
+            "retry. Grant pg_read_all_stats to the service's role to make the per-table "
+            "index gate exact",
+            AI_SCHEMA,
+        )
     return list(holders.values())
+
+
+def _backend_pid(conn):
+    return conn.execute(text("SELECT pg_backend_pid()")).scalar()
 
 
 class _TableGate:
@@ -1942,29 +2109,68 @@ class _TableGate:
     def __init__(self, conn):
         self._conn = conn
         self.held = False
+        self._pid = None
+
+    def _evidence(self, include_gate_holder: bool) -> tuple[list[dict], str | None]:
+        """The holders, or none and why: an unreadable answer refuses the gate too."""
+        try:
+            return table_ddl_holders(self._conn, include_gate_holder), None
+        except Exception as exc:
+            reason = first_error_line(exc)
+            logger.warning(
+                "Could not read which backends hold %s.embeddings (%s); not issuing any "
+                "index DDL on it this time, because the answer is what tells a free table "
+                "from a running build",
+                AI_SCHEMA,
+                reason,
+            )
+            return [], reason
 
     def hold(self) -> None:
-        """Take the table, or raise ``PerKbVectorIndexTableBusy`` having issued nothing."""
+        """Take the table, or raise ``PerKbVectorIndexTableBusy`` having issued nothing.
+
+        Idempotent for as long as the backend it was taken on is the one behind the
+        handle. It may not be: a ``RESET`` that fails after a repair or drift ``DROP``
+        makes ``_discard_connection`` reconnect, the session lock ends with the old
+        backend, and a ``held`` flag that outlived it let the build that follows --
+        hours of ``CREATE INDEX CONCURRENTLY`` -- run with no gate at all, while
+        ``release`` unlocked nothing. So the pid it was taken on is kept and checked,
+        and a replaced connection takes the gate again, holder check included, before
+        the next statement.
+        """
         if self.held:
-            return
+            if _backend_pid(self._conn) == self._pid:
+                return
+            logger.warning(
+                "The connection holding the %s index-build gate was replaced (backend %s "
+                "is gone, and its session lock with it); taking the gate again before the "
+                "next statement",
+                AI_SCHEMA + ".embeddings",
+                self._pid,
+            )
+            self.held = False
         subject = table_lock_relation()
         if not _try_lock(self._conn, subject):
-            holders = table_ddl_holders(self._conn)
+            holders, error = self._evidence(include_gate_holder=True)
             raise PerKbVectorIndexTableBusy(
-                f"another index build or drop owns {AI_SCHEMA}.embeddings",
+                f"another index build or drop owns {AI_SCHEMA}.embeddings "
+                f"({describe_table_holders(holders, error)})",
                 holders=holders,
                 lock_held=True,
+                evidence_error=error,
             )
-        # Held from here, so a failure in the check below still gives it back.
+        # Held from here, so a failure in anything below still gives it back.
         self.held = True
-        holders = table_ddl_holders(self._conn)
-        if holders:
+        self._pid = _backend_pid(self._conn)
+        holders, error = self._evidence(include_gate_holder=False)
+        if holders or error:
             self.release()
             raise PerKbVectorIndexTableBusy(
-                f"{AI_SCHEMA}.embeddings is held against an index build by a backend "
-                "that does not take this module's table lock",
+                f"{AI_SCHEMA}.embeddings is held against an index build by a backend that "
+                f"does not take this module's table lock ({describe_table_holders(holders, error)})",
                 holders=holders,
                 lock_held=False,
+                evidence_error=error,
             )
 
     def release(self) -> None:
@@ -1974,16 +2180,31 @@ class _TableGate:
         _release_lock(self._conn, table_lock_relation())
 
 
-def describe_table_holders(holders) -> str:
-    """The holders as one log fragment: pid, mode, how long, and what."""
-    if not holders:
-        return "no backend is holding the table against a build"
-    return "; ".join(
-        f"pid {h['pid']} ({h.get('backend_type') or 'backend'}, {h.get('mode')}, "
-        f"{h.get('state') or 'unknown state'}, running {h.get('running_s')} s): "
-        f"{h.get('query') or '(query not visible)'}"
-        for h in holders
+def _describe_holder(holder: dict) -> str:
+    ages = []
+    if holder.get("running_s") is not None:
+        ages.append(f"statement {holder['running_s']} s")
+    if holder.get("xact_s") is not None:
+        ages.append(f"transaction {holder['xact_s']} s")
+    if holder.get("state") not in (None, "active") and holder.get("idle_s") is not None:
+        ages.append(f"{holder['state']} for {holder['idle_s']} s")
+    return (
+        f"pid {holder['pid']} ({holder.get('kind', 'unknown')}: "
+        f"{holder.get('backend_type') or 'backend type not visible'}, "
+        f"{holder.get('lock', 'relation')} {holder.get('mode')}, "
+        f"{holder.get('state') or 'state not visible'}"
+        + (f", {', '.join(ages)}" if ages else "")
+        + f"): {holder.get('query') or '(query not visible)'}"
     )
+
+
+def describe_table_holders(holders, evidence_error: str | None = None) -> str:
+    """The holders as one log fragment: pid, what kind, which lock, how long, and what."""
+    if evidence_error:
+        return f"which backends hold the table could not be read: {evidence_error}"
+    if not holders:
+        return "no backend holding the table or its index-build lock could be found"
+    return "; ".join(_describe_holder(holder) for holder in holders)
 
 
 # ---------------------------------------------------------------------------
@@ -2387,9 +2608,12 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     cap_reached: int | None = None
     above_limit: list[int] = []
     # Dimensions that reached DDL and found the table owned by another build or
-    # drop (``_TableGate``), and the evidence the last refusal came with.
+    # drop (``_TableGate``), and the evidence every refusal came with, merged by pid:
+    # a later dimension that happened to look in a window with nothing to see must
+    # not turn the earlier one's live build into "nothing is running".
     table_busy: list[str] = []
-    table_holders: list[dict] = []
+    table_holders: dict[int, dict] = {}
+    evidence_error: str | None = None
 
     with _autocommit_connection(engine) as conn:
         existing = per_kb_index_states(conn, kb_id)
@@ -2745,14 +2969,13 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                 # Refused before this dimension issued anything: no DDL, no session
                 # setting lifted, no count written -- so neither build bound moves,
                 # which is right, because nothing was attempted. The task comes back
-                # on a clock of its own (``outcome_waits_for_the_table``).
-                logger.info(
-                    "Not touching partial HNSW index %s.%s yet: %s. Nothing was issued; "
-                    "this knowledge base is reconciled again once the table is free. %s",
+                # on a clock of its own (``outcome_waits_for_the_table``) and logs the
+                # wait with the evidence, so this line is only for a debug trace.
+                logger.debug(
+                    "Not touching partial HNSW index %s.%s yet: %s",
                     AI_SCHEMA,
                     name,
                     busy,
-                    describe_table_holders(busy.holders),
                 )
                 progress(
                     "waiting_for_table",
@@ -2760,7 +2983,9 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                     holder_pids=[holder["pid"] for holder in busy.holders],
                 )
                 table_busy.append(name)
-                table_holders = busy.holders
+                for holder in busy.holders:
+                    table_holders.setdefault(holder["pid"], holder)
+                evidence_error = evidence_error or busy.evidence_error
                 continue
             finally:
                 gate.release()
@@ -2805,17 +3030,30 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
         # Outranks even ``building``: it is the one outcome that has work left
         # which only this knowledge base's own task will come back for, and it
         # comes back on a clock of its own. ``build_alive`` is what the task spends
-        # its uncounted wait on, so the evidence travels with it.
+        # its uncounted wait on, so the evidence travels with it; the skip lists
+        # set above stay in the dict for the task's summary line.
+        holders = list(table_holders.values())
+        alive = any(holder["kind"] == "running" for holder in holders)
+        if alive:
+            reason = "table_ddl_in_progress"
+        elif holders:
+            reason = "table_held_without_a_build"
+        elif evidence_error:
+            reason = "table_holders_unreadable"
+        else:
+            reason = "table_lock_held"
         outcome.update(
             {
                 "status": "table_busy",
-                "reason": "table_ddl_in_progress" if table_holders else "table_lock_held",
+                "reason": reason,
                 "index": table_busy[0],
                 "table_busy": table_busy,
-                "table_holders": table_holders,
-                "build_alive": bool(table_holders),
+                "table_holders": holders,
+                "build_alive": alive,
             }
         )
+        if evidence_error:
+            outcome["evidence_error"] = evidence_error
     return outcome
 
 

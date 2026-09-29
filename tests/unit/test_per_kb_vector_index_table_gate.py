@@ -940,7 +940,7 @@ def test_table_busy_outranks_what_another_dimension_reports(monkeypatch, other):
 
 def _busy_with(*rows) -> dict:
     holders = [pvi._holder_evidence(row) for row in rows]
-    alive = any(h["kind"] == "build" for h in holders)
+    alive = any(h["kind"] == "running" for h in holders)
     return {
         **_busy(alive=alive),
         "table_holders": holders,
