@@ -478,6 +478,31 @@ class PerKbVectorIndexBuildInProgress(RuntimeError):
     """Another caller holds the build lock for this index."""
 
 
+class PerKbVectorIndexTableBusy(PerKbVectorIndexBuildInProgress):
+    """Another build or drop owns ``ai.embeddings`` right now; nothing was issued.
+
+    ``holders`` is the evidence (``table_ddl_holders``): the other backends holding
+    a lock on the table that a ``CREATE``/``DROP INDEX CONCURRENTLY`` would queue
+    behind. ``build_alive`` is whether there is any -- the one thing the task spends
+    its uncounted wait on. ``lock_held`` says which way the gate was refused: this
+    module's own table lock held by another caller, or free and the table held by
+    something that does not take it (a manual ``DROP INDEX CONCURRENTLY``, a worker
+    from before the gate existed).
+
+    A subclass of the per-index one so that every caller already retrying a held
+    lock retries this too; the ones that can wait longer tell them apart.
+    """
+
+    def __init__(self, message: str, holders=(), lock_held: bool = True):
+        super().__init__(message)
+        self.holders = list(holders)
+        self.lock_held = lock_held
+
+    @property
+    def build_alive(self) -> bool:
+        return bool(self.holders)
+
+
 class PerKbVectorIndexDropFailed(RuntimeError):
     """An index could not be dropped for a reason a retry cannot get past.
 
@@ -588,6 +613,22 @@ def _like_prefix(prefix: str) -> str:
 def index_lock_relation(knowledge_base_id: Any, dims: Any) -> str:
     """Advisory-lock subject for building or dropping one of these indexes."""
     return f"{AI_SCHEMA}.{per_kb_index_name(knowledge_base_id, dims)}"
+
+
+def table_lock_relation() -> str:
+    """Advisory-lock subject for *any* of these builds or drops: one per table.
+
+    Every index this module creates lives on ``ai.embeddings``, so this is one
+    subject for the whole project, taken on top of ``index_lock_relation`` before
+    each ``CREATE``/``DROP INDEX CONCURRENTLY`` -- see ``_TableGate`` for why.
+
+    Suffixed rather than the bare table name, the convention the BM25 path's move
+    gate (``ai.chunks#move``) set: its per-item-table build lock *is* the bare
+    name, and a gate that only means "one index DDL at a time" must not share a
+    key with a lock that means something else if ``embeddings`` ever becomes a
+    table that path manages.
+    """
+    return f"{AI_SCHEMA}.embeddings#index-ddl"
 
 
 # ---------------------------------------------------------------------------
@@ -1721,6 +1762,201 @@ def _build_in_progress(conn, kb_id: str, dims: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# One build or drop at a time on the table
+# ---------------------------------------------------------------------------
+
+# The lock modes a ``CREATE``/``DROP INDEX CONCURRENTLY`` on the table would queue
+# behind: its own ``ShareUpdateExclusiveLock`` conflicts with itself and with every
+# stronger mode. A plain ``CREATE INDEX`` (``ShareLock``) is in the list on purpose
+# -- ``base_vector_store.ensure_embedding_index`` issues one, inside an indexing
+# transaction, the first time a dimension appears.
+_TABLE_DDL_LOCK_MODES = (
+    "ShareUpdateExclusiveLock",
+    "ShareLock",
+    "ShareRowExclusiveLock",
+    "ExclusiveLock",
+    "AccessExclusiveLock",
+)
+
+# Read from ``pg_locks`` rather than by matching ``CONCURRENTLY`` in query text:
+# a concurrent build or drop holds its table lock as a *session* lock across all
+# of its internal transactions, so it is here, granted, from its first phase to
+# its last -- including the final wait, when ``pg_stat_activity.query`` of a
+# pooled caller may already say something else -- and ``pg_locks`` is readable by
+# every role, where another role's query text is not. ``granted`` because a
+# backend still queued is not a build that is running; autovacuum is left out
+# because it cancels itself for a lock waiter (anti-wraparound excepted, which is
+# a plain wait with no cycle), so queueing behind it costs about a second.
+_TABLE_HOLDERS_SQL = (
+    "SELECT a.pid, a.backend_type, l.mode, a.state, "
+    "floor(extract(epoch FROM clock_timestamp() - a.query_start))::bigint, "
+    "left(a.query, 200) "
+    "FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+    "WHERE l.locktype = 'relation' "
+    "AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) "
+    "AND l.relation = to_regclass(:table) "
+    "AND l.granted AND l.pid <> pg_backend_pid() "
+    "AND l.mode IN (" + ", ".join(f"'{mode}'" for mode in _TABLE_DDL_LOCK_MODES) + ") "
+    "AND a.backend_type IS DISTINCT FROM 'autovacuum worker' "
+    "ORDER BY a.query_start NULLS LAST, a.pid"
+)
+
+
+def _holder_evidence(row) -> dict:
+    """One ``_TABLE_HOLDERS_SQL`` row as the outcome and the logs report it."""
+    pid, backend_type, mode, state, running_s, query = row
+    return {
+        "pid": int(pid),
+        "backend_type": backend_type,
+        "mode": mode,
+        "state": state,
+        "running_s": None if running_s is None else int(running_s),
+        "query": query,
+    }
+
+
+def table_ddl_holders(conn) -> list[dict]:
+    """The other backends holding ``ai.embeddings`` against an index build or drop.
+
+    Per *table*, where ``_build_in_progress`` is per index, and the difference is
+    what issue #95 turned on: during the fight it described below, the repair path
+    logged that no build was running on ``ai.embeddings`` -- true of the one index it
+    had asked about -- while another knowledge base's ``CREATE INDEX CONCURRENTLY``
+    had been running on that table for hours. This is the question the gate needs
+    answered, and it is the evidence the task spends its uncounted wait on
+    (``PerKbVectorIndexTableBusy.build_alive``).
+
+    A plain read of two statistics views: it takes no lock that can wait, so it is
+    safe to ask on the gate's AUTOCOMMIT connection with the table busy.
+    """
+    rows = conn.execute(text(_TABLE_HOLDERS_SQL), {"table": f'"{AI_SCHEMA}".embeddings'}).all()
+    holders: dict[int, dict] = {}
+    for row in rows:
+        evidence = _holder_evidence(row)
+        holders.setdefault(evidence["pid"], evidence)
+    return list(holders.values())
+
+
+class _TableGate:
+    """One ``CREATE``/``DROP INDEX CONCURRENTLY`` on ``ai.embeddings`` at a time, per project.
+
+    **Why any DDL queued on the table while a build runs kills that build, at its
+    end.** Every concurrent build and drop on the table takes its
+    ``ShareUpdateExclusiveLock``, which conflicts with itself. The per-index lock
+    (``index_lock_relation``) keeps two callers off *one* index and nothing more,
+    so a second knowledge base's build or drop used to go straight to Postgres and
+    queue there on the table lock -- with ``lock_timeout = 0``, for as long as the
+    running build took, and with a snapshot already taken (its ``backend_xmin`` is
+    set while it waits). The running build's last step, ``WaitForOlderSnapshots``,
+    waits for every backend whose snapshot is older than its reference snapshot:
+    the queued one among them. The queued one waits for the table lock the build
+    holds. That is a cycle, the build is the later waiter, and the deadlock
+    detector kills it -- after its catalog entry, its whole graph build and its
+    validation scan, leaving an INVALID index behind. Observed on a production
+    project with three qualifying knowledge bases (2.85M, 1.09M and 73k chunk rows
+    at 1536 dimensions, all dispatched together): every build that reached its end
+    was killed, four times in 30 hours, one 8-hour 20 GB build three times over;
+    the retries then livelocked, because a retry of a killed build begins with a
+    repair drop, which is DDL that queues in turn and kills whichever build is
+    finishing next. Revoking the other tasks by hand let each one build alone
+    without incident: 25 s, 63 min and 9.6 h.
+
+    **Why the gate is here, and not in the lock queue.** No build or drop can
+    wait for that lock inside Postgres safely: it has taken its snapshot before it
+    queues and holds it while it waits, and an older snapshot is exactly what the
+    running build's last phase waits on. ``lock_timeout`` does not
+    help either -- the build's own is 0 for the reasons ``_create_index`` gives, and
+    a bounded one on the *waiter* only changes which of the two dies. So the waiting
+    moves out of the database: a session advisory lock on ``table_lock_relation``,
+    only ever *tried*, on the same AUTOCOMMIT connection as the DDL and held until
+    that dimension's last statement, so a caller that does not get it has issued
+    nothing, holds no transaction and leaves nothing for a running build to wait
+    on. It reports ``PerKbVectorIndexTableBusy`` and the task comes back later on
+    a clock of its own; the gate is what removes the only waiter that could form
+    the cycle, so the DDL itself keeps ``lock_timeout = 0``.
+
+    The advisory lock only stops callers of this module, so a free lock is not
+    taken as a free table: ``table_ddl_holders`` is asked as well, and anything
+    holding the table against a build -- an operator's ``DROP INDEX
+    CONCURRENTLY``, a worker still running a version from before this gate during a
+    rolling deploy, the shared per-dimension index being created -- refuses the gate
+    exactly as a held lock does, with the lock given straight back. There is a
+    window between that check and the DDL that nothing can close from here; it is
+    the width of two round trips rather than the length of a build.
+
+    **Operator rule: never run a manual ``CREATE`` or ``DROP INDEX CONCURRENTLY``
+    on ``ai.embeddings`` while a build is running** (``table_ddl_holders``, or
+    ``pg_stat_progress_create_index`` on the table) -- it queues, it holds a
+    snapshot while it queues, and it kills the build at its very end, by the
+    mechanism above. Wait for the build, or cancel it deliberately.
+
+    A long read is different and is not gated: ``pg_dump``'s ``COPY`` of the table,
+    or any transaction holding an old snapshot, makes the build's last phase wait
+    for it too, but that is a plain wait -- the reader never waits on the build --
+    so the build finishes when the reader does.
+
+    Taken only where a dimension reaches DDL, not at the top of every reconcile: a
+    knowledge base whose index is already right (a settle pass, a between-thresholds
+    no-op) reads the catalog and writes at most a comment on its own index, which
+    no running build waits on, and must not sit out a nine-hour build to do it. It
+    is taken *after* the per-index lock and given back before it; both are only
+    ever tried, so the order cannot deadlock, and it is the order that lets two
+    tasks for one knowledge base still see ``build_lock_held`` rather than both
+    queueing on the table.
+
+    Released on every exit through ``_release_lock``, which discards the
+    connection if the unlock fails: a pooled connection that kept this lock would
+    gate the whole table until its backend ended.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.held = False
+
+    def hold(self) -> None:
+        """Take the table, or raise ``PerKbVectorIndexTableBusy`` having issued nothing."""
+        if self.held:
+            return
+        subject = table_lock_relation()
+        if not _try_lock(self._conn, subject):
+            holders = table_ddl_holders(self._conn)
+            raise PerKbVectorIndexTableBusy(
+                f"another index build or drop owns {AI_SCHEMA}.embeddings",
+                holders=holders,
+                lock_held=True,
+            )
+        # Held from here, so a failure in the check below still gives it back.
+        self.held = True
+        holders = table_ddl_holders(self._conn)
+        if holders:
+            self.release()
+            raise PerKbVectorIndexTableBusy(
+                f"{AI_SCHEMA}.embeddings is held against an index build by a backend "
+                "that does not take this module's table lock",
+                holders=holders,
+                lock_held=False,
+            )
+
+    def release(self) -> None:
+        if not self.held:
+            return
+        self.held = False
+        _release_lock(self._conn, table_lock_relation())
+
+
+def describe_table_holders(holders) -> str:
+    """The holders as one log fragment: pid, mode, how long, and what."""
+    if not holders:
+        return "no backend is holding the table against a build"
+    return "; ".join(
+        f"pid {h['pid']} ({h.get('backend_type') or 'backend'}, {h.get('mode')}, "
+        f"{h.get('state') or 'unknown state'}, running {h.get('running_s')} s): "
+        f"{h.get('query') or '(query not visible)'}"
+        for h in holders
+    )
+
+
+# ---------------------------------------------------------------------------
 # Build and drop
 # ---------------------------------------------------------------------------
 
@@ -1890,12 +2126,16 @@ def _repair_invalid(
     was already there: the drop is what failed, so its recorded definition has to be
     read back rather than assumed to be today's.
     """
+    # "No build *of it*": this caller asked ``_build_in_progress`` about this one
+    # index. It used to say "no build is running on ai.embeddings", which read as a
+    # claim about the table and was logged, during issue #95, while another
+    # knowledge base's build had been running on the table for hours. What makes
+    # this drop safe against *those* is the table gate its caller holds.
     logger.warning(
-        "Partial HNSW index %s.%s is INVALID and no build is running on %s.embeddings (an "
-        "earlier CREATE INDEX CONCURRENTLY failed or was cancelled); dropping it",
+        "Partial HNSW index %s.%s is INVALID and no build of it is running (an earlier "
+        "CREATE INDEX CONCURRENTLY failed or was cancelled); dropping it",
         AI_SCHEMA,
         per_kb_index_name(kb_id, dims),
-        AI_SCHEMA,
     )
     try:
         _drop_index(conn, kb_id, dims)
@@ -1978,6 +2218,20 @@ def _drop_a_drifted_index(conn, kb_id: str, dims: int) -> None:
         per_kb_index_fingerprint(kb_id, dims),
     )
     _drop_index(conn, kb_id, dims)
+
+
+def outcome_waits_for_the_table(outcome: dict) -> bool:
+    """Did this ensure stop short because another build or drop owns the table?
+
+    Its own question rather than a case of ``outcome_needs_another_attempt``,
+    because the answer is on a different clock: that one is a counted, backed-off
+    retry of this index's own repair, and this one can legitimately wait for a
+    nine-hour build of another knowledge base's index. Nothing was issued and
+    nothing counted (``_TableGate``), so the whole reconcile is simply run again
+    later; ``outcome["build_alive"]`` says whether the evidence justified the long
+    wait or the lock was held with nothing running on the table.
+    """
+    return outcome.get("status") == "table_busy"
 
 
 def outcome_needs_another_attempt(outcome: dict) -> bool:
@@ -2080,6 +2334,10 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
     reschedule: str | None = None
     cap_reached: int | None = None
     above_limit: list[int] = []
+    # Dimensions that reached DDL and found the table owned by another build or
+    # drop (``_TableGate``), and the evidence the last refusal came with.
+    table_busy: list[str] = []
+    table_holders: list[dict] = []
 
     with _autocommit_connection(engine) as conn:
         existing = per_kb_index_states(conn, kb_id)
@@ -2095,6 +2353,10 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                 # will finish it. The other dimensions are still ours.
                 blocked.append(name)
                 continue
+            # Taken only where this dimension reaches DDL -- ``gate.hold()`` before
+            # each of the four statements below that can issue one -- and given
+            # back before the per-index lock.
+            gate = _TableGate(conn)
             try:
                 # Re-read under the lock: another caller may have finished
                 # between the survey above and this point.
@@ -2186,12 +2448,14 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         )
                         doomed.append(dims)
                         continue
+                    gate.hold()
                     _repair_invalid(conn, kb_id, dims, prior_failures, prior_interrupted)
                     repaired.append(name)
                     valid = None
 
                 if valid is True:
                     if rows <= drop_below:
+                        gate.hold()
                         progress("dropping", dims=dims, rows=rows, rows_are_a_floor=floored)
                         logger.info(
                             "Dropping partial HNSW index %s.%s: knowledge base %s now has "
@@ -2299,6 +2563,12 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         stale_kept.append(name)
                         cap_reached = total
                         continue
+                    # Before the count, not just before the drop: the count spends one
+                    # of ``MAX_CONSECUTIVE_DEFINITION_REBUILDS``, and a busy table
+                    # refusing the drop after it would spend it on a rebuild that
+                    # never started -- three busy passes and the index is frozen on
+                    # its old definition.
+                    gate.hold()
                     if not _count_a_definition_rebuild(conn, kb_id, dims, comment):
                         # The attempt could not be put on record, so the bound above
                         # cannot advance and nothing would stop the next reconcile
@@ -2385,6 +2655,7 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                         )
                         cap_reached = total
                         continue
+                gate.hold()
                 progress("building", dims=dims, rows=rows, rows_are_a_floor=floored)
                 floor = "at least " if floored else ""
                 logger.info(
@@ -2418,7 +2689,29 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
                     prior_rebuilds=prior_rebuilds,
                 )
                 built.append(name)
+            except PerKbVectorIndexTableBusy as busy:
+                # Refused before this dimension issued anything: no DDL, no session
+                # setting lifted, no count written -- so neither build bound moves,
+                # which is right, because nothing was attempted. The task comes back
+                # on a clock of its own (``outcome_waits_for_the_table``).
+                logger.info(
+                    "Not touching partial HNSW index %s.%s yet: %s. Nothing was issued; "
+                    "this knowledge base is reconciled again once the table is free. %s",
+                    AI_SCHEMA,
+                    name,
+                    busy,
+                    describe_table_holders(busy.holders),
+                )
+                progress(
+                    "waiting_for_table",
+                    dims=dims,
+                    holder_pids=[holder["pid"] for holder in busy.holders],
+                )
+                table_busy.append(name)
+                table_holders = busy.holders
+                continue
             finally:
+                gate.release()
                 _release_lock(conn, lock)
 
     outcome: dict = {"status": "ready", "built": built, "dropped": dropped}
@@ -2456,6 +2749,21 @@ def ensure_per_kb_vector_index(knowledge_base_id: Any, engine=None, on_progress=
         outcome["reason"] = "invalid_index_build_in_progress" if reschedule else "build_lock_held"
         if reschedule:
             outcome["reschedule"] = True
+    if table_busy:
+        # Outranks even ``building``: it is the one outcome that has work left
+        # which only this knowledge base's own task will come back for, and it
+        # comes back on a clock of its own. ``build_alive`` is what the task spends
+        # its uncounted wait on, so the evidence travels with it.
+        outcome.update(
+            {
+                "status": "table_busy",
+                "reason": "table_ddl_in_progress" if table_holders else "table_lock_held",
+                "index": table_busy[0],
+                "table_busy": table_busy,
+                "table_holders": table_holders,
+                "build_alive": bool(table_holders),
+            }
+        )
     return outcome
 
 
@@ -2480,7 +2788,9 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
     ``PerKbVectorIndexBuildInProgress`` where it happens. That is deliberate and
     the opposite case: another caller is working on this index right now, so the
     whole drop is worth retrying rather than partly completing, and the retry
-    reaches the dimensions this attempt did not.
+    reaches the dimensions this attempt did not. A table owned by another build
+    raises its subclass, ``PerKbVectorIndexTableBusy``, having issued nothing, and
+    the task waits for that build on the longer clock the reconcile's task uses.
 
     "Permanent" here means only "not on ``is_transient_db_error``'s list", and that
     list is about a *statement* failing. Some whole-server conditions are not on it
@@ -2503,9 +2813,19 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
                 raise PerKbVectorIndexBuildInProgress(
                     f"{AI_SCHEMA}.{name} is being built or dropped by another caller"
                 )
+            # The same DDL on the same table as the reconcile's, so the same gate:
+            # a deleted knowledge base's drop queued behind another knowledge base's
+            # build kills it at its end exactly as a repair drop does (``_TableGate``).
+            gate = _TableGate(conn)
             try:
+                gate.hold()
                 _drop_index(conn, kb_id, dims)
                 dropped.append(name)
+            except PerKbVectorIndexTableBusy:
+                # Nothing issued. Stops the loop like a held index lock does, and for
+                # the same reason: the whole drop is worth retrying, and the retry
+                # reaches the dimensions this attempt did not.
+                raise
             except Exception as exc:
                 if is_transient_db_error(exc):
                     raise
@@ -2514,6 +2834,7 @@ def drop_per_kb_vector_indexes(knowledge_base_id: Any, engine=None) -> dict:
                     "Could not drop partial HNSW index %s.%s", AI_SCHEMA, name, exc_info=True
                 )
             finally:
+                gate.release()
                 _release_lock(conn, lock)
 
     if failed:

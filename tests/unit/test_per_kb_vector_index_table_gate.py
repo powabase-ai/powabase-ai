@@ -137,9 +137,7 @@ _DDL_PATHS = {
     # A valid index at or below the drop threshold: DROP INDEX CONCURRENTLY.
     "threshold_drop": dict(existing=(_index_row(KB, 1536),), rows_by_dims={1536: 1_000}),
     # A valid index built from an older definition: count, drop, rebuild.
-    "definition_rebuild": dict(
-        existing=(_older_definition_row(),), rows_by_dims={1536: 20_000}
-    ),
+    "definition_rebuild": dict(existing=(_older_definition_row(),), rows_by_dims={1536: 20_000}),
 }
 
 
@@ -291,9 +289,7 @@ def test_the_holders_check_is_run_on_the_table_and_not_on_one_index(monkeypatch)
     """Per table: the issue's "no build is running" was true of one index and false of the table."""
     conn = _gated("build", table_free=False, holders=[_LIVE_BUILD])
     _ensure(monkeypatch, conn)
-    holder_params = [
-        p for st, p in zip(conn.statements, conn.params) if _HOLDERS_QUERY in st
-    ]
+    holder_params = [p for st, p in zip(conn.statements, conn.params) if _HOLDERS_QUERY in st]
     assert holder_params, conn.statements
     assert holder_params[0]["table"] == f'"{pvi.AI_SCHEMA}".embeddings'
     sql = next(st for st in conn.statements if _HOLDERS_QUERY in st)
