@@ -73,12 +73,14 @@ from ..services.citations import (
     persist_citations,
 )
 from ..services.session import (
+    SessionNotAccessible,
     build_messages_for_llm,
     get_or_create_session,
     load_session_history,
     persist_agent_run,
     seed_session_runs,
     session_accessible_to,
+    session_id_error,
     update_agent_run,
 )
 from ..services import agent_sql, tool_registry
@@ -566,18 +568,27 @@ def update_agent(agent_id: str):
 @agents_bp.route("/<agent_id>", methods=["DELETE"])
 @require_service_role
 def delete_agent(agent_id: str):
-    """Delete an agent, and the database role its tools acted as."""
-    db.session.execute(
-        text(f'DELETE FROM "{AI_SCHEMA}".agents WHERE id = :id'),
-        {"id": agent_id},
-    )
-    db.session.commit()
+    """Delete an agent, and the database login its tools acted as.
+
+    Both in one transaction, under the lock grant syncs take: no sync can
+    recreate the login in between, and if the login cannot be dropped the
+    agent is not deleted either.
+    """
     try:
-        agent_sql.drop_agent_role(agent_id)
+        uuid.UUID(agent_id)
     except ValueError:
-        pass  # not a uuid: there was never a role
+        return jsonify({"error": "Agent not found"}), 404
+    try:
+        db.session.execute(
+            text(f'DELETE FROM "{AI_SCHEMA}".agents WHERE id = :id'),
+            {"id": agent_id},
+        )
+        agent_sql.drop_agent_role_in(db.session.connection(), agent_id)
+        db.session.commit()
     except Exception:
-        logger.exception("Could not drop the database role of deleted agent %s", agent_id)
+        db.session.rollback()
+        logger.exception("Could not delete agent %s and its database login", agent_id)
+        return jsonify({"error": "The agent could not be deleted"}), 500
 
     return jsonify({"message": "Agent deleted"})
 
@@ -595,7 +606,9 @@ def _tool_config_error(config) -> str | None:
 
     Only the database tools' ``schemas`` (schema -> table names) is checked:
     its names become grants on the agent's database role, so each must be a
-    plain identifier outside the system schemas.
+    plain identifier outside the system schemas. Each existing relation must
+    also be one that row level security applies to (a table or a
+    security_invoker view); a table that does not exist yet is allowed.
     """
     if not isinstance(config, dict) or "schemas" not in config:
         return None
@@ -613,7 +626,7 @@ def _tool_config_error(config) -> str | None:
             isinstance(t, str) and _IDENTIFIER_RE.match(t) for t in tables
         ):
             return f"Invalid table names in schema '{schema_name}'"
-    return None
+    return agent_sql.configured_tables_error(schemas)
 
 
 def _sync_database_role(agent_id: str) -> None:
@@ -1451,6 +1464,9 @@ def delete_session_for_agent(agent_id: str, session_id: str):
     # form — as the create route does — so a session is deletable under every
     # spelling it was creatable under, and a non-uuid segment (which can name
     # no agent) 404s here rather than being compared as a string.
+    shape_error = session_id_error(session_id)
+    if shape_error:
+        return jsonify({"error": shape_error}), 400
     try:
         agent_id = str(uuid.UUID(agent_id))
     except ValueError:
@@ -1497,8 +1513,10 @@ def run_agent(agent_id: str):
     - Knowledge base search with token limiting
     - agentic.Agent class for LLM calls
 
-    `runtime_knowledge_bases` is rejected with 400 here — this endpoint has
-    no tool loop; use POST .../run/stream instead.
+    `runtime_knowledge_bases` is rejected with 400 here when the service
+    role sends it — this endpoint has no tool loop; use POST .../run/stream
+    instead. An end user gets 403 for it first, as for the other fields only
+    the service role may set.
     """
     data = request.get_json() or {}
     message = data.get("message")
@@ -1511,6 +1529,9 @@ def run_agent(agent_id: str):
             return jsonify({"error": body_error}), 403
 
     session_id = data.get("session_id")
+    shape_error = session_id_error(session_id)
+    if shape_error:
+        return jsonify({"error": shape_error}), 400
     knowledge_bases = data.get("knowledge_bases", [])
 
     # Validate mutual exclusivity of context sources
@@ -1602,6 +1623,10 @@ def run_agent(agent_id: str):
     started_at = datetime.now(UTC)
     context_handler_id: str | None = None
 
+    # An end user's bind re-checks the session's owner itself: the check above
+    # is not a lock, and another user can create this session_id meanwhile.
+    end_user_id = None if is_service_role else user_id
+
     # Bind run_id into the billing contextvar so KB-search / tool-call /
     # query-enrichment idempotency keys are deterministic on agent_run
     # replay (spec line 132). Reset in finally so a downstream handler in
@@ -1614,6 +1639,7 @@ def run_agent(agent_id: str):
             agent_id=agent_id,
             session_id=session_id,
             user_id=user_id,
+            end_user_id=end_user_id,
         )
 
         # Load session history for multi-turn conversations
@@ -1836,6 +1862,10 @@ def run_agent(agent_id: str):
             response["warning"] = rag_warning
         return jsonify(response), 200
 
+    except SessionNotAccessible:
+        db.session.rollback()
+        return jsonify({"error": "Session not found"}), 404
+
     except Exception as e:
         logger.exception("Agent run failed")
         db.session.rollback()
@@ -1847,6 +1877,7 @@ def run_agent(agent_id: str):
                 agent_id=agent_id,
                 session_id=session_id,
                 user_id=user_id,
+                end_user_id=end_user_id,
             )
             persist_agent_run(
                 db_session=db.session,
@@ -1930,6 +1961,9 @@ def run_agent_stream(agent_id: str):
             return jsonify({"error": body_error}), 403
 
     session_id = data.get("session_id")
+    shape_error = session_id_error(session_id)
+    if shape_error:
+        return jsonify({"error": shape_error}), 400
     knowledge_bases = data.get("knowledge_bases", [])
 
     # Validate mutual exclusivity of context sources
@@ -1962,6 +1996,7 @@ def run_agent_stream(agent_id: str):
     # service role. The tools loaded below act as the same caller.
     user_id = get_current_user_id()
     is_service_role = is_service_role_request()
+    end_user_id = None if is_service_role else user_id
     caller = ToolCaller.from_request()
 
     # Ownership check: an end user may only continue a session they own
@@ -2063,12 +2098,14 @@ def run_agent_stream(agent_id: str):
         started_at_monotonic = time.monotonic()
 
         try:
-            # Get or create session
+            # Get or create session. An end user's bind re-checks the owner
+            # itself: the view's check is not a lock.
             db_session_uuid, actual_session_id, is_new_session = get_or_create_session(
                 db_session=db.session,
                 agent_id=agent_id,
                 session_id=session_id,
                 user_id=user_id,
+                end_user_id=end_user_id,
             )
             # Commit session so it survives any RAG rollback
             db.session.commit()
@@ -2754,7 +2791,7 @@ def run_agent_stream(agent_id: str):
                         run_id,
                     )
                     callbacks_active[0] = False
-                    # PR 421 R4 C9: snapshot caller contextvars
+                    # Snapshot caller contextvars
                     # (current_byok_providers / byok_lookup_degraded /
                     # run_id_var) so the background-finish thread sees
                     # them. Without this wrap, the disconnect path re-introduces
@@ -2929,7 +2966,7 @@ def run_agent_stream(agent_id: str):
                 run_persisted,
             )
             if llm_gen is not None:
-                # PR 421 R4 C9: snapshot caller contextvars for the
+                # Snapshot caller contextvars for the
                 # pre-stream disconnect path — same rationale as the
                 # mid-stream disconnect ~150 lines above.
                 _predisconnect_ctx = contextvars.copy_context()
@@ -2982,6 +3019,7 @@ def run_agent_stream(agent_id: str):
                         agent_id=agent_id,
                         session_id=session_id,
                         user_id=user_id,
+                        end_user_id=end_user_id,
                     )
                     db.session.commit()
                     persist_agent_run(
@@ -3000,6 +3038,13 @@ def run_agent_stream(agent_id: str):
                     logger.exception(
                         "Failed to persist failed run %s after early disconnect", run_id
                     )
+            return
+
+        except SessionNotAccessible:
+            # Another user's session, bound after the view's check passed.
+            # Nothing was saved yet, and nothing is saved into it now.
+            db.session.rollback()
+            yield f"data: {json.dumps({'event': 'error', 'error': 'Session not found'})}\n\n"
             return
 
         except Exception as e:
@@ -3031,6 +3076,7 @@ def run_agent_stream(agent_id: str):
                         agent_id=agent_id,
                         session_id=session_id,
                         user_id=user_id,
+                        end_user_id=end_user_id,
                     )
                     persist_agent_run(
                         db_session=db.session,
@@ -3081,7 +3127,9 @@ def approve_run(run_id: str):
     if not context:
         return jsonify({"error": "Run not found or not waiting for approval"}), 404
     if not is_service_role_request():
-        # A backend-started run has no owner, and no end user is its owner.
+        # Only the end user who started the run may resume it. A run started
+        # with the service key is registered with no owner, even when it runs
+        # in a user's session, so only the service key can approve it.
         owner = get_active_run_owner(run_id)
         if owner is None or owner != get_current_user_id():
             return jsonify({"error": "Run not found or not waiting for approval"}), 404

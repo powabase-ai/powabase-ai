@@ -37,6 +37,13 @@ ASSIGNMENTS = [
 ]
 
 
+class _Ref:
+    value = ASSIGNMENTS
+
+
+ASSIGNMENTS_REF = _Ref()
+
+
 @pytest.fixture
 def loader(monkeypatch):
     class _Query:
@@ -44,7 +51,7 @@ def loader(monkeypatch):
             return self
 
         def all(self):
-            return ASSIGNMENTS
+            return ASSIGNMENTS_REF.value
 
     class _FakeAgentTool:
         query = _Query()
@@ -90,6 +97,12 @@ class TestAgentLoginSync:
             read_tables={"public": ["customers", "orders"]},
             write_tables={"public": ["orders"]},
         )
+
+    def test_an_agent_without_database_tools_is_never_synced(self, loader, monkeypatch):
+        """Only agents with database tools get a login; the rest cost no catalog work."""
+        monkeypatch.setattr(ASSIGNMENTS_REF, "value", ASSIGNMENTS[2:])
+        tool_registry.load_all_tools_for_agent(AGENT_ID, db_session=None, caller=SERVICE)
+        loader.sync.assert_not_called()
 
     def test_end_user_run_does_not_sync(self, loader):
         tool_registry.load_all_tools_for_agent(AGENT_ID, db_session=None, caller=USER)

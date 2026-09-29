@@ -1661,3 +1661,51 @@ class TestToolsActAsTheCaller:
     ):
         caller = self._captured_caller(client, react_agent_id, auth_headers, monkeypatch)
         assert caller is not None and not caller.is_end_user
+
+
+class TestPausedRunsAreRegisteredUnderTheCaller:
+    """A run is registered for approval under whoever started it.
+
+    The approve route lets an end user resume only a run registered under
+    their own id, so an end user's run must carry it, and a service-role run
+    must carry none.
+    """
+
+    def _registered_owners(self, client, react_agent_id, auth_headers, monkeypatch):
+        from agentic_project_service.routes import agents as agents_route
+
+        owners = []
+        real_register = agents_route.register_run
+
+        def spy(run_id, context, owner_user_id=None):
+            owners.append(owner_user_id)
+            return real_register(run_id, context, owner_user_id=owner_user_id)
+
+        monkeypatch.setattr(agents_route, "register_run", spy)
+        # Only the registration is under test, not whether an LLM key is configured.
+        monkeypatch.setattr(agents_route, "check_model_available", lambda model: None)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        with patch(
+            "agentic.agent.agent.Agent.run",
+            side_effect=lambda messages, **kw: _make_fake_agent_output("ok"),
+        ):
+            resp = client.post(
+                f"/api/agents/{react_agent_id}/run/stream",
+                json={"message": "go"},
+                headers=auth_headers,
+                buffered=True,
+            )
+        assert resp.status_code == 200
+        return owners
+
+    def test_end_user_run_is_theirs_to_approve(
+        self, client, mock_user_auth, auth_headers, react_agent_id, monkeypatch
+    ):
+        owners = self._registered_owners(client, react_agent_id, auth_headers, monkeypatch)
+        assert owners == [mock_user_auth]
+
+    def test_service_role_run_has_no_end_user_owner(
+        self, client, mock_auth, auth_headers, react_agent_id, monkeypatch
+    ):
+        owners = self._registered_owners(client, react_agent_id, auth_headers, monkeypatch)
+        assert owners == [None]

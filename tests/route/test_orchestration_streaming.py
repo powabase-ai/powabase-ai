@@ -455,14 +455,14 @@ class TestPreResponseReconciliation:
 
 
 class TestEmptyRedactionReachesTheWire:
-    """R6-C1 layer 2: a full redaction (`modified_output: ""`) must be emitted.
+    """A full redaction (`modified_output: ""`) must be emitted.
 
-    Round 5 fixed `hooks.py` so an empty-string redaction propagates into
-    `output.content`. The route then dropped it again: `if final_content:` is
+    `hooks.py` propagates an empty-string redaction into `output.content`.
+    The route used to drop it again: `if final_content:` is
     falsy for `""`, so the terminal correction chunk was never sent. A consumer
-    reading the SSE stream (the downstream backend this feature exists for) sees
+    reading the SSE stream (the downstream backend this feature exists for) saw
     the raw streamed answer and no correction — while the DB row and the audit
-    record both say the answer was redacted.
+    record both said the answer was redacted.
     """
 
     def test_empty_redaction_emits_terminal_chunk(
@@ -521,7 +521,7 @@ class TestEmptyRedactionReachesTheWire:
 
 
 class TestHooksReachTheEngine:
-    """R6-C2: the route must actually hand the DB's hooks to the engine.
+    """The route must actually hand the DB's hooks to the engine.
 
     `test_supervisor_hooks.py` proves `Orchestration.run(hooks=...)` forwards
     correctly, but constructs the Orchestration directly. The streaming route

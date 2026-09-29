@@ -13,7 +13,7 @@ import pytest
 from flask import Flask
 
 from agentic_project_service.routes import agents as agents_route
-from agentic_project_service.services import tool_registry
+from agentic_project_service.services import agent_sql, tool_registry
 
 AGENT_ID = "3f9a1c2e-5b7d-4e11-9a3c-8d2f6b4e1a70"
 ASSIGNMENT_ID = "7e1f5a6b-9c2d-4e55-9f7a-c16d0f8e5b14"
@@ -46,6 +46,17 @@ def sync():
     # Added to tool_registry alongside this change; created here so the test
     # does not depend on which lands first.
     with patch.object(tool_registry, "sync_agent_database_role", create=True) as fn:
+        yield fn
+
+
+@pytest.fixture(autouse=True)
+def relations():
+    """The configured relations' kinds, as the database would report them.
+
+    Every relation is acceptable unless a test says otherwise. Created here so
+    the test does not depend on which change lands first.
+    """
+    with patch.object(agent_sql, "configured_tables_error", create=True, return_value=None) as fn:
         yield fn
 
 
@@ -93,6 +104,91 @@ class TestAssignToolValidatesLikePatch:
         )
         assert patched.status_code == assigned.status_code == 400
         assert patched.get_json() == assigned.get_json()
+
+
+UNSAFE_RELATION = (
+    "public.notes_view is a view without security_invoker; "
+    "only tables and security_invoker views can be configured"
+)
+
+
+class TestConfiguredRelationsAreChecked:
+    """A view that runs as its owner, a materialized view or a foreign table
+    would let the agent read past row level security, so it is refused when
+    it is configured, not only when a run finally touches it."""
+
+    CONFIG = {"schemas": {"public": ["notes_view"]}}
+
+    def test_assign_refuses_an_unsafe_relation(self, client, db_session, sync, relations):
+        relations.return_value = UNSAFE_RELATION
+        resp = client.post(
+            f"/api/agents/{AGENT_ID}/tools",
+            headers=HEADERS,
+            json={
+                "tool_type": "builtin",
+                "tool_name": "database_write",
+                "config_override": self.CONFIG,
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.get_json() == {"error": UNSAFE_RELATION}
+        relations.assert_called_once_with({"public": ["notes_view"]})
+        db_session.add.assert_not_called()
+        db_session.commit.assert_not_called()
+        sync.assert_not_called()
+
+    def test_patch_refuses_an_unsafe_relation(self, client, db_session, sync, relations):
+        relations.return_value = UNSAFE_RELATION
+        assignment = MagicMock(config_override={})
+        with patch.object(agents_route, "AgentTool") as model:
+            model.query.filter_by.return_value.first.return_value = assignment
+            resp = client.patch(
+                f"/api/agents/{AGENT_ID}/tools/{ASSIGNMENT_ID}",
+                headers=HEADERS,
+                json={"config_override": self.CONFIG},
+            )
+        assert resp.status_code == 400
+        assert resp.get_json() == {"error": UNSAFE_RELATION}
+        assert assignment.config_override == {}
+        db_session.commit.assert_not_called()
+        sync.assert_not_called()
+
+    def test_names_are_checked_before_the_database_is_asked(
+        self, client, db_session, sync, relations
+    ):
+        resp = client.post(
+            f"/api/agents/{AGENT_ID}/tools",
+            headers=HEADERS,
+            json={
+                "tool_type": "builtin",
+                "tool_name": "database_query",
+                "config_override": {"schemas": {"auth": ["users"]}},
+            },
+        )
+        assert resp.status_code == 400
+        relations.assert_not_called()
+
+    def test_a_config_without_schemas_is_not_looked_up(self, client, db_session, sync, relations):
+        resp = client.post(
+            f"/api/agents/{AGENT_ID}/tools",
+            headers=HEADERS,
+            json={"tool_type": "builtin", "tool_name": "web_search", "config_override": {}},
+        )
+        assert resp.status_code == 201, resp.get_data(as_text=True)
+        relations.assert_not_called()
+
+    def test_acceptable_relations_are_saved(self, client, db_session, sync, relations):
+        resp = client.post(
+            f"/api/agents/{AGENT_ID}/tools",
+            headers=HEADERS,
+            json={
+                "tool_type": "builtin",
+                "tool_name": "database_query",
+                "config_override": {"schemas": {"public": ["notes"]}},
+            },
+        )
+        assert resp.status_code == 201, resp.get_data(as_text=True)
+        relations.assert_called_once_with({"public": ["notes"]})
 
 
 class TestAssignmentChangesResyncTheRole:
@@ -171,26 +267,3 @@ class TestAssignmentChangesResyncTheRole:
         assert len(errors) == 1
         assert errors[0].exc_info is not None
         assert AGENT_ID in errors[0].getMessage()
-
-
-class TestDeleteAgentDropsItsRole:
-    def test_row_is_deleted_then_the_role_dropped(self, client, db_session):
-        order = []
-        db_session.commit.side_effect = lambda: order.append("commit")
-        with patch.object(agents_route.agent_sql, "drop_agent_role") as drop:
-            drop.side_effect = lambda agent_id: order.append(("drop", agent_id))
-            resp = client.delete(f"/api/agents/{AGENT_ID}", headers=HEADERS)
-        assert resp.status_code == 200
-        assert order == ["commit", ("drop", AGENT_ID)]
-
-    def test_a_failed_drop_is_logged_and_the_delete_still_succeeds(
-        self, client, db_session, caplog
-    ):
-        with (
-            patch.object(agents_route.agent_sql, "drop_agent_role", side_effect=RuntimeError("x")),
-            caplog.at_level(logging.ERROR, logger=agents_route.logger.name),
-        ):
-            resp = client.delete(f"/api/agents/{AGENT_ID}", headers=HEADERS)
-        assert resp.status_code == 200
-        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
-        assert len(errors) == 1 and errors[0].exc_info is not None

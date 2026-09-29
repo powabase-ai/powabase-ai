@@ -14,6 +14,7 @@ from ..services.session import (
     get_session_by_id,
     get_session_owner,
     list_runs_for_session,
+    session_id_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -22,12 +23,16 @@ sessions_bp = Blueprint("sessions", __name__, url_prefix="/api/sessions")
 
 
 def _verify_session_access(session_id: str):
-    """Return None if caller may access session, else a (response, 404) tuple.
+    """Return None if caller may access session, else a (response, status) tuple.
 
-    Service-role callers bypass the check. For user-scoped callers, return 404
-    (not 403) on both "not found" and "owned by someone else" to avoid leaking
-    session existence.
+    An id no session can have is 400 for every caller. Service-role callers
+    bypass the ownership check. For user-scoped callers, return 404 (not 403)
+    on both "not found" and "owned by someone else" to avoid leaking session
+    existence.
     """
+    shape_error = session_id_error(session_id)
+    if shape_error:
+        return jsonify({"error": shape_error}), 400
     if is_service_role_request():
         return None
 

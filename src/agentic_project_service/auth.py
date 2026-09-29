@@ -69,13 +69,15 @@ def decode_jwt(token: str) -> dict:
         except jwt.InvalidTokenError as e:
             raise AuthError(f"Invalid service token: {str(e)}") from None
 
-    # For regular user tokens, validate audience
+    # For regular user tokens, validate audience. GoTrue always sets exp and
+    # sub; a token without them never expires or names nobody.
     try:
         payload = jwt.decode(
             token,
             jwt_secret,
             algorithms=["HS256"],
             audience="authenticated",
+            options={"require": ["exp", "sub"]},
         )
     except jwt.ExpiredSignatureError:
         raise AuthError("Token has expired") from None
@@ -128,8 +130,12 @@ def _authenticate():
     # Every end-user check downstream compares a row's owner with this id, so
     # an end-user token must carry one: without it, "owned by nobody" and "the
     # caller" would both be None.
-    if not is_service_role and not _is_uuid(payload.get("sub")):
-        return jsonify({"error": "Invalid token: sub must be a user id"}), 401
+    if not is_service_role:
+        if not _is_uuid(payload.get("sub")):
+            return jsonify({"error": "Invalid token: sub must be a user id"}), 401
+        # Owners are compared as canonical strings, so one spelling of the id
+        # throughout: the tools act with these same claims.
+        payload["sub"] = str(uuid.UUID(payload["sub"]))
 
     g.is_service_role = is_service_role
     g.user_id = payload.get("sub")
@@ -217,32 +223,3 @@ def end_user_run_body_error(data: dict) -> str | None:
         f"{', '.join(named)} may only be set with the project's service role key; "
         "an end user's run uses the knowledge bases configured on the agent"
     )
-
-
-def optional_auth(f):
-    """Decorator for routes that optionally use authentication."""
-
-    @functools.wraps(f)
-    def decorated(*args, **kwargs):
-        token = get_token_from_header()
-        if token:
-            try:
-                payload = decode_jwt(token)
-                g.is_service_role = payload.get("is_service_role") is True
-                g.user_id = payload.get("sub")
-                g.user_role = payload.get("role", "authenticated")
-                g.jwt_payload = payload
-            except AuthError:
-                g.is_service_role = False
-                g.user_id = None
-                g.user_role = None
-                g.jwt_payload = None
-        else:
-            g.is_service_role = False
-            g.user_id = None
-            g.user_role = None
-            g.jwt_payload = None
-
-        return f(*args, **kwargs)
-
-    return decorated

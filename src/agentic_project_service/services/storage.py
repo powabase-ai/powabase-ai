@@ -16,16 +16,52 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+def _reported_status(response: httpx.Response) -> int:
+    """The status an error answer stands for.
+
+    storage-api answers some errors, such as a missing object or bucket, or an
+    object the caller's storage policies deny, with HTTP 400 and the real
+    status as a string in the JSON body's ``statusCode``.
+    """
+    if response.status_code == 400:
+        try:
+            code = response.json().get("statusCode")
+        except Exception:
+            code = None
+        if isinstance(code, str) and code.isdigit():
+            return int(code)
+    return response.status_code
+
+
 class StorageError(Exception):
     """Raised when a storage operation fails.
 
     ``status_code`` is the HTTP status Storage answered with, or None when no
     answer came back (a transport error) or the request was never sent.
+    ``reported_status`` is the status the answer stands for (see
+    :func:`_reported_status`); it is ``status_code`` unless the body says
+    otherwise.
     """
 
-    def __init__(self, message: str = "", status_code: int | None = None):
+    def __init__(
+        self,
+        message: str = "",
+        status_code: int | None = None,
+        *,
+        reported_status: int | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.reported_status = reported_status if reported_status is not None else status_code
+
+    @classmethod
+    def from_response(cls, message: str, response: httpx.Response) -> "StorageError":
+        """An error for Storage's ``response``; ``message`` should say what failed."""
+        return cls(
+            f"{message}: {response.text}",
+            response.status_code,
+            reported_status=_reported_status(response),
+        )
 
 
 def _object_url_path(bucket_id: str, path: str = "") -> str:
@@ -34,9 +70,14 @@ def _object_url_path(bucket_id: str, path: str = "") -> str:
 
     httpx removes ``.``/``..`` segments before sending, so ``../other/x`` or a
     bucket of ``x/../other`` would reach a different bucket; both are refused.
-    The bucket is percent-encoded. The path is not re-encoded: existing object
-    keys, and callers that pass an already-escaped key, keep the request form
-    they have always had.
+    The bucket is percent-encoded. The path is passed through as given, so
+    existing object keys, and callers that pass an already-escaped key, keep
+    the request form they have always had: httpx then percent-encodes only
+    what a URL path cannot hold (a space, a non-ASCII letter, ``"``, ``<``),
+    refuses control characters, and leaves ``%`` escapes, sub-delimiters such
+    as ``+``/``&``, and ``;`` as they are. A caller that takes object names
+    from elsewhere must refuse or encode ``?``, ``#`` and ``%`` itself (the
+    agent storage tools do).
     """
     if not bucket_id or bucket_id in (".", "..") or "/" in bucket_id:
         raise StorageError(f"Invalid bucket name: {bucket_id!r}")
@@ -114,18 +155,15 @@ class SupabaseStorage:
         if response.status_code == 404:
             return None
         if response.status_code == 400:
+            if _reported_status(response) == 404:
+                return None
             try:
-                data = response.json()
-                if (
-                    data.get("statusCode") == "404"
-                    or "not found" in data.get("message", "").lower()
-                ):
+                if "not found" in response.json().get("message", "").lower():
                     return None
             except Exception:
                 pass
-            raise StorageError(f"Failed to get bucket: {response.text}", response.status_code)
         if response.status_code != 200:
-            raise StorageError(f"Failed to get bucket: {response.text}", response.status_code)
+            raise StorageError.from_response("Failed to get bucket", response)
         return response.json()
 
     def create_bucket(
@@ -182,7 +220,7 @@ class SupabaseStorage:
         )
 
         if response.status_code not in (200, 201):
-            raise StorageError(f"Failed to upload file: {response.text}", response.status_code)
+            raise StorageError.from_response("Failed to upload file", response)
 
         return f"{bucket_id}/{path}"
 
@@ -234,7 +272,7 @@ class SupabaseStorage:
         if response.status_code == 404:
             raise StorageError(f"File not found: {bucket_id}/{path}", 404)
         if response.status_code != 200:
-            raise StorageError(f"Failed to download file: {response.text}", response.status_code)
+            raise StorageError.from_response("Failed to download file", response)
 
         return response.content
 
@@ -330,9 +368,7 @@ class SupabaseStorage:
         )
 
         if response.status_code != 200:
-            raise StorageError(
-                f"Failed to create signed URL: {response.text}", response.status_code
-            )
+            raise StorageError.from_response("Failed to create signed URL", response)
 
         data = response.json()
         signed_url_path = data.get("signedURL")

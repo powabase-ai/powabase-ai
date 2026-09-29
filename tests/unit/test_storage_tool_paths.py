@@ -3,12 +3,12 @@
 ``bucket`` and ``path`` come from the model. Before these checks they went into
 the object URL as-is, and httpx removes dot segments, so ``../sources/...`` or a
 bucket of ``x/../sources`` reached the internal sources bucket with the service
-key. Each form below was reproduced against a real storage server; the tests
-drive the handlers through the real ``SupabaseStorage`` client and record the
-URL httpx would send.
+key. The tests drive the handlers through the real ``SupabaseStorage`` client
+and record the URL httpx would send.
 """
 
 import json
+import time
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -21,7 +21,10 @@ from agentic_project_service.tools import builtin
 from agentic_project_service.tools.builtin import storage_read_handler, storage_write_handler
 
 SERVICE = ToolCaller.service()
-USER = ToolCaller(claims={"sub": "user-1", "role": "authenticated"}, token="user-jwt")
+USER = ToolCaller(
+    claims={"sub": "user-1", "role": "authenticated", "exp": time.time() + 3600},
+    token="user-jwt",
+)
 
 
 class _Recorder:
@@ -30,6 +33,7 @@ class _Recorder:
     def __init__(self):
         self.urls: list[httpx.URL] = []
         self.clients = 0  # storage clients the handler asked for
+        self.binary = False  # download bodies that are not UTF-8
 
     def _response(self, method, url):
         request = httpx.Request(method, url)
@@ -42,6 +46,8 @@ class _Recorder:
             )
         if method == "POST":
             return httpx.Response(200, json={"Key": "k"}, request=request)
+        if self.binary:
+            return httpx.Response(200, content=bytes([0xFF, 0xFE]), request=request)
         return httpx.Response(200, content=b"a,b\n1,2\n", request=request)
 
     def request(self, method, url, **kwargs):
@@ -84,7 +90,7 @@ def _write(caller, bucket, path):
 
 
 # ---------------------------------------------------------------------------
-# The review's reproduced forms, and their near relatives
+# Bucket and path forms that would name another bucket, or an internal one
 # ---------------------------------------------------------------------------
 
 
@@ -115,6 +121,11 @@ REJECTED_CALLS = [
     ("download bucket .", lambda c: _read(c, "download", ".", "a.pdf")),
     ("download bucket with backslash", lambda c: _read(c, "download", "x\\..\\sources", "a.pdf")),
     ("download bucket with space", lambda c: _read(c, "download", "my bucket", "a.pdf")),
+    # "$" in a pattern also matches before a trailing newline.
+    ("download bucket sources\\n", lambda c: _read(c, "download", "sources\n", "a.pdf")),
+    ("list bucket sources\\n", lambda c: _read(c, "list", "sources\n", "")),
+    ("write bucket sources\\n", lambda c: _write(c, "sources\n", "a.txt")),
+    ("download bucket docs\\n", lambda c: _read(c, "download", "docs\n", "a.pdf")),
     ("download path %2e%2e", lambda c: _read(c, "download", "public", "%2e%2e/sources/a.pdf")),
     ("download path ./", lambda c: _read(c, "download", "public", "./a.pdf")),
     ("download path a/./b", lambda c: _read(c, "download", "public", "a/./b.pdf")),
@@ -198,6 +209,55 @@ class TestOrdinaryPathsWork:
 
     def test_a_dotted_file_name_is_not_a_dot_segment(self, real_storage, caller):
         assert "content" in _read(caller, "download", "public", "a/..b/.hidden/v1.2..csv")
+
+
+# ---------------------------------------------------------------------------
+# Punctuation in file names reaches Storage as written
+# ---------------------------------------------------------------------------
+
+# storage-api signs the object key exactly as the request path spells it, so a
+# signed URL for a key whose sub-delimiters went out percent-encoded does not
+# verify when it is fetched. These characters are sent as they are, the way
+# httpx and the Supabase clients send them; only what could be read as URL
+# syntax (a space, a non-ASCII letter, ";") is encoded.
+PUNCTUATED_NAMES = [
+    ("Smith & Co.pdf", "Smith%20&%20Co.pdf"),
+    ("Q1+Q2.png", "Q1+Q2.png"),
+    ("a,b.pdf", "a,b.pdf"),
+    ("x=y:z@w$.txt", "x=y:z@w$.txt"),
+    ("it's (final)!*.txt", "it's%20(final)!*.txt"),
+    ("a;b.txt", "a%3Bb.txt"),
+]
+
+
+@pytest.mark.parametrize("caller", [SERVICE, USER], ids=["service", "end-user"])
+@pytest.mark.parametrize(("name", "sent"), PUNCTUATED_NAMES, ids=[n for n, _ in PUNCTUATED_NAMES])
+class TestPunctuatedNames:
+    def test_download(self, real_storage, caller, name, sent):
+        result = _read(caller, "download", "public", f"reports/{name}")
+        assert result["path"] == f"reports/{name}"
+        assert real_storage.paths() == [f"/storage/v1/object/public/reports/{sent}"]
+
+    def test_signed_url_for_a_binary_file(self, real_storage, caller, name, sent):
+        real_storage.binary = True
+        result = _read(caller, "download", "public", f"reports/{name}")
+        assert result["encoding"] == "binary"
+        assert real_storage.paths() == [
+            f"/storage/v1/object/public/reports/{sent}",
+            f"/storage/v1/object/sign/public/reports/{sent}",
+        ]
+
+    def test_write(self, real_storage, caller, name, sent):
+        result = _write(caller, "public", f"reports/{name}")
+        assert result["path"] == f"public/reports/{name}"
+        assert real_storage.paths() == [f"/storage/v1/object/public/reports/{sent}"]
+
+
+@pytest.mark.parametrize("name", ["Smith & Co%20.pdf", "Q1+Q2?.png", "a,b#.pdf", "a=b\\c.txt"])
+def test_escapes_and_url_syntax_are_still_refused(real_storage, name):
+    assert "Invalid path" in _read(SERVICE, "download", "public", name)["error"]
+    assert "Invalid path" in _write(SERVICE, "public", name)["error"]
+    assert real_storage.urls == []
 
 
 # ---------------------------------------------------------------------------

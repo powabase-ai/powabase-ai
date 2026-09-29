@@ -47,6 +47,25 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def set_up_agent_tool_logins() -> None:
+    """Create the end-user tool login and reconcile the agents' logins.
+
+    Neither failure is fatal: without the logins the database tools refuse,
+    and everything else works. The reconcile drops logins of agents that are
+    gone or have no database tools, and follows a password rotation.
+    """
+    from .services import agent_sql
+
+    try:
+        agent_sql.ensure_login_roles()
+    except Exception:
+        logger.exception("Could not set up the agent tool database logins")
+    try:
+        agent_sql.reconcile_agent_roles()
+    except Exception:
+        logger.exception("Could not reconcile the agent tool database logins")
+
+
 def create_app(testing: bool = False):
     """Create and configure the Flask application.
 
@@ -480,18 +499,7 @@ def create_app(testing: bool = False):
     # password rotation follows. Not fatal: without them the database tools
     # refuse, and everything else works.
     with app.app_context():
-        from .services.agent_sql import ensure_login_roles, reconcile_agent_roles
-
-        try:
-            ensure_login_roles()
-        except Exception:
-            logger.exception("Could not set up the agent tool database logins")
-        # Drop logins of agents deleted while a drop failed or raced a run,
-        # and follow a password rotation on the rest.
-        try:
-            reconcile_agent_roles()
-        except Exception:
-            logger.exception("Could not reconcile the agent tool database logins")
+        set_up_agent_tool_logins()
 
     if not os.getenv("SERVICE_ROLE_KEY"):
         logger.warning(

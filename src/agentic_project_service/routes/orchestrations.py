@@ -50,7 +50,12 @@ from ..services.run_context import (
     reset_run_id,
     set_run_id,
 )
-from ..services.session import _load_tool_calls_for_runs, persist_agent_run
+from ..services.session import (
+    SessionNotAccessible,
+    _load_tool_calls_for_runs,
+    persist_agent_run,
+    session_id_error,
+)
 from ..services.tool_caller import ToolCaller
 from ._runtime_kb import validate_runtime_knowledge_bases
 
@@ -122,6 +127,9 @@ def _verify_orchestration_session_access(session_id: str):
     (not 403) on both "not found" and "owned by someone else" to avoid leaking
     session existence. Mirrors routes/sessions.py:_verify_session_access.
     """
+    shape_error = session_id_error(session_id)
+    if shape_error:
+        return jsonify({"error": shape_error}), 400
     if is_service_role_request():
         return None
 
@@ -928,9 +936,13 @@ def run_orchestration_stream(orch_id: str):
         return jsonify({"error": "message is required"}), 400
 
     session_id = data.get("session_id")
+    shape_error = session_id_error(session_id)
+    if shape_error:
+        return jsonify({"error": shape_error}), 400
     user_id = get_current_user_id()
+    is_service_role = is_service_role_request()
 
-    if not is_service_role_request():
+    if not is_service_role:
         body_error = end_user_run_body_error(data)
         if body_error:
             return jsonify({"error": body_error}), 403
@@ -1005,10 +1017,14 @@ def run_orchestration_stream(orch_id: str):
 
             hooks = load_hooks_for_orchestration(orch_id)
 
+            # An end user's bind re-checks the session's owner itself: the
+            # view's check is not a lock, and another user can create this
+            # session_id while the orchestration is being built.
             db_session_uuid, actual_session_id, is_new = get_or_create_orchestration_session(
                 orchestration_id=orch_id,
                 session_id=session_id,
                 user_id=user_id,
+                end_user_id=None if is_service_role else user_id,
             )
 
             # Load chat history from prior completed runs in this session
@@ -1368,6 +1384,13 @@ def run_orchestration_stream(orch_id: str):
                 "provider": e.provider,
             }
             yield f"data: {json.dumps(err_payload)}\n\n"
+            return
+
+        except SessionNotAccessible:
+            # Another user's session, created after the view's check passed.
+            # The run was never created, and nothing is saved into it.
+            db.session.rollback()
+            yield f"data: {json.dumps({'event': 'error', 'error': 'Session not found'})}\n\n"
             return
 
         except Exception as e:

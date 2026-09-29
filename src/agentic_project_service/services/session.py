@@ -143,12 +143,43 @@ def _summarize_tool_calls(tool_calls: list[dict] | None) -> dict[str, int]:
 # =============================================================================
 
 
+# agent_sessions.session_id and orchestration_sessions.session_id are VARCHAR(255).
+MAX_SESSION_ID_LENGTH = 255
+
+
+def session_id_error(session_id: Any) -> str | None:
+    """Why a client-supplied ``session_id`` cannot name a session, or None.
+
+    Checked before any query: a JSON number, object or list would otherwise
+    reach the database as a parameter of the wrong type and fail there.
+    ``None`` (absent) is fine; the run then starts a new session.
+    """
+    if session_id is None:
+        return None
+    if not isinstance(session_id, str):
+        return "session_id must be a string"
+    if len(session_id) > MAX_SESSION_ID_LENGTH:
+        return f"session_id must be at most {MAX_SESSION_ID_LENGTH} characters"
+    return None
+
+
+class SessionNotAccessible(Exception):
+    """An end user's run named a session that is not theirs to continue.
+
+    Raised by the get-or-create functions when ``end_user_id`` is set and the
+    session exists but belongs to someone else, to nobody, or to another agent
+    or orchestration. Routes answer it exactly like a missing session.
+    """
+
+
 def get_or_create_session(
     db_session: Session,
     agent_id: str,
     session_id: str | None = None,
     user_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    *,
+    end_user_id: str | None = None,
 ) -> tuple[str, str, bool]:
     """
     Get an existing session or create a new one.
@@ -159,10 +190,23 @@ def get_or_create_session(
         session_id: Optional user-facing session ID to look up
         user_id: Optional user ID to associate with new session
         metadata: Optional metadata for new session
+        end_user_id: The end user a run acts for, or None for the service
+            role. When set, the session is created owned by this user, and an
+            existing one is returned only if it is this user's own session of
+            this agent; anything else raises :class:`SessionNotAccessible`.
 
     Returns:
         Tuple of (db_session_uuid, session_id, is_new)
     """
+    if end_user_id is not None:
+        return _bind_end_user_session(
+            db_session,
+            agent_id,
+            session_id or f"sess_{uuid.uuid4().hex[:12]}",
+            end_user_id,
+            metadata,
+        )
+
     if session_id:
         # Try to find existing session
         result = db_session.execute(
@@ -204,6 +248,80 @@ def get_or_create_session(
     )
 
     return db_session_uuid, new_session_id, True
+
+
+def same_uuid(a: Any, b: Any) -> bool:
+    """Whether two values name the same uuid, whatever their spelling."""
+    if a is None or b is None:
+        return False
+    try:
+        return uuid.UUID(str(a)) == uuid.UUID(str(b))
+    except ValueError:
+        return False
+
+
+def _bind_end_user_session(
+    db_session: Session,
+    agent_id: str,
+    session_id: str,
+    end_user_id: str,
+    metadata: dict[str, Any] | None,
+) -> tuple[str, str, bool]:
+    """Create ``session_id`` for the end user, or return it if it is theirs.
+
+    The route's earlier ownership check is not a lock: another caller can
+    create the same id before the run binds to it. So the bind checks again,
+    atomically. ``session_id`` is unique across all agents; the INSERT either
+    creates the row or, if any agent's session already has that id, does
+    nothing, waiting first for a concurrent creator to commit. Of two runs
+    creating one id, exactly one inserts; the other reads the winner's row and
+    is refused unless it is the same user and agent.
+    """
+    now = datetime.now(UTC)
+    inserted = db_session.execute(
+        text(
+            f"""
+            INSERT INTO "{AI_SCHEMA}".agent_sessions
+            (id, session_id, agent_id, user_id, session_data, metadata, created_at, updated_at)
+            VALUES (:id, :session_id, :agent_id, :user_id, :session_data, :metadata, :created_at, :updated_at)
+            ON CONFLICT (session_id) DO NOTHING
+            RETURNING id
+        """
+        ),
+        {
+            "id": str(uuid.uuid4()),
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "user_id": end_user_id,
+            "session_data": "{}",
+            "metadata": json.dumps(metadata) if metadata else "{}",
+            "created_at": now,
+            "updated_at": now,
+        },
+    ).fetchone()
+    if inserted is not None:
+        return str(inserted[0]), session_id, True
+
+    # Deliberately not filtered by agent: a session of another agent with this
+    # id must be seen and refused, not mistaken for a free id.
+    existing = db_session.execute(
+        text(
+            f"""
+            SELECT id, agent_id, user_id FROM "{AI_SCHEMA}".agent_sessions
+            WHERE session_id = :session_id
+        """
+        ),
+        {"session_id": session_id},
+    ).fetchone()
+    # None: the conflicting session was deleted in between. Refusing is safe;
+    # the caller can retry.
+    if (
+        existing is None
+        or not same_uuid(existing[2], end_user_id)
+        or not same_uuid(existing[1], agent_id)
+    ):
+        raise SessionNotAccessible(session_id)
+    return str(existing[0]), session_id, False
 
 
 def session_accessible_to(db_session: Session, session_id: str, user_id: str | None) -> bool:

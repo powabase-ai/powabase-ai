@@ -15,6 +15,7 @@ from agentic_project_service.tools.builtin import (
     BUILTIN_HANDLERS,
     BUILTIN_TOOL_DEFINITIONS,
     code_execute_handler,
+    database_query_handler,
     database_write_handler,
     storage_read_handler,
     storage_write_handler,
@@ -23,6 +24,8 @@ from agentic_project_service.tools.builtin import (
 
 _SERVICE = ToolCaller.service()
 _AGENT = "3f9a1c2e-5b7d-4e11-9a3c-8d2f6b4e1a70"
+_USERS = {"public": ["users"]}
+_ITEMS = {"public": ["items"]}
 
 
 @contextmanager
@@ -38,7 +41,11 @@ def _as_tool_transaction(conn):
         opened.append(read_only)
         yield conn
 
-    with patch.object(builtin_mod.agent_sql, "agent_transaction", transaction):
+    with (
+        patch.object(builtin_mod.agent_sql, "agent_transaction", transaction),
+        # A plain table: the database-side check is pinned in the store tests.
+        patch.object(builtin_mod.agent_sql, "check_write_target", create=True),
+    ):
         yield opened
 
 
@@ -814,7 +821,7 @@ class TestStorageWriteUpload:
 class TestDatabaseWriteHandler:
     def test_invalid_operation_returns_error(self):
         result = database_write_handler(
-            {"table": "users", "operation": "drop"},
+            {"table": "users", "operation": "drop", "_schemas_config": _USERS},
             context=None,
         )
         data = json.loads(result)
@@ -823,7 +830,7 @@ class TestDatabaseWriteHandler:
 
     def test_insert_empty_data_returns_error(self):
         result = database_write_handler(
-            {"table": "users", "operation": "insert", "data": {}},
+            {"table": "users", "operation": "insert", "data": {}, "_schemas_config": _USERS},
             context=None,
         )
         data = json.loads(result)
@@ -832,7 +839,7 @@ class TestDatabaseWriteHandler:
 
     def test_delete_empty_where_returns_error(self):
         result = database_write_handler(
-            {"table": "users", "operation": "delete", "where": {}},
+            {"table": "users", "operation": "delete", "where": {}, "_schemas_config": _USERS},
             context=None,
         )
         data = json.loads(result)
@@ -841,7 +848,13 @@ class TestDatabaseWriteHandler:
 
     def test_update_empty_where_returns_error(self):
         result = database_write_handler(
-            {"table": "users", "operation": "update", "data": {"name": "Alice"}, "where": {}},
+            {
+                "table": "users",
+                "operation": "update",
+                "data": {"name": "Alice"},
+                "where": {},
+                "_schemas_config": _USERS,
+            },
             context=None,
         )
         data = json.loads(result)
@@ -854,6 +867,7 @@ class TestDatabaseWriteHandler:
                 "table": "users; DROP TABLE users--",
                 "operation": "insert",
                 "data": {"name": "Alice"},
+                "_schemas_config": _USERS,
             },
             context=None,
         )
@@ -867,11 +881,37 @@ class TestDatabaseWriteHandler:
                 "table": "users",
                 "operation": "insert",
                 "data": {"name; DROP TABLE users--": "Alice"},
+                "_schemas_config": _USERS,
             },
             context=None,
         )
         data = json.loads(result)
         assert data["success"] is False
+
+    def test_a_trailing_newline_is_not_part_of_an_identifier(self):
+        # "$" in a pattern also matches before a trailing newline.
+        result = database_write_handler(
+            {
+                "table": "users",
+                "operation": "insert",
+                "data": {"name\n": "Alice"},
+                "_caller": _SERVICE,
+                "_agent_id": _AGENT,
+                "_schemas_config": _USERS,
+            },
+            context=None,
+        )
+        assert json.loads(result) == {"success": False, "message": "Invalid column name: 'name\\n'"}
+        result = database_query_handler(
+            {
+                "query": "SELECT 1",
+                "_caller": _SERVICE,
+                "_agent_id": _AGENT,
+                "_schemas_config": {"public\n": ["users"]},
+            },
+            context=None,
+        )
+        assert json.loads(result) == {"error": "Invalid schema name: public\n"}
 
     def test_successful_insert_calls_db_session(self):
         mock_result = MagicMock()
@@ -887,6 +927,7 @@ class TestDatabaseWriteHandler:
                     "table": "items",
                     "_caller": _SERVICE,
                     "_agent_id": _AGENT,
+                    "_schemas_config": _ITEMS,
                     "operation": "insert",
                     "data": {"name": "widget"},
                 },
@@ -924,6 +965,7 @@ class TestDatabaseWriteHandler:
                     "table": "items",
                     "_caller": _SERVICE,
                     "_agent_id": _AGENT,
+                    "_schemas_config": _ITEMS,
                     "operation": "insert",
                     "data": {"id": 1, "name": "widget"},
                 },
@@ -962,6 +1004,7 @@ class TestDatabaseWriteHandler:
                     "table": "items",
                     "_caller": _SERVICE,
                     "_agent_id": _AGENT,
+                    "_schemas_config": _ITEMS,
                     "operation": "insert",
                     "data": {"id": 1},
                 },
@@ -995,6 +1038,7 @@ class TestDatabaseWriteHandler:
                     "table": "items",
                     "_caller": _SERVICE,
                     "_agent_id": _AGENT,
+                    "_schemas_config": _ITEMS,
                     "operation": "insert",
                     "data": {"id": 1, "name": "widget"},
                 },
@@ -1029,6 +1073,7 @@ class TestDatabaseWriteHandler:
                     "table": "items",
                     "_caller": _SERVICE,
                     "_agent_id": _AGENT,
+                    "_schemas_config": _ITEMS,
                     "operation": "insert",
                     "data": {"id": 1, "name": "widget"},
                 },

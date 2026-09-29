@@ -28,7 +28,7 @@ from unittest.mock import MagicMock, patch
 
 import jwt as pyjwt
 import pytest
-from flask import Blueprint, Flask, jsonify
+from flask import Blueprint, Flask, g, jsonify
 
 from agentic_project_service import auth
 from agentic_project_service import routes as routes_pkg
@@ -42,6 +42,8 @@ OTHER_USER_ID = "22222222-2222-4222-8222-222222222222"
 AGENT_ID = "3f9a1c2e-5b7d-4e11-9a3c-8d2f6b4e1a70"
 ORCH_ID = "4a8b2d3f-6c8e-4f22-8b4d-9e3a7c5f2b81"
 KB_ID = "5b9c3e4a-7d9f-4a33-9c5e-af4b8d6a3c92"
+# A user id with letters in it, so that its upper-case spelling differs.
+LETTERED_USER_ID = "aa1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
 
 
 # ---------------------------------------------------------------------------
@@ -96,44 +98,66 @@ def _full_app() -> Flask:
 # Inventory: deny-by-default, and the end-user list is exactly this
 # ---------------------------------------------------------------------------
 
-# Every route an end user's own JWT may call. Adding to this set is a security
-# decision: the route must scope everything it reads or changes to the caller.
-END_USER_ENDPOINTS = {
+# Every route an end user's own JWT may call, as (method, rule, endpoint).
+# Adding to this set is a security decision: the route must scope everything it
+# reads or changes to the caller. Keyed by method and rule, not by endpoint
+# alone, so a new URL or method mapped onto an allowed view is caught too.
+END_USER_ROUTES = {
     # Agent conversations. Sessions and runs are owned by the calling user.
-    "agents.list_sessions",
-    "agents.create_session_for_agent",
-    "agents.delete_session_for_agent",
-    "agents.run_agent",
-    "agents.run_agent_stream",
-    "agents.get_agent_run",
-    "agents.approve_run",
+    ("GET", "/api/agents/<agent_id>/sessions", "agents.list_sessions"),
+    ("POST", "/api/agents/<agent_id>/sessions", "agents.create_session_for_agent"),
+    ("DELETE", "/api/agents/<agent_id>/sessions/<session_id>", "agents.delete_session_for_agent"),
+    ("POST", "/api/agents/<agent_id>/run", "agents.run_agent"),
+    ("POST", "/api/agents/<agent_id>/run/stream", "agents.run_agent_stream"),
+    ("GET", "/api/agents/runs/<run_id>", "agents.get_agent_run"),
+    ("POST", "/api/agents/runs/<run_id>/approve", "agents.approve_run"),
     # Session reads/deletes, owner-only.
-    "sessions.get_session",
-    "sessions.get_messages",
-    "sessions.get_runs",
-    "sessions.get_run_retrieved_context_route",
-    "sessions.delete_session_route",
+    ("GET", "/api/sessions/<session_id>", "sessions.get_session"),
+    ("GET", "/api/sessions/<session_id>/messages", "sessions.get_messages"),
+    ("GET", "/api/sessions/<session_id>/runs", "sessions.get_runs"),
+    (
+        "GET",
+        "/api/sessions/<session_id>/runs/<run_id>/retrieved-context",
+        "sessions.get_run_retrieved_context_route",
+    ),
+    ("DELETE", "/api/sessions/<session_id>", "sessions.delete_session_route"),
     # Orchestration conversations, owner-only.
-    "orchestrations.list_orchestration_sessions",
-    "orchestrations.get_orchestration_session_messages",
-    "orchestrations.run_orchestration_stream",
-    "orchestrations.get_orchestration_run",
+    (
+        "GET",
+        "/api/orchestrations/<orch_id>/sessions",
+        "orchestrations.list_orchestration_sessions",
+    ),
+    (
+        "GET",
+        "/api/orchestrations/<orch_id>/sessions/<session_id>/messages",
+        "orchestrations.get_orchestration_session_messages",
+    ),
+    (
+        "POST",
+        "/api/orchestrations/<orch_id>/run/stream",
+        "orchestrations.run_orchestration_stream",
+    ),
+    ("GET", "/api/orchestrations/runs/<run_id>", "orchestrations.get_orchestration_run"),
 }
 
 # Routes that take no bearer at all because they authenticate some other way.
-UNAUTHENTICATED_ENDPOINTS = {
+UNAUTHENTICATED_ROUTES = {
     # Inbound webhooks: verified by the per-workflow webhook secret.
-    "webhooks.trigger_webhook",
+    ("POST", "/api/webhooks/<webhook_id>", "webhooks.trigger_webhook"),
     # Docs search for the in-project copilot: verified by X-Docs-Search-Token.
-    "internal_docs.docs_search",
+    ("POST", "/api/internal/docs/search", "internal_docs.docs_search"),
 }
 
+Route = tuple[str, str, str]
 
-def _api_endpoints(app: Flask) -> dict[str, object]:
+
+def _api_routes(app: Flask) -> dict[Route, object]:
+    """Every (method, rule, endpoint) under /api/, with the view it calls."""
     return {
-        rule.endpoint: app.view_functions[rule.endpoint]
+        (method, rule.rule, rule.endpoint): app.view_functions[rule.endpoint]
         for rule in app.url_map.iter_rules()
         if rule.rule.startswith("/api/") and rule.endpoint != "static"
+        for method in sorted(rule.methods - {"HEAD", "OPTIONS"})
     }
 
 
@@ -149,39 +173,39 @@ def served_app() -> Flask:
     return create_app(testing=True)
 
 
-def _inventory(*apps: Flask) -> dict[str, object]:
-    endpoints: dict[str, object] = {}
+def _inventory(*apps: Flask) -> dict[Route, object]:
+    routes: dict[Route, object] = {}
     for app in apps:
-        endpoints.update(_api_endpoints(app))
-    return endpoints
+        routes.update(_api_routes(app))
+    return routes
 
 
-def _undeclared(endpoints: dict[str, object]) -> list[str]:
+def _undeclared(routes: dict[Route, object]) -> list[Route]:
     return sorted(
-        name
-        for name, view in endpoints.items()
-        if getattr(view, "auth_mode", None) is None and name not in UNAUTHENTICATED_ENDPOINTS
+        route
+        for route, view in routes.items()
+        if getattr(view, "auth_mode", None) is None and route not in UNAUTHENTICATED_ROUTES
     )
 
 
-def _end_user(endpoints: dict[str, object]) -> set[str]:
-    return {name for name, view in endpoints.items() if getattr(view, "auth_mode", None) == "user"}
+def _end_user(routes: dict[Route, object]) -> set[Route]:
+    return {route for route, view in routes.items() if getattr(view, "auth_mode", None) == "user"}
 
 
 class TestRouteInventory:
     def test_every_api_route_declares_who_may_call_it(self, served_app):
         assert _undeclared(_inventory(served_app, _full_app())) == []
 
-    def test_end_user_routes_are_exactly_the_reviewed_list(self, served_app):
-        assert _end_user(_inventory(served_app, _full_app())) == END_USER_ENDPOINTS
+    def test_end_user_routes_are_exactly_the_allowed_list(self, served_app):
+        assert _end_user(_inventory(served_app, _full_app())) == END_USER_ROUTES
 
     def test_unauthenticated_list_names_real_routes(self, served_app):
         """A stale entry here would silently exempt a future route of that name."""
-        assert UNAUTHENTICATED_ENDPOINTS <= set(_inventory(served_app))
+        assert UNAUTHENTICATED_ROUTES <= set(_inventory(served_app))
 
     def test_served_app_has_every_blueprint_route(self, served_app):
         """A blueprint defined but never registered would pass the walk and never be served."""
-        assert set(_api_endpoints(_full_app())) <= set(_api_endpoints(served_app))
+        assert set(_api_routes(_full_app())) <= set(_api_routes(served_app))
 
     def test_catches_a_route_added_on_the_app_itself(self):
         from agentic_project_service.main import create_app
@@ -192,7 +216,7 @@ class TestRouteInventory:
         def debug_env():
             return jsonify({})
 
-        assert _undeclared(_inventory(app)) == ["debug_env"]
+        assert _undeclared(_inventory(app)) == [("GET", "/api/debug/env", "debug_env")]
 
     def test_catches_a_blueprint_mounted_under_api_by_its_registration(self):
         from agentic_project_service.main import create_app
@@ -210,9 +234,51 @@ class TestRouteInventory:
             return jsonify({})
 
         app.register_blueprint(extra, url_prefix="/api/extra")
-        endpoints = _inventory(app)
-        assert _undeclared(endpoints) == ["extra.dump"]
-        assert _end_user(endpoints) - END_USER_ENDPOINTS == {"extra.mine"}
+        routes = _inventory(app)
+        assert _undeclared(routes) == [("GET", "/api/extra/dump", "extra.dump")]
+        assert _end_user(routes) - END_USER_ROUTES == {("GET", "/api/extra/mine", "extra.mine")}
+
+    def test_catches_a_new_url_mapped_onto_an_end_user_view(self):
+        """The view scopes its own URL; a new URL for it is a new decision."""
+        from agentic_project_service.main import create_app
+
+        app = create_app(testing=True)
+        app.add_url_rule(
+            "/api/sessions/<session_id>/export",
+            endpoint="sessions.get_session",
+            view_func=app.view_functions["sessions.get_session"],
+        )
+        assert _end_user(_inventory(app)) - END_USER_ROUTES == {
+            ("GET", "/api/sessions/<session_id>/export", "sessions.get_session")
+        }
+
+    def test_catches_a_new_method_on_an_end_user_url(self):
+        from agentic_project_service.main import create_app
+
+        app = create_app(testing=True)
+        app.add_url_rule(
+            "/api/sessions/<session_id>",
+            endpoint="sessions.get_session",
+            view_func=app.view_functions["sessions.get_session"],
+            methods=["PATCH"],
+        )
+        assert _end_user(_inventory(app)) - END_USER_ROUTES == {
+            ("PATCH", "/api/sessions/<session_id>", "sessions.get_session")
+        }
+
+    def test_catches_a_new_url_mapped_onto_an_unauthenticated_view(self):
+        from agentic_project_service.main import create_app
+
+        app = create_app(testing=True)
+        app.add_url_rule(
+            "/api/webhooks/<webhook_id>/replay",
+            endpoint="webhooks.trigger_webhook",
+            view_func=app.view_functions["webhooks.trigger_webhook"],
+            methods=["POST"],
+        )
+        assert _undeclared(_inventory(app)) == [
+            ("POST", "/api/webhooks/<webhook_id>/replay", "webhooks.trigger_webhook")
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +305,11 @@ def _decorator_app() -> Flask:
         return jsonify(
             {"user": auth.get_current_user_id(), "service": auth.is_service_role_request()}
         )
+
+    @app.route("/claims-sub")
+    @auth.require_user_auth
+    def claims_sub():
+        return jsonify({"sub": g.jwt_payload.get("sub")})
 
     return app
 
@@ -292,6 +363,16 @@ class TestRequireUserAuth:
         with _authed_as_user(sub), _decorator_app().test_client() as c:
             resp = c.get("/mine", headers=HEADERS)
         assert resp.status_code == 401
+
+    def test_upper_case_sub_is_the_same_user(self):
+        """Owners are compared as canonical strings, so the id is normalised once, here."""
+        with _authed_as_user(LETTERED_USER_ID.upper()), _decorator_app().test_client() as c:
+            whoami = c.get("/whoami", headers=HEADERS)
+            claims = c.get("/claims-sub", headers=HEADERS)
+        assert whoami.status_code == 200
+        assert whoami.get_json()["user"] == LETTERED_USER_ID
+        # The tools act with these claims; they must name the same user.
+        assert claims.get_json() == {"sub": LETTERED_USER_ID}
 
     def test_service_role_needs_no_sub(self):
         with _authed_as_service_role(), _decorator_app().test_client() as c:
@@ -429,6 +510,32 @@ class TestRealTokens:
         with _decorator_app().test_client() as c:
             resp = c.get("/mine", headers=_bearer(_sign(_user_claims(sub="user-1"))))
         assert resp.status_code == 401
+
+    def test_token_without_exp_is_401(self):
+        """A token that never expires is not one GoTrue issues."""
+        with _decorator_app().test_client() as c:
+            resp = c.get("/mine", headers=_bearer(_sign(_user_claims(exp=None))))
+        assert resp.status_code == 401
+        assert "exp" in resp.get_json()["error"]
+
+    def test_token_with_a_non_numeric_exp_is_401(self):
+        with _decorator_app().test_client() as c:
+            resp = c.get("/mine", headers=_bearer(_sign(_user_claims(exp="never"))))
+        assert resp.status_code == 401
+
+    def test_upper_case_sub_is_the_same_user(self):
+        with _decorator_app().test_client() as c:
+            token = _sign(_user_claims(sub=LETTERED_USER_ID.upper()))
+            resp = c.get("/whoami", headers=_bearer(token))
+        assert resp.status_code == 200
+        assert resp.get_json() == {"user": LETTERED_USER_ID, "service": False}
+
+    def test_the_service_key_needs_no_exp(self):
+        """Project service keys are long-lived; only end-user tokens must expire."""
+        assert "exp" not in pyjwt.decode(SERVICE_KEY, options={"verify_signature": False})
+        with _decorator_app().test_client() as c:
+            resp = c.get("/admin", headers=_bearer(SERVICE_KEY))
+        assert resp.status_code == 200
 
     def test_expired_token_is_401(self):
         expired = _sign(_user_claims(exp=int(time.time()) - 60))
@@ -950,3 +1057,164 @@ class TestGetOrchestrationRunOwnership:
             resp = c.get("/api/orchestrations/runs/orun_1", headers=HEADERS)
         assert resp.status_code == 200, resp.get_data(as_text=True)
         assert resp.get_json()["run_id"] == "orun_1"
+
+    def test_service_role_sees_any_run(self):
+        """Including one in no session at all, which no end user could own."""
+        app = _app_with(orchestrations_route.orchestrations_bp)
+        run = MagicMock(session_id=None, run_id="orun_1", orchestration_id=None)
+        for column in ("status", "content", "events", "usage", "model", "error"):
+            setattr(run, column, None)
+        run.started_at = run.completed_at = None
+        with (
+            _authed_as_service_role(),
+            patch.object(orchestrations_route, "OrchestrationRunModel") as run_model,
+            patch.object(orchestrations_route, "AgentRun") as agent_run_model,
+            patch.object(orchestrations_route, "_load_tool_calls_for_runs", return_value={}),
+            app.test_client() as c,
+        ):
+            run_model.query.filter_by.return_value.first.return_value = run
+            agent_run_model.query.filter_by.return_value.all.return_value = []
+            resp = c.get("/api/orchestrations/runs/orun_1", headers=HEADERS)
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        assert resp.get_json()["run_id"] == "orun_1"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/orchestrations/<id>/sessions/<session_id>/messages — owner-only
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestrationSessionMessagesOwnership:
+    def _get(self, session_owner):
+        app = _app_with(orchestrations_route.orchestrations_bp)
+        with (
+            _authed_as_user(),
+            patch.object(orchestrations_route, "OrchestrationSessionModel") as session_model,
+            patch.object(orchestrations_route, "OrchestrationRunModel") as run_model,
+            app.test_client() as c,
+        ):
+            session_model.query.filter_by.return_value.first.return_value = MagicMock(
+                user_id=session_owner, id="s-uuid"
+            )
+            run_model.query.filter_by.side_effect = AssertionError("must not read the runs")
+            return c.get(f"/api/orchestrations/{ORCH_ID}/sessions/sess_x/messages", headers=HEADERS)
+
+    def test_ownerless_session_is_hidden_from_end_users(self):
+        """A backend-started session belongs to no end user."""
+        resp = self._get(None)
+        assert resp.status_code == 404
+        assert resp.get_json() == {"error": "Session not found"}
+
+    def test_other_users_session_is_hidden(self):
+        assert self._get(OTHER_USER_ID).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# A session_id is a string of at most 255 characters, checked before any query
+# ---------------------------------------------------------------------------
+
+BAD_SESSION_IDS = [
+    pytest.param(123, id="int"),
+    pytest.param({"a": 1}, id="dict"),
+    pytest.param(True, id="bool"),
+    pytest.param(["sess_a"], id="list"),
+    pytest.param(1.5, id="float"),
+    pytest.param("s" * 256, id="too-long"),
+]
+
+RUN_PATHS = [
+    f"/api/agents/{AGENT_ID}/run",
+    f"/api/agents/{AGENT_ID}/run/stream",
+    f"/api/orchestrations/{ORCH_ID}/run/stream",
+]
+
+
+def _untouchable_data_layer():
+    """Patches that fail the test if a route reads anything."""
+    touched = AssertionError("the route queried the database")
+    session = MagicMock()
+    session.execute.side_effect = touched
+    session.get.side_effect = touched
+    model = MagicMock()
+    model.query.filter_by.side_effect = touched
+    return (
+        patch.object(agents_route.db, "session", session),
+        patch.object(orchestrations_route, "OrchestrationSessionModel", model),
+        patch.object(sessions_route, "get_session_owner", side_effect=touched),
+    )
+
+
+class TestSessionIdShape:
+    @pytest.mark.parametrize("service", [False, True], ids=["end-user", "service-role"])
+    @pytest.mark.parametrize("path", RUN_PATHS)
+    @pytest.mark.parametrize("session_id", BAD_SESSION_IDS)
+    def test_run_routes_refuse_it_with_400(self, path, session_id, service):
+        app = _app_with(agents_route.agents_bp, orchestrations_route.orchestrations_bp)
+        db_patch, model_patch, _ = _untouchable_data_layer()
+        with (
+            _authed_as_service_role() if service else _authed_as_user(),
+            db_patch,
+            model_patch,
+            patch.object(agents_route.billing, "check_balance") as agent_balance,
+            patch.object(orchestrations_route.billing, "check_balance") as orch_balance,
+            app.test_client() as c,
+        ):
+            resp = c.post(path, headers=HEADERS, json={"message": "hi", "session_id": session_id})
+        assert resp.status_code == 400, resp.get_data(as_text=True)
+        assert "session_id" in resp.get_json()["error"]
+        agent_balance.assert_not_called()
+        orch_balance.assert_not_called()
+
+    @pytest.mark.parametrize("path", RUN_PATHS)
+    def test_255_characters_is_still_a_session_id(self, path):
+        """Positive control: the longest id the column holds gets past the check."""
+        app = _app_with(agents_route.agents_bp, orchestrations_route.orchestrations_bp)
+        app.testing = True  # let the sentinel propagate
+        with (
+            _authed_as_user(),
+            patch.object(agents_route.db, "session", MagicMock()),
+            patch.object(
+                agents_route.billing, "check_balance", side_effect=RuntimeError("past the check")
+            ),
+            patch.object(
+                orchestrations_route.billing,
+                "check_balance",
+                side_effect=RuntimeError("past the check"),
+            ),
+            patch.object(orchestrations_route, "_end_user_may_run_in_session", return_value=True),
+            app.test_client() as c,
+        ):
+            with pytest.raises(RuntimeError, match="past the check"):
+                c.post(path, headers=HEADERS, json={"message": "hi", "session_id": "s" * 255})
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            *[(m, p.replace("sess_a", "s" * 256)) for m, p in SESSION_ROUTES],
+            ("GET", f"/api/orchestrations/{ORCH_ID}/sessions/{'s' * 256}/messages"),
+            ("DELETE", f"/api/agents/{AGENT_ID}/sessions/{'s' * 256}"),
+        ],
+        ids=[
+            *[f"{m}-{p.replace(chr(47), '_')}" for m, p in SESSION_ROUTES],
+            "GET-orchestration-session-messages",
+            "DELETE-agent-session",
+        ],
+    )
+    @pytest.mark.parametrize("service", [False, True], ids=["end-user", "service-role"])
+    def test_session_routes_refuse_an_over_long_id_with_400(self, method, path, service):
+        app = _app_with(
+            agents_route.agents_bp,
+            orchestrations_route.orchestrations_bp,
+            sessions_route.sessions_bp,
+        )
+        db_patch, model_patch, owner_patch = _untouchable_data_layer()
+        with (
+            _authed_as_service_role() if service else _authed_as_user(),
+            db_patch,
+            model_patch,
+            owner_patch,
+            app.test_client() as c,
+        ):
+            resp = c.open(path, method=method, headers=HEADERS)
+        assert resp.status_code == 400, (method, path, resp.get_data(as_text=True))
+        assert "session_id" in resp.get_json()["error"]

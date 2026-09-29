@@ -212,7 +212,7 @@ class TestOperatorsAndCasts:
     @pytest.mark.parametrize(
         "sql",
         [
-            "SELECT a <-> b FROM t",
+            "SELECT a %> b FROM t",
             "SELECT a OPERATOR(public.=) 1 FROM t",
             "SELECT 1 FROM t ORDER BY a USING public.<",
         ],

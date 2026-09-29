@@ -193,3 +193,28 @@ class TestListOrchestrationSessionsScoping:
     def test_service_role_sees_every_session(self):
         _, session_model = _list_sessions(service=True)
         session_model.query.filter_by.return_value.filter_by.assert_not_called()
+
+
+def test_end_user_without_an_id_lists_nothing_even_when_ownerless_sessions_exist():
+    """Judged by the answer, not by how the query was built."""
+    app = Flask(__name__)
+    app.register_blueprint(orchestrations_route.orchestrations_bp)
+    with (
+        _as_user(),
+        patch.object(orchestrations_route, "get_current_user_id", return_value=None),
+        patch.object(orchestrations_route, "OrchestrationSessionModel") as session_model,
+        patch.object(orchestrations_route, "OrchestrationRunModel") as run_model,
+        app.test_client() as c,
+    ):
+        unfiltered = session_model.query.filter_by.return_value
+        # Unfiltered, the orchestration has one ownerless session; filtered by
+        # user_id=None it would be that same one.
+        ownerless = MagicMock(user_id=None, session_id="orch_sess_backend", created_at=None)
+        unfiltered.order_by.return_value.limit.return_value.all.return_value = [ownerless]
+        unfiltered.filter_by.return_value.order_by.return_value.limit.return_value.all.return_value = [
+            ownerless
+        ]
+        run_model.query.filter_by.return_value.all.return_value = []
+        resp = c.get(f"/api/orchestrations/{ORCH_ID}/sessions", headers=HEADERS)
+    assert resp.status_code == 200
+    assert resp.get_json() == {"sessions": [], "total": 0}

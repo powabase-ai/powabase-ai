@@ -14,6 +14,7 @@ exercised: that one by RLS, the JSON one by a direct read.
 """
 
 import json
+import threading
 import time
 import uuid
 
@@ -31,6 +32,7 @@ USER_B = "bbbbbbbb-0000-4000-8000-000000000002"
 
 
 def _user(sub, **claims):
+    claims = {"exp": int(time.time()) + 3600, **claims}
     return ToolCaller(
         claims={"sub": sub, "role": "authenticated", "aud": "authenticated", **claims},
         token="user-token",
@@ -96,6 +98,20 @@ def project_db(app):
                 GRANT SELECT ON public.agent_sql_secrets TO authenticated;
 
                 CREATE TABLE public."we""ird" (id int);
+
+                DROP MATERIALIZED VIEW IF EXISTS public.agent_sql_notes_snapshot;
+                CREATE MATERIALIZED VIEW public.agent_sql_notes_snapshot
+                  AS SELECT * FROM public.agent_sql_notes;
+                GRANT SELECT ON public.agent_sql_notes_snapshot TO authenticated;
+
+                DROP SCHEMA IF EXISTS agent_sql_other CASCADE;
+                CREATE SCHEMA agent_sql_other;
+                CREATE TABLE agent_sql_other.things (id int);
+
+                DROP TABLE IF EXISTS public.agent_sql_vectors;
+                CREATE TABLE public.agent_sql_vectors (id int, v vector(2));
+                INSERT INTO public.agent_sql_vectors VALUES (1, '[1,1]'), (2, '[1,2]'), (3, '[9,9]');
+                GRANT SELECT ON public.agent_sql_vectors TO authenticated;
                 """
             )
         )
@@ -104,6 +120,9 @@ def project_db(app):
         yield app
         db.session.execute(
             text(
+                "DROP SCHEMA IF EXISTS agent_sql_other CASCADE; "
+                "DROP TABLE IF EXISTS public.agent_sql_vectors; "
+                "DROP MATERIALIZED VIEW IF EXISTS public.agent_sql_notes_snapshot; "
                 "DROP VIEW IF EXISTS public.agent_sql_all_notes, public.agent_sql_own_notes; "
                 "DROP TABLE IF EXISTS public.agent_sql_notes, public.agent_sql_orders, "
                 'public.agent_sql_secrets, public."we""ird" CASCADE'
@@ -124,6 +143,17 @@ def _new_agent() -> str:
     return agent
 
 
+def _give_database_tool(agent: str, tables=("agent_sql_orders",)) -> None:
+    db.session.execute(
+        text(
+            "INSERT INTO ai.agent_tools (agent_id, tool_type, tool_name, config_override) "
+            "VALUES (:a, 'builtin', 'database_query', CAST(:c AS jsonb))"
+        ),
+        {"a": agent, "c": json.dumps({"schemas": {"public": list(tables)}})},
+    )
+    db.session.commit()
+
+
 def _forget_agent(agent: str) -> None:
     db.session.execute(text("DELETE FROM ai.agents WHERE id = :id"), {"id": agent})
     db.session.commit()
@@ -138,6 +168,28 @@ def agent_id(project_db):
         _forget_agent(agent)
 
 
+def _in_app_context(app, work):
+    with app.app_context():
+        work()
+
+
+def _statements_during(work) -> list[str]:
+    """Every statement (and its parameters) the service's engine sends while ``work`` runs."""
+    from sqlalchemy import event
+
+    seen: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        seen.append(f"{statement} {parameters!r}")
+
+    event.listen(db.engine, "before_cursor_execute", record)
+    try:
+        work()
+    finally:
+        event.remove(db.engine, "before_cursor_execute", record)
+    return seen
+
+
 def _query(caller, agent, sql, tables):
     return agent_sql.run_query(caller, agent, sql, {"public": tables})
 
@@ -150,7 +202,9 @@ def _raw(caller, agent, sql, schemas=("public",)):
 
 def _sync(agent, read=None, write=None):
     agent_sql.sync_agent_role(
-        agent, read_tables={"public": read} if read else {}, write_tables={"public": write} if write else {}
+        agent,
+        read_tables={"public": read} if read else {},
+        write_tables={"public": write} if write else {},
     )
 
 
@@ -415,7 +469,7 @@ class TestServiceRuns:
     def test_removing_a_table_revokes_it(self, agent_id):
         _sync(agent_id, read=["agent_sql_orders"])
         assert _raw(SERVICE, agent_id, "SELECT count(*) FROM agent_sql_orders") == [(2,)]
-        _sync(agent_id)
+        _sync(agent_id, read=["agent_sql_notes"])
         with pytest.raises(Exception, match="permission denied"):
             _raw(SERVICE, agent_id, "SELECT count(*) FROM agent_sql_orders")
 
@@ -428,13 +482,18 @@ class TestServiceRuns:
             "WHERE n.nspname = 'public' AND a.grantee = CAST(:r AS regrole))"
         )
         assert tuple(db.session.execute(granted, {"r": role}).one()) == (True, True)
-        _sync(agent_id)
+        # Keep the login, with its only table in another schema.
+        agent_sql.sync_agent_role(
+            agent_id, read_tables={"agent_sql_other": ["things"]}, write_tables={}
+        )
         assert tuple(db.session.execute(granted, {"r": role}).one()) == (False, False)
 
     def test_read_config_grants_no_writes(self, agent_id):
         _sync(agent_id, read=["agent_sql_orders"])
         with pytest.raises(Exception, match="permission denied"):
-            with agent_sql.agent_transaction(SERVICE, agent_id, ["public"], read_only=False) as conn:
+            with agent_sql.agent_transaction(
+                SERVICE, agent_id, ["public"], read_only=False
+            ) as conn:
                 conn.execute(text("DELETE FROM agent_sql_orders"))
 
     def test_write_config_can_insert_through_a_serial_column(self, agent_id):
@@ -489,20 +548,56 @@ class TestAgentLoginLifecycle:
         _sync(agent, read=["agent_sql_orders"])
         assert not _role_exists(agent_sql.agent_role_name(agent))
 
-    def test_reconcile_drops_logins_whose_agent_is_gone(self, project_db):
+    def test_reconcile_keeps_only_logins_of_agents_with_database_tools(self, project_db):
         kept = _new_agent()
         gone = _new_agent()
+        toolless = _new_agent()
         try:
-            for agent in (kept, gone):
+            _give_database_tool(kept)
+            for agent in (kept, gone, toolless):
                 _sync(agent, read=["agent_sql_orders"])
             db.session.execute(text("DELETE FROM ai.agents WHERE id = :id"), {"id": gone})
             db.session.commit()
             agent_sql.reconcile_agent_roles()
             assert _role_exists(agent_sql.agent_role_name(kept))
             assert not _role_exists(agent_sql.agent_role_name(gone))
+            assert not _role_exists(agent_sql.agent_role_name(toolless))
         finally:
             _forget_agent(kept)
+            _forget_agent(toolless)
             agent_sql.drop_agent_role(gone)
+
+    def test_reconcile_drops_the_retired_shared_login(self, project_db):
+        db.session.execute(text("CREATE ROLE powabase_agent_backend LOGIN"))
+        db.session.commit()
+        agent_sql.reconcile_agent_roles()
+        assert not _role_exists("powabase_agent_backend")
+
+    def test_an_agent_without_tables_gets_no_login(self, agent_id):
+        _sync(agent_id, read=["agent_sql_orders"])
+        _sync(agent_id)
+        assert not _role_exists(agent_sql.agent_role_name(agent_id))
+
+    def test_a_delete_during_a_sync_leaves_no_login(self, project_db):
+        """The delete holds the roles lock with the row gone; the sync waits, then sees it."""
+        agent = _new_agent()
+        deleting = db.engine.connect()
+        tx = deleting.begin()
+        try:
+            deleting.execute(text("DELETE FROM ai.agents WHERE id = :id"), {"id": agent})
+            agent_sql.drop_agent_role_in(deleting, agent)
+            sync = threading.Thread(
+                target=_in_app_context,
+                args=(project_db, lambda: _sync(agent, read=["agent_sql_orders"])),
+            )
+            sync.start()
+            time.sleep(0.5)  # the sync is now waiting on the lock
+            tx.commit()
+            sync.join(10)
+            assert not sync.is_alive()
+            assert not _role_exists(agent_sql.agent_role_name(agent))
+        finally:
+            deleting.close()
 
 
 # ---------------------------------------------------------------------------
@@ -534,3 +629,232 @@ class TestSessionAccessibleTo:
         finally:
             # End the read, or the between-tests TRUNCATE waits on its lock.
             db.session.rollback()
+
+
+# ---------------------------------------------------------------------------
+# Setting up logins never exposes the password; syncing is quiet and safe
+# ---------------------------------------------------------------------------
+
+
+class TestLoginSetupAndSync:
+    def test_the_password_is_never_in_a_statement(self, project_db):
+        password = db.engine.url.password
+        agent = _new_agent()
+        try:
+            _give_database_tool(agent)
+            sent = _statements_during(
+                lambda: (
+                    _sync(agent, read=["agent_sql_orders"]),
+                    agent_sql.ensure_login_roles(),
+                    agent_sql.reconcile_agent_roles(),
+                )
+            )
+            assert any("PASSWORD" in statement for statement in sent)
+            assert not [statement for statement in sent if password in statement]
+        finally:
+            _forget_agent(agent)
+
+    def test_an_unchanged_sync_writes_nothing(self, agent_id):
+        _sync(agent_id, read=["agent_sql_orders"], write=["agent_sql_notes"])
+        sent = _statements_during(
+            lambda: _sync(agent_id, read=["agent_sql_orders"], write=["agent_sql_notes"])
+        )
+        writes = [
+            s
+            for s in sent
+            if s.lstrip().upper().startswith(("GRANT", "REVOKE", "ALTER", "CREATE", "DROP"))
+        ]
+        assert writes == []
+
+    def test_concurrent_syncs_of_different_agents_all_succeed(self, project_db):
+        agents = [_new_agent() for _ in range(4)]
+        failures: list[BaseException] = []
+
+        def churn(agent, table):
+            for i in range(8):
+                try:
+                    _sync(agent, read=[table] if i % 2 else ["agent_sql_orders", table])
+                except BaseException as e:  # noqa: BLE001 - collected for the assertion
+                    failures.append(e)
+
+        try:
+            threads = [
+                threading.Thread(
+                    target=_in_app_context,
+                    args=(project_db, lambda a=a, t=t: churn(a, t)),
+                )
+                for a, t in zip(agents, ["agent_sql_notes", "agent_sql_secrets"] * 2, strict=True)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(60)
+            assert failures == []
+        finally:
+            for agent in agents:
+                _forget_agent(agent)
+
+    def test_reads_keep_working_while_the_same_config_is_resynced(self, agent_id):
+        _sync(agent_id, read=["agent_sql_orders"])
+        failures: list[BaseException] = []
+        stop = threading.Event()
+
+        def resync():
+            while not stop.is_set():
+                _sync(agent_id, read=["agent_sql_orders"])
+
+        worker = threading.Thread(target=_in_app_context, args=(_current_app(), resync))
+        worker.start()
+        try:
+            for _ in range(20):
+                try:
+                    _raw(SERVICE, agent_id, "SELECT count(*) FROM agent_sql_orders")
+                except BaseException as e:  # noqa: BLE001 - collected for the assertion
+                    failures.append(e)
+        finally:
+            stop.set()
+            worker.join(30)
+        assert failures == []
+
+    def test_revocations_stand_even_when_granting_fails(self, agent_id, monkeypatch):
+        _sync(agent_id, read=["agent_sql_orders"])
+        real_target = agent_sql._target_grants
+        calls = {"n": 0}
+
+        def fail_on_grant_phase(conn, desired):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("grant phase failed")
+            return real_target(conn, desired)
+
+        monkeypatch.setattr(agent_sql, "_target_grants", fail_on_grant_phase)
+        with pytest.raises(RuntimeError, match="grant phase"):
+            _sync(agent_id, read=["agent_sql_secrets"])
+        monkeypatch.undo()
+        with pytest.raises(Exception, match="permission denied"):
+            _raw(SERVICE, agent_id, "SELECT count(*) FROM agent_sql_orders")
+
+
+def _current_app():
+    from flask import current_app
+
+    return current_app._get_current_object()
+
+
+# ---------------------------------------------------------------------------
+# Queries people actually write, with pgvector installed in public
+# ---------------------------------------------------------------------------
+
+
+class TestEverydayQueries:
+    """pgvector defines public.sum(vector) and public.avg(vector): built-ins must still work."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT sum(total) AS s FROM agent_sql_orders",
+            "SELECT avg(total) AS a FROM agent_sql_orders",
+            "SELECT round(avg(total)::numeric, 2) AS a FROM agent_sql_orders",
+            "SELECT id % 2 AS k, sum(total) AS s FROM agent_sql_orders GROUP BY 1 ORDER BY 1",
+            "WITH t AS (SELECT sum(total) AS s FROM agent_sql_orders) SELECT s FROM t",
+            "SELECT count(DISTINCT total) AS n, max(total) AS m, min(total) AS l FROM agent_sql_orders",
+            "SELECT body FROM agent_sql_notes WHERE body LIKE 'a!%' ESCAPE '!'",
+            "SELECT body FROM agent_sql_notes WHERE body ILIKE 'A%' ORDER BY body",
+            "SELECT string_agg(body, ',' ORDER BY body) AS s FROM agent_sql_notes",
+            "SELECT body, rank() OVER (ORDER BY body) AS r FROM agent_sql_notes",
+            "SELECT coalesce(nullif(body, ''), 'x') AS b, CASE WHEN id > 1 THEN 1 ELSE 0 END AS c "
+            "FROM agent_sql_notes",
+            "SELECT date_trunc('day', now()) AS d, extract(year FROM now()) AS y",
+        ],
+    )
+    def test_accepted(self, agent_id, sql):
+        _sync(agent_id, read=["agent_sql_orders", "agent_sql_notes"])
+        _query(SERVICE, agent_id, sql, ["agent_sql_orders", "agent_sql_notes"])
+
+    def test_pgvector_distance_over_a_vector_column_is_accepted(self, agent_id):
+        rows = _query(
+            _user(USER_A),
+            agent_id,
+            "SELECT id FROM agent_sql_vectors "
+            "ORDER BY v <-> (SELECT v FROM agent_sql_vectors WHERE id = 1) LIMIT 2",
+            ["agent_sql_vectors"],
+        )
+        assert [r["id"] for r in rows] == [1, 2]
+
+    def test_casting_to_an_extension_type_is_rejected(self, agent_id):
+        with pytest.raises(AgentSqlRejected, match="vector"):
+            _query(
+                _user(USER_A),
+                agent_id,
+                "SELECT count(*) FROM agent_sql_vectors WHERE v <-> '[1,2]'::vector < 1",
+                ["agent_sql_vectors"],
+            )
+
+
+# ---------------------------------------------------------------------------
+# Only an installed extension's own operators; tables and invoker views only
+# ---------------------------------------------------------------------------
+
+
+class TestOperatorsAndRelationKinds:
+    def test_a_non_extension_operator_calling_a_builtin_is_rejected(self, agent_id):
+        db.session.execute(
+            text(
+                "CREATE OPERATOR public.= (LEFTARG = text, RIGHTARG = boolean, "
+                "FUNCTION = pg_catalog.current_setting)"
+            )
+        )
+        db.session.commit()
+        try:
+            with pytest.raises(AgentSqlRejected, match="Operator ="):
+                _query(
+                    _user(USER_A),
+                    agent_id,
+                    "SELECT CAST('search_path' AS text) = true AS v",
+                    ["agent_sql_notes"],
+                )
+        finally:
+            db.session.execute(text("DROP OPERATOR public.= (text, boolean)"))
+            db.session.commit()
+
+    def test_a_materialized_view_is_rejected_and_never_granted(self, agent_id):
+        with pytest.raises(AgentSqlRejected, match="agent_sql_notes_snapshot"):
+            _query(
+                _user(USER_A),
+                agent_id,
+                "SELECT body FROM agent_sql_notes_snapshot",
+                ["agent_sql_notes_snapshot"],
+            )
+        _sync(agent_id, read=["agent_sql_notes_snapshot"])
+        with pytest.raises(Exception, match="permission denied"):
+            _raw(SERVICE, agent_id, "SELECT count(*) FROM agent_sql_notes_snapshot")
+
+    @pytest.mark.parametrize(
+        ("target", "ok"),
+        [
+            ("agent_sql_notes", True),
+            ("agent_sql_own_notes", True),
+            ("agent_sql_all_notes", False),
+            ("agent_sql_notes_snapshot", False),
+        ],
+    )
+    def test_write_targets(self, agent_id, target, ok):
+        with agent_sql.agent_transaction(
+            _user(USER_A), agent_id, ["public"], read_only=True
+        ) as conn:
+            if ok:
+                agent_sql.check_write_target(conn, None, target)
+            else:
+                with pytest.raises(AgentSqlRejected, match=target):
+                    agent_sql.check_write_target(conn, "public", target)
+
+    def test_configuring_tables(self, project_db):
+        assert agent_sql.configured_tables_error({"public": ["agent_sql_notes", "not_yet"]}) is None
+        assert agent_sql.configured_tables_error({"public": ["agent_sql_own_notes"]}) is None
+        assert "agent_sql_all_notes" in agent_sql.configured_tables_error(
+            {"public": ["agent_sql_all_notes"]}
+        )
+        assert "agent_sql_notes_snapshot" in agent_sql.configured_tables_error(
+            {"public": ["agent_sql_notes_snapshot"]}
+        )
+        assert "auth" in agent_sql.configured_tables_error({"auth": ["users"]})

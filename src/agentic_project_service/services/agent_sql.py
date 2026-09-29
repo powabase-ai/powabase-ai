@@ -35,7 +35,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 
 from pglast import ast, parse_sql
@@ -44,6 +44,7 @@ from pglast.parser import ParseError
 from pglast.stream import RawStream
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import NullPool
 
 from ..db import AI_SCHEMA, db
@@ -169,8 +170,8 @@ ALLOWED_FUNCTIONS = frozenset(
         # text search (not ts_stat / ts_rewrite, which run a SQL string)
         "to_tsvector", "to_tsquery", "plainto_tsquery", "phraseto_tsquery",
         "websearch_to_tsquery", "ts_rank", "ts_rank_cd", "ts_headline", "setweight",
-        # misc
-        "gen_random_uuid", "num_nulls", "num_nonnulls",
+        # misc ("like_escape" is what LIKE ... ESCAPE calls)
+        "gen_random_uuid", "num_nulls", "num_nonnulls", "like_escape",
         # function-style casts to built-in types
         "int2", "int4", "int8", "float4", "float8", "text", "date", "timestamptz",
         "bool",
@@ -183,6 +184,8 @@ ALLOWED_OPERATORS = frozenset(
         "@", "&", "|", "#", "~", "<<", ">>",
         "~~", "!~~", "~~*", "!~~*", "!~", "~*", "!~*",
         "->", "->>", "#>", "#>>", "@>", "<@", "?", "?|", "?&", "&&", "@?", "@@", "#-",
+        # pgvector's distances; trusted only as an installed extension's own
+        "<->", "<=>", "<#>", "<+>",
     }
 )  # fmt: skip
 
@@ -340,20 +343,73 @@ def _walk(node, visible_ctes: tuple[frozenset[str], ...], parsed: ParsedSelect) 
 _LOGIN_ATTRIBUTES = "LOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION"
 _AGENT_ATTRIBUTES = "LOGIN NOSUPERUSER BYPASSRLS NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION"
 
+# Every change to the tool logins and their grants takes this one lock.
+# GRANT and REVOKE rewrite shared catalog rows (the schema's, the table's), so
+# two agents' syncs touching the same schema would otherwise collide.
+_ROLES_LOCK = "powabase_agent_roles"
+
+# Transient failures of catalog writes under concurrent DDL: "tuple
+# concurrently updated", deadlock, serialization failure.
+_RETRYABLE_SQLSTATES = frozenset({"XX000", "40P01", "40001"})
+
+# A login the tool logins replaced; dropped wherever it is found.
+_RETIRED_LOGINS = ("powabase_agent_backend",)
+
 # Whether this process set up the end-user login. Until it has, end-user
 # runs' database tools refuse rather than fail on a missing login.
 _user_login_ready = False
+_user_login_attempted_at = 0.0
+_USER_LOGIN_RETRY_SECONDS = 60.0
+
+
+def _lock_roles(conn: Connection) -> None:
+    conn.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(CAST(:k AS text)))"), {"k": _ROLES_LOCK}
+    )
+
+
+def _ddl(conn: Connection, statement: str) -> None:
+    """Run a statement with no parameters, so nothing in it is read as a placeholder."""
+    conn.exec_driver_sql(statement)
+
+
+def _untracked(conn: Connection) -> None:
+    """Keep this transaction's utility statements out of pg_stat_statements."""
+    if (
+        conn.execute(
+            text("SELECT current_setting('pg_stat_statements.track_utility', true)")
+        ).scalar()
+        is None
+    ):
+        return
+    conn.execute(text("SAVEPOINT agent_sql_untracked"))
+    try:
+        conn.execute(text("SET LOCAL pg_stat_statements.track_utility = off"))
+        conn.execute(text("RELEASE SAVEPOINT agent_sql_untracked"))
+    except Exception:
+        conn.execute(text("ROLLBACK TO SAVEPOINT agent_sql_untracked"))
 
 
 def _set_password(conn: Connection, role: str) -> None:
+    """Give ``role`` the service's database password, never sending it as text.
+
+    The statement carries a SCRAM verifier computed here, so the password
+    itself appears in no statement text, log line or pg_stat_statements row.
+    """
     password = db.engine.url.password
     if password is None:
+        logger.warning("The database URL has no password; the tool login %s gets none", role)
         return
+    driver = conn.connection.driver_connection
+    verifier = driver.pgconn.encrypt_password(
+        password.encode(), role.encode(), b"scram-sha-256"
+    ).decode()
+    _untracked(conn)
     statement = conn.execute(
-        text("SELECT format('ALTER ROLE %I PASSWORD %L', CAST(:r AS text), CAST(:p AS text))"),
-        {"r": role, "p": password},
+        text("SELECT format('ALTER ROLE %I PASSWORD %L', CAST(:r AS text), CAST(:v AS text))"),
+        {"r": role, "v": verifier},
     ).scalar_one()
-    conn.execute(text(statement))
+    _ddl(conn, statement)
 
 
 def _role_attributes_match(conn: Connection, role: str, bypass_rls: bool) -> bool | None:
@@ -370,14 +426,18 @@ def _role_attributes_match(conn: Connection, role: str, bypass_rls: bool) -> boo
     return tuple(row) == (True, False, bypass_rls, False, False, False, False)
 
 
-def _ensure_login(conn: Connection, role: str, attributes: str, bypass_rls: bool) -> None:
-    """Create the login, or correct its attributes only when they differ."""
+def _ensure_login(conn: Connection, role: str, attributes: str, bypass_rls: bool) -> bool:
+    """Create the login, or correct its attributes only when they differ.
+
+    Returns whether it was created; the caller sets its password then.
+    """
     matches = _role_attributes_match(conn, role, bypass_rls)
     if matches is None:
-        conn.execute(text(f"CREATE ROLE {_ident(role)} {attributes}"))
-    elif not matches:
-        conn.execute(text(f"ALTER ROLE {_ident(role)} {attributes}"))
-    _set_password(conn, role)
+        _ddl(conn, f"CREATE ROLE {_ident(role)} {attributes}")
+        return True
+    if not matches:
+        _ddl(conn, f"ALTER ROLE {_ident(role)} {attributes}")
+    return False
 
 
 def ensure_login_roles() -> None:
@@ -387,42 +447,66 @@ def ensure_login_roles() -> None:
     stack logs in with its own role and the shared database password; setting
     it on every boot follows a rotation.
     """
-    global _user_login_ready
+    global _user_login_ready, _user_login_attempted_at
+    _user_login_attempted_at = time.monotonic()
     with db.engine.begin() as conn:
-        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('powabase_agent_logins'))"))
+        _lock_roles(conn)
         _ensure_login(conn, USER_LOGIN, _LOGIN_ATTRIBUTES, bypass_rls=False)
-        if conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname = 'authenticated'")).first():
-            conn.execute(text(f"GRANT authenticated TO {_ident(USER_LOGIN)}"))
-        else:
+        _set_password(conn, USER_LOGIN)
+        if not conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname = 'authenticated'")).first():
             logger.warning(
                 "No 'authenticated' role in this database; agent tools cannot run for end users"
             )
             return
+        if not conn.execute(
+            text("SELECT pg_has_role(:login, 'authenticated', 'MEMBER')"), {"login": USER_LOGIN}
+        ).scalar():
+            _ddl(conn, f"GRANT authenticated TO {_ident(USER_LOGIN)}")
     _user_login_ready = True
 
 
+def _agents_with_database_tools(conn: Connection) -> set[str]:
+    rows = conn.execute(
+        text(
+            f"""
+            SELECT DISTINCT agent_id FROM "{AI_SCHEMA}".agent_tools
+            WHERE tool_type = 'builtin'
+              AND tool_name IN ('database_query', 'database_write')
+            """
+        )
+    ).scalars()
+    return {uuid.UUID(str(agent_id)).hex for agent_id in rows}
+
+
 def reconcile_agent_roles() -> None:
-    """Drop agent logins whose agent is gone; refresh the rest's passwords. Run at boot."""
+    """Keep agent logins only for agents that have database tools. Run at boot.
+
+    Drops the logins of agents that are gone or no longer have database tools
+    (and any retired login), and refreshes the rest's passwords, which follows
+    a rotation.
+    """
     with db.engine.connect() as conn:
+        if (
+            conn.execute(text(f"SELECT to_regclass('\"{AI_SCHEMA}\".agent_tools')")).scalar()
+            is None
+        ):
+            return  # migrations have not run yet in this database
         roles = [
             name
             for name in conn.execute(
                 text("SELECT rolname FROM pg_roles WHERE rolname LIKE 'powabase\\_agent\\_%'")
             ).scalars()
-            if _AGENT_ROLE_PATTERN.match(name)
+            if _AGENT_ROLE_PATTERN.match(name) or name in _RETIRED_LOGINS
         ]
-        agents = {
-            uuid.UUID(str(agent_id)).hex
-            for agent_id in conn.execute(text(f'SELECT id FROM "{AI_SCHEMA}".agents')).scalars()
-        }
+        keep = _agents_with_database_tools(conn)
     for role in roles:
-        agent_id = str(uuid.UUID(role.removeprefix(_AGENT_ROLE_PREFIX)))
         try:
-            if role.removeprefix(_AGENT_ROLE_PREFIX) in agents:
-                with db.engine.begin() as conn:
+            with db.engine.begin() as conn:
+                _lock_roles(conn)
+                if role.removeprefix(_AGENT_ROLE_PREFIX) in keep:
                     _set_password(conn, role)
-            else:
-                drop_agent_role(agent_id)
+                else:
+                    _drop_role(conn, role)
         except Exception:
             logger.exception("Could not reconcile the database login %s", role)
 
@@ -464,6 +548,130 @@ def _readable_relation(conn: Connection, schema: str, name: str) -> bool:
     )
 
 
+def configured_tables_error(schemas: dict[str, list[str]]) -> str | None:
+    """Why a database tool may not be configured with these tables, or None.
+
+    Tables that do not exist yet are fine: they are granted once they do.
+    """
+    with db.engine.connect() as conn:
+        for schema, names in (schemas or {}).items():
+            if _is_protected_schema(schema):
+                return f"Schema {schema} cannot be used by agent database tools"
+            for name in names or []:
+                exists = conn.execute(
+                    text("SELECT to_regclass(format('%I.%I', CAST(:s AS text), CAST(:t AS text)))"),
+                    {"s": schema, "t": name},
+                ).scalar()
+                if exists is not None and not _readable_relation(conn, schema, name):
+                    return (
+                        f"{schema}.{name} is not a table or a security_invoker view; agent "
+                        "database tools can use only those"
+                    )
+    return None
+
+
+def check_write_target(conn: Connection, schema: str | None, table: str) -> None:
+    """Refuse a write to anything but a table or a security_invoker view.
+
+    Resolved on ``conn`` as the write will resolve it. Other views run as
+    their owner, so a write through one is not held to the caller's RLS.
+    """
+    row = conn.execute(
+        text(
+            """
+            SELECT n.nspname, c.relname
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.oid = to_regclass(
+                CASE WHEN CAST(:s AS text) IS NULL THEN format('%I', CAST(:t AS text))
+                     ELSE format('%I.%I', CAST(:s AS text), CAST(:t AS text)) END)
+            """
+        ),
+        {"s": schema, "t": table},
+    ).first()
+    label = f"{schema}.{table}" if schema else table
+    if row is None:
+        raise AgentSqlRejected(f"Table {label} does not exist or is not available")
+    if not _readable_relation(conn, row[0], row[1]):
+        raise AgentSqlRejected(
+            f"{label} is not a table or a security_invoker view; agent database tools "
+            "can write only to those"
+        )
+
+
+def _current_grants(conn: Connection, role: str):
+    """What the role holds: table privileges, sequences, and schemas it may use."""
+    oid = conn.execute(text("SELECT oid FROM pg_roles WHERE rolname = :r"), {"r": role}).scalar()
+    tables: dict[tuple[str, str], set[str]] = {}
+    sequences: set[tuple[str, str]] = set()
+    for schema, name, kind, privileges in conn.execute(
+        text(
+            """
+            SELECT n.nspname, c.relname, c.relkind, array_agg(a.privilege_type)
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            CROSS JOIN LATERAL aclexplode(c.relacl) a
+            WHERE a.grantee = :oid
+            GROUP BY 1, 2, 3
+            """
+        ),
+        {"oid": oid},
+    ):
+        if kind == "S":
+            sequences.add((schema, name))
+        else:
+            tables[(schema, name)] = set(privileges)
+    schemas = set(
+        conn.execute(
+            text(
+                "SELECT n.nspname FROM pg_namespace n CROSS JOIN LATERAL aclexplode(n.nspacl) a "
+                "WHERE a.grantee = :oid"
+            ),
+            {"oid": oid},
+        ).scalars()
+    )
+    return tables, sequences, schemas
+
+
+def _target_grants(conn: Connection, desired: dict[tuple[str, str], set[str]]):
+    """The grants the role should hold, limited to relations that exist and qualify."""
+    tables = {
+        key: privileges for key, privileges in desired.items() if _readable_relation(conn, *key)
+    }
+    sequences: set[tuple[str, str]] = set()
+    for (schema, name), privileges in tables.items():
+        if "INSERT" not in privileges:
+            continue
+        sequences.update(
+            (row[0], row[1])
+            for row in conn.execute(
+                text(
+                    """
+                    SELECT sn.nspname, s.relname
+                    FROM pg_depend d
+                    JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+                    JOIN pg_namespace sn ON sn.oid = s.relnamespace
+                    JOIN pg_class t ON t.oid = d.refobjid
+                    JOIN pg_namespace n ON n.oid = t.relnamespace
+                    WHERE n.nspname = :s AND t.relname = :t AND d.deptype IN ('a', 'i')
+                    """
+                ),
+                {"s": schema, "t": name},
+            )
+        )
+    schemas = {schema for schema, _ in tables} | {schema for schema, _ in sequences}
+    return tables, sequences, schemas
+
+
+def _agent_exists(conn: Connection, agent_id: str) -> bool:
+    return (
+        conn.execute(
+            text(f'SELECT 1 FROM "{AI_SCHEMA}".agents WHERE id = CAST(:id AS uuid)'),
+            {"id": str(uuid.UUID(str(agent_id)))},
+        ).first()
+        is not None
+    )
+
+
 def sync_agent_role(
     agent_id: str,
     read_tables: dict[str, list[str]],
@@ -474,108 +682,100 @@ def sync_agent_role(
     ``read_tables`` get SELECT; ``write_tables`` get SELECT, INSERT, UPDATE and
     DELETE plus the sequences their columns draw from. Relations that do not
     exist, are not tables or security-invoker views, or sit in protected
-    schemas are skipped. Revocations commit first, in their own transaction,
-    so a failure later can only leave the login with less than it had. If the
-    agent no longer exists, its login is dropped instead. Raises on failure.
+    schemas are skipped. With no tables configured, or no agent any more, the
+    login is dropped instead: only agents with database tools have one.
+
+    Works from a diff against what the login holds, so an unchanged
+    configuration writes nothing. Revocations commit before grants, so a
+    failure in between can only leave the login with less. Retries transient
+    catalog conflicts; raises on failure.
     """
     role = agent_role_name(agent_id)
     desired = _desired_grants(read_tables, write_tables)
+    configured = any(names for names in (read_tables or {}).values()) or any(
+        names for names in (write_tables or {}).values()
+    )
+    for attempt in range(3):
+        try:
+            _sync_once(agent_id, role, desired, configured)
+            return
+        except DBAPIError as e:
+            sqlstate = getattr(getattr(e, "orig", None), "sqlstate", None)
+            if sqlstate not in _RETRYABLE_SQLSTATES or attempt == 2:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
-    with db.engine.begin() as conn:
-        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(CAST(:r AS text)))"), {"r": role})
-        agent_exists = conn.execute(
-            text(f'SELECT 1 FROM "{AI_SCHEMA}".agents WHERE id = CAST(:id AS uuid)'),
-            {"id": str(uuid.UUID(str(agent_id)))},
-        ).first()
-    if not agent_exists:
-        drop_agent_role(agent_id)
-        return
 
+def _sync_once(agent_id: str, role: str, desired, configured: bool) -> None:
     with db.engine.begin() as conn:
-        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(CAST(:r AS text)))"), {"r": role})
-        _ensure_login(conn, role, _AGENT_ATTRIBUTES, bypass_rls=True)
-        oid = conn.execute(text("SELECT oid FROM pg_roles WHERE rolname = :r"), {"r": role}).scalar()
-        granted = conn.execute(
-            text(
-                """
-                SELECT n.nspname, c.relname, c.relkind, array_agg(a.privilege_type)
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                CROSS JOIN LATERAL aclexplode(c.relacl) a
-                WHERE a.grantee = :oid
-                GROUP BY 1, 2, 3
-                """
-            ),
-            {"oid": oid},
-        ).all()
-        existing = {(s, t): set(p) for s, t, kind, p in granted if kind != "S"}
-        for (schema, name), privileges in existing.items():
-            extra = privileges - desired.get((schema, name), set())
+        _lock_roles(conn)
+        if not configured or not _agent_exists(conn, agent_id):
+            _drop_role(conn, role)
+            return
+        if _ensure_login(conn, role, _AGENT_ATTRIBUTES, bypass_rls=True):
+            _set_password(conn, role)
+        held_tables, held_sequences, held_schemas = _current_grants(conn, role)
+        want_tables, want_sequences, want_schemas = _target_grants(conn, desired)
+        for (schema, name), privileges in held_tables.items():
+            extra = privileges - want_tables.get((schema, name), set())
             if extra:
-                conn.execute(
-                    text(
-                        f"REVOKE {', '.join(sorted(extra))} ON TABLE "
-                        f"{_ident(schema)}.{_ident(name)} FROM {_ident(role)}"
-                    )
+                _ddl(
+                    conn,
+                    f"REVOKE {', '.join(sorted(extra))} ON TABLE "
+                    f"{_ident(schema)}.{_ident(name)} FROM {_ident(role)}",
                 )
-        for schema, name, kind, _ in granted:
-            if kind == "S":
-                conn.execute(
-                    text(
-                        f"REVOKE ALL ON SEQUENCE {_ident(schema)}.{_ident(name)} FROM {_ident(role)}"
-                    )
-                )
-        for (schema,) in conn.execute(
-            text(
-                "SELECT n.nspname FROM pg_namespace n CROSS JOIN LATERAL aclexplode(n.nspacl) a "
-                "WHERE a.grantee = :oid"
-            ),
-            {"oid": oid},
-        ):
-            conn.execute(text(f"REVOKE USAGE ON SCHEMA {_ident(schema)} FROM {_ident(role)}"))
-
-    with db.engine.begin() as conn:
-        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(CAST(:r AS text)))"), {"r": role})
-        for (schema, name), privileges in desired.items():
-            if not _readable_relation(conn, schema, name):
-                continue
-            conn.execute(text(f"GRANT USAGE ON SCHEMA {_ident(schema)} TO {_ident(role)}"))
-            conn.execute(
-                text(
-                    f"GRANT {', '.join(sorted(privileges))} ON TABLE "
-                    f"{_ident(schema)}.{_ident(name)} TO {_ident(role)}"
-                )
+        for schema, name in held_sequences - want_sequences:
+            _ddl(
+                conn, f"REVOKE ALL ON SEQUENCE {_ident(schema)}.{_ident(name)} FROM {_ident(role)}"
             )
-            if "INSERT" not in privileges:
-                continue
-            for (sequence,) in conn.execute(
-                text(
-                    """
-                    SELECT s.oid::regclass::text
-                    FROM pg_depend d
-                    JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
-                    JOIN pg_class t ON t.oid = d.refobjid
-                    JOIN pg_namespace n ON n.oid = t.relnamespace
-                    WHERE n.nspname = :s AND t.relname = :t AND d.deptype IN ('a', 'i')
-                    """
-                ),
-                {"s": schema, "t": name},
-            ):
-                conn.execute(text(f"GRANT USAGE ON SEQUENCE {sequence} TO {_ident(role)}"))
+        for schema in held_schemas - want_schemas:
+            _ddl(conn, f"REVOKE USAGE ON SCHEMA {_ident(schema)} FROM {_ident(role)}")
 
-
-def drop_agent_role(agent_id: str) -> None:
-    """Remove the agent's login and every grant it holds."""
-    role = agent_role_name(agent_id)
     with db.engine.begin() as conn:
-        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(CAST(:r AS text)))"), {"r": role})
-        if conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname = :r"), {"r": role}).first():
-            conn.execute(text(f"DROP OWNED BY {_ident(role)}"))
-            conn.execute(text(f"DROP ROLE {_ident(role)}"))
+        _lock_roles(conn)
+        if not _agent_exists(conn, agent_id):
+            _drop_role(conn, role)
+            return
+        held_tables, held_sequences, held_schemas = _current_grants(conn, role)
+        want_tables, want_sequences, want_schemas = _target_grants(conn, desired)
+        for schema in want_schemas - held_schemas:
+            _ddl(conn, f"GRANT USAGE ON SCHEMA {_ident(schema)} TO {_ident(role)}")
+        for (schema, name), privileges in want_tables.items():
+            missing = privileges - held_tables.get((schema, name), set())
+            if missing:
+                _ddl(
+                    conn,
+                    f"GRANT {', '.join(sorted(missing))} ON TABLE "
+                    f"{_ident(schema)}.{_ident(name)} TO {_ident(role)}",
+                )
+        for schema, name in want_sequences - held_sequences:
+            _ddl(conn, f"GRANT USAGE ON SEQUENCE {_ident(schema)}.{_ident(name)} TO {_ident(role)}")
+
+
+def _drop_role(conn: Connection, role: str) -> None:
+    if conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname = :r"), {"r": role}).first():
+        _ddl(conn, f"DROP OWNED BY {_ident(role)}")
+        _ddl(conn, f"DROP ROLE {_ident(role)}")
     with _engines_lock:
         engine = _engines.pop(role, None)
     if engine is not None:
         engine.dispose()
+
+
+def drop_agent_role_in(conn: Connection, agent_id: str) -> None:
+    """Drop the agent's login inside the caller's transaction.
+
+    For deleting an agent: taking the lock and deleting the agent row in the
+    same transaction means no sync can recreate the login in between.
+    """
+    _lock_roles(conn)
+    _drop_role(conn, agent_role_name(agent_id))
+
+
+def drop_agent_role(agent_id: str) -> None:
+    """Remove the agent's login and every grant it holds."""
+    with db.engine.begin() as conn:
+        drop_agent_role_in(conn, agent_id)
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +784,10 @@ def drop_agent_role(agent_id: str) -> None:
 
 _engines: dict[str, Engine] = {}
 _engines_lock = threading.Lock()
+
+# Agent logins connect per transaction, so cap how many this process opens at
+# once; the end-user login's pool caps itself.
+_agent_connection_slots = threading.BoundedSemaphore(8)
 
 
 def _engine(login: str) -> Engine:
@@ -596,12 +800,18 @@ def _engine(login: str) -> Engine:
         engine = _engines.get(login)
         if engine is None:
             url = db.engine.url.set(username=login)
+            connect_args = {"connect_timeout": 10}
             if login == USER_LOGIN:
                 engine = create_engine(
-                    url, pool_size=1, max_overflow=4, pool_pre_ping=True, pool_recycle=1800
+                    url,
+                    pool_size=1,
+                    max_overflow=4,
+                    pool_pre_ping=True,
+                    pool_recycle=1800,
+                    connect_args=connect_args,
                 )
             else:
-                engine = create_engine(url, poolclass=NullPool)
+                engine = create_engine(url, poolclass=NullPool, connect_args=connect_args)
             _engines[login] = engine
         return engine
 
@@ -632,10 +842,16 @@ def _set_claims(conn: Connection, claims) -> None:
 def _check_caller(caller: ToolCaller) -> None:
     if not caller.is_end_user:
         return
+    if not _user_login_ready and (
+        time.monotonic() - _user_login_attempted_at > _USER_LOGIN_RETRY_SECONDS
+    ):
+        try:
+            ensure_login_roles()
+        except Exception:
+            logger.exception("Could not set up the end-user tool login")
     if not _user_login_ready:
         raise AgentToolsUnavailable("Database tools are not set up for end users on this server")
-    expires = caller.claims.get("exp")
-    if isinstance(expires, (int, float)) and expires < time.time():
+    if caller.session_expired():
         raise AgentToolsUnavailable("The user's session has expired; ask them to sign in again")
 
 
@@ -651,14 +867,17 @@ def agent_transaction(
     """
     _check_caller(caller)
     login = USER_LOGIN if caller.is_end_user else agent_role_name(agent_id)
-    with _engine(login).connect() as conn, conn.begin():
+    slot = nullcontext() if caller.is_end_user else _agent_connection_slots
+    with slot, _engine(login).connect() as conn, conn.begin():
         if read_only:
             conn.execute(text("SET TRANSACTION READ ONLY"))
         conn.execute(text(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'"))
         conn.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
         if caller.is_end_user:
-            conn.execute(text("SET LOCAL ROLE authenticated"))
+            # Claims first, as the login, then the role: the identity is in
+            # place before anything runs as authenticated.
             _set_claims(conn, caller.claims)
+            conn.execute(text("SET LOCAL ROLE authenticated"))
         search_path = ", ".join(_ident(s) for s in schemas) or '""'
         conn.execute(text(f"SET LOCAL search_path TO {search_path}"))
         yield conn
@@ -712,6 +931,10 @@ def _check_references(
                     JOIN pg_namespace n ON n.oid = p.pronamespace
                     WHERE p.proname = ANY(:n) AND n.nspname = ANY(current_schemas(false))
                       AND n.nspname <> 'pg_catalog'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM pg_depend d
+                          WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid
+                            AND d.deptype = 'e')
                     """
                 ),
                 {"n": names},
@@ -726,22 +949,29 @@ def _check_references(
 
     operators = sorted(set(parsed.operators))
     if operators:
-        # An operator on the search path outside pg_catalog could win
-        # resolution for some operand types; one implemented in SQL or PL/pgSQL
-        # could run anything. Extension operators written in C are fine.
-        unsafe = conn.execute(
-            text(
-                """
+        # An operator on the search path outside pg_catalog can win resolution
+        # for some operand types, and its function can be anything — even a
+        # built-in such as current_setting. Only an installed extension's own
+        # operators (pgvector's distances, say) are trusted.
+        unsafe = (
+            conn.execute(
+                text(
+                    """
                 SELECT DISTINCT o.oprname FROM pg_operator o
                 JOIN pg_namespace n ON n.oid = o.oprnamespace
-                JOIN pg_proc p ON p.oid = o.oprcode
-                JOIN pg_language l ON l.oid = p.prolang
                 WHERE o.oprname = ANY(:ops) AND n.nspname = ANY(current_schemas(false))
-                  AND n.nspname <> 'pg_catalog' AND l.lanname NOT IN ('internal', 'c')
+                  AND n.nspname <> 'pg_catalog'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pg_depend d
+                      WHERE d.classid = 'pg_operator'::regclass AND d.objid = o.oid
+                        AND d.deptype = 'e')
                 """
-            ),
-            {"ops": operators},
-        ).scalars().all()
+                ),
+                {"ops": operators},
+            )
+            .scalars()
+            .all()
+        )
         if unsafe:
             raise AgentSqlRejected(f"Operator {unsafe[0]} is not allowed in this schema")
 

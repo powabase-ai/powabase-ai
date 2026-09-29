@@ -99,11 +99,14 @@ their own secret, every `/api` route takes a `Bearer` token. There are two kinds
 of caller:
 
 - **Service role** — the bearer is exactly `SERVICE_ROLE_KEY`. This is how the
-  dashboard and your own backend call the API. Every route is available.
+  dashboard and your own backend call the API. Every route that takes a bearer
+  is available.
 - **End user** — a JWT for a signed-in user of the project (audience
-  `authenticated`, signed with `JWT_SECRET`, with the user's id as `sub`). An
-  end user may only hold conversations, and only in *their own* sessions and
-  runs. These 16 routes are the whole list:
+  `authenticated`, signed with `JWT_SECRET`). It must carry the user's id, a
+  UUID, as `sub`, and an expiry as `exp`; a token without either answers `401`.
+  Tokens the project's Auth service issues always have both. An end user may
+  only hold conversations, and only in *their own* sessions and runs. These 16
+  routes are the whole list:
 
   | Method | Path | What an end user may do |
   |---|---|---|
@@ -125,11 +128,26 @@ of caller:
   | `GET` | `/api/orchestrations/runs/<run_id>` | read an orchestration run in their own session |
 
   There is no end-user route to create or delete an orchestration session: a
-  run creates one, and only the service role deletes them. A session, run or
-  paused run that is someone else's, or that a backend created without a
-  `user_id`, answers `404` as if it did not exist.
+  run creates one. No route deletes orchestration sessions at all, for any
+  caller; they stay in the database, also after their orchestration is deleted.
+  A session, run or paused run that is someone else's, or that a backend
+  created without a `user_id`, answers `404` as if it did not exist.
 
-Every other route answers an end user with `403` and
+  A `session_id`, in a run body or a path, must be a string of at most 255
+  characters; anything else answers `400`. An end user's run continues a session only if it
+  is their own session of the same agent or orchestration. The check is made
+  again when the run binds to the session, so a session that another user
+  creates with the same id while the run starts is refused too: the non-streamed
+  run answers `404`, and a streamed run ends with the event
+  `{"event": "error", "error": "Session not found"}`.
+
+  An end user may approve or reject only the paused runs they started
+  themselves. A run your backend started with the service role key has no
+  end-user owner, even when it runs in a session created with that user's
+  `user_id`, so only the service role key can approve it: relay the user's
+  decision from your backend.
+
+Every other route that takes a bearer answers an end user with `403` and
 `{"error": "This endpoint requires the project's service role key"}`.
 
 **Never ship `SERVICE_ROLE_KEY` to a browser or a mobile app.** Anyone who holds
@@ -150,14 +168,20 @@ To let users search particular knowledge bases, run the agent from your backend
 with the service role key, and pass `user_id` when creating the session so the
 conversation still belongs to that user.
 
-> **When your backend runs an agent for a user, its database tools do not act
-> as that user.** A run made with the service role key is a service-role run,
-> even in a session created with `user_id`: the agent's `database_query` and
-> `database_write` tools act as the agent's own database role, with grants on
-> the tables configured on its tools and RLS bypassed on those tables, not as
-> the session's user. Configure such an agent only with tables that every user
-> it runs for may see in full, or run agents that carry database tools with the
-> user's own JWT instead.
+> **When your backend runs an agent for a user, its data tools do not act as
+> that user.** A run made with the service role key is a service-role run, even
+> in a session created with `user_id`:
+>
+> - the agent's `database_query` and `database_write` tools act as the agent's
+>   own database role, with grants on the tables configured on its tools and
+>   RLS bypassed on those tables, not as the session's user;
+> - its `storage_read` and `storage_write` tools call Storage with the service
+>   role key, so they reach every bucket except the internal `sources` bucket,
+>   whatever your Storage policies say about the session's user.
+>
+> Configure such an agent only with tables and buckets that every user it runs
+> for may see in full, or run agents that carry data tools with the user's own
+> JWT instead.
 
 Without `SERVICE_ROLE_KEY` set, no caller is the service role. A request that
 bears the service role key is then decoded as an end-user token and answers
@@ -177,30 +201,54 @@ own database login:
 - **A service-role run** logs in as the agent's own database login, which holds
   grants on exactly the tables configured on the agent's database tools and
   bypasses RLS on those tables only. It is a member of no other role, so one
-  agent cannot take on another's grants.
+  agent cannot take on another's grants. Its storage tools use the service role
+  key (see the note above).
 
 Only plain tables, partitioned tables and views created `WITH
-(security_invoker = true)` may be configured. `database_query` accepts one
-`SELECT` over the configured tables that calls only an allowlist of built-in
-functions and operators and casts only to built-in types. Functions that change
-or read settings or run a SQL string, custom functions, operators written in SQL
-or PL/pgSQL in your schemas, and casts to domains are rejected. Every tool
-transaction has a 30-second statement timeout and a 5-second lock timeout.
+(security_invoker = true)` may be configured; assigning or updating a database
+tool whose configuration names a view without `security_invoker`, a
+materialized view or a foreign table answers `400`. A table that does not exist
+yet may be configured.
 
-The end-user login is `powabase_agent_user`; each agent's login is
-`powabase_agent_<agent id without dashes>`. The service creates them with its
-own database password, the end-user login at startup and an agent's login when
-its tools are configured or first run; none is a superuser. Deleting an agent
-drops its login, and startup removes any login whose agent is gone.
+`database_query` accepts one `SELECT` over the configured tables that calls only
+an allowlist of built-in functions and operators and casts only to built-in
+types. Functions that change or read settings or run a SQL string, custom
+functions, operators written in SQL or PL/pgSQL in your schemas, and casts to
+domains are rejected. The allowlists are fixed in the code and cannot be
+configured. Functions and operators that extensions add are generally not on
+them: pgvector's distance operators `<->`, `<=>`, `<#>` and `<+>` are accepted
+when they belong to an installed extension, but other extension functions and
+operators, such as those of pg_trgm or PostGIS, are rejected. A rejected query
+returns an error naming what was refused, in one of these shapes:
+
+```text
+Function <name> is not allowed: only a fixed set of built-in functions may be called
+Operator <operator> is not allowed
+```
+
+Every tool transaction has a 30-second statement timeout and a 5-second lock
+timeout. That applies to service-role runs as well as end users' runs, whatever
+timeout the `authenticated` role has elsewhere.
+
+The end-user login is `powabase_agent_user`. Each agent that has a database
+tool gets its own login, `powabase_agent_<agent id without dashes>`; an agent
+without database tools gets none. The service creates them with its own
+database password, the end-user login at startup and an agent's login when its
+database tools are configured or it is first run with them; none is a
+superuser. Deleting an agent drops its login, and startup removes any login
+whose agent is gone.
 
 Postgres also runs some functions implicitly, such as a domain's `CHECK` when a
 value is written or the equality operator of a column's own type when a query
 groups or joins on it. Configure agents only with tables whose column types you
 trust.
 
-The storage tools accept bucket names matching `^[A-Za-z0-9_-]+$` and paths
-without `.` or `..` segments or `%`. The internal `sources` bucket, which holds
-the original files of ingested sources, is never reachable from a tool.
+The storage tools accept bucket names matching `^[A-Za-z0-9_-]+$`, which is
+stricter than Storage itself (a bucket whose name has a `.` or a space cannot be
+used from a tool). Each `/`-separated part of a path must be a name: not empty,
+`.` or `..`, and without `%`, `\`, `?`, `#` or control characters. The internal
+`sources` bucket, which holds the original files of ingested sources, is never
+reachable from a tool.
 
 ## API Endpoints
 

@@ -12,6 +12,7 @@ tests/test_agent_sql_store.py.
 """
 
 import json
+import time
 import types
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
@@ -33,7 +34,10 @@ from agentic_project_service.tools.builtin import (
 )
 
 AGENT_ID = "3f9a1c2e-5b7d-4e11-9a3c-8d2f6b4e1a70"
-USER = ToolCaller(claims={"sub": "user-1", "role": "authenticated"}, token="user-jwt")
+USER = ToolCaller(
+    claims={"sub": "user-1", "role": "authenticated", "exp": time.time() + 3600},
+    token="user-jwt",
+)
 SERVICE = ToolCaller.service()
 SCHEMAS = {"public": ["customers"]}
 
@@ -81,6 +85,18 @@ class TestDatabaseQuery:
         assert "error" in result
         run.assert_not_called()
 
+    @pytest.mark.parametrize("caller", [USER, SERVICE], ids=["end-user", "service"])
+    def test_no_configured_tables_says_so(self, caller):
+        with patch.object(builtin.agent_sql, "run_query") as run:
+            result = json.loads(
+                database_query_handler(_query_args(caller, _schemas_config={}), None)
+            )
+        assert result == {"error": builtin._NO_TABLES_MESSAGE}
+        assert builtin._NO_TABLES_MESSAGE == (
+            "No tables are configured on this agent's database tool"
+        )
+        run.assert_not_called()
+
     def test_a_caller_the_model_supplies_is_not_trusted(self):
         """Tool arguments come from the model; only the loader's injection counts."""
         args = _query_args(None)
@@ -107,17 +123,31 @@ def _fake_transaction(conn):
     return transaction, calls
 
 
+def _check_write_target(**kwargs):
+    """Stand in for agent_sql.check_write_target (the database-side check is
+    pinned in tests/test_agent_sql_store.py)."""
+    return patch.object(builtin.agent_sql, "check_write_target", create=True, **kwargs)
+
+
+WRITES = {
+    "insert": {"data": {"name": "widget"}},
+    "update": {"data": {"name": "widget"}, "where": {"id": 7}},
+    "delete": {"where": {"id": 7}},
+}
+
+
 class TestDatabaseWrite:
-    def _args(self, caller):
+    def _args(self, caller, operation="insert", table="customers", **extra):
         return {
-            "table": "customers",
-            "operation": "insert",
-            "data": {"name": "widget"},
+            "table": table,
+            "operation": operation,
+            **WRITES[operation],
             "_caller": caller,
             "_agent_id": AGENT_ID,
             "_schemas_config": SCHEMAS,
             "_allowed_schemas": ["public"],
             "_allowed_tables": {"customers"},
+            **extra,
         }
 
     def test_writes_in_a_caller_transaction(self):
@@ -125,11 +155,68 @@ class TestDatabaseWrite:
         conn.execute.return_value.rowcount = 1
         conn.execute.return_value.__iter__.return_value = iter([])
         transaction, calls = _fake_transaction(conn)
-        with patch.object(builtin.agent_sql, "agent_transaction", transaction):
+        with (
+            patch.object(builtin.agent_sql, "agent_transaction", transaction),
+            _check_write_target(),
+        ):
             result = json.loads(database_write_handler(self._args(USER), None))
         assert result["success"] is True
         assert calls == [(USER, AGENT_ID, ["public"], False)]
         assert any("INSERT INTO" in str(c.args[0]) for c in conn.execute.call_args_list)
+
+    @pytest.mark.parametrize("operation", list(WRITES))
+    @pytest.mark.parametrize("table", ["customers", "public.customers"])
+    @pytest.mark.parametrize("caller", [USER, SERVICE], ids=["end-user", "service"])
+    def test_the_target_is_checked_in_the_transaction_before_writing(
+        self, caller, table, operation
+    ):
+        """What the name resolves to (a table, or an owner-rights view that
+        would skip the caller's row policies) is only known inside the
+        caller's transaction, so it is checked there, before any statement."""
+        events = []
+        conn = MagicMock()
+        conn.execute.side_effect = lambda *a, **k: (
+            events.append("execute") or MagicMock(rowcount=1, __iter__=lambda self: iter([]))
+        )
+        transaction, calls = _fake_transaction(conn)
+
+        def check(c, schema, name):
+            events.append(("check", c is conn, schema, name, len(calls)))
+
+        with (
+            patch.object(builtin.agent_sql, "agent_transaction", transaction),
+            _check_write_target(side_effect=check),
+        ):
+            result = json.loads(database_write_handler(self._args(caller, operation, table), None))
+        assert result["success"] is True
+        assert events[0] == ("check", True, "public", "customers", 1)
+        assert events.count("execute") >= 1
+        assert [e for e in events if e != "execute"] == [events[0]]
+
+    @pytest.mark.parametrize("operation", list(WRITES))
+    def test_a_rejected_target_is_reported_and_nothing_is_written(self, operation):
+        conn = MagicMock()
+        transaction, _ = _fake_transaction(conn)
+        rejection = AgentSqlRejected(
+            "customers is a view that does not run as the caller; it cannot be written to"
+        )
+        with (
+            patch.object(builtin.agent_sql, "agent_transaction", transaction),
+            _check_write_target(side_effect=rejection),
+        ):
+            result = json.loads(database_write_handler(self._args(USER, operation), None))
+        assert result == {"success": False, "message": str(rejection)}
+        conn.execute.assert_not_called()
+
+    @pytest.mark.parametrize("operation", list(WRITES))
+    @pytest.mark.parametrize("caller", [USER, SERVICE], ids=["end-user", "service"])
+    def test_no_configured_tables_says_so(self, caller, operation):
+        with patch.object(builtin.agent_sql, "agent_transaction") as transaction:
+            result = json.loads(
+                database_write_handler(self._args(caller, operation, _schemas_config={}), None)
+            )
+        assert result == {"success": False, "message": builtin._NO_TABLES_MESSAGE}
+        transaction.assert_not_called()
 
     def test_a_database_error_is_reported(self):
         class _RlsViolation(psycopg.errors.InsufficientPrivilege):

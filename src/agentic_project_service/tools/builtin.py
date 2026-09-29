@@ -26,11 +26,12 @@ from ..services.tool_caller import ToolCaller
 
 logger = logging.getLogger(__name__)
 
-_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
+# Matched against the whole name: "$" would also match before a trailing newline.
+_IDENTIFIER_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]{0,63}")
 
 
 def _validate_identifier(name, label="identifier"):
-    if not _IDENTIFIER_RE.match(name):
+    if not _IDENTIFIER_RE.fullmatch(name):
         raise ValueError(f"Invalid {label}: {name!r}")
 
 
@@ -337,6 +338,7 @@ def _resolve_table(table, schemas_config):
 
 
 _NO_CALLER_MESSAGE = "This tool is not available here: the run does not say who it acts for"
+_NO_TABLES_MESSAGE = "No tables are configured on this agent's database tool"
 
 
 def _pop_caller(arguments) -> ToolCaller | None:
@@ -353,20 +355,45 @@ _DB_TOOL_FAILED = "The database tool failed; the error has been logged"
 # 57014 (query_canceled, e.g. a statement timeout) is about the query.
 _SERVER_SQLSTATE_CLASSES = frozenset({"08", "28", "53", "57", "58", "F0", "XX"})
 
+# Query errors that point at the deployment rather than the model's query:
+# a missing grant (the login's grants have drifted from the tool's tables, or
+# an end user's policies refuse the row), and the statement or lock timeouts.
+# Their primary messages name only a relation, never a value from a row.
+_OPERATOR_SQLSTATES = {
+    "42501": "was refused a permission",
+    "57014": "timed out",
+    "55P03": "timed out waiting for a lock",
+}
+
 
 def _database_error_message(exc: Exception, agent_id) -> str:
-    """What a database tool tells the model about ``exc``.
+    """What a database tool tells the model about ``exc``, which is logged.
 
     A rejection is shown as is. An error in the query itself is reduced to the
     database's primary message: never the SQL text, its parameters or
-    SQLAlchemy's wrapper. Anything else is logged and replaced.
+    SQLAlchemy's wrapper. Anything else is logged and replaced. Nothing logged
+    here carries the SQL, its parameters or a message that could quote them.
     """
     if isinstance(exc, AgentSqlRejected):
+        logger.info("Database tool for agent %s refused: %s", agent_id, exc)
         return str(exc)
     if isinstance(exc, DBAPIError) and isinstance(exc.orig, psycopg.Error):
         sqlstate = exc.orig.sqlstate or ""
         primary = exc.orig.diag.message_primary
         if primary and (sqlstate == "57014" or sqlstate[:2] not in _SERVER_SQLSTATE_CLASSES):
+            if sqlstate in _OPERATOR_SQLSTATES:
+                logger.warning(
+                    "Database tool for agent %s %s (SQLSTATE %s): %s",
+                    agent_id,
+                    _OPERATOR_SQLSTATES[sqlstate],
+                    sqlstate,
+                    primary,
+                )
+            else:
+                # Its message can quote a value from the row, so only the code.
+                logger.info(
+                    "Database tool for agent %s: query error (SQLSTATE %s)", agent_id, sqlstate
+                )
             return primary
     logger.exception("Database tool failed for agent %s", agent_id)
     return _DB_TOOL_FAILED
@@ -384,8 +411,8 @@ def database_write_handler(arguments, context):
     operation = arguments.get("operation", "")
     data = arguments.get("data") or {}
     where = arguments.get("where") or {}
-    allowed_schemas = arguments.pop("_allowed_schemas", ["public"])
-    allowed_tables = arguments.pop("_allowed_tables", None)
+    arguments.pop("_allowed_schemas", None)
+    arguments.pop("_allowed_tables", None)
     schemas_config = arguments.pop("_schemas_config", {})
 
     # Validate operation early
@@ -398,37 +425,16 @@ def database_write_handler(arguments, context):
         )
 
     # Resolve table name (supports both "table" and "schema.table")
-    if schemas_config:
-        schema, table, err = _resolve_table(original_table, schemas_config)
-        if err:
-            return json.dumps({"success": False, "message": err})
-    else:
-        # Fallback to legacy flat set check
-        table = original_table
-        schema = None
-        if "." in table:
-            parts = table.split(".", 1)
-            schema, table = parts[0], parts[1]
-            # Validate schema is in the allowed list
-            if schema not in allowed_schemas:
-                return json.dumps(
-                    {
-                        "success": False,
-                        "message": f"Schema '{schema}' is not allowed. Allowed schemas: {sorted(allowed_schemas)}",
-                    }
-                )
-        if allowed_tables is not None and table not in allowed_tables:
-            return json.dumps(
-                {
-                    "success": False,
-                    "message": f"Table '{original_table}' is not in the configured access list. Available: {sorted(allowed_tables)}",
-                }
-            )
+    if not schemas_config:
+        return json.dumps({"success": False, "message": _NO_TABLES_MESSAGE})
+    schema, table, err = _resolve_table(original_table, schemas_config)
+    if err:
+        return json.dumps({"success": False, "message": err})
 
     # Defense-in-depth: validate schema names
-    effective_schemas = [schema] if schema else allowed_schemas
+    effective_schemas = [schema]
     for s in effective_schemas:
-        if not _IDENTIFIER_RE.match(s):
+        if not _IDENTIFIER_RE.fullmatch(s):
             return json.dumps({"success": False, "message": f"Invalid schema name: {s}"})
 
     # Normalize data: accept single object or array of objects for batch insert
@@ -503,6 +509,10 @@ def database_write_handler(arguments, context):
         with agent_sql.agent_transaction(
             caller, agent_id, effective_schemas, read_only=False
         ) as conn:
+            # What the name resolves to is only known here, on the caller's
+            # search path: a view that runs as its owner would skip the
+            # caller's row policies, so it is refused before any write.
+            agent_sql.check_write_target(conn, schema, table)
             total_affected = _run_write(conn, operation, table, rows, where, effective_schemas)
         return json.dumps(
             {
@@ -599,15 +609,18 @@ def database_query_handler(arguments, context):
 
     # Defense-in-depth: validate schema names
     for s in schemas_config:
-        if not _IDENTIFIER_RE.match(s):
+        if not _IDENTIFIER_RE.fullmatch(s):
             return json.dumps({"error": f"Invalid schema name: {s}"})
 
-    if caller is None or agent_id is None or not schemas_config:
+    if not schemas_config:
+        return json.dumps({"error": _NO_TABLES_MESSAGE})
+    if caller is None or agent_id is None:
         return json.dumps({"error": _NO_CALLER_MESSAGE})
 
     try:
         rows = agent_sql.run_query(caller, agent_id, sql, schemas_config)
     except Exception as e:
+        logger.debug("Database tool query for agent %s failed: %s", agent_id, sql)
         return json.dumps({"error": _database_error_message(e, agent_id)})
     return json.dumps(rows, default=str)[:50000]
 
@@ -672,9 +685,10 @@ def code_execute_handler(arguments, context):
         return json.dumps({"error": f"Sandbox unavailable: {e}"})
 
 
-# A bucket name the tools accept. Anything else (a slash, a dot segment, an
-# escape) could name a different bucket once the URL is resolved.
-_BUCKET_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# A bucket name the tools accept, matched against the whole name (``$`` would
+# also match before a trailing newline). Anything else (a slash, a dot
+# segment, an escape) could name a different bucket once the URL is resolved.
+_BUCKET_RE = re.compile(r"[A-Za-z0-9_-]+")
 _UNSAFE_PATH_CHARS = frozenset("%\\?#")
 
 _STORAGE_TOOL_FAILED = "The storage tool failed; the error has been logged"
@@ -687,7 +701,7 @@ def _storage_target_error(bucket, path, *, prefix: bool = False) -> str | None:
     free of ``%``, ``\\``, ``?``, ``#`` and control characters. A list
     ``prefix`` may be empty, or end with ``/``; an object path may not.
     """
-    if not isinstance(bucket, str) or not _BUCKET_RE.match(bucket):
+    if not isinstance(bucket, str) or not _BUCKET_RE.fullmatch(bucket):
         return "bucket must be a bucket name (letters, digits, '-' and '_')"
     if bucket.lower() == SOURCES_BUCKET:
         return f"The '{SOURCES_BUCKET}' bucket is internal and not available to agents"
@@ -711,25 +725,78 @@ def _storage_target_error(bucket, path, *, prefix: bool = False) -> str | None:
     return None
 
 
+# Sub-delimiters and ":"/"@" are left as they are, as httpx and the Supabase
+# clients send them: storage-api signs a key as the request path spells it, so
+# a signed URL made from an encoded "+" or "&" would not verify. None of them
+# is URL syntax inside a path segment, and "%", "?", "#", a backslash and dot
+# segments never get this far (see _storage_target_error).
+_PATH_SEGMENT_SAFE = "!$&'()*+,=:@"
+
+
 def _encode_object_path(path: str) -> str:
-    """``path`` with each segment percent-encoded, for an object URL.
+    """``path`` with each segment percent-encoded where needed, for an object URL.
 
     Storage decodes it back to the same key; nothing in it can be read as URL
-    syntax on the way.
+    syntax on the way. ``;`` is encoded, since some servers read it as a path
+    parameter.
     """
-    return "/".join(quote(segment, safe="") for segment in path.split("/"))
+    return "/".join(quote(segment, safe=_PATH_SEGMENT_SAFE) for segment in path.split("/"))
 
 
-def _storage_error_message(operation: str, exc: Exception) -> str:
-    """What a storage tool tells the model: the HTTP status if Storage answered,
-    never the response body or an internal URL. The details are logged."""
-    logger.exception("storage_%s failed", operation)
-    status = exc.status_code if isinstance(exc, StorageError) else None
-    if status == 404:
-        return f"Storage {operation} failed: not found (HTTP 404)"
-    if status:
-        return f"Storage {operation} failed (HTTP {status})"
+_SESSION_EXPIRED_MESSAGE = "The user's session has expired; ask them to sign in again"
+
+# What a storage refusal means to the model, by the status Storage reports.
+_STORAGE_REFUSALS = {404: "not found", 403: "access denied"}
+
+
+def _storage_error_message(
+    operation: str, exc: Exception, caller, bucket, path, agent_id=None
+) -> str:
+    """What a storage tool tells the model: what Storage reported, never the
+    response body or an internal URL. The details are logged."""
+    if isinstance(exc, StorageError) and exc.status_code:
+        refusal = _STORAGE_REFUSALS.get(exc.reported_status)
+        if refusal:
+            # An everyday answer (a wrong name, the caller's storage policies),
+            # not a fault in the deployment.
+            logger.info(
+                "storage_%s for %r (agent %s) refused (status %s): bucket=%r path=%r",
+                operation,
+                caller,
+                agent_id,
+                exc.reported_status,
+                bucket,
+                path,
+            )
+            return f"Storage {operation} failed: {refusal}"
+        logger.exception(
+            "storage_%s for %r (agent %s) failed (HTTP %s): bucket=%r path=%r",
+            operation,
+            caller,
+            agent_id,
+            exc.status_code,
+            bucket,
+            path,
+        )
+        return f"Storage {operation} failed (HTTP {exc.status_code})"
+    logger.exception(
+        "storage_%s for %r (agent %s) failed: bucket=%r path=%r",
+        operation,
+        caller,
+        agent_id,
+        bucket,
+        path,
+    )
     return _STORAGE_TOOL_FAILED
+
+
+def _expired_session_error(caller: ToolCaller, operation: str) -> str | None:
+    """The refusal for an end user whose session is over, or None. storage-api
+    itself answers an expired token as if the bucket did not exist."""
+    if not caller.session_expired():
+        return None
+    logger.info("storage_%s for %r refused: the session has expired", operation, caller)
+    return _SESSION_EXPIRED_MESSAGE
 
 
 def _storage_for(caller: ToolCaller):
@@ -740,12 +807,16 @@ def _storage_for(caller: ToolCaller):
 def storage_read_handler(arguments, context):
     """List objects in a bucket prefix or download a file from project storage."""
     caller = _pop_caller(arguments)
+    agent_id = arguments.pop("_agent_id", None)
     if caller is None:
         return json.dumps({"error": _NO_CALLER_MESSAGE})
     operation = arguments.get("operation", "")
     bucket = arguments.get("bucket", "")
     path = arguments.get("path", "") or ""
 
+    expired = _expired_session_error(caller, "read")
+    if expired:
+        return json.dumps({"error": expired})
     if not bucket:
         return json.dumps({"error": "bucket is required"})
 
@@ -763,10 +834,12 @@ def storage_read_handler(arguments, context):
                 json={"prefix": path, "limit": 1000, "offset": 0},
             )
             if response.status_code != 200:
-                raise StorageError(f"Failed to list objects: {response.text}", response.status_code)
+                raise StorageError.from_response("Failed to list objects", response)
             return json.dumps({"bucket": bucket, "prefix": path, "objects": response.json()})
         except Exception as e:
-            return json.dumps({"error": _storage_error_message("list", e)})
+            return json.dumps(
+                {"error": _storage_error_message("list", e, caller, bucket, path, agent_id)}
+            )
 
     elif operation == "download":
         if not path:
@@ -789,7 +862,9 @@ def storage_read_handler(arguments, context):
                     {"bucket": bucket, "path": path, "encoding": "binary", "signed_url": signed_url}
                 )
         except Exception as e:
-            return json.dumps({"error": _storage_error_message("download", e)})
+            return json.dumps(
+                {"error": _storage_error_message("download", e, caller, bucket, path, agent_id)}
+            )
 
     else:
         return json.dumps({"error": f"Invalid operation: '{operation}'. Must be list or download."})
@@ -798,6 +873,7 @@ def storage_read_handler(arguments, context):
 def storage_write_handler(arguments, context):
     """Upload text content to a project storage bucket."""
     caller = _pop_caller(arguments)
+    agent_id = arguments.pop("_agent_id", None)
     if caller is None:
         return json.dumps({"error": _NO_CALLER_MESSAGE})
     bucket = arguments.get("bucket", "")
@@ -805,6 +881,9 @@ def storage_write_handler(arguments, context):
     content = arguments.get("content", "")
     content_type = arguments.get("content_type", "text/plain")
 
+    expired = _expired_session_error(caller, "write")
+    if expired:
+        return json.dumps({"error": expired})
     if not bucket:
         return json.dumps({"error": "bucket is required"})
     if not path:
@@ -812,6 +891,8 @@ def storage_write_handler(arguments, context):
     invalid = _storage_target_error(bucket, path)
     if invalid:
         return json.dumps({"error": invalid})
+    if not isinstance(content, str):
+        return json.dumps({"error": "content must be a string"})
 
     try:
         encoded = content.encode("utf-8")
@@ -819,7 +900,9 @@ def storage_write_handler(arguments, context):
         storage.upload(bucket, _encode_object_path(path), encoded, content_type)
         return json.dumps({"path": f"{bucket}/{path}", "size": len(encoded)})
     except Exception as e:
-        return json.dumps({"error": _storage_error_message("write", e)})
+        return json.dumps(
+            {"error": _storage_error_message("write", e, caller, bucket, path, agent_id)}
+        )
 
 
 def web_search_handler(arguments, context):

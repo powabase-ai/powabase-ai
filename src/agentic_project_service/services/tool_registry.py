@@ -674,11 +674,12 @@ def _introspect_table_metadata(db_session, schemas_config: dict[str, list[str]])
 _CALLER_SCOPED_TOOLS = frozenset({"storage_read", "storage_write"})
 
 
-def _with_caller(handler, caller: ToolCaller | None):
+def _with_caller(handler, caller: ToolCaller | None, agent_id: str):
     """Always set the caller the loader was given, over anything the model sent."""
 
     def with_caller(arguments, context):
         arguments["_caller"] = caller
+        arguments["_agent_id"] = agent_id
         return handler(arguments, context)
 
     return with_caller
@@ -739,7 +740,11 @@ def load_all_tools_for_agent(
     # must hold exactly the configured tables first. If that fails they refuse
     # rather than run with whatever grants the login had before.
     database_tools_error: str | None = None
-    if caller is not None and not caller.is_end_user:
+    has_database_tools = any(
+        a.tool_type == "builtin" and a.tool_name in ("database_query", "database_write")
+        for a in assignments
+    )
+    if caller is not None and not caller.is_end_user and has_database_tools:
         try:
             read_tables, write_tables = _database_tables(assignments)
             agent_sql.sync_agent_role(agent_id, read_tables=read_tables, write_tables=write_tables)
@@ -848,7 +853,7 @@ def load_all_tools_for_agent(
             # resolves the action. Wrapping the other way bills the standard
             # rate while running the pricier deep search.
             if tool_name in _CALLER_SCOPED_TOOLS:
-                handler = _with_caller(handler, caller)
+                handler = _with_caller(handler, caller, agent_id)
             tool_handler = _wrap_handler_with_billing(
                 _ensure_app_context(handler, app), defn["name"]
             )
