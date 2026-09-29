@@ -2,9 +2,9 @@
 
 import logging
 
-from flask import Blueprint, g, jsonify, request
+from flask import Blueprint, jsonify, request
 
-from ..auth import get_current_user_id, require_user_auth
+from ..auth import get_current_user_id, is_service_role_request, require_user_auth
 from ..db import db
 from ..services.context_handler import resolve_tool_call_image_refs
 from ..services.session import (
@@ -28,8 +28,7 @@ def _verify_session_access(session_id: str):
     (not 403) on both "not found" and "owned by someone else" to avoid leaking
     session existence.
     """
-    jwt_payload = getattr(g, "jwt_payload", None) or {}
-    if jwt_payload.get("is_service_role", False):
+    if is_service_role_request():
         return None
 
     owner = get_session_owner(db.session, session_id)

@@ -21,9 +21,12 @@ Flask app, and the data layer is stubbed where a request gets past auth.
 """
 
 import importlib
+import logging
 import pkgutil
+import time
 from unittest.mock import MagicMock, patch
 
+import jwt as pyjwt
 import pytest
 from flask import Blueprint, Flask, jsonify
 
@@ -31,6 +34,7 @@ from agentic_project_service import auth
 from agentic_project_service import routes as routes_pkg
 from agentic_project_service.routes import agents as agents_route
 from agentic_project_service.routes import orchestrations as orchestrations_route
+from agentic_project_service.routes import sessions as sessions_route
 from agentic_project_service.services import run_registry
 
 USER_ID = "11111111-1111-4111-8111-111111111111"
@@ -133,27 +137,82 @@ def _api_endpoints(app: Flask) -> dict[str, object]:
     }
 
 
+@pytest.fixture(scope="module")
+def served_app() -> Flask:
+    """The application exactly as it is served.
+
+    Routes added on the app itself, or blueprints registered with a
+    ``url_prefix``, exist only here; a walk of the routes package misses them.
+    """
+    from agentic_project_service.main import create_app
+
+    return create_app(testing=True)
+
+
+def _inventory(*apps: Flask) -> dict[str, object]:
+    endpoints: dict[str, object] = {}
+    for app in apps:
+        endpoints.update(_api_endpoints(app))
+    return endpoints
+
+
+def _undeclared(endpoints: dict[str, object]) -> list[str]:
+    return sorted(
+        name
+        for name, view in endpoints.items()
+        if getattr(view, "auth_mode", None) is None and name not in UNAUTHENTICATED_ENDPOINTS
+    )
+
+
+def _end_user(endpoints: dict[str, object]) -> set[str]:
+    return {name for name, view in endpoints.items() if getattr(view, "auth_mode", None) == "user"}
+
+
 class TestRouteInventory:
-    def test_every_api_route_declares_who_may_call_it(self):
-        endpoints = _api_endpoints(_full_app())
-        undeclared = sorted(
-            name
-            for name, view in endpoints.items()
-            if getattr(view, "auth_mode", None) is None and name not in UNAUTHENTICATED_ENDPOINTS
-        )
-        assert undeclared == []
+    def test_every_api_route_declares_who_may_call_it(self, served_app):
+        assert _undeclared(_inventory(served_app, _full_app())) == []
 
-    def test_end_user_routes_are_exactly_the_reviewed_list(self):
-        endpoints = _api_endpoints(_full_app())
-        end_user = {
-            name for name, view in endpoints.items() if getattr(view, "auth_mode", None) == "user"
-        }
-        assert end_user == END_USER_ENDPOINTS
+    def test_end_user_routes_are_exactly_the_reviewed_list(self, served_app):
+        assert _end_user(_inventory(served_app, _full_app())) == END_USER_ENDPOINTS
 
-    def test_unauthenticated_list_names_real_routes(self):
+    def test_unauthenticated_list_names_real_routes(self, served_app):
         """A stale entry here would silently exempt a future route of that name."""
-        endpoints = _api_endpoints(_full_app())
-        assert UNAUTHENTICATED_ENDPOINTS <= set(endpoints)
+        assert UNAUTHENTICATED_ENDPOINTS <= set(_inventory(served_app))
+
+    def test_served_app_has_every_blueprint_route(self, served_app):
+        """A blueprint defined but never registered would pass the walk and never be served."""
+        assert set(_api_endpoints(_full_app())) <= set(_api_endpoints(served_app))
+
+    def test_catches_a_route_added_on_the_app_itself(self):
+        from agentic_project_service.main import create_app
+
+        app = create_app(testing=True)
+
+        @app.route("/api/debug/env")
+        def debug_env():
+            return jsonify({})
+
+        assert _undeclared(_inventory(app)) == ["debug_env"]
+
+    def test_catches_a_blueprint_mounted_under_api_by_its_registration(self):
+        from agentic_project_service.main import create_app
+
+        app = create_app(testing=True)
+        extra = Blueprint("extra", __name__)
+
+        @extra.route("/dump")
+        def dump():
+            return jsonify({})
+
+        @extra.route("/mine")
+        @auth.require_user_auth
+        def mine():
+            return jsonify({})
+
+        app.register_blueprint(extra, url_prefix="/api/extra")
+        endpoints = _inventory(app)
+        assert _undeclared(endpoints) == ["extra.dump"]
+        assert _end_user(endpoints) - END_USER_ENDPOINTS == {"extra.mine"}
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +232,13 @@ def _decorator_app() -> Flask:
     @auth.require_user_auth
     def mine():
         return jsonify({"user": auth.get_current_user_id()})
+
+    @app.route("/whoami")
+    @auth.require_user_auth
+    def whoami():
+        return jsonify(
+            {"user": auth.get_current_user_id(), "service": auth.is_service_role_request()}
+        )
 
     return app
 
@@ -207,6 +273,32 @@ class TestRequireServiceRole:
 
 
 class TestRequireUserAuth:
+    def test_end_user_token_without_sub_is_401(self):
+        """Without an id, every "is it theirs?" check downstream compares None to None."""
+        with (
+            patch(
+                "agentic_project_service.auth.decode_jwt",
+                return_value={"role": "authenticated", "aud": "authenticated"},
+            ),
+            _decorator_app().test_client() as c,
+        ):
+            resp = c.get("/mine", headers=HEADERS)
+        assert resp.status_code == 401
+
+    @pytest.mark.parametrize(
+        "sub", ["", "user-1", 42, "{" + USER_ID + "}", USER_ID.replace("-", "")]
+    )
+    def test_end_user_token_with_a_non_uuid_sub_is_401(self, sub):
+        with _authed_as_user(sub), _decorator_app().test_client() as c:
+            resp = c.get("/mine", headers=HEADERS)
+        assert resp.status_code == 401
+
+    def test_service_role_needs_no_sub(self):
+        with _authed_as_service_role(), _decorator_app().test_client() as c:
+            resp = c.get("/whoami", headers=HEADERS)
+        assert resp.status_code == 200
+        assert resp.get_json() == {"user": None, "service": True}
+
     def test_allows_end_user_and_exposes_their_id(self):
         with _authed_as_user(), _decorator_app().test_client() as c:
             resp = c.get("/mine", headers=HEADERS)
@@ -221,6 +313,140 @@ class TestRequireUserAuth:
     def test_missing_bearer_is_401(self):
         with _decorator_app().test_client() as c:
             resp = c.get("/mine")
+        assert resp.status_code == 401
+
+
+class TestRefusalsAreLogged:
+    def test_service_only_refusal_logs_method_path_and_sub(self, caplog):
+        with (
+            caplog.at_level(logging.INFO, logger="agentic_project_service.auth"),
+            _authed_as_user(),
+            _decorator_app().test_client() as c,
+        ):
+            c.get("/admin", headers={"Authorization": "Bearer do-not-log-me"})
+        refusals = [r for r in caplog.records if r.name == "agentic_project_service.auth"]
+        assert len(refusals) == 1
+        assert refusals[0].levelno == logging.INFO
+        message = refusals[0].getMessage()
+        assert "GET" in message and "/admin" in message and USER_ID in message
+        assert "do-not-log-me" not in message
+
+    def test_service_role_is_not_logged(self, caplog):
+        with (
+            caplog.at_level(logging.INFO, logger="agentic_project_service.auth"),
+            _authed_as_service_role(),
+            _decorator_app().test_client() as c,
+        ):
+            c.get("/admin", headers=HEADERS)
+        assert [r for r in caplog.records if r.name == "agentic_project_service.auth"] == []
+
+
+# ---------------------------------------------------------------------------
+# Real tokens through decode_jwt — nothing mocked below the HTTP request
+# ---------------------------------------------------------------------------
+
+JWT_SECRET = "unit-test-jwt-secret-that-is-long-enough-for-hs256"
+
+
+def _sign(claims: dict, secret: str = JWT_SECRET) -> str:
+    return pyjwt.encode(claims, secret, algorithm="HS256")
+
+
+def _user_claims(**overrides) -> dict:
+    claims = {
+        "sub": USER_ID,
+        "role": "authenticated",
+        "aud": "authenticated",
+        "exp": int(time.time()) + 3600,
+    }
+    claims.update(overrides)
+    return {k: v for k, v in claims.items() if v is not None}
+
+
+SERVICE_KEY = _sign({"role": "service_role", "iss": "supabase", "iat": 1700000000})
+
+
+@pytest.fixture
+def real_keys(monkeypatch):
+    monkeypatch.setenv("JWT_SECRET", JWT_SECRET)
+    monkeypatch.setenv("SERVICE_ROLE_KEY", SERVICE_KEY)
+
+
+def _bearer(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.usefixtures("real_keys")
+class TestRealTokens:
+    def test_user_token_is_an_end_user(self):
+        with _decorator_app().test_client() as c:
+            resp = c.get("/whoami", headers=_bearer(_sign(_user_claims())))
+        assert resp.status_code == 200
+        assert resp.get_json() == {"user": USER_ID, "service": False}
+
+    def test_user_token_is_refused_on_a_service_route_with_the_documented_body(self):
+        with _decorator_app().test_client() as c:
+            resp = c.get("/admin", headers=_bearer(_sign(_user_claims())))
+        assert resp.status_code == 403
+        assert resp.get_json() == {"error": "This endpoint requires the project's service role key"}
+
+    def test_the_exact_service_key_is_the_service_role(self):
+        with _decorator_app().test_client() as c:
+            admin = c.get("/admin", headers=_bearer(SERVICE_KEY))
+            whoami = c.get("/whoami", headers=_bearer(SERVICE_KEY))
+        assert admin.status_code == 200
+        assert whoami.get_json()["service"] is True
+
+    def test_is_service_role_claim_in_a_user_token_is_not_the_service_role(self):
+        """A custom access-token hook, or a project minting its own tokens, can add any claim."""
+        token = _sign(_user_claims(is_service_role=True))
+        with _decorator_app().test_client() as c:
+            admin = c.get("/admin", headers=_bearer(token))
+            whoami = c.get("/whoami", headers=_bearer(token))
+        assert admin.status_code == 403
+        assert whoami.get_json() == {"user": USER_ID, "service": False}
+
+    def test_decode_jwt_drops_the_claim_from_user_payloads(self):
+        payload = auth.decode_jwt(_sign(_user_claims(is_service_role=True)))
+        assert "is_service_role" not in payload
+        assert payload["sub"] == USER_ID
+
+    def test_decode_jwt_marks_the_service_key(self):
+        assert auth.decode_jwt(SERVICE_KEY)["is_service_role"] is True
+
+    def test_a_different_token_with_role_service_role_is_not_the_service_role(self):
+        forged = _sign(_user_claims(role="service_role"))
+        with _decorator_app().test_client() as c:
+            resp = c.get("/admin", headers=_bearer(forged))
+        assert resp.status_code == 403
+
+    def test_token_without_sub_is_401(self):
+        with _decorator_app().test_client() as c:
+            resp = c.get("/mine", headers=_bearer(_sign(_user_claims(sub=None))))
+        assert resp.status_code == 401
+
+    def test_token_with_a_non_uuid_sub_is_401(self):
+        with _decorator_app().test_client() as c:
+            resp = c.get("/mine", headers=_bearer(_sign(_user_claims(sub="user-1"))))
+        assert resp.status_code == 401
+
+    def test_expired_token_is_401(self):
+        expired = _sign(_user_claims(exp=int(time.time()) - 60))
+        with _decorator_app().test_client() as c:
+            resp = c.get("/mine", headers=_bearer(expired))
+        assert resp.status_code == 401
+        assert resp.get_json() == {"error": "Token has expired"}
+
+    def test_token_signed_with_another_secret_is_401(self):
+        with _decorator_app().test_client() as c:
+            resp = c.get("/mine", headers=_bearer(_sign(_user_claims(), secret="x" * 40)))
+        assert resp.status_code == 401
+
+    def test_without_a_service_key_configured_the_service_key_is_401(self, monkeypatch):
+        """It is decoded as a user token then, and it has no audience."""
+        monkeypatch.delenv("SERVICE_ROLE_KEY")
+        with _decorator_app().test_client() as c:
+            resp = c.get("/admin", headers=_bearer(SERVICE_KEY))
         assert resp.status_code == 401
 
 
@@ -416,6 +642,26 @@ class TestRunRoutesUseStrictOwnership:
         check.assert_called_once()
         assert check.call_args.args[1:] == ("sess_x", USER_ID)
 
+    @pytest.mark.parametrize(
+        "path",
+        [f"/api/agents/{AGENT_ID}/run", f"/api/agents/{AGENT_ID}/run/stream"],
+    )
+    def test_owner_gets_past_the_session_check(self, path):
+        """Positive control: the next thing the route does is look the agent up."""
+        app = _app_with(agents_route.agents_bp)
+        session = MagicMock()
+        session.execute.return_value.fetchone.return_value = None
+        with (
+            _authed_as_user(),
+            patch.object(agents_route.db, "session", session),
+            patch.object(agents_route.billing, "check_balance"),
+            patch.object(agents_route, "session_accessible_to", return_value=True),
+            app.test_client() as c,
+        ):
+            resp = c.post(path, headers=HEADERS, json={"message": "hi", "session_id": "sess_x"})
+        assert resp.status_code == 404
+        assert resp.get_json() == {"error": "Agent not found"}
+
 
 # ---------------------------------------------------------------------------
 # GET /api/agents/runs/<id> — end users see only runs in their own sessions
@@ -423,7 +669,28 @@ class TestRunRoutesUseStrictOwnership:
 
 
 def _agent_run(session_id):
+    """An AgentRun row the route can serialize: every column None but these."""
     run = MagicMock()
+    for column in (
+        "id",
+        "parent_orchestration_run_id",
+        "parent_workflow_execution_id",
+        "status",
+        "input_messages",
+        "output_messages",
+        "content",
+        "usage",
+        "retrieved_context",
+        "error",
+        "started_at",
+        "completed_at",
+        "steps",
+        "events",
+        "tool_calls",
+        "reasoning_steps",
+        "created_at",
+    ):
+        setattr(run, column, None)
     run.session_id = session_id
     run.run_id = "run_1"
     return run
@@ -452,6 +719,112 @@ class TestGetAgentRunOwnership:
 
     def test_other_users_run_is_hidden(self):
         assert self._get(_agent_run("s-uuid"), OTHER_USER_ID).status_code == 404
+
+    def test_owner_sees_their_run(self):
+        resp = self._get(_agent_run("s-uuid"), USER_ID)
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        assert resp.get_json()["run_id"] == "run_1"
+
+    def test_service_role_sees_any_run(self):
+        assert self._get(_agent_run(None), ..., service=True).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# GET /api/agents/<id>/sessions — an end user lists only their own sessions
+# ---------------------------------------------------------------------------
+
+
+class TestListAgentSessionsScoping:
+    def _list(self, *, service=False, user_id=...):
+        app = _app_with(agents_route.agents_bp)
+        session = MagicMock()
+        session.execute.return_value.__iter__.return_value = iter([])
+        session.execute.return_value.scalar.return_value = 0
+        user_patch = (
+            patch.object(agents_route, "get_current_user_id", return_value=user_id)
+            if user_id is not ...
+            else patch.object(agents_route, "get_current_user_id", wraps=auth.get_current_user_id)
+        )
+        with (
+            _authed_as_service_role() if service else _authed_as_user(),
+            patch.object(agents_route.db, "session", session),
+            user_patch,
+            app.test_client() as c,
+        ):
+            resp = c.get(f"/api/agents/{AGENT_ID}/sessions", headers=HEADERS)
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        # Both the page query and the count query carry the same filter.
+        return [(str(call.args[0]), call.args[1]) for call in session.execute.call_args_list]
+
+    def test_end_user_is_filtered_to_their_own_sessions(self):
+        queries = self._list()
+        assert len(queries) == 2
+        for sql, params in queries:
+            assert "s.user_id = :scoped_user_id" in sql
+            assert params["scoped_user_id"] == USER_ID
+
+    def test_end_user_filter_does_not_depend_on_having_an_id(self):
+        """A missing id must filter to nothing, never drop the filter."""
+        for sql, params in self._list(user_id=None):
+            assert "s.user_id = :scoped_user_id" in sql
+            assert params["scoped_user_id"] is None
+
+    def test_service_role_sees_every_session(self):
+        for sql, params in self._list(service=True):
+            assert "scoped_user_id" not in sql
+            assert "scoped_user_id" not in params
+
+
+# ---------------------------------------------------------------------------
+# /api/sessions/<id>/... — owner-only reads and deletes
+# ---------------------------------------------------------------------------
+
+SESSION_ROUTES = [
+    ("GET", "/api/sessions/sess_a"),
+    ("GET", "/api/sessions/sess_a/messages"),
+    ("GET", "/api/sessions/sess_a/runs"),
+    ("GET", "/api/sessions/sess_a/runs/run_1/retrieved-context"),
+    ("DELETE", "/api/sessions/sess_a"),
+]
+
+
+class TestSessionRoutesOwnership:
+    def _call(self, method, path, owner, *, service=False):
+        app = _app_with(sessions_route.sessions_bp)
+        with (
+            _authed_as_service_role() if service else _authed_as_user(),
+            patch.object(sessions_route.db, "session", MagicMock()),
+            patch.object(sessions_route, "get_session_owner", return_value=owner) as lookup,
+            patch.object(
+                sessions_route, "get_session_by_id", return_value={"session_id": "sess_a"}
+            ),
+            patch.object(sessions_route, "get_chat_messages", return_value=[]),
+            patch.object(sessions_route, "list_runs_for_session", return_value=[]),
+            patch.object(sessions_route, "get_run_retrieved_context", return_value=[]),
+            patch.object(sessions_route, "delete_session", return_value=True) as delete,
+            app.test_client() as c,
+        ):
+            resp = c.open(path, method=method, headers=HEADERS)
+        return resp, lookup, delete
+
+    @pytest.mark.parametrize(("method", "path"), SESSION_ROUTES)
+    def test_owner_gets_200(self, method, path):
+        resp, lookup, _ = self._call(method, path, USER_ID)
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        assert lookup.call_args.args[1] == "sess_a"
+
+    @pytest.mark.parametrize(("method", "path"), SESSION_ROUTES)
+    @pytest.mark.parametrize("owner", [OTHER_USER_ID, None])
+    def test_other_users_and_ownerless_sessions_are_404(self, method, path, owner):
+        resp, _, delete = self._call(method, path, owner)
+        assert resp.status_code == 404
+        delete.assert_not_called()
+
+    @pytest.mark.parametrize(("method", "path"), SESSION_ROUTES)
+    def test_service_role_skips_the_owner_lookup(self, method, path):
+        resp, lookup, _ = self._call(method, path, OTHER_USER_ID, service=True)
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        lookup.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +865,31 @@ class TestApproveRunOwnership:
         assert self._approve("run_backend").status_code == 404
         ctx.set_approval_decision.assert_not_called()
 
+    def test_token_without_sub_cannot_approve_a_backend_run(self):
+        """None == None must not read as "the owner"."""
+        ctx = MagicMock()
+        run_registry.register_run("run_backend", ctx, owner_user_id=None)
+        app = _app_with(agents_route.agents_bp)
+        with (
+            patch(
+                "agentic_project_service.auth.decode_jwt",
+                return_value={"role": "authenticated", "aud": "authenticated"},
+            ),
+            app.test_client() as c,
+        ):
+            resp = c.post(
+                "/api/agents/runs/run_backend/approve", headers=HEADERS, json={"approved": True}
+            )
+        assert resp.status_code == 401
+        ctx.set_approval_decision.assert_not_called()
+
+    def test_end_user_without_an_id_never_matches_an_ownerless_run(self):
+        ctx = MagicMock()
+        run_registry.register_run("run_backend", ctx, owner_user_id=None)
+        with patch.object(agents_route, "get_current_user_id", return_value=None):
+            assert self._approve("run_backend").status_code == 404
+        ctx.set_approval_decision.assert_not_called()
+
     def test_service_role_may_approve_any_run(self):
         ctx = MagicMock()
         run_registry.register_run("run_theirs", ctx, owner_user_id=OTHER_USER_ID)
@@ -529,3 +927,26 @@ class TestGetOrchestrationRunOwnership:
 
     def test_other_users_run_is_hidden(self):
         assert self._get("s-uuid", OTHER_USER_ID).status_code == 404
+
+    def test_owner_sees_their_run(self):
+        app = _app_with(orchestrations_route.orchestrations_bp)
+        run = MagicMock(session_id="s-uuid", run_id="orun_1", orchestration_id=None)
+        for column in ("status", "content", "events", "usage", "model", "error"):
+            setattr(run, column, None)
+        run.started_at = run.completed_at = None
+        with (
+            _authed_as_user(),
+            patch.object(orchestrations_route, "OrchestrationRunModel") as run_model,
+            patch.object(orchestrations_route, "OrchestrationSessionModel") as session_model,
+            patch.object(orchestrations_route, "AgentRun") as agent_run_model,
+            patch.object(orchestrations_route, "_load_tool_calls_for_runs", return_value={}),
+            app.test_client() as c,
+        ):
+            run_model.query.filter_by.return_value.first.return_value = run
+            session_model.query.filter_by.return_value.first.return_value = MagicMock(
+                user_id=USER_ID
+            )
+            agent_run_model.query.filter_by.return_value.all.return_value = []
+            resp = c.get("/api/orchestrations/runs/orun_1", headers=HEADERS)
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        assert resp.get_json()["run_id"] == "orun_1"

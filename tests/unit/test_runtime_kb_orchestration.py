@@ -11,6 +11,7 @@ the resolved ``runtime_kb_configs`` reaches each sub-agent's
 from unittest.mock import MagicMock
 
 from agentic_project_service.services import orchestration as orch_service
+from agentic_project_service.services.tool_caller import ToolCaller
 
 
 class _FakeOrchRow:
@@ -116,7 +117,7 @@ def test_build_orchestration_threads_runtime_kb_configs_to_both_entities(monkeyp
 
     runtime_kb_configs = [{"id": "kb-r"}]
     orch_row, orchestration = orch_service.build_orchestration(
-        "orch-1", runtime_kb_configs=runtime_kb_configs
+        "orch-1", runtime_kb_configs=runtime_kb_configs, caller=ToolCaller.service()
     )
 
     assert isinstance(orch_row, _FakeOrchRow)
@@ -133,7 +134,7 @@ def test_build_orchestration_defaults_runtime_kb_configs_to_none(monkeypatch):
     load_tools_calls: list = []
     _install_fakes(monkeypatch, entities, agent_rows, load_tools_calls)
 
-    orch_service.build_orchestration("orch-1")
+    orch_service.build_orchestration("orch-1", caller=ToolCaller.service())
 
     assert len(load_tools_calls) == 2
     for _agent_id, kwargs in load_tools_calls:

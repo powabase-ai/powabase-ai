@@ -1,22 +1,29 @@
 """Run agent database tools as the caller, never as the service's own login.
 
 The service connects as a superuser, so SQL run on its connection ignores
-every privilege and RLS policy. Agent tools therefore use their own logins,
-which are neither superusers nor able to bypass RLS:
+every privilege and RLS policy. Agent tools therefore use logins of their own,
+none of them a superuser:
 
-* ``powabase_agent_user`` — for runs an end user started. Each transaction
-  becomes ``authenticated`` with that user's JWT claims, so the agent reads
-  and writes exactly what the user could through the REST API with their own
-  token: the project's grants plus its RLS policies.
-* ``powabase_agent_backend`` — for runs started with the service role key.
-  Each transaction becomes the agent's own role, which holds grants on exactly
-  the tables configured on its database tools (and bypasses RLS on them, as
-  the service role would).
+* ``powabase_agent_user`` — for runs an end user started. It may only become
+  ``authenticated``; each transaction does, with that user's JWT claims, so
+  the project's grants and RLS policies for that user apply.
+* ``powabase_agent_<agent id>`` — one login per agent, for runs started with
+  the service role key. It holds grants on exactly the tables configured on
+  the agent's database tools and bypasses RLS on those alone. It is a member
+  of no other role, so it cannot take on another agent's grants.
 
-The caller's identity lives in session settings that SQL can overwrite in the
-same statement (``set_config('request.jwt.claims', ...)``,
-``set_config('role', ...)``), so free-form SQL from ``database_query`` is also
-parsed before it runs: see :func:`parse_select`.
+The caller's identity lives in session settings that SQL could overwrite
+(``set_config('request.jwt.claims', ...)``), so free-form SQL from
+``database_query`` is parsed before it runs and may only call an allowlist of
+built-in functions and operators: see :func:`parse_select`. An allowlist
+rather than a denylist, because some built-ins run a SQL string they are
+handed (``ts_stat``, ``query_to_xml``) and no denylist stays complete.
+
+Known limit: Postgres also runs functions implicitly — a domain's CHECK when
+a value is written, the equality operator of a column's own type when a query
+groups or joins on it. Those come from objects a privileged role already
+created in the schemas an agent is given; configure agents only with tables
+whose types you trust.
 """
 
 from __future__ import annotations
@@ -25,24 +32,32 @@ import json
 import logging
 import re
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from pglast import ast, parse_sql
+from pglast.enums.parsenodes import A_Expr_Kind
 from pglast.parser import ParseError
+from pglast.stream import RawStream
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.pool import NullPool
 
-from ..db import db
+from ..db import AI_SCHEMA, db
 from .tool_caller import ToolCaller
 
 logger = logging.getLogger(__name__)
 
 USER_LOGIN = "powabase_agent_user"
-BACKEND_LOGIN = "powabase_agent_backend"
 _AGENT_ROLE_PREFIX = "powabase_agent_"
+_AGENT_ROLE_PATTERN = re.compile(r"^powabase_agent_[0-9a-f]{32}$")
+
+# Every tool transaction gives up rather than hold a connection or a lock.
+STATEMENT_TIMEOUT = "30s"
+LOCK_TIMEOUT = "5s"
 
 # Never granted to an agent role, whatever its tool configuration names.
 _PROTECTED_SCHEMAS = frozenset(
@@ -68,11 +83,19 @@ _PROTECTED_SCHEMAS = frozenset(
 
 
 class AgentSqlRejected(ValueError):
-    """The SQL is not something an agent's query tool may run."""
+    """The SQL is not something an agent's query tool may run.
+
+    The message is meant for the model: it says what to change, and carries
+    no SQL text, parameters or server details.
+    """
+
+
+class AgentToolsUnavailable(AgentSqlRejected):
+    """The database tools cannot run here (not set up, or the session expired)."""
 
 
 def agent_role_name(agent_id: str) -> str:
-    """The Postgres role a service-role run of this agent's tools assumes."""
+    """The login a service-role run of this agent's database tools uses."""
     return f"{_AGENT_ROLE_PREFIX}{uuid.UUID(str(agent_id)).hex}"
 
 
@@ -80,54 +103,105 @@ def _is_protected_schema(schema: str) -> bool:
     return schema in _PROTECTED_SCHEMAS or schema.startswith("pg_")
 
 
-# Built-in functions an agent's SQL may not call, even though they live in
-# pg_catalog: they change session settings (the caller's identity lives
-# there), run a SQL string the parse gate cannot see into, read other
-# sessions or the server's files, or hold the connection.
-_DENIED_FUNCTIONS = frozenset(
+def _ident(name: str) -> str:
+    """Quote an identifier for SQL, as ``quote_ident`` does."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+# ---------------------------------------------------------------------------
+# The SQL gate
+# ---------------------------------------------------------------------------
+
+# The only functions an agent's query may call: built-ins that compute on
+# their arguments. None of them changes a setting, reads one, or runs SQL.
+# Each must also exist in pg_catalog and not be shadowed on the search path,
+# which is checked in the database (see _check_references).
+ALLOWED_FUNCTIONS = frozenset(
     {
-        "set_config",
-        "query_to_xml",
-        "query_to_xmlschema",
-        "query_to_xml_and_xmlschema",
-        "cursor_to_xml",
-        "cursor_to_xmlschema",
-        "table_to_xml",
-        "table_to_xmlschema",
-        "table_to_xml_and_xmlschema",
-        "schema_to_xml",
-        "schema_to_xmlschema",
-        "schema_to_xml_and_xmlschema",
-        "database_to_xml",
-        "database_to_xmlschema",
-        "database_to_xml_and_xmlschema",
-        "pg_sleep",
-        "pg_sleep_for",
-        "pg_sleep_until",
-        "pg_notify",
-        "dblink",
+        # aggregates
+        "count", "sum", "avg", "min", "max", "string_agg", "array_agg", "bool_and",
+        "bool_or", "every", "json_agg", "jsonb_agg", "json_object_agg",
+        "jsonb_object_agg", "stddev", "stddev_pop", "stddev_samp", "variance",
+        "var_pop", "var_samp", "percentile_cont", "percentile_disc", "mode", "corr",
+        "covar_pop", "covar_samp", "regr_slope", "regr_intercept", "bit_and", "bit_or",
+        # window
+        "row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile",
+        "lag", "lead", "first_value", "last_value", "nth_value",
+        # strings
+        "lower", "upper", "initcap", "length", "char_length", "character_length",
+        "octet_length", "substr", "substring", "left", "right", "btrim", "ltrim",
+        "rtrim", "replace", "concat", "concat_ws", "position", "strpos", "split_part",
+        "regexp_replace", "regexp_matches", "regexp_match", "regexp_split_to_array",
+        "regexp_split_to_table", "regexp_count", "regexp_instr", "regexp_like",
+        "regexp_substr", "lpad", "rpad", "reverse", "repeat", "format", "md5",
+        "sha256", "starts_with", "translate", "chr", "ascii", "to_hex", "encode",
+        "decode", "overlay", "similar_to_escape", "normalize", "quote_literal",
+        "quote_ident",
+        # formatting
+        "to_char", "to_number", "to_date", "to_timestamp",
+        # numbers
+        "abs", "ceil", "ceiling", "floor", "round", "trunc", "mod", "power", "pow",
+        "sqrt", "cbrt", "exp", "ln", "log", "log10", "sign", "pi", "random", "degrees",
+        "radians", "div", "gcd", "lcm", "width_bucket", "sin", "cos", "tan", "asin",
+        "acos", "atan", "atan2",
+        # dates and times
+        "now", "date_trunc", "date_part", "extract", "age", "make_date", "make_time",
+        "make_timestamp", "make_timestamptz", "make_interval", "justify_days",
+        "justify_hours", "justify_interval", "timezone", "date_bin", "isfinite",
+        "clock_timestamp", "statement_timestamp", "transaction_timestamp", "overlaps",
+        # json
+        "json_build_object", "jsonb_build_object", "json_build_array",
+        "jsonb_build_array", "json_object", "jsonb_object", "json_array_length",
+        "jsonb_array_length", "json_each", "jsonb_each", "json_each_text",
+        "jsonb_each_text", "json_array_elements", "jsonb_array_elements",
+        "json_array_elements_text", "jsonb_array_elements_text", "json_extract_path",
+        "jsonb_extract_path", "json_extract_path_text", "jsonb_extract_path_text",
+        "json_typeof", "jsonb_typeof", "to_json", "to_jsonb", "json_object_keys",
+        "jsonb_object_keys", "jsonb_pretty", "jsonb_set", "jsonb_insert",
+        "jsonb_strip_nulls", "json_strip_nulls", "jsonb_path_query",
+        "jsonb_path_query_array", "jsonb_path_query_first", "jsonb_path_exists",
+        "jsonb_path_match", "row_to_json", "array_to_json",
+        # arrays and sets
+        "array_length", "array_lower", "array_upper", "cardinality", "unnest",
+        "array_to_string", "string_to_array", "array_position", "array_positions",
+        "array_remove", "array_replace", "array_append", "array_prepend", "array_cat",
+        "array_dims", "generate_series", "generate_subscripts",
+        # text search (not ts_stat / ts_rewrite, which run a SQL string)
+        "to_tsvector", "to_tsquery", "plainto_tsquery", "phraseto_tsquery",
+        "websearch_to_tsquery", "ts_rank", "ts_rank_cd", "ts_headline", "setweight",
+        # misc
+        "gen_random_uuid", "num_nulls", "num_nonnulls",
+        # function-style casts to built-in types
+        "int2", "int4", "int8", "float4", "float8", "text", "date", "timestamptz",
+        "bool",
     }
-)
-_DENIED_FUNCTION_PREFIXES = (
-    "pg_advisory",
-    "pg_try_advisory",
-    "pg_stat_",
-    "pg_read_",
-    "pg_ls_",
-    "pg_file",
-    "lo_",
-    "pg_terminate",
-    "pg_cancel",
-    "pg_reload",
-    "pg_rotate",
-    "pg_logical",
-    "pg_replication",
-    "pg_create",
-    "pg_drop",
-    "pg_switch",
-    "pg_backup",
-    "pg_promote",
-    "pg_import",
+)  # fmt: skip
+
+ALLOWED_OPERATORS = frozenset(
+    {
+        "=", "<>", "<", ">", "<=", ">=", "+", "-", "*", "/", "%", "^", "||", "|/",
+        "@", "&", "|", "#", "~", "<<", ">>",
+        "~~", "!~~", "~~*", "!~~*", "!~", "~*", "!~*",
+        "->", "->>", "#>", "#>>", "@>", "<@", "?", "?|", "?&", "&&", "@?", "@@", "#-",
+    }
+)  # fmt: skip
+
+# Casting text to these looks up catalog objects by name, which reads the
+# catalogs rather than the configured tables.
+_LOOKUP_TYPES = frozenset(
+    {
+        "regclass", "regproc", "regprocedure", "regoper", "regoperator", "regtype",
+        "regrole", "regnamespace", "regconfig", "regdictionary", "regcollation",
+    }
+)  # fmt: skip
+
+_BETWEEN_KINDS = frozenset(
+    {
+        A_Expr_Kind.AEXPR_BETWEEN,
+        A_Expr_Kind.AEXPR_NOT_BETWEEN,
+        A_Expr_Kind.AEXPR_BETWEEN_SYM,
+        A_Expr_Kind.AEXPR_NOT_BETWEEN_SYM,
+    }
 )
 
 # Statements that write, and clauses that write or lock, wherever they appear
@@ -144,24 +218,27 @@ _FORBIDDEN_NODES = (
 
 @dataclass
 class ParsedSelect:
-    """What a query reads: tables as (schema or None, name), function names."""
+    """What a query reads and runs.
+
+    ``relations`` as (schema or None, name); ``functions`` and ``operators``
+    by name; ``types`` as the names of the types it casts to.
+    """
 
     relations: list[tuple[str | None, str]] = field(default_factory=list)
     functions: list[str] = field(default_factory=list)
-
-
-def _function_denied(name: str) -> bool:
-    return name in _DENIED_FUNCTIONS or name.startswith(_DENIED_FUNCTION_PREFIXES)
+    operators: list[str] = field(default_factory=list)
+    types: list[str] = field(default_factory=list)
 
 
 def parse_select(sql: str) -> ParsedSelect:
-    """Parse ``sql`` and return what it reads, or raise AgentSqlRejected.
+    """Parse ``sql`` and return what it reads and runs, or raise AgentSqlRejected.
 
-    Accepts exactly one SELECT that writes and locks nothing. Every function
-    must be unqualified or ``pg_catalog``-qualified and not denied; whether an
-    unqualified name really is a built-in is checked against the database by
-    the caller. Tables are reported, not judged: the allowlist check happens
-    in the database, where names resolve exactly as the query's will.
+    Accepts exactly one SELECT that writes and locks nothing, calling only
+    allowlisted functions and operators (unqualified or in ``pg_catalog``)
+    and casting only to ``pg_catalog`` types. Tables are reported, not
+    judged: the table allowlist, and whether each name really resolves to a
+    built-in, are checked in the database, where names resolve exactly as the
+    query's will.
     """
     try:
         statements = parse_sql(sql)
@@ -173,6 +250,17 @@ def parse_select(sql: str) -> ParsedSelect:
     parsed = ParsedSelect()
     _walk(statements[0].stmt, (), parsed)
     return parsed
+
+
+def _names(nodes) -> list[str]:
+    return [node.sval for node in nodes]
+
+
+def _add_operator(parts: list[str], parsed: ParsedSelect) -> None:
+    symbol = parts[-1]
+    if (len(parts) > 1 and parts[0] != "pg_catalog") or symbol not in ALLOWED_OPERATORS:
+        raise AgentSqlRejected(f"Operator {'.'.join(parts)} is not allowed")
+    parsed.operators.append(symbol)
 
 
 def _walk(node, visible_ctes: tuple[frozenset[str], ...], parsed: ParsedSelect) -> None:
@@ -200,16 +288,33 @@ def _walk(node, visible_ctes: tuple[frozenset[str], ...], parsed: ParsedSelect) 
         return
 
     if isinstance(node, ast.FuncCall):
-        parts = [part.sval for part in node.funcname]
+        parts = _names(node.funcname)
         name = parts[-1].lower()
-        if len(parts) > 1 and parts[0] != "pg_catalog":
+        if (len(parts) > 1 and parts[0] != "pg_catalog") or name not in ALLOWED_FUNCTIONS:
             raise AgentSqlRejected(
-                f"Function {'.'.join(parts)} is not allowed: only built-in functions may be called"
+                f"Function {'.'.join(parts)} is not allowed: only a fixed set of "
+                "built-in functions may be called"
             )
-        if _function_denied(name):
-            raise AgentSqlRejected(f"Function {name} is not allowed")
         parsed.functions.append(name)
-        # Arguments, filters and window specs can hold subqueries too.
+
+    elif isinstance(node, ast.A_Expr):
+        if node.kind in _BETWEEN_KINDS:
+            parsed.operators.extend([">=", "<="])
+        else:
+            _add_operator(_names(node.name), parsed)
+
+    elif isinstance(node, ast.SubLink) and node.operName:
+        _add_operator(_names(node.operName), parsed)
+
+    elif isinstance(node, ast.SortBy) and node.useOp:
+        _add_operator(_names(node.useOp), parsed)
+
+    elif isinstance(node, ast.TypeName):
+        parts = _names(node.names)
+        if (len(parts) > 1 and parts[0] != "pg_catalog") or parts[-1] in _LOOKUP_TYPES:
+            raise AgentSqlRejected(f"Casting to {'.'.join(parts)} is not allowed")
+        parsed.types.append(RawStream()(node))
+        return
 
     if isinstance(node, ast.SelectStmt) and node.withClause is not None:
         with_clause = node.withClause
@@ -223,6 +328,7 @@ def _walk(node, visible_ctes: tuple[frozenset[str], ...], parsed: ParsedSelect) 
                 _walk(getattr(node, attr), inner, parsed)
         return
 
+    # Arguments, filters, window specs and operands can hold subqueries too.
     for attr in node:
         _walk(getattr(node, attr), visible_ctes, parsed)
 
@@ -231,56 +337,97 @@ def _walk(node, visible_ctes: tuple[frozenset[str], ...], parsed: ParsedSelect) 
 # Roles
 # ---------------------------------------------------------------------------
 
+_LOGIN_ATTRIBUTES = "LOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION"
+_AGENT_ATTRIBUTES = "LOGIN NOSUPERUSER BYPASSRLS NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION"
+
+# Whether this process set up the end-user login. Until it has, end-user
+# runs' database tools refuse rather than fail on a missing login.
+_user_login_ready = False
+
+
+def _set_password(conn: Connection, role: str) -> None:
+    password = db.engine.url.password
+    if password is None:
+        return
+    statement = conn.execute(
+        text("SELECT format('ALTER ROLE %I PASSWORD %L', CAST(:r AS text), CAST(:p AS text))"),
+        {"r": role, "p": password},
+    ).scalar_one()
+    conn.execute(text(statement))
+
+
+def _role_attributes_match(conn: Connection, role: str, bypass_rls: bool) -> bool | None:
+    """None when the role is missing; else whether its attributes are as set here."""
+    row = conn.execute(
+        text(
+            "SELECT rolcanlogin, rolsuper, rolbypassrls, rolinherit, rolcreatedb, "
+            "rolcreaterole, rolreplication FROM pg_roles WHERE rolname = :r"
+        ),
+        {"r": role},
+    ).first()
+    if row is None:
+        return None
+    return tuple(row) == (True, False, bypass_rls, False, False, False, False)
+
+
+def _ensure_login(conn: Connection, role: str, attributes: str, bypass_rls: bool) -> None:
+    """Create the login, or correct its attributes only when they differ."""
+    matches = _role_attributes_match(conn, role, bypass_rls)
+    if matches is None:
+        conn.execute(text(f"CREATE ROLE {_ident(role)} {attributes}"))
+    elif not matches:
+        conn.execute(text(f"ALTER ROLE {_ident(role)} {attributes}"))
+    _set_password(conn, role)
+
 
 def ensure_login_roles() -> None:
-    """Create or refresh the two tool logins. Run at boot, as the service's login.
+    """Create or refresh the end-user tool login. Run at boot, as the service's login.
 
-    Their password is the service's own, as every other service in a project
+    Its password is the service's own, as every other service in a project
     stack logs in with its own role and the shared database password; setting
     it on every boot follows a rotation.
     """
-    password = db.engine.url.password
+    global _user_login_ready
     with db.engine.begin() as conn:
         conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('powabase_agent_logins'))"))
-        for login in (USER_LOGIN, BACKEND_LOGIN):
-            if conn.execute(
-                text("SELECT 1 FROM pg_roles WHERE rolname = :r"), {"r": login}
-            ).first():
-                conn.execute(text(f'ALTER ROLE "{login}" {_LOGIN_ATTRIBUTES}'))
-            else:
-                conn.execute(text(f'CREATE ROLE "{login}" {_LOGIN_ATTRIBUTES}'))
-            if password is not None:
-                statement = conn.execute(
-                    text(
-                        "SELECT format('ALTER ROLE %I PASSWORD %L', CAST(:r AS text), CAST(:p AS text))"
-                    ),
-                    {"r": login, "p": password},
-                ).scalar_one()
-                conn.execute(text(statement))
+        _ensure_login(conn, USER_LOGIN, _LOGIN_ATTRIBUTES, bypass_rls=False)
         if conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname = 'authenticated'")).first():
-            conn.execute(text(f'GRANT authenticated TO "{USER_LOGIN}"'))
+            conn.execute(text(f"GRANT authenticated TO {_ident(USER_LOGIN)}"))
         else:
             logger.warning(
                 "No 'authenticated' role in this database; agent tools cannot run for end users"
             )
+            return
+    _user_login_ready = True
 
 
-_LOGIN_ATTRIBUTES = "LOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION"
+def reconcile_agent_roles() -> None:
+    """Drop agent logins whose agent is gone; refresh the rest's passwords. Run at boot."""
+    with db.engine.connect() as conn:
+        roles = [
+            name
+            for name in conn.execute(
+                text("SELECT rolname FROM pg_roles WHERE rolname LIKE 'powabase\\_agent\\_%'")
+            ).scalars()
+            if _AGENT_ROLE_PATTERN.match(name)
+        ]
+        agents = {
+            uuid.UUID(str(agent_id)).hex
+            for agent_id in conn.execute(text(f'SELECT id FROM "{AI_SCHEMA}".agents')).scalars()
+        }
+    for role in roles:
+        agent_id = str(uuid.UUID(role.removeprefix(_AGENT_ROLE_PREFIX)))
+        try:
+            if role.removeprefix(_AGENT_ROLE_PREFIX) in agents:
+                with db.engine.begin() as conn:
+                    _set_password(conn, role)
+            else:
+                drop_agent_role(agent_id)
+        except Exception:
+            logger.exception("Could not reconcile the database login %s", role)
 
 
-def sync_agent_role(
-    agent_id: str,
-    read_tables: dict[str, list[str]],
-    write_tables: dict[str, list[str]],
-) -> None:
-    """Make the agent's role hold exactly the grants its database tools configure.
-
-    ``read_tables`` get SELECT; ``write_tables`` get SELECT, INSERT, UPDATE and
-    DELETE plus the sequences their columns draw from. Tables that do not
-    exist yet and tables in protected schemas are skipped. Grants no longer
-    configured are revoked. Cheap when nothing changed: two catalog reads.
-    """
-    role = agent_role_name(agent_id)
+def _desired_grants(read_tables, write_tables) -> dict[tuple[str, str], set[str]]:
     desired: dict[tuple[str, str], set[str]] = {}
     for tables, privileges in (
         (read_tables, {"SELECT"}),
@@ -291,79 +438,144 @@ def sync_agent_role(
                 continue
             for name in names or []:
                 desired.setdefault((schema, name), set()).update(privileges)
+    return desired
+
+
+def _readable_relation(conn: Connection, schema: str, name: str) -> bool:
+    """A plain or partitioned table, or a view that runs as its caller.
+
+    Other views run as their owner, so their rows are not filtered by the
+    caller's RLS policies; materialized views and foreign tables have none.
+    """
+    return bool(
+        conn.execute(
+            text(
+                """
+                SELECT c.relkind IN ('r', 'p')
+                    OR (c.relkind = 'v' AND coalesce(c.reloptions, '{}')
+                        && ARRAY['security_invoker=true', 'security_invoker=on',
+                                 'security_invoker=1'])
+                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = :s AND c.relname = :t
+                """
+            ),
+            {"s": schema, "t": name},
+        ).scalar()
+    )
+
+
+def sync_agent_role(
+    agent_id: str,
+    read_tables: dict[str, list[str]],
+    write_tables: dict[str, list[str]],
+) -> None:
+    """Make the agent's login hold exactly the grants its database tools configure.
+
+    ``read_tables`` get SELECT; ``write_tables`` get SELECT, INSERT, UPDATE and
+    DELETE plus the sequences their columns draw from. Relations that do not
+    exist, are not tables or security-invoker views, or sit in protected
+    schemas are skipped. Revocations commit first, in their own transaction,
+    so a failure later can only leave the login with less than it had. If the
+    agent no longer exists, its login is dropped instead. Raises on failure.
+    """
+    role = agent_role_name(agent_id)
+    desired = _desired_grants(read_tables, write_tables)
 
     with db.engine.begin() as conn:
         conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(CAST(:r AS text)))"), {"r": role})
-        if not conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname = :r"), {"r": role}).first():
-            conn.execute(text(f'CREATE ROLE "{role}" NOLOGIN NOINHERIT BYPASSRLS'))
-        conn.execute(text(f'GRANT "{role}" TO "{BACKEND_LOGIN}"'))
+        agent_exists = conn.execute(
+            text(f'SELECT 1 FROM "{AI_SCHEMA}".agents WHERE id = CAST(:id AS uuid)'),
+            {"id": str(uuid.UUID(str(agent_id)))},
+        ).first()
+    if not agent_exists:
+        drop_agent_role(agent_id)
+        return
 
-        existing = {
-            (row.schema, row.table): set(row.privileges)
-            for row in conn.execute(
-                text(
-                    """
-                    SELECT n.nspname AS schema, c.relname AS table,
-                           array_agg(a.privilege_type) AS privileges
-                    FROM pg_class c
-                    JOIN pg_namespace n ON n.oid = c.relnamespace
-                    CROSS JOIN LATERAL aclexplode(c.relacl) a
-                    WHERE a.grantee = (SELECT oid FROM pg_roles WHERE rolname = :r)
-                      AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
-                    GROUP BY 1, 2
-                    """
-                ),
-                {"r": role},
-            )
-        }
-
+    with db.engine.begin() as conn:
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(CAST(:r AS text)))"), {"r": role})
+        _ensure_login(conn, role, _AGENT_ATTRIBUTES, bypass_rls=True)
+        oid = conn.execute(text("SELECT oid FROM pg_roles WHERE rolname = :r"), {"r": role}).scalar()
+        granted = conn.execute(
+            text(
+                """
+                SELECT n.nspname, c.relname, c.relkind, array_agg(a.privilege_type)
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                CROSS JOIN LATERAL aclexplode(c.relacl) a
+                WHERE a.grantee = :oid
+                GROUP BY 1, 2, 3
+                """
+            ),
+            {"oid": oid},
+        ).all()
+        existing = {(s, t): set(p) for s, t, kind, p in granted if kind != "S"}
         for (schema, name), privileges in existing.items():
             extra = privileges - desired.get((schema, name), set())
             if extra:
                 conn.execute(
                     text(
-                        f'REVOKE {", ".join(sorted(extra))} ON TABLE "{schema}"."{name}" FROM "{role}"'
+                        f"REVOKE {', '.join(sorted(extra))} ON TABLE "
+                        f"{_ident(schema)}.{_ident(name)} FROM {_ident(role)}"
                     )
                 )
-
-        for (schema, name), privileges in desired.items():
-            if not conn.execute(
-                text("SELECT to_regclass(format('%I.%I', CAST(:s AS text), CAST(:t AS text)))"),
-                {"s": schema, "t": name},
-            ).scalar():
-                continue
-            missing = privileges - existing.get((schema, name), set())
-            if missing:
-                conn.execute(text(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role}"'))
+        for schema, name, kind, _ in granted:
+            if kind == "S":
                 conn.execute(
                     text(
-                        f'GRANT {", ".join(sorted(missing))} ON TABLE "{schema}"."{name}" TO "{role}"'
+                        f"REVOKE ALL ON SEQUENCE {_ident(schema)}.{_ident(name)} FROM {_ident(role)}"
                     )
                 )
-            if "INSERT" in privileges:
-                for (sequence,) in conn.execute(
-                    text(
-                        """
-                        SELECT s.oid::regclass::text
-                        FROM pg_depend d
-                        JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
-                        WHERE d.refobjid = to_regclass(format('%I.%I', CAST(:s AS text), CAST(:t AS text)))
-                          AND d.deptype IN ('a', 'i')
-                        """
-                    ),
-                    {"s": schema, "t": name},
-                ):
-                    conn.execute(text(f'GRANT USAGE ON SEQUENCE {sequence} TO "{role}"'))
+        for (schema,) in conn.execute(
+            text(
+                "SELECT n.nspname FROM pg_namespace n CROSS JOIN LATERAL aclexplode(n.nspacl) a "
+                "WHERE a.grantee = :oid"
+            ),
+            {"oid": oid},
+        ):
+            conn.execute(text(f"REVOKE USAGE ON SCHEMA {_ident(schema)} FROM {_ident(role)}"))
+
+    with db.engine.begin() as conn:
+        conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(CAST(:r AS text)))"), {"r": role})
+        for (schema, name), privileges in desired.items():
+            if not _readable_relation(conn, schema, name):
+                continue
+            conn.execute(text(f"GRANT USAGE ON SCHEMA {_ident(schema)} TO {_ident(role)}"))
+            conn.execute(
+                text(
+                    f"GRANT {', '.join(sorted(privileges))} ON TABLE "
+                    f"{_ident(schema)}.{_ident(name)} TO {_ident(role)}"
+                )
+            )
+            if "INSERT" not in privileges:
+                continue
+            for (sequence,) in conn.execute(
+                text(
+                    """
+                    SELECT s.oid::regclass::text
+                    FROM pg_depend d
+                    JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+                    JOIN pg_class t ON t.oid = d.refobjid
+                    JOIN pg_namespace n ON n.oid = t.relnamespace
+                    WHERE n.nspname = :s AND t.relname = :t AND d.deptype IN ('a', 'i')
+                    """
+                ),
+                {"s": schema, "t": name},
+            ):
+                conn.execute(text(f"GRANT USAGE ON SEQUENCE {sequence} TO {_ident(role)}"))
 
 
 def drop_agent_role(agent_id: str) -> None:
-    """Remove the agent's role and every grant it holds."""
+    """Remove the agent's login and every grant it holds."""
     role = agent_role_name(agent_id)
     with db.engine.begin() as conn:
         conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(CAST(:r AS text)))"), {"r": role})
         if conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname = :r"), {"r": role}).first():
-            conn.execute(text(f'DROP OWNED BY "{role}"'))
-            conn.execute(text(f'DROP ROLE "{role}"'))
+            conn.execute(text(f"DROP OWNED BY {_ident(role)}"))
+            conn.execute(text(f"DROP ROLE {_ident(role)}"))
+    with _engines_lock:
+        engine = _engines.pop(role, None)
+    if engine is not None:
+        engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -375,17 +587,21 @@ _engines_lock = threading.Lock()
 
 
 def _engine(login: str) -> Engine:
-    """A small pool logged in as ``login``, with the service's host and password."""
+    """An engine logged in as ``login``, with the service's host and password.
+
+    The end-user login keeps a small pool. Agent logins connect per
+    transaction: there is one per agent, and a pool each would add up.
+    """
     with _engines_lock:
         engine = _engines.get(login)
         if engine is None:
-            engine = create_engine(
-                db.engine.url.set(username=login),
-                pool_size=1,
-                max_overflow=4,
-                pool_pre_ping=True,
-                pool_recycle=1800,
-            )
+            url = db.engine.url.set(username=login)
+            if login == USER_LOGIN:
+                engine = create_engine(
+                    url, pool_size=1, max_overflow=4, pool_pre_ping=True, pool_recycle=1800
+                )
+            else:
+                engine = create_engine(url, poolclass=NullPool)
             _engines[login] = engine
         return engine
 
@@ -393,13 +609,14 @@ def _engine(login: str) -> Engine:
 _CLAIM_KEY = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 
-def _set_claims(conn: Connection, claims: dict) -> None:
+def _set_claims(conn: Connection, claims) -> None:
     """Expose the caller's JWT claims to RLS, both ways ``auth.uid()`` reads them.
 
     Newer Supabase databases read the ``request.jwt.claims`` JSON; older ones
     read one ``request.jwt.claim.<name>`` setting per claim, as PostgREST used
     to set them. Both are set so policies work on either.
     """
+    claims = dict(claims)
     conn.execute(
         text("SELECT set_config('request.jwt.claims', :claims, true)"),
         {"claims": json.dumps(claims)},
@@ -412,6 +629,16 @@ def _set_claims(conn: Connection, claims: dict) -> None:
             )
 
 
+def _check_caller(caller: ToolCaller) -> None:
+    if not caller.is_end_user:
+        return
+    if not _user_login_ready:
+        raise AgentToolsUnavailable("Database tools are not set up for end users on this server")
+    expires = caller.claims.get("exp")
+    if isinstance(expires, (int, float)) and expires < time.time():
+        raise AgentToolsUnavailable("The user's session has expired; ask them to sign in again")
+
+
 @contextmanager
 def agent_transaction(
     caller: ToolCaller, agent_id: str, schemas: list[str], *, read_only: bool
@@ -419,20 +646,20 @@ def agent_transaction(
     """A transaction on a tool login, acting as ``caller``. Commits on success.
 
     An end user's transaction is ``authenticated`` with their JWT claims; a
-    service-role transaction is the agent's own role (see
-    :func:`sync_agent_role`). Either way the login is not a superuser and
-    cannot bypass RLS itself.
+    service-role transaction is the agent's own login (see
+    :func:`sync_agent_role`). Neither login is a superuser.
     """
-    login = USER_LOGIN if caller.is_end_user else BACKEND_LOGIN
+    _check_caller(caller)
+    login = USER_LOGIN if caller.is_end_user else agent_role_name(agent_id)
     with _engine(login).connect() as conn, conn.begin():
         if read_only:
             conn.execute(text("SET TRANSACTION READ ONLY"))
+        conn.execute(text(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'"))
+        conn.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
         if caller.is_end_user:
             conn.execute(text("SET LOCAL ROLE authenticated"))
             _set_claims(conn, caller.claims)
-        else:
-            conn.execute(text(f'SET LOCAL ROLE "{agent_role_name(agent_id)}"'))
-        search_path = ", ".join(f'"{s}"' for s in schemas) or '""'
+        search_path = ", ".join(_ident(s) for s in schemas) or '""'
         conn.execute(text(f"SET LOCAL search_path TO {search_path}"))
         yield conn
 
@@ -440,7 +667,7 @@ def agent_transaction(
 def _check_references(
     conn: Connection, parsed: ParsedSelect, allowed: dict[str, list[str]]
 ) -> None:
-    """Resolve what the query names, as the query will, and hold it to the allowlist."""
+    """Resolve what the query names, as the query will, and hold it to the allowlists."""
     permitted = {(schema, name) for schema, names in allowed.items() for name in names or []}
     for schema, name in parsed.relations:
         row = conn.execute(
@@ -456,42 +683,78 @@ def _check_references(
             {"s": schema, "t": name},
         ).first()
         label = f"{schema}.{name}" if schema else name
-        if row is None or (row[0], row[1]) not in permitted:
+        if (
+            row is None
+            or (row[0], row[1]) not in permitted
+            or not _readable_relation(conn, row[0], row[1])
+        ):
             raise AgentSqlRejected(
                 f"Table {label} is not in this agent's configured tables: "
                 f"{sorted(f'{s}.{t}' for s, t in permitted)}"
             )
 
     names = sorted(set(parsed.functions))
-    if not names:
-        return
-    builtin = set(
-        conn.execute(
-            text(
-                "SELECT DISTINCT proname FROM pg_proc "
-                "WHERE pronamespace = 'pg_catalog'::regnamespace AND proname = ANY(:n)"
-            ),
-            {"n": names},
-        ).scalars()
-    )
-    shadowed = set(
-        conn.execute(
+    if names:
+        builtin = set(
+            conn.execute(
+                text(
+                    "SELECT DISTINCT proname FROM pg_proc "
+                    "WHERE pronamespace = 'pg_catalog'::regnamespace AND proname = ANY(:n)"
+                ),
+                {"n": names},
+            ).scalars()
+        )
+        shadowed = set(
+            conn.execute(
+                text(
+                    """
+                    SELECT DISTINCT p.proname FROM pg_proc p
+                    JOIN pg_namespace n ON n.oid = p.pronamespace
+                    WHERE p.proname = ANY(:n) AND n.nspname = ANY(current_schemas(false))
+                      AND n.nspname <> 'pg_catalog'
+                    """
+                ),
+                {"n": names},
+            ).scalars()
+        )
+        for name in names:
+            if name not in builtin or name in shadowed:
+                raise AgentSqlRejected(
+                    f"Function {name} is not allowed: only a fixed set of built-in "
+                    "functions may be called"
+                )
+
+    operators = sorted(set(parsed.operators))
+    if operators:
+        # An operator on the search path outside pg_catalog could win
+        # resolution for some operand types; one implemented in SQL or PL/pgSQL
+        # could run anything. Extension operators written in C are fine.
+        unsafe = conn.execute(
             text(
                 """
-                SELECT DISTINCT p.proname FROM pg_proc p
-                JOIN pg_namespace n ON n.oid = p.pronamespace
-                WHERE p.proname = ANY(:n) AND n.nspname = ANY(current_schemas(false))
-                  AND n.nspname <> 'pg_catalog'
+                SELECT DISTINCT o.oprname FROM pg_operator o
+                JOIN pg_namespace n ON n.oid = o.oprnamespace
+                JOIN pg_proc p ON p.oid = o.oprcode
+                JOIN pg_language l ON l.oid = p.prolang
+                WHERE o.oprname = ANY(:ops) AND n.nspname = ANY(current_schemas(false))
+                  AND n.nspname <> 'pg_catalog' AND l.lanname NOT IN ('internal', 'c')
                 """
             ),
-            {"n": names},
-        ).scalars()
-    )
-    for name in names:
-        if name not in builtin or name in shadowed:
-            raise AgentSqlRejected(
-                f"Function {name} is not allowed: only built-in functions may be called"
-            )
+            {"ops": operators},
+        ).scalars().all()
+        if unsafe:
+            raise AgentSqlRejected(f"Operator {unsafe[0]} is not allowed in this schema")
+
+    for type_name in sorted(set(parsed.types)):
+        row = conn.execute(
+            text(
+                "SELECT t.typnamespace = 'pg_catalog'::regnamespace AND t.typtype <> 'd' "
+                "FROM pg_type t WHERE t.oid = to_regtype(:t)"
+            ),
+            {"t": type_name},
+        ).first()
+        if row is None or not row[0]:
+            raise AgentSqlRejected(f"Casting to {type_name} is not allowed")
 
 
 def run_query(

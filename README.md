@@ -101,20 +101,68 @@ of caller:
 - **Service role** — the bearer is exactly `SERVICE_ROLE_KEY`. This is how the
   dashboard and your own backend call the API. Every route is available.
 - **End user** — a JWT for a signed-in user of the project (audience
-  `authenticated`, signed with `JWT_SECRET`). An end user may only hold
-  conversations: create, list, continue and delete *their own* agent and
-  orchestration sessions, run agents and orchestrations in them, read their own
-  runs, and approve their own paused runs. Every other route answers `403`.
+  `authenticated`, signed with `JWT_SECRET`, with the user's id as `sub`). An
+  end user may only hold conversations, and only in *their own* sessions and
+  runs. These 16 routes are the whole list:
+
+  | Method | Path | What an end user may do |
+  |---|---|---|
+  | `GET` | `/api/agents/<agent_id>/sessions` | list their own sessions with the agent |
+  | `POST` | `/api/agents/<agent_id>/sessions` | create a session, owned by them |
+  | `DELETE` | `/api/agents/<agent_id>/sessions/<session_id>` | delete their own session |
+  | `POST` | `/api/agents/<agent_id>/run` | run the agent, in a new session or their own |
+  | `POST` | `/api/agents/<agent_id>/run/stream` | the same, streamed |
+  | `GET` | `/api/agents/runs/<run_id>` | read a run in their own session |
+  | `POST` | `/api/agents/runs/<run_id>/approve` | approve or reject their own paused run |
+  | `GET` | `/api/sessions/<session_id>` | read their own session |
+  | `GET` | `/api/sessions/<session_id>/messages` | read its messages |
+  | `GET` | `/api/sessions/<session_id>/runs` | read its runs |
+  | `GET` | `/api/sessions/<session_id>/runs/<run_id>/retrieved-context` | read a run's retrieved context |
+  | `DELETE` | `/api/sessions/<session_id>` | delete their own session |
+  | `GET` | `/api/orchestrations/<orch_id>/sessions` | list their own orchestration sessions |
+  | `GET` | `/api/orchestrations/<orch_id>/sessions/<session_id>/messages` | read their own orchestration session's messages |
+  | `POST` | `/api/orchestrations/<orch_id>/run/stream` | run the orchestration, in a new session or their own session of it |
+  | `GET` | `/api/orchestrations/runs/<run_id>` | read an orchestration run in their own session |
+
+  There is no end-user route to create or delete an orchestration session: a
+  run creates one, and only the service role deletes them. A session, run or
+  paused run that is someone else's, or that a backend created without a
+  `user_id`, answers `404` as if it did not exist.
+
+Every other route answers an end user with `403` and
+`{"error": "This endpoint requires the project's service role key"}`.
+
+**Never ship `SERVICE_ROLE_KEY` to a browser or a mobile app.** Anyone who holds
+it can call every route above as an administrator. Browsers and apps call with
+the signed-in user's own JWT.
 
 An end user's run uses the knowledge bases configured on the agent. The run-body
 fields that point it at other stored data — `knowledge_bases`,
 `runtime_knowledge_bases`, `context_handler_id` and by-reference `context_items`
-— are service-role only. To let users search particular knowledge bases, run
-the agent from your backend with the service role key, and pass `user_id` when
-creating the session so the conversation still belongs to that user.
+— are service-role only. An end user who sends one gets `403` with a body naming
+the fields, for example:
 
-Without `SERVICE_ROLE_KEY` set, no caller is the service role and every
-management route answers `403`.
+```json
+{"error": "knowledge_bases may only be set with the project's service role key; an end user's run uses the knowledge bases configured on the agent"}
+```
+
+To let users search particular knowledge bases, run the agent from your backend
+with the service role key, and pass `user_id` when creating the session so the
+conversation still belongs to that user.
+
+> **When your backend runs an agent for a user, its database tools do not act
+> as that user.** A run made with the service role key is a service-role run,
+> even in a session created with `user_id`: the agent's `database_query` and
+> `database_write` tools act as the agent's own database role, with grants on
+> the tables configured on its tools and RLS bypassed on those tables, not as
+> the session's user. Configure such an agent only with tables that every user
+> it runs for may see in full, or run agents that carry database tools with the
+> user's own JWT instead.
+
+Without `SERVICE_ROLE_KEY` set, no caller is the service role. A request that
+bears the service role key is then decoded as an end-user token and answers
+`401` (it has no `authenticated` audience); the management routes are
+unreachable.
 
 ### What an agent's tools can reach
 
@@ -122,24 +170,41 @@ An agent's `database_query`, `database_write`, `storage_read` and
 `storage_write` tools act as whoever started the run, never as this service's
 own database login:
 
-- **An end user's run** queries Postgres as `authenticated` with that user's JWT
-  claims, and calls Storage with their own token. The agent can read and write
-  exactly what the user could through the REST API themselves: your grants and
-  RLS policies decide.
-- **A service-role run** queries Postgres as a role of its own that holds grants
-  on exactly the tables configured on the agent's database tools, and bypasses
-  RLS on those tables only.
+- **An end user's run** queries Postgres as the `authenticated` role with that
+  user's JWT claims, limited to the tables configured on the agent's database
+  tools, so your grants and RLS policies for that user apply to those tables.
+  It calls Storage with the user's own token.
+- **A service-role run** logs in as the agent's own database login, which holds
+  grants on exactly the tables configured on the agent's database tools and
+  bypasses RLS on those tables only. It is a member of no other role, so one
+  agent cannot take on another's grants.
 
-`database_query` accepts one plain `SELECT` that reads only the configured
-tables and calls only built-in functions; `set_config`, functions that run a SQL
-string, and functions defined in your own schemas are rejected. The tools log in
-as `powabase_agent_user` and `powabase_agent_backend`, which the service creates
-at startup with its own database password. Neither is a superuser or can bypass
-RLS itself.
+Only plain tables, partitioned tables and views created `WITH
+(security_invoker = true)` may be configured. `database_query` accepts one
+`SELECT` over the configured tables that calls only an allowlist of built-in
+functions and operators and casts only to built-in types. Functions that change
+or read settings or run a SQL string, custom functions, operators written in SQL
+or PL/pgSQL in your schemas, and casts to domains are rejected. Every tool
+transaction has a 30-second statement timeout and a 5-second lock timeout.
+
+The end-user login is `powabase_agent_user`; each agent's login is
+`powabase_agent_<agent id without dashes>`. The service creates them with its
+own database password, the end-user login at startup and an agent's login when
+its tools are configured or first run; none is a superuser. Deleting an agent
+drops its login, and startup removes any login whose agent is gone.
+
+Postgres also runs some functions implicitly, such as a domain's `CHECK` when a
+value is written or the equality operator of a column's own type when a query
+groups or joins on it. Configure agents only with tables whose column types you
+trust.
+
+The storage tools accept bucket names matching `^[A-Za-z0-9_-]+$` and paths
+without `.` or `..` segments or `%`. The internal `sources` bucket, which holds
+the original files of ingested sources, is never reachable from a tool.
 
 ## API Endpoints
 
-- `GET /api/health` - Health check
+- `GET /health` - Health check
 - `GET /api/sources` - List sources
 - `POST /api/sources` - Create source
 - `POST /api/sources/<id>/reextract` - Re-run extraction

@@ -14,7 +14,12 @@ string.
 
 import pytest
 
-from agentic_project_service.services.agent_sql import AgentSqlRejected, parse_select
+from agentic_project_service.services.agent_sql import (
+    ALLOWED_FUNCTIONS,
+    ALLOWED_OPERATORS,
+    AgentSqlRejected,
+    parse_select,
+)
 
 
 def _rels(sql):
@@ -91,6 +96,13 @@ class TestRejectsIdentityAndSqlStringFunctions:
             "SELECT SET_CONFIG('role', 'x', true)",
             # Running a SQL string, which the parse gate cannot see into.
             "SELECT query_to_xml('select 1', true, true, '')",
+            "SELECT * FROM ts_stat($q$select to_tsvector(set_config('role','x',true))$q$)",
+            "SELECT ts_rewrite('a'::tsquery, $q$select 'a'::tsquery, 'b'::tsquery$q$)",
+            # Reading the settings the caller's identity lives in.
+            "SELECT current_setting('request.jwt.claims')",
+            # Anything not on the allowlist, however harmless it looks.
+            "SELECT pg_typeof(1)",
+            "SELECT version()",
             "SELECT table_to_xml('t', true, true, '')",
             "SELECT cursor_to_xml('c', 1, true, true, '')",
             # Reading other sessions, files, large objects; sleeping; locking.
@@ -142,3 +154,92 @@ class TestCteScoping:
     def test_cte_never_hides_a_schema_qualified_table(self):
         sql = "WITH orders AS (SELECT 1 AS x) SELECT * FROM public.orders"
         assert _rels(sql) == [("public", "orders")]
+
+
+class TestTheAllowlistIsClosed:
+    """Functions are allowed by name; everything else is rejected."""
+
+    # Names SQL spells with keyword syntax rather than name(...).
+    _KEYWORD_SYNTAX = {
+        "extract": "SELECT extract(year FROM now())",
+        "position": "SELECT position('a' IN 'b')",
+        "normalize": "SELECT normalize('a')",
+        "json_object": "SELECT json_object('{a,1}')",
+    }
+
+    @pytest.mark.parametrize("name", sorted(ALLOWED_FUNCTIONS))
+    def test_allowed_names_pass_the_parse_gate(self, name):
+        sql = self._KEYWORD_SYNTAX.get(name, f"SELECT {name}()")
+        assert name in parse_select(sql).functions
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT substring('abc' FROM 1 FOR 2)",
+            "SELECT trim(both ' ' FROM 'a')",
+            "SELECT overlay('abc' PLACING 'x' FROM 1)",
+            "SELECT now() AT TIME ZONE 'UTC'",
+            "SELECT (1, 2) OVERLAPS (3, 4)",
+            "SELECT current_date, current_timestamp",
+        ],
+    )
+    def test_keyword_spellings_of_allowed_functions(self, sql):
+        parse_select(sql)
+
+    @pytest.mark.parametrize(
+        "name",
+        ["set_config", "current_setting", "ts_stat", "ts_rewrite", "query_to_xml", "dblink"],
+    )
+    def test_identity_and_sql_string_functions_are_not_on_it(self, name):
+        assert name not in ALLOWED_FUNCTIONS
+
+
+class TestOperatorsAndCasts:
+    def test_operators_are_reported(self):
+        parsed = parse_select("SELECT a FROM t WHERE a = 1 AND b LIKE 'x%' AND c + 1 > 2")
+        assert set(parsed.operators) == {"=", "~~", "+", ">"}
+
+    def test_between_is_its_two_comparisons(self):
+        assert set(parse_select("SELECT 1 FROM t WHERE a BETWEEN 1 AND 2").operators) == {
+            ">=",
+            "<=",
+        }
+
+    def test_sublink_and_sort_operators_are_reported(self):
+        parsed = parse_select("SELECT a FROM t WHERE a = ANY (SELECT b FROM u) ORDER BY a USING <")
+        assert {"=", "<"} <= set(parsed.operators)
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT a <-> b FROM t",
+            "SELECT a OPERATOR(public.=) 1 FROM t",
+            "SELECT 1 FROM t ORDER BY a USING public.<",
+        ],
+    )
+    def test_unlisted_or_non_catalog_operators_are_rejected(self, sql):
+        with pytest.raises(AgentSqlRejected):
+            parse_select(sql)
+
+    def test_pg_catalog_qualified_operator_is_fine(self):
+        assert parse_select("SELECT a OPERATOR(pg_catalog.+) 1 FROM t").operators == ["+"]
+
+    def test_cast_types_are_reported(self):
+        parsed = parse_select("SELECT a::integer, b::text[], CAST(c AS numeric(10, 2)) FROM t")
+        assert sorted(parsed.types) == ["integer", "numeric(10, 2)", "text[]"]
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT CAST(id AS public.trap) FROM t",
+            "SELECT id::regclass FROM t",
+            "SELECT 'pg_authid'::regclass",
+            "SELECT 'postgres'::regrole",
+        ],
+    )
+    def test_casts_to_non_catalog_or_catalog_lookup_types_are_rejected(self, sql):
+        with pytest.raises(AgentSqlRejected):
+            parse_select(sql)
+
+    def test_every_allowed_operator_is_a_symbol(self):
+        assert all(not op.isidentifier() for op in ALLOWED_OPERATORS)

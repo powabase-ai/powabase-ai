@@ -16,7 +16,9 @@ import types
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
+import psycopg.errors
 import pytest
+from sqlalchemy.exc import ProgrammingError
 
 from agentic_project_service.services import tool_registry
 from agentic_project_service.services.agent_sql import AgentSqlRejected
@@ -130,9 +132,16 @@ class TestDatabaseWrite:
         assert any("INSERT INTO" in str(c.args[0]) for c in conn.execute.call_args_list)
 
     def test_a_database_error_is_reported(self):
+        class _RlsViolation(psycopg.errors.InsufficientPrivilege):
+            @property
+            def diag(self):
+                return types.SimpleNamespace(
+                    message_primary="new row violates row-level security policy"
+                )
+
         @contextmanager
         def failing(*a, **k):
-            raise RuntimeError("new row violates row-level security policy")
+            raise ProgrammingError("INSERT ...", {}, _RlsViolation())
             yield  # pragma: no cover
 
         with patch.object(builtin.agent_sql, "agent_transaction", failing):
@@ -313,7 +322,7 @@ class TestLoaderCarriesTheCaller:
         loader.sync.assert_not_called()
 
     def test_no_caller_means_tools_that_refuse(self, loader):
-        tools = tool_registry.load_all_tools_for_agent(AGENT_ID, db_session=None)
+        tools = tool_registry.load_all_tools_for_agent(AGENT_ID, db_session=None, caller=None)
         tools["database_query"].handler({}, None)
         assert loader.seen["database_query"]["_caller"] is None
         loader.sync.assert_not_called()

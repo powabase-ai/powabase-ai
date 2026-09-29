@@ -31,7 +31,7 @@ from agentic.agent.hooks import (
 from agentic.agent.message import Message
 from agentic.execution.context import ExecutionContext
 from agentic.mcp import McpError, discover_mcp_tools
-from flask import Blueprint, Response, current_app, g, jsonify, request, stream_with_context
+from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from sqlalchemy import text
 
 from ..auth import (
@@ -81,7 +81,7 @@ from ..services.session import (
     session_accessible_to,
     update_agent_run,
 )
-from ..services import agent_sql
+from ..services import agent_sql, tool_registry
 from ..services.tool_caller import ToolCaller
 from ..services.run_registry import (
     get_active_run_context,
@@ -587,6 +587,47 @@ def delete_agent(agent_id: str):
 # =============================================================================
 
 
+_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
+
+
+def _tool_config_error(config) -> str | None:
+    """Why a tool assignment's ``config_override`` is refused, or None.
+
+    Only the database tools' ``schemas`` (schema -> table names) is checked:
+    its names become grants on the agent's database role, so each must be a
+    plain identifier outside the system schemas.
+    """
+    if not isinstance(config, dict) or "schemas" not in config:
+        return None
+    from ..routes.database import SYSTEM_SCHEMAS
+
+    schemas = config["schemas"]
+    if not isinstance(schemas, dict):
+        return "schemas must be a dict"
+    for schema_name, tables in schemas.items():
+        if not _IDENTIFIER_RE.match(schema_name):
+            return f"Invalid schema name: {schema_name}"
+        if schema_name in SYSTEM_SCHEMAS or schema_name.startswith("pg_"):
+            return f"System schema '{schema_name}' is not allowed"
+        if not isinstance(tables, list) or not all(
+            isinstance(t, str) and _IDENTIFIER_RE.match(t) for t in tables
+        ):
+            return f"Invalid table names in schema '{schema_name}'"
+    return None
+
+
+def _sync_database_role(agent_id: str) -> None:
+    """Re-grant the agent's database role after its tool assignments changed.
+
+    The change is already committed, so a failure is logged rather than
+    returned: the next service-role run of the agent syncs the grants again.
+    """
+    try:
+        tool_registry.sync_agent_database_role(agent_id)
+    except Exception:
+        logger.exception("Could not sync the database role of agent %s", agent_id)
+
+
 @agents_bp.route("/<agent_id>/tools", methods=["POST"])
 @require_service_role
 def assign_tool(agent_id: str):
@@ -596,15 +637,21 @@ def assign_tool(agent_id: str):
     if not tool_type or not tool_name:
         return jsonify({"error": "tool_type and tool_name are required"}), 400
 
+    config_override = data.get("config_override", {})
+    config_error = _tool_config_error(config_override)
+    if config_error:
+        return jsonify({"error": config_error}), 400
+
     assignment = AgentTool(
         agent_id=agent_id,
         tool_id=data.get("tool_id"),
         tool_type=tool_type,
         tool_name=tool_name,
-        config_override=data.get("config_override", {}),
+        config_override=config_override,
     )
     db.session.add(assignment)
     db.session.commit()
+    _sync_database_role(agent_id)
     return jsonify({"id": str(assignment.id), "tool_name": tool_name}), 201
 
 
@@ -636,6 +683,7 @@ def remove_agent_tool(agent_id: str, assignment_id: str):
         return jsonify({"error": "Assignment not found"}), 404
     db.session.delete(assignment)
     db.session.commit()
+    _sync_database_role(agent_id)
     return jsonify({"deleted": True})
 
 
@@ -650,25 +698,12 @@ def update_agent_tool(agent_id: str, assignment_id: str):
     data = request.get_json(silent=True) or {}
     if "config_override" in data:
         config = data["config_override"]
-        # Validate schema config if present
-        if isinstance(config, dict) and "schemas" in config:
-            from ..routes.database import SYSTEM_SCHEMAS
-
-            _ID_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
-            schemas = config["schemas"]
-            if not isinstance(schemas, dict):
-                return jsonify({"error": "schemas must be a dict"}), 400
-            for schema_name, tables in schemas.items():
-                if not _ID_RE.match(schema_name):
-                    return jsonify({"error": f"Invalid schema name: {schema_name}"}), 400
-                if schema_name in SYSTEM_SCHEMAS or schema_name.startswith("pg_"):
-                    return jsonify({"error": f"System schema '{schema_name}' is not allowed"}), 400
-                if not isinstance(tables, list) or not all(
-                    isinstance(t, str) and _ID_RE.match(t) for t in tables
-                ):
-                    return jsonify({"error": f"Invalid table names in schema '{schema_name}'"}), 400
+        config_error = _tool_config_error(config)
+        if config_error:
+            return jsonify({"error": config_error}), 400
         assignment.config_override = config
     db.session.commit()
+    _sync_database_role(agent_id)
 
     return jsonify(
         {
@@ -1079,16 +1114,13 @@ def list_sessions(agent_id: str):
     min_runs = request.args.get("min_runs", "").strip()
     max_runs = request.args.get("max_runs", "").strip()
 
-    # Scope to authenticated user unless caller is service-role
-    is_service_role = (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False)
-    scoped_user_id = None if is_service_role else get_current_user_id()
-
     params: dict[str, object] = {"agent_id": agent_id, "limit": limit, "offset": offset}
     where_clauses: list[str] = []
     having_clauses: list[str] = []
 
-    if scoped_user_id is not None:
-        params["scoped_user_id"] = scoped_user_id
+    # An end user sees only their own sessions; the service role sees all.
+    if not is_service_role_request():
+        params["scoped_user_id"] = get_current_user_id()
         where_clauses.append("s.user_id = :scoped_user_id")
 
     if search:
@@ -1332,19 +1364,17 @@ def create_session_for_agent(agent_id: str):
     # one. A service-role create therefore owns the session to the `user_id`
     # the body names, or to nobody.
     #
-    # Owning it to nobody is not merely an invisibility problem. list_sessions
-    # skips a NULL-owner session and the agent-scoped DELETE below 404s for
-    # every user-scoped caller, but run_agent and the streaming path gate on
-    # `owner is not None and owner != user_id` — which a NULL owner passes for
-    # *every* authenticated user of the project. Anyone who learns the `sess_`
-    # id can attach to it and have the model replay what is in it. A bare
-    # ownerless session exposes nothing; one pre-loaded with an imported
-    # conversation exposes that conversation, so the combination is refused.
+    # An ownerless session belongs to no end user: list_sessions skips it, and
+    # the agent-scoped DELETE below and the run routes (session_accessible_to)
+    # answer 404 to every user-scoped caller. Only the service role can read or
+    # continue it. Seeding one is still refused: an imported conversation is
+    # always someone's, and unowned it could never be listed or continued by
+    # the user it belongs to.
     #
     # Only service role may name an owner, and a user-scoped caller that tries
     # is refused rather than silently ignored — ignoring it would return 201
     # for a session belonging to someone other than the one asked for.
-    is_service_role = (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False)
+    is_service_role = is_service_role_request()
     requested_user_id = data.get("user_id")
     if requested_user_id is None:
         if is_service_role and initial:
@@ -1438,8 +1468,7 @@ def delete_session_for_agent(agent_id: str, session_id: str):
     if not row or str(row[1]) != agent_id:
         return jsonify({"error": "Session not found"}), 404
 
-    is_service_role = (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False)
-    if not is_service_role and (row[2] is None or str(row[2]) != get_current_user_id()):
+    if not is_service_role_request() and (row[2] is None or str(row[2]) != get_current_user_id()):
         return jsonify({"error": "Session not found"}), 404
 
     db_session_uuid = str(row[0])
@@ -1929,12 +1958,14 @@ def run_agent_stream(agent_id: str):
     # dispatch-fee pre-check.
     billing.check_balance(estimated_cost=_AGENT_RUN_ESTIMATED_COST)
 
-    # Get user_id from auth context
+    # Who the run acts for, read once from the request: the end user or the
+    # service role. The tools loaded below act as the same caller.
     user_id = get_current_user_id()
+    is_service_role = is_service_role_request()
+    caller = ToolCaller.from_request()
 
     # Ownership check: an end user may only continue a session they own
     # (service-role bypasses). Ownerless sessions belong to no end user.
-    is_service_role = is_service_role_request()
     if (
         session_id
         and not is_service_role
@@ -2149,7 +2180,7 @@ def run_agent_stream(agent_id: str):
                 max_tool_output_length=max_tool_output,
                 default_max_result_chars=max_result_chars,
                 runtime_kb_configs=runtime_kb_configs or None,
-                caller=ToolCaller.from_request(),
+                caller=caller,
             )
 
             # Citation handling — gate on context being available either from
@@ -3047,10 +3078,13 @@ def approve_run(run_id: str):
     if not isinstance(data["approved"], bool):
         return jsonify({"error": "'approved' must be a boolean"}), 400
     context = get_active_run_context(run_id)
-    if not context or (
-        not is_service_role_request() and get_active_run_owner(run_id) != get_current_user_id()
-    ):
+    if not context:
         return jsonify({"error": "Run not found or not waiting for approval"}), 404
+    if not is_service_role_request():
+        # A backend-started run has no owner, and no end user is its owner.
+        owner = get_active_run_owner(run_id)
+        if owner is None or owner != get_current_user_id():
+            return jsonify({"error": "Run not found or not waiting for approval"}), 404
     context.set_approval_decision(data)
     return jsonify({"status": "resumed"})
 

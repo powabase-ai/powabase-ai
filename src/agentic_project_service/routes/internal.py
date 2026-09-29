@@ -5,10 +5,10 @@ job polls per project to read the trailing-30d MAU counts it bills against
 the compute-tier bundle.
 """
 
-from flask import Blueprint, g, jsonify
+from flask import Blueprint, jsonify
 from sqlalchemy import text
 
-from ..auth import require_service_role
+from ..auth import is_service_role_request, require_service_role
 from ..db import db
 
 internal_bp = Blueprint("internal", __name__, url_prefix="/api/internal")
@@ -58,7 +58,7 @@ def mau_count():
     Service-role only: the MAU-drain job authenticates with the per-project
     service_role_key, which PS auth decodes and marks is_service_role.
     """
-    if (getattr(g, "jwt_payload", None) or {}).get("is_service_role") is not True:
+    if not is_service_role_request():
         return jsonify({"error": "Service role required"}), 403
 
     regular = db.session.execute(_REGULAR_MAU_SQL).scalar() or 0

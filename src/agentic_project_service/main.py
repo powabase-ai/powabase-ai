@@ -480,12 +480,24 @@ def create_app(testing: bool = False):
     # password rotation follows. Not fatal: without them the database tools
     # refuse, and everything else works.
     with app.app_context():
-        try:
-            from .services.agent_sql import ensure_login_roles
+        from .services.agent_sql import ensure_login_roles, reconcile_agent_roles
 
+        try:
             ensure_login_roles()
         except Exception:
             logger.exception("Could not set up the agent tool database logins")
+        # Drop logins of agents deleted while a drop failed or raced a run,
+        # and follow a password rotation on the rest.
+        try:
+            reconcile_agent_roles()
+        except Exception:
+            logger.exception("Could not reconcile the agent tool database logins")
+
+    if not os.getenv("SERVICE_ROLE_KEY"):
+        logger.warning(
+            "SERVICE_ROLE_KEY is not set: no request can authenticate as the service role, "
+            "so every management route is unreachable"
+        )
 
     return app
 

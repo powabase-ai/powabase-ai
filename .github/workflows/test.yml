@@ -142,7 +142,19 @@ jobs:
       #
       # tests/test_agent_sql_store.py pins that agent database tools run as the
       # caller: tool logins that are not superusers, an end user's run held to
-      # their RLS policies, a service-role run held to its agent's tables.
+      # their RLS policies, a service-role run held to its agent's own login.
+      # The two route classes pin that agent and orchestration runs load their
+      # tools for the request's caller; they boot the app, whose migrations
+      # grant to the Supabase roles, so those roles are created first.
+      - name: Create the Supabase roles the migrations grant to
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U supabase_admin -d postgres_test -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE anon NOLOGIN" \
+            -c "CREATE ROLE authenticated NOLOGIN" \
+            -c "CREATE ROLE service_role NOLOGIN BYPASSRLS"
+
       - name: Run store tests
         run: |
           set -o pipefail
@@ -154,6 +166,8 @@ jobs:
             tests/test_index_source_retry.py \
             tests/test_run_usage_cache_creation_store.py \
             tests/test_agent_sql_store.py \
+            "tests/route/test_agent_streaming.py::TestToolsActAsTheCaller" \
+            "tests/route/test_orchestration_streaming.py::TestSubAgentToolsActAsTheCaller" \
             -q -rs | tee pytest-store.log
           if grep -Eq "[0-9]+ (skipped|deselected|xfailed|xpassed)" pytest-store.log; then
             echo "::error::the store tier did not run every test; this job must run all of them"

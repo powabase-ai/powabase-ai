@@ -10,7 +10,7 @@ import time
 import uuid as _uuid
 
 import litellm
-from flask import Blueprint, Response, current_app, g, jsonify, request, stream_with_context
+from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from sqlalchemy import text
 
 from agentic.agent.rules import validate_condition
@@ -122,8 +122,7 @@ def _verify_orchestration_session_access(session_id: str):
     (not 403) on both "not found" and "owned by someone else" to avoid leaking
     session existence. Mirrors routes/sessions.py:_verify_session_access.
     """
-    jwt_payload = getattr(g, "jwt_payload", None) or {}
-    if jwt_payload.get("is_service_role", False):
+    if is_service_role_request():
         return None
 
     session = OrchestrationSessionModel.query.filter_by(session_id=session_id).first()
@@ -134,6 +133,26 @@ def _verify_orchestration_session_access(session_id: str):
     if session.user_id is None or str(session.user_id) != caller:
         return jsonify({"error": "Session not found"}), 404
     return None
+
+
+def _end_user_may_run_in_session(session_id: str, orch_id: str, user_id: str | None) -> bool:
+    """Whether an end user may run ``orch_id`` in the session named ``session_id``.
+
+    An unknown id is allowed: the run creates the session, owned by the
+    caller. An existing session must be the caller's own and belong to this
+    orchestration. Ownerless sessions, which a backend started, belong to no
+    end user. Continuing a session replays its history to the model and saves
+    the run under the session's owner, so any other answer leaks it.
+    """
+    session = OrchestrationSessionModel.query.filter_by(session_id=session_id).first()
+    if session is None:
+        return True
+    if session.user_id is None or user_id is None or str(session.user_id) != user_id:
+        return False
+    try:
+        return _uuid.UUID(str(session.orchestration_id)) == _uuid.UUID(orch_id)
+    except ValueError:
+        return False
 
 
 def _require_uuid(value: str, label: str = "id"):
@@ -673,12 +692,13 @@ def list_orchestration_sessions(orch_id: str):
     (which sees all sessions). Mirrors the agent path's pattern at
     routes/agents.py:list_sessions.
     """
-    is_service_role = (getattr(g, "jwt_payload", None) or {}).get("is_service_role", False)
-    scoped_user_id = None if is_service_role else get_current_user_id()
-
     query = OrchestrationSessionModel.query.filter_by(orchestration_id=orch_id)
-    if scoped_user_id is not None:
-        query = query.filter_by(user_id=scoped_user_id)
+    if not is_service_role_request():
+        user_id = get_current_user_id()
+        if user_id is None:
+            # filter_by(user_id=None) would select the ownerless sessions.
+            return jsonify({"sessions": [], "total": 0})
+        query = query.filter_by(user_id=user_id)
     sessions = query.order_by(OrchestrationSessionModel.created_at.desc()).limit(100).all()
 
     result = []
@@ -898,20 +918,24 @@ def run_orchestration_stream(orch_id: str):
 
     Security: only the service role key may set this field. An end user's
     JWT gets 403, so an end user's run can only read the knowledge bases
-    configured on the orchestration's agents.
+    configured on the orchestration's agents. An end user may continue only
+    their own session of this orchestration; any other existing `session_id`
+    answers 404.
     """
     data = request.get_json()
     message = data.get("message")
     if not message:
         return jsonify({"error": "message is required"}), 400
 
+    session_id = data.get("session_id")
+    user_id = get_current_user_id()
+
     if not is_service_role_request():
         body_error = end_user_run_body_error(data)
         if body_error:
             return jsonify({"error": body_error}), 403
-
-    session_id = data.get("session_id")
-    user_id = get_current_user_id()
+        if session_id and not _end_user_may_run_in_session(session_id, orch_id, user_id):
+            return jsonify({"error": "Session not found"}), 404
 
     runtime_kb_configs, runtime_kb_error = validate_runtime_knowledge_bases(data, db.session)
     if runtime_kb_error:

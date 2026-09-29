@@ -4,10 +4,15 @@ Validates tokens issued by the project's Supabase Auth.
 """
 
 import functools
+import hmac
+import logging
 import os
+import uuid
 
 import jwt
 from flask import g, jsonify, request
+
+logger = logging.getLogger(__name__)
 
 
 class AuthError(Exception):
@@ -38,6 +43,10 @@ def decode_jwt(token: str) -> dict:
     Accepts both:
     - User tokens with audience="authenticated"
     - Service role tokens (bypass audience check)
+
+    Only the second carries ``is_service_role``, and only because the bearer
+    is exactly ``SERVICE_ROLE_KEY``: a user token that claims it has the claim
+    removed.
     """
     jwt_secret = os.getenv("JWT_SECRET")
     if not jwt_secret:
@@ -45,7 +54,7 @@ def decode_jwt(token: str) -> dict:
 
     # Check if this is the service role key
     service_role_key = os.getenv("SERVICE_ROLE_KEY")
-    if service_role_key and token == service_role_key:
+    if service_role_key and hmac.compare_digest(token.encode(), service_role_key.encode()):
         # Decode without audience validation for service role
         try:
             payload = jwt.decode(
@@ -68,13 +77,16 @@ def decode_jwt(token: str) -> dict:
             algorithms=["HS256"],
             audience="authenticated",
         )
-        return payload
     except jwt.ExpiredSignatureError:
         raise AuthError("Token has expired") from None
     except jwt.InvalidAudienceError:
         raise AuthError("Invalid token audience") from None
     except jwt.InvalidTokenError as e:
         raise AuthError(f"Invalid token: {str(e)}") from None
+    # Stock GoTrue never issues this claim, but a custom access-token hook or a
+    # project minting its own tokens can put anything in a JWT it signs.
+    payload.pop("is_service_role", None)
+    return payload
 
 
 def get_current_user_id() -> str | None:
@@ -84,7 +96,17 @@ def get_current_user_id() -> str | None:
 
 def is_service_role_request() -> bool:
     """True when the current request authenticated with the service role key."""
-    return bool((getattr(g, "jwt_payload", None) or {}).get("is_service_role", False))
+    return getattr(g, "is_service_role", False) is True
+
+
+def _is_uuid(value) -> bool:
+    """True for a uuid in its canonical hyphenated spelling (any case)."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(uuid.UUID(value)) == value.lower()
+    except ValueError:
+        return False
 
 
 def _authenticate():
@@ -101,6 +123,15 @@ def _authenticate():
     except AuthError as e:
         return jsonify({"error": e.message}), e.status_code
 
+    # decode_jwt sets the flag only when the bearer is the service role key.
+    is_service_role = payload.get("is_service_role") is True
+    # Every end-user check downstream compares a row's owner with this id, so
+    # an end-user token must carry one: without it, "owned by nobody" and "the
+    # caller" would both be None.
+    if not is_service_role and not _is_uuid(payload.get("sub")):
+        return jsonify({"error": "Invalid token: sub must be a user id"}), 401
+
+    g.is_service_role = is_service_role
     g.user_id = payload.get("sub")
     g.user_role = payload.get("role", "authenticated")
     g.jwt_payload = payload
@@ -128,6 +159,13 @@ def require_service_role(f):
         if error:
             return error
         if not is_service_role_request():
+            # The token itself is never logged.
+            logger.info(
+                "Refused %s %s: service role key required (sub=%s)",
+                request.method,
+                request.path,
+                get_current_user_id(),
+            )
             return jsonify({"error": "This endpoint requires the project's service role key"}), 403
         return f(*args, **kwargs)
 
@@ -190,14 +228,17 @@ def optional_auth(f):
         if token:
             try:
                 payload = decode_jwt(token)
+                g.is_service_role = payload.get("is_service_role") is True
                 g.user_id = payload.get("sub")
                 g.user_role = payload.get("role", "authenticated")
                 g.jwt_payload = payload
             except AuthError:
+                g.is_service_role = False
                 g.user_id = None
                 g.user_role = None
                 g.jwt_payload = None
         else:
+            g.is_service_role = False
             g.user_id = None
             g.user_role = None
             g.jwt_payload = None

@@ -7,10 +7,13 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote
 
 import litellm
+import psycopg
 import requests as http_requests
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from ..services import agent_sql
 from ..services.agent_sql import AgentSqlRejected
@@ -18,7 +21,7 @@ from ..services.external_api import parse_retry_after
 from ..services.llm_call import with_llm_key
 from ..services.rate_limit import external_limiter
 from ..services.settings_registry import get_setting
-from ..services.storage import SOURCES_BUCKET, get_storage, get_storage_for_user
+from ..services.storage import SOURCES_BUCKET, StorageError, get_storage, get_storage_for_user
 from ..services.tool_caller import ToolCaller
 
 logger = logging.getLogger(__name__)
@@ -343,6 +346,32 @@ def _pop_caller(arguments) -> ToolCaller | None:
     return caller if isinstance(caller, ToolCaller) else None
 
 
+_DB_TOOL_FAILED = "The database tool failed; the error has been logged"
+
+# SQLSTATE classes about the server or the connection rather than the query:
+# their messages name hosts, logins and files, and the model cannot fix them.
+# 57014 (query_canceled, e.g. a statement timeout) is about the query.
+_SERVER_SQLSTATE_CLASSES = frozenset({"08", "28", "53", "57", "58", "F0", "XX"})
+
+
+def _database_error_message(exc: Exception, agent_id) -> str:
+    """What a database tool tells the model about ``exc``.
+
+    A rejection is shown as is. An error in the query itself is reduced to the
+    database's primary message: never the SQL text, its parameters or
+    SQLAlchemy's wrapper. Anything else is logged and replaced.
+    """
+    if isinstance(exc, AgentSqlRejected):
+        return str(exc)
+    if isinstance(exc, DBAPIError) and isinstance(exc.orig, psycopg.Error):
+        sqlstate = exc.orig.sqlstate or ""
+        primary = exc.orig.diag.message_primary
+        if primary and (sqlstate == "57014" or sqlstate[:2] not in _SERVER_SQLSTATE_CLASSES):
+            return primary
+    logger.exception("Database tool failed for agent %s", agent_id)
+    return _DB_TOOL_FAILED
+
+
 def database_write_handler(arguments, context):
     """Perform a structured INSERT, UPDATE, or DELETE on the configured schema(s).
 
@@ -490,7 +519,7 @@ def database_write_handler(arguments, context):
             }
         )
     except Exception as e:
-        return json.dumps({"success": False, "message": str(e)})
+        return json.dumps({"success": False, "message": _database_error_message(e, agent_id)})
 
 
 class _NothingToInsert(Exception):
@@ -578,10 +607,8 @@ def database_query_handler(arguments, context):
 
     try:
         rows = agent_sql.run_query(caller, agent_id, sql, schemas_config)
-    except AgentSqlRejected as e:
-        return json.dumps({"error": str(e)})
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return json.dumps({"error": _database_error_message(e, agent_id)})
     return json.dumps(rows, default=str)[:50000]
 
 
@@ -645,15 +672,64 @@ def code_execute_handler(arguments, context):
         return json.dumps({"error": f"Sandbox unavailable: {e}"})
 
 
-def _storage_refusal(caller: ToolCaller | None, bucket: str) -> str | None:
-    """Why this storage call may not run, as the tool's JSON reply, or None."""
-    if caller is None:
-        return json.dumps({"error": _NO_CALLER_MESSAGE})
-    if bucket == SOURCES_BUCKET:
-        return json.dumps(
-            {"error": f"The '{SOURCES_BUCKET}' bucket is internal and not available to agents"}
-        )
+# A bucket name the tools accept. Anything else (a slash, a dot segment, an
+# escape) could name a different bucket once the URL is resolved.
+_BUCKET_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_UNSAFE_PATH_CHARS = frozenset("%\\?#")
+
+_STORAGE_TOOL_FAILED = "The storage tool failed; the error has been logged"
+
+
+def _storage_target_error(bucket, path, *, prefix: bool = False) -> str | None:
+    """Why ``bucket``/``path`` may not be used, or None.
+
+    Every path segment must be a plain name: not empty, ``.`` or ``..``, and
+    free of ``%``, ``\\``, ``?``, ``#`` and control characters. A list
+    ``prefix`` may be empty, or end with ``/``; an object path may not.
+    """
+    if not isinstance(bucket, str) or not _BUCKET_RE.match(bucket):
+        return "bucket must be a bucket name (letters, digits, '-' and '_')"
+    if bucket.lower() == SOURCES_BUCKET:
+        return f"The '{SOURCES_BUCKET}' bucket is internal and not available to agents"
+    if not isinstance(path, str):
+        return "path must be a string"
+    if prefix and path == "":
+        return None
+    segments = path.split("/")
+    if prefix and segments[-1] == "":
+        segments.pop()  # "reports/2026/" lists a folder
+    for segment in segments:
+        if (
+            segment in ("", ".", "..")
+            or any(ch in _UNSAFE_PATH_CHARS for ch in segment)
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in segment)
+        ):
+            return (
+                f"Invalid path {path!r}: each '/'-separated part must be a name, not "
+                "empty, '.' or '..', without '%', '\\', '?', '#' or control characters"
+            )
     return None
+
+
+def _encode_object_path(path: str) -> str:
+    """``path`` with each segment percent-encoded, for an object URL.
+
+    Storage decodes it back to the same key; nothing in it can be read as URL
+    syntax on the way.
+    """
+    return "/".join(quote(segment, safe="") for segment in path.split("/"))
+
+
+def _storage_error_message(operation: str, exc: Exception) -> str:
+    """What a storage tool tells the model: the HTTP status if Storage answered,
+    never the response body or an internal URL. The details are logged."""
+    logger.exception("storage_%s failed", operation)
+    status = exc.status_code if isinstance(exc, StorageError) else None
+    if status == 404:
+        return f"Storage {operation} failed: not found (HTTP 404)"
+    if status:
+        return f"Storage {operation} failed (HTTP {status})"
+    return _STORAGE_TOOL_FAILED
 
 
 def _storage_for(caller: ToolCaller):
@@ -664,17 +740,19 @@ def _storage_for(caller: ToolCaller):
 def storage_read_handler(arguments, context):
     """List objects in a bucket prefix or download a file from project storage."""
     caller = _pop_caller(arguments)
+    if caller is None:
+        return json.dumps({"error": _NO_CALLER_MESSAGE})
     operation = arguments.get("operation", "")
     bucket = arguments.get("bucket", "")
     path = arguments.get("path", "") or ""
 
     if not bucket:
         return json.dumps({"error": "bucket is required"})
-    refusal = _storage_refusal(caller, bucket)
-    if refusal:
-        return refusal
 
     if operation == "list":
+        invalid = _storage_target_error(bucket, path, prefix=True)
+        if invalid:
+            return json.dumps({"error": invalid})
         try:
             storage = _storage_for(caller)
             # NOTE: Uses storage._request (private API) — should be replaced with
@@ -685,29 +763,33 @@ def storage_read_handler(arguments, context):
                 json={"prefix": path, "limit": 1000, "offset": 0},
             )
             if response.status_code != 200:
-                return json.dumps({"error": f"Failed to list objects: {response.text}"})
+                raise StorageError(f"Failed to list objects: {response.text}", response.status_code)
             return json.dumps({"bucket": bucket, "prefix": path, "objects": response.json()})
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            return json.dumps({"error": _storage_error_message("list", e)})
 
     elif operation == "download":
         if not path:
             return json.dumps({"error": "path is required for download"})
+        invalid = _storage_target_error(bucket, path)
+        if invalid:
+            return json.dumps({"error": invalid})
+        encoded = _encode_object_path(path)
         try:
             storage = _storage_for(caller)
-            data = storage.download_from_path(f"{bucket}/{path}")
+            data = storage.download_from_path(f"{bucket}/{encoded}")
             try:
                 content = data.decode("utf-8")
                 return json.dumps(
                     {"bucket": bucket, "path": path, "encoding": "utf-8", "content": content}
                 )
             except UnicodeDecodeError:
-                signed_url = storage.create_signed_url(bucket, path)
+                signed_url = storage.create_signed_url(bucket, encoded)
                 return json.dumps(
                     {"bucket": bucket, "path": path, "encoding": "binary", "signed_url": signed_url}
                 )
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            return json.dumps({"error": _storage_error_message("download", e)})
 
     else:
         return json.dumps({"error": f"Invalid operation: '{operation}'. Must be list or download."})
@@ -716,6 +798,8 @@ def storage_read_handler(arguments, context):
 def storage_write_handler(arguments, context):
     """Upload text content to a project storage bucket."""
     caller = _pop_caller(arguments)
+    if caller is None:
+        return json.dumps({"error": _NO_CALLER_MESSAGE})
     bucket = arguments.get("bucket", "")
     path = arguments.get("path", "")
     content = arguments.get("content", "")
@@ -725,17 +809,17 @@ def storage_write_handler(arguments, context):
         return json.dumps({"error": "bucket is required"})
     if not path:
         return json.dumps({"error": "path is required"})
-    refusal = _storage_refusal(caller, bucket)
-    if refusal:
-        return refusal
+    invalid = _storage_target_error(bucket, path)
+    if invalid:
+        return json.dumps({"error": invalid})
 
     try:
         encoded = content.encode("utf-8")
         storage = _storage_for(caller)
-        storage_path = storage.upload(bucket, path, encoded, content_type)
-        return json.dumps({"path": storage_path, "size": len(encoded)})
+        storage.upload(bucket, _encode_object_path(path), encoded, content_type)
+        return json.dumps({"path": f"{bucket}/{path}", "size": len(encoded)})
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return json.dumps({"error": _storage_error_message("write", e)})
 
 
 def web_search_handler(arguments, context):

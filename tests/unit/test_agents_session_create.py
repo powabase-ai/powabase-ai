@@ -29,7 +29,7 @@ from agentic_project_service.routes import agents as agents_route
 from agentic_project_service.services.session import seed_session_runs
 
 AGENT_ID = "3f9a1c2e-5b7d-4e11-9a3c-8d2f6b4e1a70"
-USER_ID = "user-1"
+USER_ID = "11111111-1111-4111-8111-111111111111"
 
 
 def _make_test_app():
@@ -445,7 +445,7 @@ class TestCreateSessionRoute:
         """The authenticated caller's user_id (JWT `sub`) is forwarded to
         get_or_create_session so the session records the right owner."""
         app = _make_test_app()
-        other_user = "user-42"
+        other_user = "42424242-4242-4242-8242-424242424242"
 
         with (
             patch.object(agents_route, "get_or_create_session") as mock_get_or_create,

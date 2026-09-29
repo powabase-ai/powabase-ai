@@ -230,8 +230,13 @@ def make_services(
         accesses Flask-SQLAlchemy's thread-local db.session.
         """
         from ..services.orchestration import build_orchestration
+        from ..services.tool_caller import ToolCaller
 
-        _orch_row, orchestration = build_orchestration(orchestration_id)
+        # Workflows are started with the service role key (or by a webhook or
+        # the scheduler on its behalf), so the block's agents act as it.
+        _orch_row, orchestration = build_orchestration(
+            orchestration_id, caller=ToolCaller.service()
+        )
         with billing.llm_call_scope():
             output = orchestration.run(input=message)
         return {
