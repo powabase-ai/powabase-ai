@@ -13,7 +13,7 @@ import re
 import traceback
 
 from ..celery import celery_app
-from celery.exceptions import Retry, SoftTimeLimitExceeded
+from celery.exceptions import Reject, Retry, SoftTimeLimitExceeded
 from sqlalchemy import text
 
 from agentic.llm.cost_accumulator import init_accumulator, install
@@ -3261,7 +3261,28 @@ def _waiter_redis():
 
 
 def _waiter_key(kb_id: str) -> str:
-    return f"per_kb_vector_index:table_waiter:{os.getenv('PROJECT_REF', 'default')}:{kb_id}"
+    """The marker's key, from the canonical id: one knowledge base, one key, however spelt."""
+    canonical = pg_vector_index._validated_kb_id(kb_id)
+    return f"per_kb_vector_index:table_waiter:{os.getenv('PROJECT_REF', 'default')}:{canonical}"
+
+
+def _waiter_pending_key(kb_id: str) -> str:
+    """Set by a dispatch the waiter superseded: "run once more when you are done"."""
+    return _waiter_key(kb_id) + ":pending"
+
+
+def _mark_pending(kb_id: str) -> None:
+    try:
+        _waiter_redis().set(_waiter_pending_key(kb_id), "1", ex=PER_KB_TABLE_WAITER_TTL_S)
+    except Exception:
+        logger.debug("Could not mark KB %s's reconcile as pending", kb_id, exc_info=True)
+
+
+def _clear_pending(kb_id: str) -> None:
+    try:
+        _waiter_redis().delete(_waiter_pending_key(kb_id))
+    except Exception:
+        logger.debug("Could not clear KB %s's pending reconcile", kb_id, exc_info=True)
 
 
 def _decoded(value) -> str | None:
@@ -3277,11 +3298,18 @@ def _current_waiter(kb_id: str) -> str | None:
     dispatches a reconcile: during a nine-hour build of another knowledge base's
     index, a catalogue import into this one would otherwise turn every one of those
     dispatches into its own ten-minute poller for up to 48 hours, each running the
-    whole survey. The marker makes every dispatch after the first a single Redis
-    read that ends ``superseded``; the waiter surveys afresh on its next look, so
-    nothing a superseded dispatch was sent for is lost -- short of a dispatch that
-    lands while the waiter is in the middle of the survey that ends its wait, which
-    the next indexed source or start-up then picks up.
+    whole survey. The marker makes every dispatch after the first a couple of Redis
+    round trips that end ``superseded``.
+
+    A superseded dispatch also leaves ``_waiter_pending_key`` behind, and the waiter
+    that gives the marker back re-dispatches the reconcile once if it finds it
+    (``_release_waiter``). That closes the window a look-based waiter otherwise has:
+    a dispatch sent for something that arrived after the waiter's last survey --
+    during the final look, say -- used to be dropped with nothing coming back for it.
+    What it does not close is a waiter that dies: the marker then stays until it
+    expires, at most ``PER_KB_TABLE_WAITER_TTL_S`` after its last renewal, every
+    dispatch until then is superseded, and nobody re-runs them -- the next indexed
+    source or start-up does.
     """
     try:
         return _decoded(_waiter_redis().get(_waiter_key(kb_id)))
@@ -3325,23 +3353,47 @@ def _claim_waiter(kb_id: str, task_id: str) -> str:
 
 
 def _release_waiter(kb_id: str, task_id: str) -> None:
-    """Give the marker back, if it is still this task's. Never raises.
+    """Give the marker back, if it is still this task's, and re-run what it superseded.
 
     Compare-and-delete under ``WATCH``, so a marker that expired and was claimed by
-    another task in between is left to that task.
+    another task in between is left to that task. The pending flag is read and
+    cleared in the same transaction, and a set one dispatches the reconcile once,
+    however many dispatches were superseded -- the one it dispatches surveys afresh.
+    Never raises.
     """
-    key = _waiter_key(kb_id)
     try:
+        key = _waiter_key(kb_id)
+        pending_key = _waiter_pending_key(kb_id)
+        pending = None
         with _waiter_redis().pipeline() as pipe:
             pipe.watch(key)
-            if _decoded(pipe.get(key)) == task_id:
-                pipe.multi()
-                pipe.delete(key)
-                pipe.execute()
-            else:
+            if _decoded(pipe.get(key)) != task_id:
                 pipe.unwatch()
+                return
+            pipe.multi()
+            pipe.delete(key)
+            pipe.get(pending_key)
+            pipe.delete(pending_key)
+            pending = pipe.execute()[1]
     except Exception:
         logger.debug("Could not release the vector index waiter of KB %s", kb_id, exc_info=True)
+        return
+    if pending is None:
+        return
+    try:
+        ensure_per_kb_vector_index.delay(kb_id)
+        logger.info(
+            "Re-dispatched KB %s's vector index reconcile: dispatches arrived while this "
+            "task was waiting for the embeddings table on its behalf",
+            kb_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not re-dispatch KB %s's vector index reconcile for the dispatches it "
+            "superseded (%s); the next indexed source or start-up picks it up",
+            kb_id,
+            pg_vector_index.first_error_line(exc),
+        )
 
 
 def _counted_retries(task, table_waits: int) -> int:
@@ -3367,6 +3419,11 @@ def _reschedule(task, kb_id: str, what: str, *, orphans: bool = False, **retry_k
     except Retry:
         raise
     except Exception as exc:
+        # Celery hands a refused publish back as ``Reject(<the broker's error>, False)``,
+        # whose text is that tuple; the cause is what an operator needs to read.
+        cause = (
+            exc.reason if isinstance(exc, Reject) and isinstance(exc.reason, BaseException) else exc
+        )
         orphaned = ""
         if orphans:
             orphaned = (
@@ -3379,7 +3436,7 @@ def _reschedule(task, kb_id: str, what: str, *, orphans: bool = False, **retry_k
             "(%s); nothing will come back to it until it is dispatched again%s",
             what,
             kb_id,
-            pg_vector_index.first_error_line(exc),
+            pg_vector_index.first_error_line(cause),
             orphaned,
         )
         raise
@@ -3520,8 +3577,12 @@ def ensure_per_kb_vector_index(self, kb_id: str, table_waits: int = 0) -> dict:
     without charging the counted budget while that build is demonstrably alive.
     ``table_waits`` is how many such waits came before this run; the counted
     attempts are Celery's ``request.retries`` less those (``_counted_retries``).
-    One task waits per knowledge base (``_current_waiter``): a dispatch that finds
-    another task waiting ends ``superseded`` before surveying anything.
+    One task waits per knowledge base (``_current_waiter``), on either path: a
+    dispatch that finds another task waiting ends ``superseded`` before surveying
+    anything, and the waiter re-dispatches the reconcile once when it is done. A
+    dispatch superseded by a waiter that then dies is the one that is lost: the
+    marker blocks new ones for at most ``PER_KB_TABLE_WAITER_TTL_S`` after the
+    waiter's last look, and the next indexed source or start-up re-runs it.
 
     Every run leaves two kinds of ``per_kb_vector_index`` line: one per state the
     service enters, as it enters it, and one summary with the outcome and how
@@ -3536,22 +3597,30 @@ def ensure_per_kb_vector_index(self, kb_id: str, table_waits: int = 0) -> dict:
     if task_id:
         waiter = _current_waiter(kb_id)
         if waiter and waiter != task_id:
-            logger.info(
-                "per_kb_vector_index kb=%s outcome=superseded waiter=%s: another task is "
-                "already waiting for the embeddings table on this knowledge base's behalf, "
-                "and will survey it afresh on its next look",
-                kb_id,
-                waiter,
-            )
-            return {"status": "superseded", "waiter": waiter, "built": [], "dropped": []}
+            # Pending first, then look again: a waiter that gave the marker back
+            # between the two reads found no pending flag, so nobody would re-run
+            # this dispatch -- in that case it runs itself.
+            _mark_pending(kb_id)
+            waiter = _current_waiter(kb_id)
+            if waiter and waiter != task_id:
+                logger.info(
+                    "per_kb_vector_index kb=%s outcome=superseded waiter=%s: another task "
+                    "is already waiting for the embeddings table on this knowledge base's "
+                    "behalf, and re-dispatches this once it is done",
+                    kb_id,
+                    waiter,
+                )
+                return {"status": "superseded", "waiter": waiter, "built": [], "dropped": []}
+            _clear_pending(kb_id)
     waiting = {"kept": False}
     try:
         return _ensure_per_kb_vector_index(self, kb_id, table_waits, waiting)
     finally:
-        # The marker goes with the wait: anything but a scheduled wait -- a result,
-        # a counted retry, a failure -- gives it back, so the next dispatch for this
-        # knowledge base surveys instead of being superseded by a task that is no
-        # longer waiting.
+        # The marker goes with the wait: anything but a rescheduled table_busy -- a
+        # result, any other retry, a give-up, a failure -- gives it back, so the next
+        # dispatch for this knowledge base surveys instead of being superseded by a
+        # task that is no longer waiting; and whatever was superseded meanwhile is
+        # re-dispatched once (``_release_waiter``).
         if task_id and not waiting["kept"]:
             _release_waiter(kb_id, task_id)
 
@@ -3665,20 +3734,23 @@ def _ensure_per_kb_vector_index(self, kb_id: str, table_waits: int, waiting: dic
     if pg_vector_index.outcome_waits_for_the_table(outcome):
         index = outcome.get("index") or "(index unnamed)"
         holders = outcome.get("table_holders") or []
+        # One waiter per knowledge base whichever way it waits: the counted path too,
+        # or N dispatches during a stalled holder became N×7 counted surveys.
+        task_id = self.request.id
+        if task_id:
+            waiter = _claim_waiter(kb_id, task_id)
+            if waiter != task_id:
+                # Another task became the waiter while this one surveyed.
+                _mark_pending(kb_id)
+                logger.info(
+                    "per_kb_vector_index kb=%s outcome=superseded waiter=%s: another task "
+                    "is already waiting for the embeddings table on this knowledge base's "
+                    "behalf",
+                    kb_id,
+                    waiter,
+                )
+                return {**outcome, "status": "superseded", "waiter": waiter}
         if outcome.get("build_alive"):
-            task_id = self.request.id
-            if task_id:
-                waiter = _claim_waiter(kb_id, task_id)
-                if waiter != task_id:
-                    # Another task became the waiter while this one surveyed.
-                    logger.info(
-                        "per_kb_vector_index kb=%s outcome=superseded waiter=%s: another "
-                        "task is already waiting for the embeddings table on this "
-                        "knowledge base's behalf",
-                        kb_id,
-                        waiter,
-                    )
-                    return {**outcome, "status": "superseded", "waiter": waiter}
             retry = _wait_for_the_table(
                 self, kb_id, table_waits, holders, f"reconcile vector index {index}"
             )
@@ -3724,6 +3796,9 @@ def _ensure_per_kb_vector_index(self, kb_id: str, table_waits: int, waiting: dic
             self.max_retries + 1,
             holder_text,
         )
+        # The counted countdown is at most 750 s, inside the marker's TTL, so the
+        # marker outlives the gap and this task stays the one that comes back.
+        waiting["kept"] = True
         raise retry
 
     # An INVALID index the ensure had to leave alone, because a build of it was
