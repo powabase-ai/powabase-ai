@@ -39,12 +39,14 @@ IMAGE_MIME_TYPES: dict[str, str] = {
 UPLOAD_MIME_TYPES: dict[str, str] = {**DOCUMENT_MIME_TYPES, **IMAGE_MIME_TYPES}
 IMPORT_MIME_TYPES: dict[str, str] = DOCUMENT_MIME_TYPES
 
-# The short names /import-from-storage stored before it used MIME types.
-# Rows written then still carry them; extraction maps them back.
+# The short names stored before every route used MIME types: import-from-storage
+# wrote all but "md", which the documentation knowledge base wrote. Migration
+# 0034 rewrites stored rows; extraction still maps any it meets.
 LEGACY_SHORT_FILE_TYPES: dict[str, str] = {
     "pdf": DOCUMENT_MIME_TYPES[".pdf"],
     "text": DOCUMENT_MIME_TYPES[".txt"],
     "markdown": DOCUMENT_MIME_TYPES[".md"],
+    "md": DOCUMENT_MIME_TYPES[".md"],
     "docx": DOCUMENT_MIME_TYPES[".docx"],
     "xlsx": DOCUMENT_MIME_TYPES[".xlsx"],
     "xls": DOCUMENT_MIME_TYPES[".xls"],
