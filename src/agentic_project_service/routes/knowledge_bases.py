@@ -1539,6 +1539,9 @@ def remove_source_from_kb(kb_id: str, indexed_source_id: str):
     )
 
 
+_REINDEX_BODY_KEYS = frozenset({"indexed_source_ids", "failed_only"})
+
+
 @knowledge_bases_bp.route("/<kb_id>/reindex", methods=["POST"])
 @require_service_role
 def reindex_kb(kb_id: str):
@@ -1554,6 +1557,16 @@ def reindex_kb(kb_id: str):
         return err
 
     data = request.get_json(silent=True) or {}
+    # An unread key must not fall through to "reindex everything": that
+    # re-embeds and bills every source in the knowledge base.
+    unknown = sorted(set(data) - _REINDEX_BODY_KEYS) if isinstance(data, dict) else []
+    if unknown:
+        return jsonify(
+            {
+                "error": f"Unknown field(s) {', '.join(unknown)}. Accepted: "
+                f"{', '.join(sorted(_REINDEX_BODY_KEYS))}; an empty body reindexes every source."
+            }
+        ), 400
     indexed_source_ids = data.get("indexed_source_ids") or []
     failed_only = bool(data.get("failed_only"))
 
