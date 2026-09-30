@@ -286,6 +286,7 @@ def test_the_boot_path_runs_the_sweep(monkeypatch):
     fake_db = MagicMock()
     monkeypatch.setattr(main, "db", fake_db)
     monkeypatch.setattr(main, "quiet_pg_search_planner_warnings", lambda engine: None)
+    monkeypatch.setattr(main, "install_pg_text_guard", lambda engine: None)
     monkeypatch.setattr(main, "ensure_pg_search_extension", lambda engine: None)
     # No ai schema yet: the migration branch that skips Alembic entirely, which
     # is still followed by every start-up sweep.
