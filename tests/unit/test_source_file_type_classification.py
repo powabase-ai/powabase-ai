@@ -152,6 +152,7 @@ LEGACY = [
     ("pptx", "pptx"),
     ("markdown", "text"),
     ("text", "txt"),
+    ("md", "text"),
 ]
 
 
@@ -203,3 +204,21 @@ def test_a_source_imported_before_the_fix_re_extracts_with_its_real_extractor(mo
     docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     assert looked_up == [docx]
     assert handed == [docx]
+
+
+def test_documentation_sources_are_stored_as_markdown(monkeypatch):
+    """The docs knowledge base writes its sources itself; they carry the same
+    MIME type an uploaded .md file gets."""
+    from agentic_project_service.routes import knowledge_bases
+    from agentic_project_service.services import docs_refresh
+    from agentic_project_service.tasks import extraction as extraction_task
+
+    session = _Session()
+    monkeypatch.setattr(extraction_task, "update_source_extraction_result", MagicMock())
+    monkeypatch.setattr(knowledge_bases, "index_source_into_kb", MagicMock(return_value={}))
+    doc = docs_refresh.DocRecord(key="docs:a.md", title="A", content="# A", content_hash="h")
+
+    docs_refresh._ingest_markdown_source(session, MagicMock(), "kb-1", doc)
+
+    (insert,) = session.inserts
+    assert insert["file_type"] == "text/markdown"

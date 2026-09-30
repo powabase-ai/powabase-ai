@@ -187,9 +187,7 @@ def test_a_multi_row_orm_flush_is_cleaned(app):
             {"ids": [s.id for s in sources]},
         ).all()
 
-    assert [(r.name, r.auto_metadata) for r in rows] == [
-        (f"many{i}", {"n": i}) for i in range(3)
-    ]
+    assert [(r.name, r.auto_metadata) for r in rows] == [(f"many{i}", {"n": i}) for i in range(3)]
 
 
 def test_a_multi_row_insert_returning_is_cleaned(app):
@@ -199,18 +197,30 @@ def test_a_multi_row_insert_returning_is_cleaned(app):
 
     table = Source.__table__
     with app.app_context():
-        ids = db.session.execute(
-            insert(table).returning(table.c.id),
-            [
-                {"name": f"ret\x00{i}", "file_type": "text/plain", "storage_path": f"sources/r{i}"}
-                for i in range(3)
-            ],
-        ).scalars().all()
+        ids = (
+            db.session.execute(
+                insert(table).returning(table.c.id),
+                [
+                    {
+                        "name": f"ret\x00{i}",
+                        "file_type": "text/plain",
+                        "storage_path": f"sources/r{i}",
+                    }
+                    for i in range(3)
+                ],
+            )
+            .scalars()
+            .all()
+        )
         db.session.commit()
-        names = db.session.execute(
-            text("SELECT name FROM ai.sources WHERE id = ANY(:ids) ORDER BY name"),
-            {"ids": list(ids)},
-        ).scalars().all()
+        names = (
+            db.session.execute(
+                text("SELECT name FROM ai.sources WHERE id = ANY(:ids) ORDER BY name"),
+                {"ids": list(ids)},
+            )
+            .scalars()
+            .all()
+        )
 
     assert len(ids) == 3
     assert names == ["ret0", "ret1", "ret2"]
