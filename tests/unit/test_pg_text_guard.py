@@ -5,9 +5,12 @@ pinned against a real Postgres in tests/test_pg_text_guard_store.py.
 """
 
 import json
+from collections import namedtuple
+from types import SimpleNamespace
 
 from psycopg.types.json import Jsonb
 from sqlalchemy import create_engine, event
+from sqlalchemy.engine.interfaces import ExecuteStyle
 
 from agentic_project_service._pg_text_guard import (
     _before_cursor_execute,
@@ -93,6 +96,39 @@ def test_every_parameter_set_of_an_executemany_is_cleaned():
     )
     assert statement == "INSERT ..."
     assert params == [{"t": "a"}, {"t": "b"}]
+
+
+def test_an_insertmanyvalues_batch_is_one_parameter_set():
+    """SQLAlchemy runs a multi-row INSERT (an ORM flush of several objects,
+    ``insert().returning()`` over a list) as batches of one statement each:
+    ``executemany`` is true, yet the parameters are one flattened mapping."""
+    context = SimpleNamespace(execute_style=ExecuteStyle.INSERTMANYVALUES)
+
+    _, params = _before_cursor_execute(
+        None, None, "INSERT ...", {"t__0": "a\x00", "t__1": "b"}, context, True
+    )
+
+    assert params == {"t__0": "a", "t__1": "b"}
+
+
+def test_a_driver_executemany_cleans_each_parameter_set():
+    context = SimpleNamespace(execute_style=ExecuteStyle.EXECUTEMANY)
+
+    _, params = _before_cursor_execute(
+        None, None, "UPDATE ...", [{"t": "a\x00"}, {"t": "b\x00"}], context, True
+    )
+
+    assert params == [{"t": "a"}, {"t": "b"}]
+
+
+def test_a_named_tuple_keeps_its_type():
+    Pair = namedtuple("Pair", "name n")
+
+    cleaned = clean_parameter(Pair("a\x00", 1))
+    inside = clean_parameter(Jsonb({"p": Pair("b\x00", 2)})).obj["p"]
+
+    assert cleaned == Pair("a", 1) and type(cleaned) is Pair
+    assert inside == Pair("b", 2) and type(inside) is Pair
 
 
 def test_positional_parameters_are_cleaned():

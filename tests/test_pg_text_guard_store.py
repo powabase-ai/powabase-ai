@@ -163,3 +163,54 @@ def test_a_jsonb_value_written_through_the_orm_is_cleaned(app):
 
     assert row.name == "name"
     assert row.auto_metadata == {"title": "Title", "parts": ["a"]}
+
+
+def test_a_multi_row_orm_flush_is_cleaned(app):
+    """Several objects of one model in one flush go out as a single
+    multi-row INSERT ... RETURNING (SQLAlchemy's insertmanyvalues)."""
+    from agentic_project_service.models.tenant import Source
+
+    with app.app_context():
+        sources = [
+            Source(
+                name=f"many\x00{i}",
+                file_type="text/plain",
+                storage_path=f"sources/many{i}.txt",
+                auto_metadata={"n\x00": i},
+            )
+            for i in range(3)
+        ]
+        db.session.add_all(sources)
+        db.session.commit()
+        rows = db.session.execute(
+            text("SELECT name, auto_metadata FROM ai.sources WHERE id = ANY(:ids) ORDER BY name"),
+            {"ids": [s.id for s in sources]},
+        ).all()
+
+    assert [(r.name, r.auto_metadata) for r in rows] == [
+        (f"many{i}", {"n": i}) for i in range(3)
+    ]
+
+
+def test_a_multi_row_insert_returning_is_cleaned(app):
+    from sqlalchemy import insert
+
+    from agentic_project_service.models.tenant import Source
+
+    table = Source.__table__
+    with app.app_context():
+        ids = db.session.execute(
+            insert(table).returning(table.c.id),
+            [
+                {"name": f"ret\x00{i}", "file_type": "text/plain", "storage_path": f"sources/r{i}"}
+                for i in range(3)
+            ],
+        ).scalars().all()
+        db.session.commit()
+        names = db.session.execute(
+            text("SELECT name FROM ai.sources WHERE id = ANY(:ids) ORDER BY name"),
+            {"ids": list(ids)},
+        ).scalars().all()
+
+    assert len(ids) == 3
+    assert names == ["ret0", "ret1", "ret2"]

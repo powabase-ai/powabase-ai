@@ -31,6 +31,7 @@ from typing import Any
 
 from psycopg.types.json import Json, Jsonb
 from sqlalchemy import event
+from sqlalchemy.engine.interfaces import ExecuteStyle
 
 _UNPAIRED_SURROGATE = re.compile("[\ud800-\udfff]")
 
@@ -49,13 +50,23 @@ def clean_text(value: str) -> str:
     return value
 
 
+def _rebuilt(sequence: list | tuple, items) -> list | tuple:
+    """*items* in a sequence of *sequence*'s kind. A named tuple is rebuilt as
+    itself; its constructor takes fields, not one iterable."""
+    if isinstance(sequence, list):
+        return list(items)
+    if hasattr(sequence, "_make"):
+        return type(sequence)._make(items)
+    return tuple(items)
+
+
 def _clean_object(value: Any) -> Any:
     if isinstance(value, str):
         return clean_text(value)
     if isinstance(value, dict):
         return {_clean_object(k): _clean_object(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return type(value)(_clean_object(v) for v in value)
+        return _rebuilt(value, (_clean_object(v) for v in value))
     return value
 
 
@@ -81,7 +92,7 @@ def clean_parameter(value: Any) -> Any:
         # How SQLAlchemy binds a JSON/JSONB column's Python value.
         return type(value)(_clean_object(value.obj), value.dumps)
     if isinstance(value, (list, tuple)):
-        return type(value)(clean_parameter(v) for v in value)
+        return _rebuilt(value, (clean_parameter(v) for v in value))
     return value
 
 
@@ -89,12 +100,16 @@ def _clean_parameter_set(parameters: Any) -> Any:
     if isinstance(parameters, dict):
         return {k: clean_parameter(v) for k, v in parameters.items()}
     if isinstance(parameters, (list, tuple)):
-        return type(parameters)(clean_parameter(v) for v in parameters)
+        return _rebuilt(parameters, (clean_parameter(v) for v in parameters))
     return parameters
 
 
 def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
-    if executemany:
+    # ``executemany`` is also true for an "insertmanyvalues" batch -- a
+    # multi-row INSERT from an ORM flush or ``insert().returning()`` -- whose
+    # parameters are ONE flattened mapping, not a list of them. Only a driver
+    # executemany passes a list.
+    if executemany and (context is None or context.execute_style is ExecuteStyle.EXECUTEMANY):
         parameters = [_clean_parameter_set(p) for p in parameters]
     else:
         parameters = _clean_parameter_set(parameters)
