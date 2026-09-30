@@ -42,14 +42,21 @@ def _upgrade(migration):
             migration.upgrade()
 
 
-def _seed(file_type, status, auto_metadata="{}"):
+def _seed(file_type, status, auto_metadata="{}", storage_path="sources/x"):
     source_id = str(uuid.uuid4())
     db.session.execute(
         text(
             "INSERT INTO ai.sources (id, name, file_type, storage_path, extraction_status, "
-            "auto_metadata) VALUES (:id, :name, :ft, 'sources/x', :st, CAST(:am AS jsonb))"
+            "auto_metadata) VALUES (:id, :name, :ft, :sp, :st, CAST(:am AS jsonb))"
         ),
-        {"id": source_id, "name": source_id, "ft": file_type, "st": status, "am": auto_metadata},
+        {
+            "id": source_id,
+            "name": source_id,
+            "ft": file_type,
+            "sp": storage_path,
+            "st": status,
+            "am": auto_metadata,
+        },
     )
     db.session.commit()
     return source_id
@@ -88,7 +95,11 @@ def test_an_extracted_binary_source_is_held_for_re_extraction(app, migration, le
     assert row.file_type == mime
     assert row.extraction_status == "attention_required"
     assert "re-extract" in row.error_message.lower()
-    assert row.auto_metadata == {"extraction_method": "text", "legacy_file_type": legacy}
+    assert row.auto_metadata == {
+        "extraction_method": "text",
+        "legacy_file_type": legacy,
+        "reextract_hold": True,
+    }
 
 
 @pytest.mark.parametrize(
@@ -143,13 +154,105 @@ def test_a_source_with_a_mime_type_is_untouched(app, migration):
 
 def test_running_it_again_changes_nothing(app, migration):
     with app.app_context():
-        source_id = _seed("pdf", "extracted")
+        ids = [
+            _seed("pdf", "extracted"),
+            _seed("application/zip", "extracted", '{"extraction_method": "text"}', "s/a.docx"),
+            _seed("application/octet-stream", "failed", "{}", "s/b.pdf"),
+        ]
         _upgrade(migration)
-        first = _row(source_id)
+        first = [_row(i) for i in ids]
         _upgrade(migration)
-        second = _row(source_id)
+        second = [_row(i) for i in ids]
 
     assert second == first
+
+
+PDF = "application/pdf"
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+
+@pytest.mark.parametrize(
+    "stored,path,method,mime",
+    [
+        ("application/octet-stream", "sources/1/original/report.pdf", "text", PDF),
+        ("application/zip", "sources/1/original/letter.docx", "text", DOCX),
+        ("application/x-pdf", "sources/1/original/SCAN.PDF", "text", PDF),
+        ("text/plain", "sources/1/original/sheet.xlsx", "txt-native", XLSX),
+        ("application/msword", "sources/1/original/deck.pptx", "text", PPTX),
+    ],
+)
+def test_an_upload_the_registry_could_not_route_is_held(app, migration, stored, path, method, mime):
+    """/upload kept a declared type no extractor is registered under (or a text
+    type for a binary file), so the file's bytes were extracted as text."""
+    with app.app_context():
+        source_id = _seed(stored, "extracted", f'{{"extraction_method": "{method}"}}', path)
+        _upgrade(migration)
+        row = _row(source_id)
+
+    assert row.file_type == mime
+    assert row.extraction_status == "attention_required"
+    assert "re-extract" in row.error_message.lower()
+    assert row.auto_metadata == {
+        "extraction_method": method,
+        "legacy_file_type": stored,
+        "reextract_hold": True,
+    }
+
+
+def test_a_binary_file_extracted_by_the_text_fallback_under_its_mime_type_is_held(app, migration):
+    """A worker still on the old code can finish a short-typed row after this
+    migration gave it its MIME type; its text is raw bytes all the same."""
+    with app.app_context():
+        source_id = _seed(PDF, "extracted", '{"extraction_method": "text"}', "sources/1/a.pdf")
+        _upgrade(migration)
+        row = _row(source_id)
+
+    assert (row.file_type, row.extraction_status) == (PDF, "attention_required")
+    assert row.auto_metadata == {"extraction_method": "text", "reextract_hold": True}
+
+
+def test_a_failed_upload_under_an_unroutable_type_gets_its_mime_type(app, migration):
+    """Not indexable, so not held -- but re-extracting it must pick the real
+    extractor, which needs the MIME type."""
+    with app.app_context():
+        source_id = _seed("application/octet-stream", "failed", "{}", "sources/1/a.docx")
+        _upgrade(migration)
+        row = _row(source_id)
+
+    assert (row.file_type, row.extraction_status) == (DOCX, "failed")
+    assert row.auto_metadata == {"legacy_file_type": "application/octet-stream"}
+
+
+@pytest.mark.parametrize(
+    "stored,path,method",
+    [
+        (PDF, "sources/1/a.pdf", "fitz"),
+        (DOCX, "sources/1/a.docx", "docx-via-pdf"),
+        ("application/octet-stream", "sources/1/notes.txt", "text"),
+        ("text/plain", "sources/1/notes.txt", "txt-native"),
+    ],
+)
+def test_a_properly_extracted_source_is_untouched(app, migration, stored, path, method):
+    with app.app_context():
+        source_id = _seed(stored, "extracted", f'{{"extraction_method": "{method}"}}', path)
+        _upgrade(migration)
+        row = _row(source_id)
+
+    assert (row.file_type, row.extraction_status, row.auto_metadata) == (
+        stored,
+        "extracted",
+        {"extraction_method": method},
+    )
+
+
+def test_a_json_null_auto_metadata_becomes_an_object(app, migration):
+    with app.app_context():
+        source_id = _seed("pdf", "extracted", "null")
+        _upgrade(migration)
+        row = _row(source_id)
+
+    assert row.auto_metadata == {"legacy_file_type": "pdf", "reextract_hold": True}
 
 
 def test_a_held_source_cannot_be_indexed(app, migration, test_knowledge_base):
