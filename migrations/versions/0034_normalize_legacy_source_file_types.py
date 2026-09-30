@@ -42,9 +42,20 @@ _MIME_TYPES = {
 }
 _BINARY = ("pdf", "docx", "xlsx", "xls", "pptx")
 
+# What the text extractors record as extraction_method. None of the PDF or
+# Office extractors records one of these.
+_TEXT_METHODS = ("text", "txt-native", "markdown-native", "html")
+
 _HELD_MESSAGE = (
-    "This file was extracted as plain text because it was stored under a short "
-    "file type, so its text is the raw bytes of the file. Re-extract it before indexing."
+    "This file was extracted as plain text because it was stored under a "
+    "file type no extractor handles, so its text is the raw bytes of the file. "
+    "Re-extract it before indexing."
+)
+
+# auto_metadata as an object: a JSON null would otherwise be concatenated into
+# an array, which every reader of auto_metadata then fails on.
+_METADATA = (
+    "CASE WHEN jsonb_typeof(auto_metadata) = 'object' THEN auto_metadata ELSE '{}'::jsonb END"
 )
 
 
@@ -53,6 +64,9 @@ def _quoted(values) -> str:
 
 
 def upgrade():
+    # 1. Short types, whatever the path: all of them get their MIME type, and a
+    #    binary one that completed extraction is held -- it can only have been
+    #    extracted by the text fallback.
     mime_case = " ".join(f"WHEN '{short}' THEN '{mime}'" for short, mime in _MIME_TYPES.items())
     held = f"file_type IN ({_quoted(_BINARY)}) AND extraction_status = 'extracted'"
     # Every right-hand side reads the row as it was before this UPDATE.
@@ -64,10 +78,48 @@ def upgrade():
                                      ELSE extraction_status END,
             error_message = CASE WHEN {held} THEN '{_HELD_MESSAGE}'
                                  ELSE error_message END,
-            auto_metadata = COALESCE(auto_metadata, '{{}}'::jsonb)
-                            || jsonb_build_object('legacy_file_type', file_type),
+            auto_metadata = {_METADATA}
+                            || jsonb_build_object('legacy_file_type', file_type)
+                            || CASE WHEN {held} THEN '{{"reextract_hold": true}}'::jsonb
+                                    ELSE '{{}}'::jsonb END,
             updated_at = NOW()
         WHERE file_type IN ({_quoted(_MIME_TYPES)})
+        """
+    )
+
+    # 2. Files with a PDF or Office extension stored under any other type than
+    #    their MIME type -- an upload that kept application/octet-stream, or a
+    #    declared type no extractor is registered under -- get it, so that a
+    #    re-extract picks the real extractor. Any such file whose extraction
+    #    completed with a text extractor is held: its text is its bytes.
+    extension = "lower(substring(storage_path from '\\.([A-Za-z0-9]+)$'))"
+    expected = (
+        f"CASE {extension} "
+        + " ".join(f"WHEN '{ext}' THEN '{_MIME_TYPES[ext]}'" for ext in _BINARY)
+        + " END"
+    )
+    held = (
+        "extraction_status = 'extracted' AND "
+        f"auto_metadata->>'extraction_method' IN ({_quoted(_TEXT_METHODS)})"
+    )
+    retyped = f"file_type IS DISTINCT FROM {expected}"
+    op.execute(
+        f"""
+        UPDATE ai.sources
+        SET file_type = {expected},
+            extraction_status = CASE WHEN {held} THEN 'attention_required'
+                                     ELSE extraction_status END,
+            error_message = CASE WHEN {held} THEN '{_HELD_MESSAGE}'
+                                 ELSE error_message END,
+            auto_metadata = {_METADATA}
+                            || CASE WHEN {retyped}
+                                    THEN jsonb_build_object('legacy_file_type', file_type)
+                                    ELSE '{{}}'::jsonb END
+                            || CASE WHEN {held} THEN '{{"reextract_hold": true}}'::jsonb
+                                    ELSE '{{}}'::jsonb END,
+            updated_at = NOW()
+        WHERE {extension} IN ({_quoted(_BINARY)})
+          AND ({retyped} OR ({held}))
         """
     )
 
