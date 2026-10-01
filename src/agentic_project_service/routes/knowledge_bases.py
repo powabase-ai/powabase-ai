@@ -1556,10 +1556,18 @@ def reindex_kb(kb_id: str):
     if err:
         return err
 
-    data = request.get_json(silent=True) or {}
-    # An unread key must not fall through to "reindex everything": that
-    # re-embeds and bills every source in the knowledge base.
-    unknown = sorted(set(data) - _REINDEX_BODY_KEYS) if isinstance(data, dict) else []
+    # No body means "reindex everything", which re-embeds and bills every
+    # source in the knowledge base. So a body that is there but cannot be read
+    # (not JSON, not an object, a key this route does not take, an empty id
+    # list) is refused rather than taken for no body.
+    data = {}
+    if request.get_data().strip():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify(
+                {"error": "Body must be a JSON object, sent with Content-Type: application/json"}
+            ), 400
+    unknown = sorted(set(data) - _REINDEX_BODY_KEYS)
     if unknown:
         return jsonify(
             {
@@ -1567,6 +1575,10 @@ def reindex_kb(kb_id: str):
                 f"{', '.join(sorted(_REINDEX_BODY_KEYS))}; an empty body reindexes every source."
             }
         ), 400
+    if "indexed_source_ids" in data and not (
+        isinstance(data["indexed_source_ids"], list) and data["indexed_source_ids"]
+    ):
+        return jsonify({"error": "indexed_source_ids must be a non-empty list"}), 400
     indexed_source_ids = data.get("indexed_source_ids") or []
     failed_only = bool(data.get("failed_only"))
 
