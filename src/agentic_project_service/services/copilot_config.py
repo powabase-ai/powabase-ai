@@ -37,19 +37,28 @@ DEFAULT_COPILOT_MODEL = "claude-opus-4-6"
 
 # Allowed models for the copilot agent. Displayed in the copilot model
 # picker UI. Only function-calling-capable models should be listed here.
-# Verified against the LiteLLM model registry (1.83.14 as currently resolved
-# in uv.lock — a >= floor, not a hard pin, so a lock bump can shift it) — all
+# Verified against the LiteLLM model registry (1.103.2 as currently resolved
+# in uv.lock — a >= floor, not a hard pin, so a lock bump can shift it) plus
+# the entries powabase-agentic registers for models newer than that map — all
 # entries return supports_function_calling=True via litellm.get_model_info().
 # test_copilot_picker_models.py enforces this (resolves + cost + fcall) per CI,
 # so a lock bump that drops an entry fails CI rather than silently shipping.
 # Format: list of (display_label, model_id) tuples.
 COPILOT_MODEL_OPTIONS = [
     # Anthropic
+    ("Claude Fable 5.1", "claude-fable-5-1"),
+    ("Claude Opus 5.5", "claude-opus-5-5"),
+    ("Claude Sonnet 5.5", "claude-sonnet-5-5"),
+    ("Claude Opus 4.8", "claude-opus-4-8"),
     ("Claude Opus 4.7", "claude-opus-4-7"),
     ("Claude Opus 4.6", "claude-opus-4-6"),
     ("Claude Sonnet 4.6", "claude-sonnet-4-6"),
     ("Claude Haiku 4.5", "claude-haiku-4-5"),
     # OpenAI
+    ("GPT-6 Astra", "gpt-6-astra"),
+    ("GPT-6.1 Sol", "gpt-6.1-sol"),
+    ("GPT-6 Luna", "gpt-6-luna"),
+    ("GPT-5.6", "gpt-5.6"),
     ("GPT-5.2 Pro", "gpt-5.2-pro"),
     ("GPT-5.2", "gpt-5.2"),
     ("GPT-5", "gpt-5"),
@@ -66,6 +75,7 @@ COPILOT_MODEL_OPTIONS = [
     ("o4 Mini", "o4-mini"),
     # Google
     ("Gemini 3.1 Pro (Preview)", "gemini/gemini-3.1-pro-preview"),
+    ("Gemini 3.8 Flash", "gemini/gemini-3.8-flash"),
     ("Gemini 2.5 Pro", "gemini/gemini-2.5-pro"),
     ("Gemini 2.5 Flash", "gemini/gemini-2.5-flash"),
 ]

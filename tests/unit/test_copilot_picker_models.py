@@ -27,6 +27,11 @@ import litellm
 
 from agentic_project_service.services.copilot_config import COPILOT_MODEL_OPTIONS
 
+# The running service imports powabase-agentic, which registers models newer
+# than the pinned litellm's bundled cost map. Import it here too, so these
+# checks see the registry the service actually runs with.
+import agentic  # noqa: E402,F401
+
 
 _PICKER_MODEL_IDS = [model_id for _label, model_id in COPILOT_MODEL_OPTIONS]
 
