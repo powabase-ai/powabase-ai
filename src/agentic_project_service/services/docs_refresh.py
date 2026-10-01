@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 
 from ..db import AI_SCHEMA, db
 from ..strategies.registry import get_strategy
+from .source_file_types import DOCUMENT_MIME_TYPES
 from .storage import SOURCES_BUCKET, StorageError, get_derivative_storage_path, get_storage
 
 logger = logging.getLogger(__name__)
@@ -281,9 +282,15 @@ def _ingest_markdown_source(session: Session, storage, kb_id: str, doc: DocRecor
             text(f"""
                 INSERT INTO "{AI_SCHEMA}".sources
                     (id, name, file_type, storage_path, extraction_status, content_hash)
-                VALUES (:id, :n, 'md', :sp, 'pending', :h)
+                VALUES (:id, :n, :file_type, :sp, 'pending', :h)
             """),
-            {"id": source_id, "n": doc.key, "sp": stored_path, "h": doc.content_hash},
+            {
+                "id": source_id,
+                "n": doc.key,
+                "file_type": DOCUMENT_MIME_TYPES[".md"],
+                "sp": stored_path,
+                "h": doc.content_hash,
+            },
         )
     session.commit()
 

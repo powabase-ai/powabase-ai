@@ -797,6 +797,10 @@ def _engine(login: str) -> Engine:
 
     The end-user login keeps a small pool. Agent logins connect per
     transaction: there is one per agent, and a pool each would add up.
+
+    Deliberately without the service engine's text guard (``_pg_text_guard``):
+    these run the agent's own SQL against the caller's tables, and a value
+    Postgres refuses should fail that statement visibly, not be rewritten.
     """
     with _engines_lock:
         engine = _engines.get(login)

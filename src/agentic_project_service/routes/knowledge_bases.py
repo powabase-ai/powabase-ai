@@ -1539,6 +1539,9 @@ def remove_source_from_kb(kb_id: str, indexed_source_id: str):
     )
 
 
+_REINDEX_BODY_KEYS = frozenset({"indexed_source_ids", "failed_only"})
+
+
 @knowledge_bases_bp.route("/<kb_id>/reindex", methods=["POST"])
 @require_service_role
 def reindex_kb(kb_id: str):
@@ -1553,7 +1556,29 @@ def reindex_kb(kb_id: str):
     if err:
         return err
 
-    data = request.get_json(silent=True) or {}
+    # No body means "reindex everything", which re-embeds and bills every
+    # source in the knowledge base. So a body that is there but cannot be read
+    # (not JSON, not an object, a key this route does not take, an empty id
+    # list) is refused rather than taken for no body.
+    data = {}
+    if request.get_data().strip():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify(
+                {"error": "Body must be a JSON object, sent with Content-Type: application/json"}
+            ), 400
+    unknown = sorted(set(data) - _REINDEX_BODY_KEYS)
+    if unknown:
+        return jsonify(
+            {
+                "error": f"Unknown field(s) {', '.join(unknown)}. Accepted: "
+                f"{', '.join(sorted(_REINDEX_BODY_KEYS))}; an empty body reindexes every source."
+            }
+        ), 400
+    if "indexed_source_ids" in data and not (
+        isinstance(data["indexed_source_ids"], list) and data["indexed_source_ids"]
+    ):
+        return jsonify({"error": "indexed_source_ids must be a non-empty list"}), 400
     indexed_source_ids = data.get("indexed_source_ids") or []
     failed_only = bool(data.get("failed_only"))
 

@@ -24,6 +24,12 @@ from ..services.ai_provider_keys_resolver import get_all_user_provider_keys
 from ..services import billing_port as billing
 from ..services.rate_limit import external_limiter
 from ..services.settings_registry import EXTRACTION_METHOD_CHOICES, get_setting
+from ..services.source_file_types import (
+    IMPORT_MIME_TYPES,
+    UPLOAD_MIME_TYPES,
+    file_extension,
+    source_mime_type,
+)
 from ..services.storage import (
     StorageError,
     get_source_storage_path,
@@ -317,48 +323,15 @@ def upload_source():
                 f"Valid options: {', '.join(sorted(VALID_EXTRACTION_MODELS))}"
             }
         ), 400
-    # Validate file extension
-    ALLOWED_EXTENSIONS = {
-        ".pdf",
-        ".txt",
-        ".md",
-        ".docx",
-        ".xlsx",
-        ".xls",
-        ".pptx",
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".webp",
-        ".gif",
-        ".tiff",
-    }
-    ext = os.path.splitext(file.filename)[1].lower() if file.filename else ""
-    if ext not in ALLOWED_EXTENSIONS:
+    # The extension decides the stored type (see services/source_file_types).
+    file_type = source_mime_type(file.filename, UPLOAD_MIME_TYPES)
+    if file_type is None:
+        ext = file_extension(file.filename)
         return jsonify(
             {
-                "error": f"Unsupported file type '{ext}'. Supported: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+                "error": f"Unsupported file type '{ext}'. Supported: {', '.join(sorted(UPLOAD_MIME_TYPES))}"
             }
         ), 400
-
-    file_type = file.content_type or "application/octet-stream"
-
-    # Browsers may send application/octet-stream for certain file types;
-    # the extraction pipeline routes by MIME type, so we must correct these.
-    _EXT_MIME_OVERRIDES = {
-        ".md": "text/markdown",
-        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ".xls": "application/vnd.ms-excel",
-        ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".webp": "image/webp",
-        ".gif": "image/gif",
-        ".tiff": "image/tiff",
-    }
-    if file_type == "application/octet-stream" and ext in _EXT_MIME_OVERRIDES:
-        file_type = _EXT_MIME_OVERRIDES[ext]
 
     source_id = str(uuid.uuid4())
     uploaded_storage_path: str | None = None
@@ -751,25 +724,16 @@ def import_from_storage():
     if not bucket or not path:
         return jsonify({"error": "bucket and path are required"}), 400
 
-    # Determine file_type from extension
-    EXTENSION_MAP = {
-        ".pdf": "pdf",
-        ".md": "markdown",
-        ".txt": "text",
-        ".docx": "docx",
-        ".xlsx": "xlsx",
-        ".xls": "xls",
-        ".pptx": "pptx",
-    }
-    ext = os.path.splitext(path)[1].lower()
-    if ext not in EXTENSION_MAP:
+    # Classified exactly as /upload classifies the same file.
+    file_type = source_mime_type(path, IMPORT_MIME_TYPES)
+    if file_type is None:
+        ext = file_extension(path)
         return jsonify(
             {
                 "error": f"Unsupported file type '{ext}'. "
-                f"Supported: {', '.join(sorted(EXTENSION_MAP.keys()))}"
+                f"Supported: {', '.join(sorted(IMPORT_MIME_TYPES))}"
             }
         ), 400
-    file_type = EXTENSION_MAP[ext]
 
     # Derive name from body or filename
     filename = os.path.basename(path)
@@ -791,17 +755,6 @@ def import_from_storage():
     uploaded_storage_path: str | None = None
     source_row_committed = False
     storage = None
-
-    # MIME type mapping for content-type when re-uploading
-    MIME_MAP = {
-        "pdf": "application/pdf",
-        "markdown": "text/markdown",
-        "text": "text/plain",
-        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "xls": "application/vnd.ms-excel",
-        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    }
 
     # Pre-charge balance check before any storage work. The billing port no-ops
     # the check when billing is unconfigured.
@@ -835,13 +788,12 @@ def import_from_storage():
 
         # Re-upload to managed sources bucket (same structure as upload endpoint)
         storage_dest = get_source_storage_path(source_id, filename)
-        content_type = MIME_MAP.get(file_type, "application/octet-stream")
         uploaded_storage_path = storage_dest
         full_path = storage.upload(
             bucket_id=SOURCES_BUCKET,
             path=storage_dest,
             file_data=file_data,
-            content_type=content_type,
+            content_type=file_type,
         )
 
         # Create DB record pointing to sources bucket (not user bucket)

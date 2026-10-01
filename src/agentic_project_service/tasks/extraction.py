@@ -25,6 +25,7 @@ from ..services.extraction_gate import (
     WaitingExtractions,
     is_large_file,
 )
+from ..services.source_file_types import extraction_mime_type
 from ..services.storage import (
     StorageError,
     SupabaseStorage,
@@ -399,7 +400,9 @@ async def run_extraction(
 
     source_id = source["id"]
     storage_path = source["storage_path"]
-    file_type = source["file_type"]
+    # Rows written by import-from-storage before it stored MIME types carry a
+    # short name (``docx``) no extractor is registered under.
+    file_type = extraction_mime_type(source["file_type"])
     filename = source["name"]
 
     logger.info(f"Downloading source {source_id} from {storage_path}")

@@ -140,6 +140,12 @@ jobs:
       # through their hand-written INSERT/UPDATE/SELECT lists, one of which is
       # read back by position.
       #
+      # tests/test_pg_text_guard_store.py pins that text Postgres refuses (NUL,
+      # unpaired surrogates) is cleaned on the way in rather than failing the
+      # write -- only the server says what it refuses.
+      # tests/test_legacy_source_file_types_store.py runs migration 0034's SQL
+      # against real rows.
+      #
       # tests/test_agent_sql_store.py pins that agent database tools run as the
       # caller: tool logins that are not superusers, an end user's run held to
       # their RLS policies, a service-role run held to its agent's own login.
@@ -179,6 +185,8 @@ jobs:
             tests/test_tool_error_messages_store.py \
             tests/test_agent_tool_writes_store.py \
             tests/test_agent_tool_logins_boot_store.py \
+            tests/test_pg_text_guard_store.py \
+            tests/test_legacy_source_file_types_store.py \
             -q -rs | tee pytest-store.log
           if grep -Eq "[0-9]+ (skipped|deselected|xfailed|xpassed)" pytest-store.log; then
             echo "::error::the store tier did not run every test; this job must run all of them"
