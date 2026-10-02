@@ -18,7 +18,7 @@ from sqlalchemy import inspect
 
 from ._pg_search_extension import ensure_pg_search_extension, quiet_pg_search_planner_warnings
 from .celery import init_celery
-from .db import db, get_database_url
+from .db import db, engine_options, get_database_url, limit_connection_reuse
 from .migrate import migrate
 from .routes.sources import sources_bp
 from .routes.knowledge_bases import knowledge_bases_bp
@@ -258,7 +258,14 @@ def create_app(testing: bool = False):
     # Database configuration - connect to project's Supabase Postgres
     app.config["SQLALCHEMY_DATABASE_URI"] = get_database_url()
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    # Unprepared statements and short-lived pooled connections: both keep a
+    # backend's relation cache, which PostgreSQL never evicts, from growing
+    # with the number of knowledge bases. The Celery worker builds its app
+    # here too, so it gets the same engine.
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = engine_options()
     db.init_app(app)
+    with app.app_context():
+        limit_connection_reuse(db.engine)
     migrate.init_app(app, db, directory="migrations")
 
     if testing:

@@ -16,7 +16,7 @@ from sqlalchemy import text
 
 from agentic.knowledge.models import RetrievedItem
 from agentic_project_service.db import db
-from agentic_project_service.services import base_toc_store
+from agentic_project_service.services import base_toc_store, graph_index_store
 from agentic_project_service.services.graph_index_node_store import GraphIndexNodeStore
 from agentic_project_service.services.graph_index_store import GraphIndexStore
 
@@ -141,8 +141,17 @@ class TestGetTocOutline:
 PRUNE_SCHEMA = "gi_prune_test"
 KB_MINE = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
 KB_OTHER = "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+KB_THIRD = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 PART_MINE = "graph_index_nodes_kb_mine"
 PART_OTHER = "graph_index_nodes_kb_other"
+PART_THIRD = "graph_index_nodes_kb_third"
+PART_DEFAULT = "graph_index_nodes_default"
+ALL_PARTITIONS = (PART_MINE, PART_OTHER, PART_THIRD, PART_DEFAULT)
+
+# psycopg prepares a statement on a connection after 5 executions, and
+# PostgreSQL weighs a generic plan for it after 5 more. Past this many runs a
+# statement has been through both.
+RUNS_PAST_THE_GENERIC_PLAN = 15
 
 
 class _RecordingSession:
@@ -163,13 +172,17 @@ class _RecordingSession:
 @pytest.fixture
 def partitioned_nodes(app, monkeypatch):
     """graph_index_nodes as a migrated pg_search database has it: partitioned
-    by knowledge base, one partition per KB. Two KBs, each with one ToC holding
-    a parent section and its child, under the *same* node_ids -- so a lookup
-    that loses its KB or toc scoping shows up as a wrong row, not only a plan.
+    by knowledge base, one partition per KB plus DEFAULT, each partition with a
+    primary key of its own on ``id`` (the parent has none). Three KBs, each
+    with one ToC holding a parent section and its child, under the *same*
+    node_ids -- so a lookup that loses its KB or toc scoping shows up as a
+    wrong row, not only a plan.
     """
     monkeypatch.setattr(base_toc_store, "AI_SCHEMA", PRUNE_SCHEMA)
-    tocs = {KB_MINE: str(uuid.uuid4()), KB_OTHER: str(uuid.uuid4())}
-    node_ids: dict[str, dict[str, str]] = {KB_MINE: {}, KB_OTHER: {}}
+    monkeypatch.setattr(graph_index_store, "AI_SCHEMA", PRUNE_SCHEMA)
+    partitions = ((PART_MINE, KB_MINE), (PART_OTHER, KB_OTHER), (PART_THIRD, KB_THIRD))
+    tocs = {kb: str(uuid.uuid4()) for _, kb in partitions}
+    node_ids: dict[str, dict[str, str]] = {kb: {} for _, kb in partitions}
     with app.app_context():
         with db.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             conn.execute(text(f"DROP SCHEMA IF EXISTS {PRUNE_SCHEMA} CASCADE"))
@@ -198,12 +211,11 @@ def partitioned_nodes(app, monkeypatch):
                         depth int,
                         parent_node_id text,
                         line_num int,
-                        meta jsonb DEFAULT '{{}}'::jsonb,
-                        PRIMARY KEY (knowledge_base_id, id)
+                        meta jsonb DEFAULT '{{}}'::jsonb
                     ) PARTITION BY LIST (knowledge_base_id)
                 """)
             )
-            for partition, kb in ((PART_MINE, KB_MINE), (PART_OTHER, KB_OTHER)):
+            for partition, kb in partitions:
                 conn.execute(
                     text(
                         f"CREATE TABLE {PRUNE_SCHEMA}.{partition} "
@@ -213,10 +225,13 @@ def partitioned_nodes(app, monkeypatch):
                 )
             conn.execute(
                 text(
-                    f"CREATE TABLE {PRUNE_SCHEMA}.graph_index_nodes_default "
+                    f"CREATE TABLE {PRUNE_SCHEMA}.{PART_DEFAULT} "
                     f"PARTITION OF {PRUNE_SCHEMA}.graph_index_nodes DEFAULT"
                 )
             )
+            for partition in ALL_PARTITIONS:
+                conn.execute(text(f"ALTER TABLE {PRUNE_SCHEMA}.{partition} ADD PRIMARY KEY (id)"))
+                conn.execute(text(f"CREATE INDEX ON {PRUNE_SCHEMA}.{partition} (toc_id, node_id)"))
             source_id = str(uuid.uuid4())
             for kb, toc_id in tocs.items():
                 conn.execute(
@@ -264,8 +279,29 @@ def _partitions_read(session, statements) -> set[str]:
         plan = "\n".join(
             row[0] for row in session.execute(text(f"EXPLAIN (COSTS OFF) {sql}"), params)
         )
-        touched.update(p for p in (PART_MINE, PART_OTHER, "graph_index_nodes_default") if p in plan)
+        touched.update(p for p in ALL_PARTITIONS if p in plan)
     return touched
+
+
+def _partitions_locked(session) -> set[str]:
+    """Every partition this backend holds a lock on in the open transaction.
+
+    A relation lock is held to the end of the transaction, so this is every
+    partition any statement in it opened -- including the ones a plan opened
+    and then discarded, which EXPLAIN never shows: a generic plan locks every
+    partition, prunes at run time, and reports only the survivor.
+    """
+    rows = session.execute(
+        text(
+            "SELECT DISTINCT c.relname FROM pg_locks l "
+            "JOIN pg_class c ON c.oid = l.relation "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE l.pid = pg_backend_pid() AND l.locktype = 'relation' "
+            "AND n.nspname = :schema AND c.relname = ANY(:names)"
+        ),
+        {"schema": PRUNE_SCHEMA, "names": list(ALL_PARTITIONS)},
+    )
+    return {row[0] for row in rows}
 
 
 @pytest.mark.integration
@@ -327,3 +363,59 @@ class TestNodeLookupsReadOnlyTheKbsPartition:
                 "doc_description": "",
             }
             assert _partitions_read(db.session, session.statements) == {PART_MINE}
+
+
+@pytest.mark.integration
+class TestRepeatedLookupsStayInTheKbsPartition:
+    """The same statement, run often enough on one connection, must still open
+    only its KB's partition.
+
+    The KB is a bound parameter. Once the driver has server-prepared a
+    statement and PostgreSQL builds its generic plan, ``knowledge_base_id = $1``
+    proves nothing at plan time, so that plan opens every partition and every
+    index on them -- and the backend keeps their relcache entries even though
+    it discards the plan. The predicate alone moved that from a connection's
+    first graph search to its eleventh. What keeps it away for good is the
+    engine never preparing statements (``db.engine_options``); these tests run
+    through the app's own engine, so they hold both halves in place.
+    """
+
+    def _run_repeatedly(self, lookup):
+        for _ in range(RUNS_PAST_THE_GENERIC_PLAN):
+            lookup()
+
+    def test_node_lookups(self, app, partitioned_nodes):
+        toc = partitioned_nodes["tocs"][KB_MINE]
+        with app.app_context():
+            store = GraphIndexStore(db_session=db.session, knowledge_base_id=KB_MINE)
+            self._run_repeatedly(lambda: store.get_nodes_by_ids([(toc, "0001"), (toc, "0002")]))
+            self._run_repeatedly(lambda: store.get_children_by_parent_ids([(toc, "0001")]))
+
+            assert _partitions_locked(db.session) == {PART_MINE}
+
+    def test_search_result_resolution(self, app, partitioned_nodes):
+        row_id = partitioned_nodes["node_ids"][KB_MINE]["0002"]
+        with app.app_context():
+            store = GraphIndexNodeStore(
+                db_session=db.session, knowledge_base_id=KB_MINE, schema=PRUNE_SCHEMA
+            )
+
+            def resolve():
+                item = RetrievedItem(item_id=row_id, text="b", score=1.0, source_id="s", meta={})
+                store._resolve_results([item])
+
+            self._run_repeatedly(resolve)
+
+            assert _partitions_locked(db.session) == {PART_MINE}
+
+    def test_statements_that_always_named_the_kb(self, app, partitioned_nodes):
+        """The outline and the node count named the KB before any of this, and
+        opened every partition on their eleventh run all the same."""
+        toc = partitioned_nodes["tocs"][KB_MINE]
+        with app.app_context():
+            store = GraphIndexStore(db_session=db.session, knowledge_base_id=KB_MINE)
+            self._run_repeatedly(lambda: store.get_toc_outline([toc], 200))
+            self._run_repeatedly(store.count_nodes)
+
+            assert store.count_nodes() == 2
+            assert _partitions_locked(db.session) == {PART_MINE}

@@ -37,6 +37,9 @@ class GraphIndexNodeStore(BasePgVectorStore):
             # The KB predicate prunes this to the KB's own partition. By id
             # alone it runs on every search against every KB's partition, and
             # the connection keeps all of their relcache entries afterwards.
+            # A bound parameter prunes only in a plan built with its value;
+            # the engine never prepares statements for that reason
+            # (db.engine_options).
             {"kb_id": self.kb_id, "ids": "{" + ",".join(item_ids) + "}"},
         )
 

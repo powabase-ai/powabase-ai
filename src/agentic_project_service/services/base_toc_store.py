@@ -155,7 +155,11 @@ class BaseTocStore:
             # graph_index_nodes is partitioned by knowledge base, and toc_id
             # alone makes Postgres plan and open every KB's partition and
             # indexes -- relcache the pooled connection then keeps for good.
-            # A toc belongs to exactly one KB, so the result is unchanged.
+            # It prunes only while the statement is planned with its values,
+            # which is why the engine never prepares (db.engine_options): a
+            # generic plan cannot prune on a bound parameter.
+            # Callers only pass tocs of the store's own KB (nothing in the
+            # schema ties a node's KB to its toc's), so the result is unchanged.
             {**params, "kb_id": self.kb_id},
         )
 

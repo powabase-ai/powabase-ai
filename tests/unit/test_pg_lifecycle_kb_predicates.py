@@ -15,6 +15,10 @@ import re
 from unittest.mock import MagicMock
 
 from agentic.knowledge.models import RetrievedItem
+from sqlalchemy import create_engine
+from sqlalchemy.pool import QueuePool
+
+from agentic_project_service import db as db_module
 from agentic_project_service.services.base_vector_store import BasePgVectorStore
 from agentic_project_service.services.full_document_store import FullDocumentStore
 from agentic_project_service.services.graph_index_node_store import GraphIndexNodeStore
@@ -85,12 +89,17 @@ def test_fetch_items_by_ids_is_scoped_to_the_kb():
     _assert_kb_scoped(session, ".chunks")
 
 
-# The retrieval-path lookups below run on every graph_index search, in the
-# request's pooled connection. Unpruned, each one plans across every knowledge
+# The retrieval-path lookups below run in the request's pooled connection:
+# result resolution on every graph_index search, the node lookups when graph
+# expansion follows a reference. Unpruned, each one plans across every knowledge
 # base's partition and opens all their indexes; the backend then keeps that
 # relcache for the life of the connection. On a project with 512 graph_index
 # KBs that was ~65 MB per connection, and a handful of them OOM-killed a 512 MiB
 # Postgres in a loop.
+#
+# These pin the predicate only. That it still prunes on a statement's eleventh
+# run -- when a prepared statement's generic plan would open every partition
+# regardless -- is pinned against a real database in tests/test_graph_index_store.py.
 
 
 def test_graph_expansion_node_lookups_are_scoped_to_the_kb():
@@ -137,5 +146,50 @@ def test_graph_node_result_resolution_is_scoped_to_the_kb():
     statements = [sql for sql, _ in session.calls if "graph_index_nodes" in sql]
     assert statements, session.calls
     for sql in statements:
-        assert re.search(r"n\.knowledge_base_id\s*=\s*:kb_id", sql), sql
+        # AND, not OR: ``kb = :kb_id OR id = ANY(...)`` names the KB and prunes nothing.
+        assert re.search(r"WHERE n\.knowledge_base_id = :kb_id\s+AND n\.id = ANY", sql), sql
     assert all(params["kb_id"] == KB for sql, params in session.calls if "graph_index_nodes" in sql)
+
+
+def test_the_engine_never_prepares_statements_and_recycles_its_connections():
+    # A generic plan cannot prune on ``knowledge_base_id = $1``; see db.engine_options.
+    options = db_module.engine_options()
+    assert options["connect_args"] == {"prepare_threshold": None}
+    assert options["pool_pre_ping"] is True
+    assert options["pool_recycle"] == db_module.DB_POOL_RECYCLE_SECONDS > 0
+
+
+def test_pool_bounds_can_be_tuned_or_turned_off_from_the_environment(monkeypatch):
+    monkeypatch.setenv("DB_POOL_RECYCLE_SECONDS", "60")
+    assert db_module.engine_options()["pool_recycle"] == 60
+    monkeypatch.setenv("DB_POOL_RECYCLE_SECONDS", "0")
+    assert "pool_recycle" not in db_module.engine_options()
+    monkeypatch.setenv("DB_POOL_RECYCLE_SECONDS", "soon")
+    assert db_module.engine_options()["pool_recycle"] == db_module.DB_POOL_RECYCLE_SECONDS
+
+
+def test_a_pooled_connection_is_replaced_after_its_checkout_limit(monkeypatch):
+    monkeypatch.setenv("DB_POOL_MAX_CHECKOUTS", "3")
+    engine = create_engine("sqlite://", poolclass=QueuePool, pool_size=1, max_overflow=0)
+    db_module.limit_connection_reuse(engine)
+
+    seen = []
+    for _ in range(7):
+        with engine.connect() as conn:
+            seen.append(id(conn.connection.dbapi_connection))
+
+    # Three checkouts each, then a fresh connection -- never an error to the caller.
+    assert seen[0] == seen[1] == seen[2]
+    assert seen[3] == seen[4] == seen[5]
+    assert len({seen[0], seen[3], seen[6]}) == 3
+
+
+def test_the_checkout_limit_can_be_turned_off(monkeypatch):
+    monkeypatch.setenv("DB_POOL_MAX_CHECKOUTS", "0")
+    engine = create_engine("sqlite://", poolclass=QueuePool, pool_size=1, max_overflow=0)
+    db_module.limit_connection_reuse(engine)
+    seen = set()
+    for _ in range(5):
+        with engine.connect() as conn:
+            seen.add(id(conn.connection.dbapi_connection))
+    assert len(seen) == 1
