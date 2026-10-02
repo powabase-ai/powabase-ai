@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/powabase-ai/powabase-ai/compare/v0.13.0...v0.13.1) (2026-10-02)
+
+
+### Bug Fixes
+
+* keep graph_index lookups to the KB's partition, and bound pooled connections ([#105](https://github.com/powabase-ai/powabase-ai/issues/105)) ([b63d150](https://github.com/powabase-ai/powabase-ai/commit/b63d150b636c335764a78b73721c2a4d6b6e7a6e))
+
 ## [0.13.0](https://github.com/powabase-ai/powabase-ai/compare/v0.12.0...v0.13.0) (2026-10-02)
 
 
