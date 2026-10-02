@@ -104,18 +104,10 @@ def test_choice_supports_function_calling(model_id: str) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "model_id",
-    [
-        "gpt-6-astra",
-        "gpt-6.1-sol",
-        "gpt-6-luna",
-        "claude-fable-5-1",
-        "claude-opus-5-5",
-        "claude-sonnet-5-5",
-        "gemini/gemini-3.8-flash",
-        "openrouter/moonshotai/kimi-k3",
-    ],
-)
-def test_newest_models_are_offered(model_id: str) -> None:
-    assert model_id in _LLM_MODEL_CHOICES
+def test_copilot_options_are_all_offered_in_the_shared_picker() -> None:
+    """PUT /copilot/settings/model validates against _LLM_MODEL_CHOICES, so a
+    copilot option missing from it could be shown but never saved."""
+    from agentic_project_service.services.copilot_config import COPILOT_MODEL_OPTIONS
+
+    missing = {model for _, model in COPILOT_MODEL_OPTIONS} - set(_LLM_MODEL_CHOICES)
+    assert not missing, f"copilot options missing from _LLM_MODEL_CHOICES: {sorted(missing)}"
