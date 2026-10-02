@@ -44,6 +44,11 @@ from litellm.litellm_core_utils.get_model_cost_map import get_model_cost_map_sou
 
 from agentic_project_service.services.settings_registry import _LLM_MODEL_CHOICES
 
+# The running service imports powabase-agentic, which registers models newer
+# than the pinned litellm's bundled cost map. Import it here too, so these
+# checks see the registry the service actually runs with.
+import agentic  # noqa: E402,F401
+
 
 def test_registry_is_the_pinned_local_cost_map() -> None:
     """Every assertion below is only reproducible if litellm loaded its cost
@@ -97,3 +102,12 @@ def test_choice_supports_function_calling(model_id: str) -> None:
         f"agent/copilot would fail on first tool call. Remove from "
         f"_LLM_MODEL_CHOICES."
     )
+
+
+def test_copilot_options_are_all_offered_in_the_shared_picker() -> None:
+    """PUT /copilot/settings/model validates against _LLM_MODEL_CHOICES, so a
+    copilot option missing from it could be shown but never saved."""
+    from agentic_project_service.services.copilot_config import COPILOT_MODEL_OPTIONS
+
+    missing = {model for _, model in COPILOT_MODEL_OPTIONS} - set(_LLM_MODEL_CHOICES)
+    assert not missing, f"copilot options missing from _LLM_MODEL_CHOICES: {sorted(missing)}"

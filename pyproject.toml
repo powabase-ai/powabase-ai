@@ -20,7 +20,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pyjwt>=2.13.0",
     "openai>=1.0.0",
-    "litellm>=1.90.1,!=1.92.0,!=1.92.1",  # 1.92.0/1.92.1 eager-import litellm.proxy->fastapi inside completion() whenever `tools=` is passed; fastapi is not a dependency, so every tool-calling completion raises ModuleNotFoundError. Fixed from 1.93.0. Floor is for Anthropic adaptive-thinking (Opus 4.7/4.8) reasoning separation.
+    "litellm>=1.103.2,!=1.92.0,!=1.92.1",  # 1.92.0/1.92.1 eager-import litellm.proxy->fastapi inside completion() whenever `tools=` is passed; fastapi is not a dependency, so every tool-calling completion raises ModuleNotFoundError. Fixed from 1.93.0. Floor 1.103.2: the models offered in the pickers (GPT-6, Claude 5.5, Kimi K3) and the per-model reasoning-effort resolver powabase-agentic>=0.6.0 uses; kept in step with that floor.
     "flask-migrate>=4.0.0",
     "pgvector>=0.3.0",
     "gunicorn>=26.0.0",
@@ -54,7 +54,11 @@ dependencies = [
     # Large-file extraction passes a `page_image_sink` that 0.3.1 and earlier
     # ignore; the worker detects that at runtime and logs a WARNING rather than
     # this floor naming a version that is not yet published.
-    "powabase-agentic[rerankers]>=0.3.0",
+    # Floor at 0.6.0: it handles litellm 1.103 (the thinking-budget signature
+    # and repeated thinking text on signature deltas) and registers the
+    # picker models newer than litellm's bundled cost map. Older releases
+    # break on litellm 1.103.
+    "powabase-agentic[rerankers]>=0.6.0",
     "pglast>=8.4",
 ]
 

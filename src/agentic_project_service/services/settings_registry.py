@@ -24,6 +24,11 @@ SECRET_MASK = "••••••••"
 # Model choices shared across multiple settings
 _LLM_MODEL_CHOICES = [
     # OpenAI
+    "gpt-6-astra",
+    "gpt-6.1-sol",
+    "gpt-6-luna",
+    "gpt-5.6",
+    "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-pro",
     "gpt-5.4-mini",
@@ -41,6 +46,10 @@ _LLM_MODEL_CHOICES = [
     "o3-pro",
     "o4-mini",
     # Anthropic
+    "claude-fable-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
@@ -53,6 +62,8 @@ _LLM_MODEL_CHOICES = [
     "claude-haiku-4-5-20251001",
     # Google
     "gemini/gemini-3.1-pro-preview",
+    "gemini/gemini-3.8-flash",
+    "gemini/gemini-3.5-flash",
     "gemini/gemini-3-flash-preview",
     "gemini/gemini-2.5-pro",
     "gemini/gemini-2.5-flash",
@@ -64,6 +75,7 @@ _LLM_MODEL_CHOICES = [
     # is why mistral-small-3.1-24b-instruct is excluded here even though it
     # resolves in LiteLLM: litellm.supports_function_calling(...) is False.
     # Enforced by tests/unit/test_llm_model_choices.py.
+    "openrouter/moonshotai/kimi-k3",
     "openrouter/qwen/qwen3-235b-a22b-2507",
     "openrouter/mistralai/mistral-large-2512",
 ]
