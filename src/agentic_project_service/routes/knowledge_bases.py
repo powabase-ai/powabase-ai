@@ -2548,12 +2548,15 @@ def list_chunks_for_indexed_source(kb_id: str, indexed_source_id: str):
     return jsonify({"chunks": chunks, "total": total, "limit": limit, "offset": offset})
 
 
-def _fetch_index_nodes(table: str, indexed_source_id: str) -> list[dict]:
+def _fetch_index_nodes(table: str, indexed_source_id: str, kb_id: str) -> list[dict]:
     """Shared row-fetch for page_index_nodes / graph_index_nodes.
 
     `table` is always one of those two Python-literal constants passed by
     the route handlers below — never user input — so the f-string
     interpolation is not an injection surface.
+
+    The knowledge base is named so the read prunes to its partition of
+    graph_index_nodes; by indexed source alone it opens every KB's partition.
     """
     rows = db.session.execute(
         text(f"""
@@ -2561,10 +2564,10 @@ def _fetch_index_nodes(table: str, indexed_source_id: str) -> list[dict]:
                    node_id, title, depth, parent_node_id, text, line_num, meta,
                    created_at
             FROM "{AI_SCHEMA}".{table}
-            WHERE indexed_source_id = :isid
+            WHERE indexed_source_id = :isid AND knowledge_base_id = :kb_id
             ORDER BY id ASC
         """),
-        {"isid": indexed_source_id},
+        {"isid": indexed_source_id, "kb_id": kb_id},
     ).fetchall()
     return [
         {
@@ -2618,7 +2621,7 @@ def list_page_index_nodes(kb_id: str, indexed_source_id: str):
     err = _require_indexed_source_in_kb(kb_id, indexed_source_id)
     if err:
         return err
-    return jsonify({"nodes": _fetch_index_nodes("page_index_nodes", indexed_source_id)})
+    return jsonify({"nodes": _fetch_index_nodes("page_index_nodes", indexed_source_id, kb_id)})
 
 
 @knowledge_bases_bp.route(
@@ -2648,7 +2651,7 @@ def list_graph_index_nodes(kb_id: str, indexed_source_id: str):
     err = _require_indexed_source_in_kb(kb_id, indexed_source_id)
     if err:
         return err
-    return jsonify({"nodes": _fetch_index_nodes("graph_index_nodes", indexed_source_id)})
+    return jsonify({"nodes": _fetch_index_nodes("graph_index_nodes", indexed_source_id, kb_id)})
 
 
 @knowledge_bases_bp.route(

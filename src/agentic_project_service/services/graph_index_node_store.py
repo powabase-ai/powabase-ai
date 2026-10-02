@@ -31,9 +31,16 @@ class GraphIndexNodeStore(BasePgVectorStore):
                        t.doc_name, t.doc_description
                 FROM "{self.schema}".{self.TABLE} n
                 JOIN "{self.schema}".graph_index_toc t ON t.id = n.toc_id
-                WHERE n.id = ANY(CAST(:ids AS uuid[]))
+                WHERE n.knowledge_base_id = :kb_id
+                  AND n.id = ANY(CAST(:ids AS uuid[]))
             """),
-            {"ids": "{" + ",".join(item_ids) + "}"},
+            # The KB predicate prunes this to the KB's own partition. By id
+            # alone it runs on every search against every KB's partition, and
+            # the connection keeps all of their relcache entries afterwards.
+            # A bound parameter prunes only in a plan built with its value;
+            # the engine never prepares statements for that reason
+            # (db.engine_options).
+            {"kb_id": self.kb_id, "ids": "{" + ",".join(item_ids) + "}"},
         )
 
         extra: dict[str, dict] = {}

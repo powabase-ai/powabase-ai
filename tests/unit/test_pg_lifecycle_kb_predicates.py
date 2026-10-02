@@ -14,10 +14,17 @@ import asyncio
 import re
 from unittest.mock import MagicMock
 
+from agentic.knowledge.models import RetrievedItem
+from sqlalchemy import create_engine
+from sqlalchemy.pool import QueuePool
+
+from agentic_project_service import db as db_module
 from agentic_project_service.services.base_vector_store import BasePgVectorStore
 from agentic_project_service.services.full_document_store import FullDocumentStore
+from agentic_project_service.services.graph_index_node_store import GraphIndexNodeStore
 from agentic_project_service.services.graph_index_store import GraphIndexStore
 from agentic_project_service.services.knowledge_store import PgVectorKnowledgeStore
+from agentic_project_service.services.page_index_store import PageIndexStore
 
 KB = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
 
@@ -80,3 +87,109 @@ def test_fetch_items_by_ids_is_scoped_to_the_kb():
     store = _Chunks(db_session=session, knowledge_base_id=KB)
     asyncio.run(store._fetch_items_by_ids(["a", "b"]))
     _assert_kb_scoped(session, ".chunks")
+
+
+# The retrieval-path lookups below run in the request's pooled connection:
+# result resolution on every graph_index search, the node lookups when graph
+# expansion follows a reference. Unpruned, each one plans across every knowledge
+# base's partition and opens all their indexes; the backend then keeps that
+# relcache for the life of the connection. On a project with 512 graph_index
+# KBs that was ~65 MB per connection, and a handful of them OOM-killed a 512 MiB
+# Postgres in a loop.
+#
+# These pin the predicate only. That it still prunes on a statement's eleventh
+# run -- when a prepared statement's generic plan would open every partition
+# regardless -- is pinned against a real database in tests/test_graph_index_store.py.
+
+
+def test_graph_expansion_node_lookups_are_scoped_to_the_kb():
+    session = _spy()
+    store = GraphIndexStore(db_session=session, knowledge_base_id=KB)
+    store.get_nodes_by_ids([("toc-1", "0001"), ("toc-2", "0002")])
+    store.get_children_by_parent_ids([("toc-1", "0001"), ("toc-2", "0002")])
+    assert len(session.calls) == 2, session.calls
+    _assert_kb_scoped(session, "graph_index_nodes")
+
+
+def test_page_index_node_lookups_are_scoped_to_the_kb():
+    session = _spy()
+    store = PageIndexStore(db_session=session, knowledge_base_id=KB)
+    store.get_nodes_by_ids([("toc-1", "0001")])
+    store.get_children_by_parent_ids([("toc-1", "0001")])
+    assert len(session.calls) == 2, session.calls
+    _assert_kb_scoped(session, "page_index_nodes")
+
+
+def test_or_of_node_pairs_cannot_escape_the_kb_predicate():
+    # ``kb AND a OR b`` would scope only the first pair: the pairs must be
+    # parenthesised as a group, or every pair after the first reads all partitions.
+    session = _spy()
+    store = GraphIndexStore(db_session=session, knowledge_base_id=KB)
+    store.get_nodes_by_ids([("toc-1", "0001"), ("toc-2", "0002")])
+    store.get_children_by_parent_ids([("toc-1", "0001"), ("toc-2", "0002")])
+    for sql, _ in session.calls:
+        flat = " ".join(sql.split())
+        assert re.search(r"knowledge_base_id = :kb_id AND \(\(.*\) OR \(.*\)\)$", flat), flat
+
+
+def test_graph_node_result_resolution_is_scoped_to_the_kb():
+    session = _spy()
+    store = GraphIndexNodeStore(db_session=session, knowledge_base_id=KB)
+    item = RetrievedItem(
+        item_id="8a1556b9-75cb-4cd3-83a7-5207e591cffb",
+        text="t",
+        score=1.0,
+        source_id="s",
+        meta={},
+    )
+    store._resolve_results([item])
+    statements = [sql for sql, _ in session.calls if "graph_index_nodes" in sql]
+    assert statements, session.calls
+    for sql in statements:
+        # AND, not OR: ``kb = :kb_id OR id = ANY(...)`` names the KB and prunes nothing.
+        assert re.search(r"WHERE n\.knowledge_base_id = :kb_id\s+AND n\.id = ANY", sql), sql
+    assert all(params["kb_id"] == KB for sql, params in session.calls if "graph_index_nodes" in sql)
+
+
+def test_the_engine_never_prepares_statements_and_recycles_its_connections():
+    # A generic plan cannot prune on ``knowledge_base_id = $1``; see db.engine_options.
+    options = db_module.engine_options()
+    assert options["connect_args"] == {"prepare_threshold": None}
+    assert options["pool_pre_ping"] is True
+    assert options["pool_recycle"] == db_module.DB_POOL_RECYCLE_SECONDS > 0
+
+
+def test_pool_bounds_can_be_tuned_or_turned_off_from_the_environment(monkeypatch):
+    monkeypatch.setenv("DB_POOL_RECYCLE_SECONDS", "60")
+    assert db_module.engine_options()["pool_recycle"] == 60
+    monkeypatch.setenv("DB_POOL_RECYCLE_SECONDS", "0")
+    assert "pool_recycle" not in db_module.engine_options()
+    monkeypatch.setenv("DB_POOL_RECYCLE_SECONDS", "soon")
+    assert db_module.engine_options()["pool_recycle"] == db_module.DB_POOL_RECYCLE_SECONDS
+
+
+def test_a_pooled_connection_is_replaced_after_its_checkout_limit(monkeypatch):
+    monkeypatch.setenv("DB_POOL_MAX_CHECKOUTS", "3")
+    engine = create_engine("sqlite://", poolclass=QueuePool, pool_size=1, max_overflow=0)
+    db_module.limit_connection_reuse(engine)
+
+    seen = []
+    for _ in range(7):
+        with engine.connect() as conn:
+            seen.append(id(conn.connection.dbapi_connection))
+
+    # Three checkouts each, then a fresh connection -- never an error to the caller.
+    assert seen[0] == seen[1] == seen[2]
+    assert seen[3] == seen[4] == seen[5]
+    assert len({seen[0], seen[3], seen[6]}) == 3
+
+
+def test_the_checkout_limit_can_be_turned_off(monkeypatch):
+    monkeypatch.setenv("DB_POOL_MAX_CHECKOUTS", "0")
+    engine = create_engine("sqlite://", poolclass=QueuePool, pool_size=1, max_overflow=0)
+    db_module.limit_connection_reuse(engine)
+    seen = set()
+    for _ in range(5):
+        with engine.connect() as conn:
+            seen.add(id(conn.connection.dbapi_connection))
+    assert len(seen) == 1
