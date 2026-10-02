@@ -12,3 +12,12 @@ updates:
       prefix: "fix"
       prefix-development: "chore"
       include: "scope"
+    ignore:
+      # litellm 1.103 changed two things powabase-agentic relies on (the
+      # thinking-budget helper's signature and how Anthropic thinking blocks
+      # stream), and only a powabase-agentic release carrying the fixes can
+      # run on it. A Dependabot PR moving litellm alone would ship both
+      # breakages. litellm moves with that powabase-agentic bump instead;
+      # remove this entry in the same change.
+      - dependency-name: "litellm"
+        versions: [">=1.103"]
