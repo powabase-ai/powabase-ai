@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/powabase-ai/powabase-ai/compare/v0.12.0...v0.13.0) (2026-10-02)
+
+
+### Features
+
+* offer Claude 5.5, Fable 5.1, GPT-6, Gemini 3.8 Flash and Kimi K3 ([#102](https://github.com/powabase-ai/powabase-ai/issues/102)) ([5be8d15](https://github.com/powabase-ai/powabase-ai/commit/5be8d1513d306a67b2620a3b340bc01b0d649a54))
+
 ## [0.12.0](https://github.com/powabase-ai/powabase-ai/compare/v0.11.0...v0.12.0) (2026-09-29)
 
 
