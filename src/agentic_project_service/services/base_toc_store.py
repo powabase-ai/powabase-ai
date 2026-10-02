@@ -149,9 +149,14 @@ class BaseTocStore:
                        parent_node_id, line_num, meta, source_id,
                        knowledge_base_id
                 FROM "{AI_SCHEMA}".{self.NODES_TABLE}
-                WHERE {where_clause}
+                WHERE knowledge_base_id = :kb_id AND ({where_clause})
             """),
-            params,
+            # The KB predicate is what prunes this to one partition:
+            # graph_index_nodes is partitioned by knowledge base, and toc_id
+            # alone makes Postgres plan and open every KB's partition and
+            # indexes -- relcache the pooled connection then keeps for good.
+            # A toc belongs to exactly one KB, so the result is unchanged.
+            {**params, "kb_id": self.kb_id},
         )
 
         nodes: dict[tuple[str, str], dict] = {}
@@ -203,9 +208,10 @@ class BaseTocStore:
                        parent_node_id, line_num, meta, source_id,
                        knowledge_base_id
                 FROM "{AI_SCHEMA}".{self.NODES_TABLE}
-                WHERE {where_clause}
+                WHERE knowledge_base_id = :kb_id AND ({where_clause})
             """),
-            params,
+            # Scoped to the KB for partition pruning, as in get_nodes_by_ids.
+            {**params, "kb_id": self.kb_id},
         )
 
         children: dict[tuple[str, str], list[dict]] = {}
