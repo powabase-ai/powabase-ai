@@ -95,7 +95,7 @@ class TestMappedItems:
         assert (unit["title"], unit["url"]) == ("Deep", None)
 
     def test_an_existing_cite_field_is_overwritten_and_preserved_in_meta(self):
-        """Review focus 3."""
+        """A provider-supplied cite field is overwritten with the key and kept in meta."""
         doc = {"results": [{"name": "A", "cite": "provider-cite-1"}]}
         out, registry = _key(json.dumps(doc), RULE)
         assert json.loads(out)["results"][0]["cite"] == "[1]"
@@ -140,7 +140,7 @@ class TestWholeCall:
         ],
     )
     def test_path_matching_no_objects_falls_back_to_one_whole_call_unit(self, body):
-        """Review focus 2: never inject into scalars; never drop the result."""
+        """A path matching no objects keeps the whole result as one keyed unit."""
         out, registry = _key(body, RULE)
         assert out == f"[1] {body}"
         assert [u["kind"] for u in registry.citation_map().values()] == ["tool_call"]
@@ -158,7 +158,7 @@ class TestNoUnit:
         ],
     )
     def test_engine_error_and_empty_results_get_no_key(self, result):
-        """Review focus 1."""
+        """Engine error and empty results get no citation key."""
         for rule in (None, RULE):
             out, registry = _key(result, rule)
             assert out == result

@@ -1,7 +1,5 @@
 """Unit tests for citation labeling, parsing, and persistence."""
 
-import pytest
-
 
 class TestBuildCitationMap:
     """Test build_citation_map: takes retrieved_context items, returns citation_map."""

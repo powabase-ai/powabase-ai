@@ -865,7 +865,7 @@ def list_mcp_servers(agent_id: str):
                     "headers": s.headers,
                     "config": s.config,
                     "enabled": s.enabled,
-            "citation_mapping": s.citation_mapping,
+                    "citation_mapping": s.citation_mapping,
                     "created_at": s.created_at.isoformat() if s.created_at else None,
                     "updated_at": s.updated_at.isoformat() if s.updated_at else None,
                 }
@@ -2664,8 +2664,14 @@ def run_agent_stream(agent_id: str):
                 db.session.commit()
 
                 if citation_rows:
-                    persist_citations(db.session, run_id, citation_rows)
-                    db.session.commit()
+                    # Citation storage must never fail a run that has completed:
+                    # the run is already committed and its charge still follows.
+                    try:
+                        persist_citations(db.session, run_id, citation_rows)
+                        db.session.commit()
+                    except Exception:
+                        logger.exception("Could not store citations for run %s", run_id)
+                        db.session.rollback()
 
                 # Billing: post the agent_run dispatch fee on success only.
                 # Tool calls inside the ReAct loop are independently billed
@@ -3226,7 +3232,8 @@ def get_agent_run(run_id: str):
             return jsonify({"error": "Run not found"}), 404
 
     # Every citation unit the run registered, cited or not. A failure here must
-    # not take down the run payload, whose other fields are already in memory.
+    # not take down the run payload; null (not []) tells consumers the units
+    # could not be loaded, as opposed to the run having none.
     try:
         citation_units = fetch_citations_for_runs(
             db.session, [str(row.id)], include_uncited=True
@@ -3234,7 +3241,7 @@ def get_agent_run(run_id: str):
     except Exception:
         logger.warning("Could not load citation units for run %s", run_id, exc_info=True)
         db.session.rollback()
-        citation_units = []
+        citation_units = None
 
     return jsonify(
         {

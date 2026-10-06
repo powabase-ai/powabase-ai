@@ -87,6 +87,31 @@ def _uuid_or_none(value: Any) -> str | None:
         return None
 
 
+SMALLINT_MAX = 32767
+
+
+def _clean_text(value: Any) -> Any:
+    """Strip NUL bytes, which Postgres text columns reject."""
+    return value.replace("\x00", "") if isinstance(value, str) else value
+
+
+def _meta_json(meta: Any) -> str:
+    """Serialize ``meta`` for a jsonb column: no NaN/Infinity, no NUL characters."""
+    try:
+        encoded = json.dumps(meta or {}, default=str, allow_nan=False)
+    except ValueError:
+        logger.warning("Citation meta has non-finite numbers; storing it empty")
+        return "{}"
+    return encoded.replace("\\u0000", "")
+
+
+def _key_in_range(cite: dict[str, Any]) -> bool:
+    if int(cite["key"]) <= SMALLINT_MAX:
+        return True
+    logger.warning("Skipping citation %s: key exceeds the column range", cite["key"])
+    return False
+
+
 def persist_citations(
     db_session: Session,
     run_id: str,
@@ -123,21 +148,25 @@ def persist_citations(
         return
     run_uuid = str(row[0])
 
+    citations = [c for c in citations if _key_in_range(c)]
+    if not citations:
+        return
+
     rows = [
         {
             "run_id": run_uuid,
             "citation_key": int(cite["key"]),
             "item_id": _uuid_or_none(cite.get("item_id")),
             "source_id": _uuid_or_none(cite.get("source_id")),
-            "text_excerpt": cite.get("text_excerpt", ""),
-            "meta": json.dumps(cite.get("meta") or {}, default=str),
+            "text_excerpt": _clean_text(cite.get("text_excerpt", "")),
+            "meta": _meta_json(cite.get("meta")),
             "kind": cite.get("kind") or "kb_chunk",
-            "tool_name": cite.get("tool_name"),
-            "call_id": cite.get("call_id"),
-            "title": cite.get("title"),
-            "url": cite.get("url"),
+            "tool_name": _clean_text(cite.get("tool_name")),
+            "call_id": _clean_text(cite.get("call_id")),
+            "title": _clean_text(cite.get("title")),
+            "url": _clean_text(cite.get("url")),
             "knowledge_base_id": _uuid_or_none(cite.get("knowledge_base_id")),
-            "cited": cite.get("cited", True),
+            "cited": cite.get("cited") is not False,
         }
         for cite in citations
     ]

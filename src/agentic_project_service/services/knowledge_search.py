@@ -2565,7 +2565,7 @@ def format_items_as_context(
 
     token_limit = max_tokens
     if citations_enabled and token_limit:
-        # Reserve ~60 tokens for the citation instruction that will be
+        # Reserve room for the citation instruction that will be
         # appended to the system prompt by the caller.
         from agentic_project_service.services.citations import build_citation_instruction
 
