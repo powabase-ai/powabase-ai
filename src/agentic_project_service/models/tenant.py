@@ -673,6 +673,10 @@ class AgentMcpServer(db.Model):
     headers: Mapped[dict | None] = mapped_column(JSONB, server_default=sa_text("'{}'::jsonb"))
     config: Mapped[dict | None] = mapped_column(JSONB, server_default=sa_text("'{}'::jsonb"))
     enabled: Mapped[bool | None] = mapped_column(db.Boolean, server_default=sa_text("true"))
+    # NULL: this server's results are never keyed for citations. {}: every
+    # tool's result becomes one whole-call unit. Shape and semantics:
+    # services/mcp_citations.py. none_as_null so None is SQL NULL, not JSON null.
+    citation_mapping: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     created_at: Mapped[datetime | None] = mapped_column(
         db.DateTime(timezone=True), server_default=sa_text("now()")
     )
