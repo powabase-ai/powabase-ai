@@ -3225,6 +3225,17 @@ def get_agent_run(run_id: str):
             # Return same shape as not-found to avoid leaking existence
             return jsonify({"error": "Run not found"}), 404
 
+    # Every citation unit the run registered, cited or not. A failure here must
+    # not take down the run payload, whose other fields are already in memory.
+    try:
+        citation_units = fetch_citations_for_runs(
+            db.session, [str(row.id)], include_uncited=True
+        ).get(str(row.id), [])
+    except Exception:
+        logger.warning("Could not load citation units for run %s", run_id, exc_info=True)
+        db.session.rollback()
+        citation_units = []
+
     return jsonify(
         {
             "id": str(row.id),
@@ -3248,10 +3259,7 @@ def get_agent_run(run_id: str):
             "steps": row.steps,
             "events": row.events,
             "tool_calls": row.tool_calls,
-            # Every citation unit the run registered, cited or not.
-            "citation_units": fetch_citations_for_runs(
-                db.session, [str(row.id)], include_uncited=True
-            ).get(str(row.id), []),
+            "citation_units": citation_units,
             "reasoning_steps": row.reasoning_steps,
             "created_at": row.created_at.isoformat() if row.created_at else None,
         }
