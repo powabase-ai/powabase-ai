@@ -72,6 +72,7 @@ from ..services.citations import (
     parse_citations_from_response,
     persist_citations,
 )
+from ..services.mcp_citations import citation_mapping_error
 from ..services.session import (
     SessionNotAccessible,
     build_messages_for_llm,
@@ -803,6 +804,11 @@ def add_mcp_server(agent_id: str):
     if not name or not url:
         return jsonify({"error": "name and url are required"}), 400
 
+    citation_mapping = data.get("citation_mapping")
+    mapping_error = citation_mapping_error(citation_mapping)
+    if mapping_error:
+        return jsonify({"error": mapping_error}), 400
+
     server = AgentMcpServer(
         agent_id=agent_id,
         name=name,
@@ -811,6 +817,7 @@ def add_mcp_server(agent_id: str):
         headers=data.get("headers", {}),
         config=data.get("config", {}),
         enabled=data.get("enabled", True),
+        citation_mapping=citation_mapping,
     )
     try:
         db.session.add(server)
@@ -829,6 +836,7 @@ def add_mcp_server(agent_id: str):
             "headers": server.headers,
             "config": server.config,
             "enabled": server.enabled,
+            "citation_mapping": server.citation_mapping,
             "created_at": server.created_at.isoformat() if server.created_at else None,
             "updated_at": server.updated_at.isoformat() if server.updated_at else None,
         }
@@ -851,6 +859,7 @@ def list_mcp_servers(agent_id: str):
                     "headers": s.headers,
                     "config": s.config,
                     "enabled": s.enabled,
+            "citation_mapping": s.citation_mapping,
                     "created_at": s.created_at.isoformat() if s.created_at else None,
                     "updated_at": s.updated_at.isoformat() if s.updated_at else None,
                 }
@@ -872,6 +881,11 @@ def update_mcp_server(agent_id: str, server_id: str):
     if not data:
         return jsonify({"error": "No data provided"}), 400
 
+    if "citation_mapping" in data:
+        mapping_error = citation_mapping_error(data["citation_mapping"])
+        if mapping_error:
+            return jsonify({"error": mapping_error}), 400
+
     if "name" in data:
         server.name = data["name"]
     if "transport" in data:
@@ -884,6 +898,8 @@ def update_mcp_server(agent_id: str, server_id: str):
         server.config = data["config"]
     if "enabled" in data:
         server.enabled = data["enabled"]
+    if "citation_mapping" in data:
+        server.citation_mapping = data["citation_mapping"]
 
     server.updated_at = datetime.now(UTC)
 
@@ -903,6 +919,7 @@ def update_mcp_server(agent_id: str, server_id: str):
             "headers": server.headers,
             "config": server.config,
             "enabled": server.enabled,
+            "citation_mapping": server.citation_mapping,
             "created_at": server.created_at.isoformat() if server.created_at else None,
             "updated_at": server.updated_at.isoformat() if server.updated_at else None,
         }
