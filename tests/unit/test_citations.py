@@ -238,3 +238,23 @@ class TestBuildCitationInstruction:
         from agentic_project_service.services.citations import build_citation_instruction
 
         assert len(build_citation_instruction()) > 0
+
+
+class TestCitationInstructionNamesToolKeys:
+    """Tool results carry run-wide keys; the instruction says where to find them."""
+
+    def test_names_both_key_forms(self):
+        from agentic_project_service.services.citations import build_citation_instruction
+
+        instruction = build_citation_instruction()
+        assert "a [n] label before the text" in instruction
+        assert '"cite": "[n]"' in instruction
+
+    def test_keeps_the_marker_rules_first(self):
+        from agentic_project_service.services.citations import build_citation_instruction
+
+        assert build_citation_instruction().startswith(
+            "When referencing the provided context, include citations in brackets like [1], "
+            "[2]. Each citation should be in its own brackets — use [1][2], not [1, 2]. "
+            "If no specific context is referenced, do not include a citation. "
+        )
