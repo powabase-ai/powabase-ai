@@ -20,6 +20,7 @@ from .citation_registry import (
     get_current_tool_call_id,
     kb_chunk_unit_from_item,
 )
+from .mcp_citations import citation_mapping_error, key_mcp_result
 from .run_context import (
     get_run_id,
     new_request_id,
@@ -235,6 +236,34 @@ def _wrap_tool_execute_with_billing(tool: ToolDefinition) -> None:
         return result
 
     tool.execute = billing_execute
+
+
+def _wrap_mcp_execute_with_citations(tool: ToolDefinition, rule: dict | None) -> None:
+    """Key an MCP tool's results for citations, in runs that collect them.
+
+    ``rule`` is this tool's entry in its server's ``citation_mapping``. None
+    means the tool has no entry, so each result is one whole-call unit. A run
+    without a citation registry gets the result unchanged: that covers runs
+    with citations off and every path other than the streaming ReAct run.
+    """
+    inner_execute = tool.execute
+    tool_name = tool.name
+
+    def citing_execute(arguments, context):
+        result = inner_execute(arguments, context)
+        registry = get_citation_registry()
+        if registry is None:
+            return result
+        return key_mcp_result(
+            result,
+            tool_name=tool_name,
+            arguments=arguments,
+            rule=rule,
+            registry=registry,
+            call_id=get_current_tool_call_id(),
+        )
+
+    tool.execute = citing_execute
 
 
 def _ensure_app_context(func, app):
@@ -948,6 +977,16 @@ def build_mcp_tools_for_agent(
     tools: dict[str, ToolDefinition] = {}
 
     for server in servers:
+        mapping = server.citation_mapping
+        mapping_error = citation_mapping_error(mapping) if mapping is not None else None
+        if mapping_error:
+            logger.warning(
+                "Ignoring invalid citation_mapping on MCP server %s for agent %s: %s",
+                server.name,
+                agent_id,
+                mapping_error,
+            )
+            mapping = None
         try:
             mcp_tools = discover_mcp_tools(server.url, server.headers or {})
         except Exception as e:
@@ -982,6 +1021,8 @@ def build_mcp_tools_for_agent(
             if default_max_result_chars is not None:
                 mcp_tool_def.max_result_chars = default_max_result_chars
             _wrap_tool_execute_with_billing(mcp_tool_def)
+            if mapping is not None:
+                _wrap_mcp_execute_with_citations(mcp_tool_def, mapping.get(mcp_tool.name))
             tools[tool_name] = mcp_tool_def
 
     return tools
