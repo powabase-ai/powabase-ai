@@ -182,6 +182,7 @@ jobs:
             tests/test_message_citations_schema_store.py \
             tests/test_citation_units_store.py \
             tests/test_agent_mcp_citation_mapping.py \
+            tests/route/test_agent_streaming_citations.py \
             -q -rs | tee pytest-store.log
           if grep -Eq "[0-9]+ (skipped|deselected|xfailed|xpassed)" pytest-store.log; then
             echo "::error::the store tier did not run every test; this job must run all of them"
