@@ -137,7 +137,7 @@ def test_a_legacy_citation_dict_is_a_cited_kb_chunk(app):
 
 
 def test_non_uuid_ids_and_missing_sources_store_null(app):
-    """Review focus 5: one bad id must not abort the run's whole insert."""
+    """Non-UUID ids and dangling source references store NULL instead of aborting the insert."""
     unit = {
         "key": "1",
         "kind": "kb_chunk",
@@ -193,3 +193,28 @@ def test_get_run_exposes_every_unit(app, client, mock_auth, auth_headers, test_s
         ("2", "tool_item", False),
         ("3", "tool_call", True),
     ]
+
+
+def test_values_postgres_rejects_are_sanitized_and_other_units_persist(app):
+    """NUL bytes, NaN and out-of-range keys cannot abort the run's whole insert."""
+    base = {"kind": "tool_item", "item_id": None, "source_id": None, "meta": {}, "cited": True}
+    units = [
+        {**base, "key": "1", "text_excerpt": "a\x00b", "title": "t\x00", "meta": {"k": "v\x00"}},
+        {**base, "key": "2", "text_excerpt": "ok", "meta": {"score": float("nan")}},
+        {**base, "key": "40000", "text_excerpt": "too big"},
+        {**base, "key": "3", "text_excerpt": "fine", "cited": None},
+    ]
+    with app.app_context():
+        run_id, run_uuid = _run()
+        persist_citations(db.session, run_id, units)
+        db.session.commit()
+        rows = fetch_citations_for_runs(db.session, [run_uuid], include_uncited=True)[run_uuid]
+    assert [(r["key"], r["text_excerpt"]) for r in rows] == [
+        ("1", "ab"),
+        ("2", "ok"),
+        ("3", "fine"),
+    ]
+    assert rows[0]["title"] == "t"
+    assert rows[0]["meta"] == {"k": "v"}
+    assert rows[1]["meta"] == {}
+    assert rows[2]["cited"] is True

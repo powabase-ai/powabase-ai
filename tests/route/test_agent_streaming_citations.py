@@ -317,3 +317,26 @@ def test_citations_off_leaves_mapped_results_alone(
     assert seen["search"] == SEARCH_RESULT
     assert _events(resp, "citation_registered") == []
     assert _rows(_events(resp, "start")[0]["run_id"]) == []
+
+
+def test_a_citation_storage_failure_does_not_fail_a_completed_run(
+    client, kb_agent, fake_retrieval, auth_headers, mocker
+):
+    def fake_run(messages, *, context=None, tools=None, **kwargs):
+        _tool_call(context, "knowledge_search", "call_a", {"query": "alpha"})
+        tools["knowledge_search"].execute({"query": "alpha"}, context)
+        return _make_fake_agent_output(content="Alpha [1].")
+
+    mocker.patch("agentic.agent.agent.Agent.run", side_effect=fake_run)
+    mocker.patch(
+        "agentic_project_service.routes.agents.persist_citations",
+        side_effect=RuntimeError("storage down"),
+    )
+    resp = _stream(client, auth_headers, kb_agent["agent_id"], citations_enabled=True)
+
+    assert _events(resp, "error") == []
+    [complete] = _events(resp, "complete")
+    assert complete["status"] == "completed"
+    run_id = _events(resp, "start")[0]["run_id"]
+    run = client.get(f"/api/agents/runs/{run_id}", headers=auth_headers).get_json()
+    assert run["status"] == "completed"
