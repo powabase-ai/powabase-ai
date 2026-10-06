@@ -15,6 +15,11 @@ from ..services.context_handler import create_and_execute
 from ..tools.builtin import BUILTIN_HANDLERS, BUILTIN_TOOL_DEFINITIONS
 from . import agent_sql
 from . import billing_port as billing
+from .citation_registry import (
+    get_citation_registry,
+    get_current_tool_call_id,
+    kb_chunk_unit_from_item,
+)
 from .run_context import (
     get_run_id,
     new_request_id,
@@ -308,7 +313,7 @@ def _sanitize_kb_error_note(error: dict) -> str:
     return f"{kb_id}: {detail}"
 
 
-def _make_search_handler(db_session):
+def _make_search_handler(db_session, tool_name: str = "knowledge_search"):
     """Create a search handler closure that wraps create_and_execute().
 
     The handler is called by KnowledgeSearchTool.execute() during the ReAct loop.
@@ -323,11 +328,26 @@ def _make_search_handler(db_session):
     are not thread-safe, so concurrent ``commit()`` calls collide with
     "method 'commit()' is already in progress". Using a dedicated session per
     call (mirroring context_handler._search_single_kb) isolates them.
+
+    When the run collects citations (a registry is bound), every chunk the call
+    retrieves is registered under the next run-wide key, and the formatted
+    context is labelled with those keys instead of restarting at [1].
     """
     app = _get_flask_app()
     engine = db_session.get_bind()
 
     def _raw_handler(query, kb_configs, max_tokens, session_history):
+        registry = get_citation_registry()
+        register_items = None
+        if registry is not None:
+            call_id = get_current_tool_call_id()
+
+            def register_items(items):
+                return registry.register_many(
+                    kb_chunk_unit_from_item(item, tool_name=tool_name, call_id=call_id)
+                    for item in items
+                )
+
         call_session = Session(bind=engine)
         try:
             handler_id, result = create_and_execute(
@@ -336,6 +356,7 @@ def _make_search_handler(db_session):
                 knowledge_base_configs=kb_configs,
                 max_context_tokens=max_tokens,
                 session_history=session_history,
+                register_items=register_items,
             )
             # Commit the context_handler immediately so it's visible in the DB
             # even before the ReAct loop completes

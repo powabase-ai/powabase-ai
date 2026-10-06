@@ -11,6 +11,7 @@ import json
 import logging
 import uuid
 import contextvars
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from typing import Any
@@ -621,6 +622,7 @@ def execute_retrieval(
     knowledge_base_configs: list[dict[str, Any]],
     max_context_tokens: int | None = None,
     session_history: list[dict[str, Any]] | None = None,
+    register_items: Callable[[list[RetrievedItem]], list[int]] | None = None,
 ) -> dict[str, Any]:
     """
     Core retrieval orchestration over one or more knowledge bases.
@@ -634,6 +636,9 @@ def execute_retrieval(
         knowledge_base_configs: List of KB configs (each with 'id' and optional params)
         max_context_tokens: Maximum tokens for the formatted context
         session_history: Optional conversation history for query enrichment context
+        register_items: Optional. Called once with every retrieved item, in
+            score order; returns the run-wide citation key for each, which
+            labels the formatted context and is recorded as ``citation_key``.
 
     Returns:
         Dict with keys: formatted_context, retrieved_context, metadata, errors, status
@@ -890,6 +895,7 @@ def execute_retrieval(
         )
 
     # 3. Format context with token limiting
+    labels = register_items(all_items) if register_items is not None and all_items else None
     formatted_context, diagnostics = format_items_as_context(
         all_items,
         max_tokens=max_context_tokens,
@@ -897,6 +903,7 @@ def execute_retrieval(
         source_image_map=source_image_map if any_image_mode else None,
         image_delivery=image_delivery,
         group_by_document=True,
+        labels=labels,
     )
 
     logger.info(
@@ -1014,6 +1021,10 @@ def execute_retrieval(
         enrichment = (all_items[idx].meta or {}).get("enrichment")
         if enrichment:
             item_dict["enrichment_metadata"] = enrichment
+
+    if labels is not None:
+        for idx, item_dict in enumerate(retrieved_items_list):
+            item_dict["citation_key"] = labels[idx]
 
     retrieved_context = [{"_type": "retrieval_diagnostics", **diagnostics}] + retrieved_items_list
 
@@ -1582,6 +1593,7 @@ def create_and_execute(
     knowledge_base_configs: list[dict[str, Any]],
     max_context_tokens: int | None = None,
     session_history: list[dict[str, Any]] | None = None,
+    register_items: Callable[[list[RetrievedItem]], list[int]] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """
     Convenience function: execute retrieval then persist the result.
@@ -1595,6 +1607,7 @@ def create_and_execute(
         knowledge_base_configs=knowledge_base_configs,
         max_context_tokens=max_context_tokens,
         session_history=session_history,
+        register_items=register_items,
     )
 
     handler_id = persist_context_handler(
