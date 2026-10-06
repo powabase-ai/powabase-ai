@@ -50,7 +50,9 @@ def build_citation_instruction() -> str:
     return (
         "When referencing the provided context, include citations in brackets like [1], [2]. "
         "Each citation should be in its own brackets — use [1][2], not [1, 2]. "
-        "If no specific context is referenced, do not include a citation."
+        "If no specific context is referenced, do not include a citation. "
+        "In tool results, each citable unit carries its key: a [n] label before the text, "
+        'or a "cite": "[n]" field on a JSON item. Cite that key.'
     )
 
 
