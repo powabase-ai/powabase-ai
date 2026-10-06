@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import uuid
 from typing import Any
 
 from sqlalchemy import text
@@ -75,18 +76,36 @@ def parse_citations_from_response(
     return cleaned, citations
 
 
+def _uuid_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        return str(uuid.UUID(str(value)))
+    except ValueError:
+        return None
+
+
 def persist_citations(
     db_session: Session,
     run_id: str,
     citations: list[dict[str, Any]],
 ) -> None:
     """
-    Bulk-insert citations into ai.message_citations.
+    Bulk-insert citation rows into ai.message_citations.
+
+    Rows come from ``build_citation_map`` / ``parse_citations_from_response``,
+    or from ``CitationRegistry.citation_map()`` with a ``cited`` flag added. A
+    row without ``kind`` is a knowledge-base chunk, and a row without ``cited``
+    is cited: that is the shape every caller wrote before run-wide keys.
+
+    Every unit of a run is persisted, not only the cited ones, so one bad value
+    must not lose them all. Ids that are not UUIDs are stored as NULL, and so is
+    a ``source_id`` whose source no longer exists (it would violate the FK).
 
     Args:
         db_session: SQLAlchemy session
         run_id: The user-facing run_id string (e.g. "run_abc123")
-        citations: List of citation dicts from parse_citations_from_response
+        citations: Citation dicts keyed as above
     """
     if not citations:
         return
@@ -102,20 +121,37 @@ def persist_citations(
         return
     run_uuid = str(row[0])
 
-    for cite in citations:
-        db_session.execute(
-            text(f"""
-                INSERT INTO "{AI_SCHEMA}".message_citations
-                (run_id, citation_key, item_id, source_id, text_excerpt, meta)
-                VALUES (:run_id, :citation_key, :item_id, :source_id, :text_excerpt, CAST(:meta AS jsonb))
-                ON CONFLICT (run_id, citation_key) DO NOTHING
-            """),
-            {
-                "run_id": run_uuid,
-                "citation_key": int(cite["key"]),
-                "item_id": cite.get("item_id"),
-                "source_id": cite.get("source_id"),
-                "text_excerpt": cite.get("text_excerpt", ""),
-                "meta": json.dumps(cite.get("meta", {})),
-            },
-        )
+    rows = [
+        {
+            "run_id": run_uuid,
+            "citation_key": int(cite["key"]),
+            "item_id": _uuid_or_none(cite.get("item_id")),
+            "source_id": _uuid_or_none(cite.get("source_id")),
+            "text_excerpt": cite.get("text_excerpt", ""),
+            "meta": json.dumps(cite.get("meta") or {}, default=str),
+            "kind": cite.get("kind") or "kb_chunk",
+            "tool_name": cite.get("tool_name"),
+            "call_id": cite.get("call_id"),
+            "title": cite.get("title"),
+            "url": cite.get("url"),
+            "knowledge_base_id": _uuid_or_none(cite.get("knowledge_base_id")),
+            "cited": cite.get("cited", True),
+        }
+        for cite in citations
+    ]
+    db_session.execute(
+        text(f"""
+            INSERT INTO "{AI_SCHEMA}".message_citations
+            (run_id, citation_key, item_id, source_id, text_excerpt, meta,
+             kind, tool_name, call_id, title, url, knowledge_base_id, cited)
+            VALUES (
+                :run_id, :citation_key, CAST(:item_id AS uuid),
+                (SELECT id FROM "{AI_SCHEMA}".sources WHERE id = CAST(:source_id AS uuid)),
+                :text_excerpt, CAST(:meta AS jsonb),
+                :kind, :tool_name, :call_id, :title, :url,
+                CAST(:knowledge_base_id AS uuid), :cited
+            )
+            ON CONFLICT (run_id, citation_key) DO NOTHING
+        """),
+        rows,
+    )

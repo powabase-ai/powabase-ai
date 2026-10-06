@@ -75,6 +75,7 @@ from ..services.citations import (
 from ..services.session import (
     SessionNotAccessible,
     build_messages_for_llm,
+    fetch_citations_for_runs,
     get_or_create_session,
     load_session_history,
     persist_agent_run,
@@ -3184,6 +3185,10 @@ def get_agent_run(run_id: str):
             "steps": row.steps,
             "events": row.events,
             "tool_calls": row.tool_calls,
+            # Every citation unit the run registered, cited or not.
+            "citation_units": fetch_citations_for_runs(
+                db.session, [str(row.id)], include_uncited=True
+            ).get(str(row.id), []),
             "reasoning_steps": row.reasoning_steps,
             "created_at": row.created_at.isoformat() if row.created_at else None,
         }

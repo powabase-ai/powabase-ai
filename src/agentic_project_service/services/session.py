@@ -1360,17 +1360,27 @@ def _load_tool_calls_for_runs(db_session: Session, run_uuids: list[str]) -> dict
     return out
 
 
-def fetch_citations_for_runs(db_session: Session, run_uuids: list[str]) -> dict[str, list[dict]]:
-    """Fetch citations for many runs in one query."""
+def fetch_citations_for_runs(
+    db_session: Session, run_uuids: list[str], include_uncited: bool = False
+) -> dict[str, list[dict]]:
+    """Fetch citations for many runs in one query.
+
+    By default this returns only the units the answer cited: the ``citations``
+    list that run responses have always carried. ``include_uncited`` returns
+    every unit the run registered, for consumers that resolve a citation
+    written without a marker against everything the run retrieved.
+    """
     if not run_uuids:
         return {}
+    cited_only = "" if include_uncited else "AND c.cited"
     stmt = text(
         f"""
         SELECT c.run_id, c.citation_key, c.item_id, c.source_id, c.text_excerpt,
-               c.meta, s.name AS source_name
+               c.meta, s.name AS source_name, c.kind, c.tool_name, c.call_id,
+               c.title, c.url, c.knowledge_base_id, c.cited
         FROM "{AI_SCHEMA}".message_citations c
         LEFT JOIN "{AI_SCHEMA}".sources s ON s.id = c.source_id
-        WHERE c.run_id IN :run_ids
+        WHERE c.run_id IN :run_ids {cited_only}
         ORDER BY c.run_id, c.citation_key
     """
     ).bindparams(bindparam("run_ids", expanding=True))
@@ -1385,6 +1395,13 @@ def fetch_citations_for_runs(db_session: Session, run_uuids: list[str]) -> dict[
             "text_excerpt": row[4],
             "meta": row[5] or {},
             "source_name": row[6] or "",
+            "kind": row[7],
+            "tool_name": row[8],
+            "call_id": row[9],
+            "title": row[10],
+            "url": row[11],
+            "knowledge_base_id": str(row[12]) if row[12] else None,
+            "cited": row[13],
         }
         citations_by_run.setdefault(run_id, []).append(payload)
     return citations_by_run
