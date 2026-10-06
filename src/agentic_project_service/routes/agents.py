@@ -72,6 +72,12 @@ from ..services.citations import (
     parse_citations_from_response,
     persist_citations,
 )
+from ..services.citation_registry import (
+    CitationRegistry,
+    citation_registry_var,
+    seed_registry_from_retrieved_context,
+    track_tool_call_id,
+)
 from ..services.mcp_citations import citation_mapping_error
 from ..services.session import (
     SessionNotAccessible,
@@ -1937,6 +1943,8 @@ def run_agent_stream(agent_id: str):
     Events sent:
     - `start`: Initial metadata (run_id, session_id)
     - `chunk`: Content chunk as it streams
+    - `citation_registered`: a citable unit received a run-wide key
+      ({key, kind, tool_name, title, url}); runs with tools and citations_enabled only
     - `complete`: Final response with metadata
     - `error`: Error information if something fails
 
@@ -2268,10 +2276,25 @@ def run_agent_stream(agent_id: str):
 
                 event_queue: queue.Queue = queue.Queue()
 
+                # One citation registry per run. Pre-fetched context is
+                # registered first: it was formatted with labels [1]..[k] in
+                # list order, so those labels stay valid and tool results
+                # continue from k+1.
+                citation_registry: CitationRegistry | None = None
+                if citations_enabled:
+                    citation_registry = CitationRegistry(on_register=event_queue.put)
+                    seed_registry_from_retrieved_context(
+                        citation_registry, retrieved_context_for_db
+                    )
+
+                def _on_engine_event(event: dict) -> None:
+                    track_tool_call_id(event)
+                    event_queue.put(event)
+
                 context = ExecutionContext(
                     execution_id=run_id,
                     session_id=actual_session_id,
-                    on_event=lambda e: event_queue.put(e),
+                    on_event=_on_engine_event,
                     session_history=[m.to_litellm_input() for m in session_history],
                     abort_signal=abort_event,
                 )
@@ -2348,6 +2371,7 @@ def run_agent_stream(agent_id: str):
                     # 132: retry of an agent_run must collide on
                     # UNIQUE(org_id, idem_key).
                     _worker_run_id_token = set_run_id(run_id)
+                    _citation_registry_token = citation_registry_var.set(citation_registry)
                     try:
                         with billing.llm_call_scope():
                             out = react_agent.run(
@@ -2365,6 +2389,7 @@ def run_agent_stream(agent_id: str):
                     except Exception as e:
                         error_holder.append(e)
                     finally:
+                        citation_registry_var.reset(_citation_registry_token)
                         reset_run_id(_worker_run_id_token)
                         unregister_run(run_id)
                         event_queue.put(None)  # sentinel
@@ -2422,6 +2447,12 @@ def run_agent_stream(agent_id: str):
                                 {"event": event_type, "error": "non-serializable event data"}
                             )
                         yield f"data: {payload}\n\n"
+                        continue
+
+                    # citation_registered: forwarded only. Every unit is
+                    # persisted to ai.message_citations at the end of the run.
+                    if event_type == "citation_registered":
+                        yield f"data: {json.dumps({'event': event_type, **event})}\n\n"
                         continue
 
                     # Terminal events: persist + forward
@@ -2569,17 +2600,32 @@ def run_agent_stream(agent_id: str):
                             final_retrieved_context
                         )
 
-                # Phase 2 patch — mirror the pre-fetched-context citation parsing
-                # so tool-based agentic runs also populate ai.message_citations and
-                # ship structured citations on the SSE complete event. Without this,
-                # [N] markers in the LLM's response decay into dead text.
+                # Citations. Units reach the registry through the platform's own
+                # tool handlers (knowledge_search, MCP) and pre-fetched context,
+                # numbered as the model saw them. Every unit is persisted; the
+                # answer's markers decide which are flagged cited. A run whose
+                # retrieved context arrived any other way keeps the merged
+                # numbering below.
                 citations_for_run: list[dict] = []
-                if citations_enabled and final_retrieved_context:
+                citation_rows: list[dict] = []
+                if citation_registry is not None and len(citation_registry):
+                    _citation_map = citation_registry.citation_map()
+                    final_content, _used = parse_citations_from_response(
+                        final_content, _citation_map
+                    )
+                    _cited_keys = {c["key"] for c in _used}
+                    citation_rows = [
+                        {**unit, "cited": unit["key"] in _cited_keys}
+                        for unit in _citation_map.values()
+                    ]
+                    citations_for_run = [row for row in citation_rows if row["cited"]]
+                elif citations_enabled and final_retrieved_context:
                     _citation_map = build_citation_map(final_retrieved_context)
                     if _citation_map:
                         final_content, citations_for_run = parse_citations_from_response(
                             final_content, _citation_map
                         )
+                    citation_rows = citations_for_run
 
                 reasoning = extract_reasoning_steps(output.messages) if output.messages else None
 
@@ -2617,8 +2663,8 @@ def run_agent_stream(agent_id: str):
                 )
                 db.session.commit()
 
-                if citations_for_run:
-                    persist_citations(db.session, run_id, citations_for_run)
+                if citation_rows:
+                    persist_citations(db.session, run_id, citation_rows)
                     db.session.commit()
 
                 # Billing: post the agent_run dispatch fee on success only.
