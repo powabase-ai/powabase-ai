@@ -256,3 +256,45 @@ class TestCitationInstructionNamesToolKeys:
             "[2]. Each citation should be in its own brackets — use [1][2], not [1, 2]. "
             "If no specific context is referenced, do not include a citation. "
         )
+
+
+class TestScrubNul:
+    """NUL characters leave the meta object before it is encoded, never after."""
+
+    def test_removes_nul_from_keys_and_nested_values(self):
+        from agentic_project_service.services.citations import scrub_nul
+
+        value = {"a\x00": ["x\x00y", {"k": "v\x00", "n": 3, "f": 1.5, "b": None}], "t": ("p\x00",)}
+        assert scrub_nul(value) == {
+            "a": ["xy", {"k": "v", "n": 3, "f": 1.5, "b": None}],
+            "t": ["p"],
+        }
+
+    def test_leaves_a_literal_backslash_u0000_sequence_alone(self):
+        from agentic_project_service.services.citations import scrub_nul
+
+        assert scrub_nul({"raw": "path C:\\u0000x"}) == {"raw": "path C:\\u0000x"}
+
+
+class TestMetaJson:
+    """The encoded meta is always valid JSON that round-trips the scrubbed object."""
+
+    def test_literal_backslash_u0000_round_trips(self):
+        import json
+
+        from agentic_project_service.services.citations import _meta_json
+
+        meta = {"raw": "path C:\\u0000x", "body": 'body {"a":"\\u0000"}'}
+        assert json.loads(_meta_json(meta)) == meta
+
+    def test_real_nul_is_removed(self):
+        import json
+
+        from agentic_project_service.services.citations import _meta_json
+
+        assert json.loads(_meta_json({"raw": "a\x00b", "k\x00": 1})) == {"raw": "ab", "k": 1}
+
+    def test_non_finite_numbers_store_empty(self):
+        from agentic_project_service.services.citations import _meta_json
+
+        assert _meta_json({"score": float("nan")}) == "{}"

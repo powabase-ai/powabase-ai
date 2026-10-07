@@ -218,3 +218,23 @@ def test_values_postgres_rejects_are_sanitized_and_other_units_persist(app):
     assert rows[0]["meta"] == {"k": "v"}
     assert rows[1]["meta"] == {}
     assert rows[2]["cited"] is True
+
+
+def test_a_literal_backslash_u0000_in_meta_round_trips_and_the_batch_persists(app):
+    """Only real NUL characters are removed; text that looks escaped is data and is kept."""
+    base = {"kind": "tool_call", "item_id": None, "source_id": None, "cited": True}
+    literal = 'path C:\\u0000x and body {"a":"\\u0000"}'
+    units = [
+        {**base, "key": "1", "text_excerpt": "first", "meta": {"raw": "before"}},
+        {**base, "key": "2", "text_excerpt": "literal", "meta": {"raw": literal}},
+        {**base, "key": "3", "text_excerpt": "nul", "meta": {"raw": "a\x00b", "k\x00": ["c\x00"]}},
+    ]
+    with app.app_context():
+        run_id, run_uuid = _run()
+        persist_citations(db.session, run_id, units)
+        db.session.commit()
+        rows = fetch_citations_for_runs(db.session, [run_uuid], include_uncited=True)[run_uuid]
+    assert [r["key"] for r in rows] == ["1", "2", "3"]
+    assert rows[0]["meta"] == {"raw": "before"}
+    assert rows[1]["meta"] == {"raw": literal}
+    assert rows[2]["meta"] == {"raw": "ab", "k": ["c"]}
