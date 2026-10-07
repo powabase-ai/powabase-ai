@@ -35,6 +35,9 @@ ITEMS_NONE = "none"
 
 _RULE_KEYS = frozenset({"items", "title", "url"})
 _ARGUMENT_SUMMARY_MAX = 80
+# meta.raw cap for a whole-call unit when the tool sets no result limit. The
+# unit is stored and returned in citation payloads, so it must stay bounded.
+RAW_MAX_CHARS = 20_000
 # What the engine's MCP client returns instead of raising (agentic.mcp.client).
 _EMPTY_RESULT = "(empty response)"
 _ENGINE_ERROR_RE = re.compile(r"^Error(?: \([^)]*\))?: |^Error calling MCP tool: ")
@@ -179,8 +182,15 @@ def key_mcp_result(
     rule: dict | None,
     registry: CitationRegistry,
     call_id: str | None,
+    raw_max_chars: int | None = None,
 ) -> Any:
-    """Register citation units for one MCP tool result; return what the model sees."""
+    """Register citation units for one MCP tool result; return what the model sees.
+
+    A whole-call unit keeps at most ``raw_max_chars`` (the tool's result limit;
+    ``RAW_MAX_CHARS`` when unset) of the result in ``meta.raw``, with
+    ``meta.raw_truncated`` set when it was cut. What the model sees is uncapped
+    here; the engine applies the tool's limit to it afterwards.
+    """
     if not isinstance(result, str) or result == _EMPTY_RESULT or _ENGINE_ERROR_RE.match(result):
         return result
     if rule is not None:
@@ -191,6 +201,10 @@ def key_mcp_result(
         )
         if keyed is not None:
             return keyed
+    limit = raw_max_chars or RAW_MAX_CHARS
+    meta: dict[str, Any] = {"raw": result[:limit], "arguments": arguments or {}}
+    if len(result) > limit:
+        meta["raw_truncated"] = True
     key = registry.register(
         CitationUnit(
             kind=KIND_TOOL_CALL,
@@ -198,7 +212,7 @@ def key_mcp_result(
             call_id=call_id,
             title=f"{tool_name} {_argument_summary(arguments)}",
             text_excerpt=result[:TEXT_EXCERPT_MAX_LEN],
-            meta={"raw": result, "arguments": arguments or {}},
+            meta=meta,
         )
     )
     return f"[{key}] {result}"

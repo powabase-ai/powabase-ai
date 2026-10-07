@@ -261,6 +261,7 @@ def _wrap_mcp_execute_with_citations(tool: ToolDefinition, rule: dict | None) ->
             rule=rule,
             registry=registry,
             call_id=get_current_tool_call_id(),
+            raw_max_chars=tool.max_result_chars,
         )
 
     tool.execute = citing_execute
