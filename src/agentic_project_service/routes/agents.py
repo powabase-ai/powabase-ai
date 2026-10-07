@@ -1944,7 +1944,8 @@ def run_agent_stream(agent_id: str):
     - `start`: Initial metadata (run_id, session_id)
     - `chunk`: Content chunk as it streams
     - `citation_registered`: a citable unit received a run-wide key
-      ({key, kind, tool_name, title, url}); runs with tools and citations_enabled only
+      ({key, kind, tool_name, title, url}); runs with tools and citations_enabled only.
+      Not ordered by key across concurrent tool calls, and no seq/ts
     - `complete`: Final response with metadata
     - `error`: Error information if something fails
 
@@ -2451,6 +2452,9 @@ def run_agent_stream(agent_id: str):
 
                     # citation_registered: forwarded only. Every unit is
                     # persisted to ai.message_citations at the end of the run.
+                    # Concurrent tool calls interleave these, so they are not
+                    # in key order across calls, and they bypass emit_event,
+                    # so they carry no seq/ts.
                     if event_type == "citation_registered":
                         yield f"data: {json.dumps({'event': event_type, **event})}\n\n"
                         continue

@@ -61,7 +61,14 @@ class CitationRegistry:
         return self.register_many([unit])[0]
 
     def register_many(self, units: Iterable[CitationUnit]) -> list[int]:
-        """Register units in order; their keys are contiguous."""
+        """Register units in order; their keys are contiguous.
+
+        ``on_register`` runs after the lock is released, once per unit in this
+        batch's key order. Batches from concurrent tool calls interleave, so
+        ``citation_registered`` events are not guaranteed to arrive in key
+        order across calls, and they carry no ``seq``/``ts``. Consumers must
+        index units by ``key``.
+        """
         batch = list(units)
         with self._lock:
             first = len(self._units) + 1
