@@ -8,6 +8,7 @@ import pytest
 
 from agentic_project_service.services.citation_registry import CitationRegistry
 from agentic_project_service.services.mcp_citations import (
+    RAW_MAX_CHARS,
     citation_mapping_error,
     compile_items_path,
     key_mcp_result,
@@ -144,6 +145,38 @@ class TestWholeCall:
         out, registry = _key(body, RULE)
         assert out == f"[1] {body}"
         assert [u["kind"] for u in registry.citation_map().values()] == ["tool_call"]
+
+
+class TestRawCap:
+    """A whole-call unit stores a bounded prefix of the result in meta.raw."""
+
+    def test_long_result_is_capped_at_the_default_and_flagged(self):
+        body = "a" * (RAW_MAX_CHARS + 5)
+        out, registry = _key(body, None)
+        assert out == f"[1] {body}"
+        meta = registry.citation_map()["1"]["meta"]
+        assert meta["raw"] == "a" * RAW_MAX_CHARS
+        assert meta["raw_truncated"] is True
+
+    def test_short_result_is_unchanged_and_not_flagged(self):
+        body = "a" * RAW_MAX_CHARS
+        _, registry = _key(body, None)
+        meta = registry.citation_map()["1"]["meta"]
+        assert meta == {"raw": body, "arguments": {"q": "a"}}
+
+    def test_the_tools_own_limit_is_preferred(self):
+        registry = CitationRegistry()
+        key_mcp_result(
+            "abcdefghij",
+            tool_name=TOOL,
+            arguments={},
+            rule=None,
+            registry=registry,
+            call_id="call_1",
+            raw_max_chars=4,
+        )
+        meta = registry.citation_map()["1"]["meta"]
+        assert (meta["raw"], meta["raw_truncated"]) == ("abcd", True)
 
 
 class TestNoUnit:

@@ -95,3 +95,12 @@ def test_an_invalid_stored_mapping_is_ignored_loudly(monkeypatch, registry, capl
     assert tools["mcp__docs__search_items"].execute({}, None) == SEARCH
     assert len(registry) == 0
     assert "citation_mapping" in caplog.text and "docs" in caplog.text
+
+
+def test_a_whole_call_unit_caps_raw_at_the_tools_result_limit(monkeypatch, registry):
+    tools = _build(monkeypatch, {})
+    lookup = tools["mcp__docs__lookup"]
+    lookup.max_result_chars = 5
+    assert lookup.execute({}, None) == "[1] Plain answer text."
+    meta = registry.citation_map()["1"]["meta"]
+    assert (meta["raw"], meta["raw_truncated"]) == ("Plain", True)
