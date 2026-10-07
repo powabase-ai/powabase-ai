@@ -95,14 +95,32 @@ def _clean_text(value: Any) -> Any:
     return value.replace("\x00", "") if isinstance(value, str) else value
 
 
+def scrub_nul(value: Any) -> Any:
+    """Return ``value`` with NUL characters removed from every string in it.
+
+    Walks dicts (keys and values), lists and tuples. Postgres rejects NUL in
+    text and jsonb, so it must leave the object before encoding: removing the
+    escaped form from encoded JSON would also corrupt a literal backslash that
+    precedes ``u0000`` in the data.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {scrub_nul(k): scrub_nul(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrub_nul(v) for v in value]
+    return value
+
+
 def _meta_json(meta: Any) -> str:
     """Serialize ``meta`` for a jsonb column: no NaN/Infinity, no NUL characters."""
     try:
-        encoded = json.dumps(meta or {}, default=str, allow_nan=False)
+        return json.dumps(
+            scrub_nul(meta or {}), default=lambda o: scrub_nul(str(o)), allow_nan=False
+        )
     except ValueError:
         logger.warning("Citation meta has non-finite numbers; storing it empty")
         return "{}"
-    return encoded.replace("\\u0000", "")
 
 
 def _key_in_range(cite: dict[str, Any]) -> bool:
