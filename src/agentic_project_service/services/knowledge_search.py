@@ -2527,6 +2527,7 @@ def format_items_as_context(
     image_delivery: str = "base64",
     group_by_document: bool = True,
     citations_enabled: bool = False,
+    labels: list[int] | None = None,
 ) -> tuple[str | list[dict], dict]:
     """
     Format retrieved items into context for the LLM.
@@ -2542,12 +2543,20 @@ def format_items_as_context(
         source_image_map: Map of source_id -> [{"page": N, "content": url_or_b64}, ...]
         image_delivery: "url" or "base64" (only used when context_mode="image")
         group_by_document: Group chunks under document headers (default True)
+        labels: Bracket label per item, parallel to ``items`` (default: 1..N).
+            Callers pass run-wide citation keys here.
 
     Returns:
         Tuple of (formatted context (str or list[dict]), diagnostics dict)
     """
     if not items:
         return "", {"total_items": 0, "items_included": 0, "items_dropped": 0}
+
+    if labels is not None and len(labels) != len(items):
+        raise ValueError(f"labels has {len(labels)} entries for {len(items)} items")
+
+    def _label(idx: int) -> int:
+        return labels[idx] if labels is not None else idx + 1
 
     # Determine if any KB uses image mode
     any_image_mode = False
@@ -2556,7 +2565,7 @@ def format_items_as_context(
 
     token_limit = max_tokens
     if citations_enabled and token_limit:
-        # Reserve ~60 tokens for the citation instruction that will be
+        # Reserve room for the citation instruction that will be
         # appended to the system prompt by the caller.
         from agentic_project_service.services.citations import build_citation_instruction
 
@@ -2616,7 +2625,7 @@ def format_items_as_context(
 
                         if new_images:
                             chunk_ann = _format_chunk_annotation(item)
-                            label = f"  [{orig_idx + 1}]"
+                            label = f"  [{_label(orig_idx)}]"
                             if chunk_ann:
                                 label += f" [{chunk_ann}]"
                             item_tokens = len(label) // 4 + len(new_images) * TOKENS_PER_IMAGE
@@ -2662,7 +2671,7 @@ def format_items_as_context(
                         elif matched_images:
                             # All pages already shown — emit annotation only
                             chunk_ann = _format_chunk_annotation(item)
-                            label = f"  [{orig_idx + 1}]"
+                            label = f"  [{_label(orig_idx)}]"
                             if chunk_ann:
                                 label += f" [{chunk_ann}]"
                             item_text = f"{label} (content already shown above)"
@@ -2676,7 +2685,7 @@ def format_items_as_context(
                         else:
                             # No matching page images — fall back to text content
                             chunk_ann = _format_chunk_annotation(item)
-                            label = f"  [{orig_idx + 1}]"
+                            label = f"  [{_label(orig_idx)}]"
                             if chunk_ann:
                                 label += f" [{chunk_ann}]"
                             item_text = f"{label}\n  {item.text}"
@@ -2694,7 +2703,7 @@ def format_items_as_context(
                         item_pages = (item.meta or {}).get("pages", [])
                         new_pages = [p for p in item_pages if (item.source_id, p) not in seen_pages]
                         chunk_ann = _format_chunk_annotation(item)
-                        label = f"  [{orig_idx + 1}]"
+                        label = f"  [{_label(orig_idx)}]"
                         if chunk_ann:
                             label += f" [{chunk_ann}]"
 
@@ -2740,7 +2749,7 @@ def format_items_as_context(
 
                     if new_images:
                         annotation = _format_enrichment_annotation(item)
-                        label = f"[{i + 1}] (Source: {item.source_id})"
+                        label = f"[{_label(i)}] (Source: {item.source_id})"
                         if annotation:
                             label += f" [{annotation}]"
                         item_tokens = len(label) // 4 + len(new_images) * TOKENS_PER_IMAGE
@@ -2787,7 +2796,7 @@ def format_items_as_context(
                     elif matched_images:
                         # All pages already shown — annotation only
                         annotation = _format_enrichment_annotation(item)
-                        label = f"[{i + 1}] (Source: {item.source_id})"
+                        label = f"[{_label(i)}] (Source: {item.source_id})"
                         if annotation:
                             label += f" [{annotation}]"
                         item_text = f"{label} (content already shown above)"
@@ -2800,7 +2809,7 @@ def format_items_as_context(
                     else:
                         # No matching page images — fall back to text content
                         annotation = _format_enrichment_annotation(item)
-                        label = f"[{i + 1}] (Source: {item.source_id})"
+                        label = f"[{_label(i)}] (Source: {item.source_id})"
                         if annotation:
                             label += f" [{annotation}]"
                         item_text = f"{label}\n{item.text}"
@@ -2824,24 +2833,24 @@ def format_items_as_context(
                     if item_pages and not new_pages:
                         # Fully overlapping — annotation only
                         if include_source_info and item.source_id:
-                            header = f"[{i + 1}] (Source: {item.source_id})"
+                            header = f"[{_label(i)}] (Source: {item.source_id})"
                             if annotation:
                                 header += f" [{annotation}]"
                             item_text = f"{header} (content already shown above)"
                         elif annotation:
-                            item_text = f"[{i + 1}] [{annotation}] (content already shown above)"
+                            item_text = f"[{_label(i)}] [{annotation}] (content already shown above)"
                         else:
-                            item_text = f"[{i + 1}] (content already shown above)"
+                            item_text = f"[{_label(i)}] (content already shown above)"
                     else:
                         if include_source_info and item.source_id:
-                            header = f"[{i + 1}] (Source: {item.source_id})"
+                            header = f"[{_label(i)}] (Source: {item.source_id})"
                             if annotation:
                                 header += f" [{annotation}]"
                             item_text = f"{header}\n{item.text}"
                         elif annotation:
-                            item_text = f"[{i + 1}] [{annotation}]\n{item.text}"
+                            item_text = f"[{_label(i)}] [{annotation}]\n{item.text}"
                         else:
-                            item_text = f"[{i + 1}] {item.text}"
+                            item_text = f"[{_label(i)}] {item.text}"
                         for p in item_pages:
                             seen_pages.add((item.source_id, p))
 
@@ -2909,15 +2918,15 @@ def format_items_as_context(
                     # Fully overlapping — annotation only
                     if chunk_ann:
                         item_text = (
-                            f"  [{orig_idx + 1}] [{chunk_ann}] (content already shown above)"
+                            f"  [{_label(orig_idx)}] [{chunk_ann}] (content already shown above)"
                         )
                     else:
-                        item_text = f"  [{orig_idx + 1}] (content already shown above)"
+                        item_text = f"  [{_label(orig_idx)}] (content already shown above)"
                 else:
                     if chunk_ann:
-                        item_text = f"  [{orig_idx + 1}] [{chunk_ann}]\n  {item.text}"
+                        item_text = f"  [{_label(orig_idx)}] [{chunk_ann}]\n  {item.text}"
                     else:
-                        item_text = f"  [{orig_idx + 1}]\n  {item.text}"
+                        item_text = f"  [{_label(orig_idx)}]\n  {item.text}"
                     for p in item_pages:
                         seen_pages.add((item.source_id, p))
 
@@ -2943,24 +2952,24 @@ def format_items_as_context(
             if item_pages and not new_pages:
                 # Fully overlapping — annotation only
                 if include_source_info and item.source_id:
-                    header = f"[{i + 1}] (Source: {item.source_id})"
+                    header = f"[{_label(i)}] (Source: {item.source_id})"
                     if annotation:
                         header += f" [{annotation}]"
                     item_text = f"{header} (content already shown above)"
                 elif annotation:
-                    item_text = f"[{i + 1}] [{annotation}] (content already shown above)"
+                    item_text = f"[{_label(i)}] [{annotation}] (content already shown above)"
                 else:
-                    item_text = f"[{i + 1}] (content already shown above)"
+                    item_text = f"[{_label(i)}] (content already shown above)"
             else:
                 if include_source_info and item.source_id:
-                    header = f"[{i + 1}] (Source: {item.source_id})"
+                    header = f"[{_label(i)}] (Source: {item.source_id})"
                     if annotation:
                         header += f" [{annotation}]"
                     item_text = f"{header}\n{item.text}"
                 elif annotation:
-                    item_text = f"[{i + 1}] [{annotation}]\n{item.text}"
+                    item_text = f"[{_label(i)}] [{annotation}]\n{item.text}"
                 else:
-                    item_text = f"[{i + 1}] {item.text}"
+                    item_text = f"[{_label(i)}] {item.text}"
                 for p in item_pages:
                     seen_pages.add((item.source_id, p))
 

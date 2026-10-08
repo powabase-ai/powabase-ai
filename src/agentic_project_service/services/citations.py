@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import uuid
 from typing import Any
 
 from sqlalchemy import text
@@ -49,7 +50,9 @@ def build_citation_instruction() -> str:
     return (
         "When referencing the provided context, include citations in brackets like [1], [2]. "
         "Each citation should be in its own brackets — use [1][2], not [1, 2]. "
-        "If no specific context is referenced, do not include a citation."
+        "If no specific context is referenced, do not include a citation. "
+        "In tool results, each citable unit carries its key: a [n] label before the text, "
+        'or a "cite": "[n]" field on a JSON item. Cite that key.'
     )
 
 
@@ -75,18 +78,79 @@ def parse_citations_from_response(
     return cleaned, citations
 
 
+def _uuid_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        return str(uuid.UUID(str(value)))
+    except ValueError:
+        return None
+
+
+SMALLINT_MAX = 32767
+
+
+def _clean_text(value: Any) -> Any:
+    """Strip NUL bytes, which Postgres text columns reject."""
+    return value.replace("\x00", "") if isinstance(value, str) else value
+
+
+def scrub_nul(value: Any) -> Any:
+    """Return ``value`` with NUL characters removed from every string in it.
+
+    Walks dicts (keys and values), lists and tuples. Postgres rejects NUL in
+    text and jsonb, so it must leave the object before encoding: removing the
+    escaped form from encoded JSON would also corrupt a literal backslash that
+    precedes ``u0000`` in the data.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {scrub_nul(k): scrub_nul(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [scrub_nul(v) for v in value]
+    return value
+
+
+def _meta_json(meta: Any) -> str:
+    """Serialize ``meta`` for a jsonb column: no NaN/Infinity, no NUL characters."""
+    try:
+        return json.dumps(
+            scrub_nul(meta or {}), default=lambda o: scrub_nul(str(o)), allow_nan=False
+        )
+    except ValueError:
+        logger.warning("Citation meta has non-finite numbers; storing it empty")
+        return "{}"
+
+
+def _key_in_range(cite: dict[str, Any]) -> bool:
+    if int(cite["key"]) <= SMALLINT_MAX:
+        return True
+    logger.warning("Skipping citation %s: key exceeds the column range", cite["key"])
+    return False
+
+
 def persist_citations(
     db_session: Session,
     run_id: str,
     citations: list[dict[str, Any]],
 ) -> None:
     """
-    Bulk-insert citations into ai.message_citations.
+    Bulk-insert citation rows into ai.message_citations.
+
+    Rows come from ``build_citation_map`` / ``parse_citations_from_response``,
+    or from ``CitationRegistry.citation_map()`` with a ``cited`` flag added. A
+    row without ``kind`` is a knowledge-base chunk, and a row without ``cited``
+    is cited: that is the shape every caller wrote before run-wide keys.
+
+    Every unit of a run is persisted, not only the cited ones, so one bad value
+    must not lose them all. Ids that are not UUIDs are stored as NULL, and so is
+    a ``source_id`` whose source no longer exists (it would violate the FK).
 
     Args:
         db_session: SQLAlchemy session
         run_id: The user-facing run_id string (e.g. "run_abc123")
-        citations: List of citation dicts from parse_citations_from_response
+        citations: Citation dicts keyed as above
     """
     if not citations:
         return
@@ -102,20 +166,41 @@ def persist_citations(
         return
     run_uuid = str(row[0])
 
-    for cite in citations:
-        db_session.execute(
-            text(f"""
-                INSERT INTO "{AI_SCHEMA}".message_citations
-                (run_id, citation_key, item_id, source_id, text_excerpt, meta)
-                VALUES (:run_id, :citation_key, :item_id, :source_id, :text_excerpt, CAST(:meta AS jsonb))
-                ON CONFLICT (run_id, citation_key) DO NOTHING
-            """),
-            {
-                "run_id": run_uuid,
-                "citation_key": int(cite["key"]),
-                "item_id": cite.get("item_id"),
-                "source_id": cite.get("source_id"),
-                "text_excerpt": cite.get("text_excerpt", ""),
-                "meta": json.dumps(cite.get("meta", {})),
-            },
-        )
+    citations = [c for c in citations if _key_in_range(c)]
+    if not citations:
+        return
+
+    rows = [
+        {
+            "run_id": run_uuid,
+            "citation_key": int(cite["key"]),
+            "item_id": _uuid_or_none(cite.get("item_id")),
+            "source_id": _uuid_or_none(cite.get("source_id")),
+            "text_excerpt": _clean_text(cite.get("text_excerpt", "")),
+            "meta": _meta_json(cite.get("meta")),
+            "kind": cite.get("kind") or "kb_chunk",
+            "tool_name": _clean_text(cite.get("tool_name")),
+            "call_id": _clean_text(cite.get("call_id")),
+            "title": _clean_text(cite.get("title")),
+            "url": _clean_text(cite.get("url")),
+            "knowledge_base_id": _uuid_or_none(cite.get("knowledge_base_id")),
+            "cited": cite.get("cited") is not False,
+        }
+        for cite in citations
+    ]
+    db_session.execute(
+        text(f"""
+            INSERT INTO "{AI_SCHEMA}".message_citations
+            (run_id, citation_key, item_id, source_id, text_excerpt, meta,
+             kind, tool_name, call_id, title, url, knowledge_base_id, cited)
+            VALUES (
+                :run_id, :citation_key, CAST(:item_id AS uuid),
+                (SELECT id FROM "{AI_SCHEMA}".sources WHERE id = CAST(:source_id AS uuid)),
+                :text_excerpt, CAST(:meta AS jsonb),
+                :kind, :tool_name, :call_id, :title, :url,
+                CAST(:knowledge_base_id AS uuid), :cited
+            )
+            ON CONFLICT (run_id, citation_key) DO NOTHING
+        """),
+        rows,
+    )

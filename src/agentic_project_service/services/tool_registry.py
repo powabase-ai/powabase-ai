@@ -15,6 +15,12 @@ from ..services.context_handler import create_and_execute
 from ..tools.builtin import BUILTIN_HANDLERS, BUILTIN_TOOL_DEFINITIONS
 from . import agent_sql
 from . import billing_port as billing
+from .citation_registry import (
+    get_citation_registry,
+    get_current_tool_call_id,
+    kb_chunk_unit_from_item,
+)
+from .mcp_citations import citation_mapping_error, key_mcp_result
 from .run_context import (
     get_run_id,
     new_request_id,
@@ -232,6 +238,35 @@ def _wrap_tool_execute_with_billing(tool: ToolDefinition) -> None:
     tool.execute = billing_execute
 
 
+def _wrap_mcp_execute_with_citations(tool: ToolDefinition, rule: dict | None) -> None:
+    """Key an MCP tool's results for citations, in runs that collect them.
+
+    ``rule`` is this tool's entry in its server's ``citation_mapping``. None
+    means the tool has no entry, so each result is one whole-call unit. A run
+    without a citation registry gets the result unchanged: that covers runs
+    with citations off and every path other than the streaming ReAct run.
+    """
+    inner_execute = tool.execute
+    tool_name = tool.name
+
+    def citing_execute(arguments, context):
+        result = inner_execute(arguments, context)
+        registry = get_citation_registry()
+        if registry is None:
+            return result
+        return key_mcp_result(
+            result,
+            tool_name=tool_name,
+            arguments=arguments,
+            rule=rule,
+            registry=registry,
+            call_id=get_current_tool_call_id(),
+            raw_max_chars=tool.max_result_chars,
+        )
+
+    tool.execute = citing_execute
+
+
 def _ensure_app_context(func, app):
     """Wrap a function so it pushes Flask app context if not already present.
 
@@ -308,7 +343,7 @@ def _sanitize_kb_error_note(error: dict) -> str:
     return f"{kb_id}: {detail}"
 
 
-def _make_search_handler(db_session):
+def _make_search_handler(db_session, tool_name: str = "knowledge_search"):
     """Create a search handler closure that wraps create_and_execute().
 
     The handler is called by KnowledgeSearchTool.execute() during the ReAct loop.
@@ -323,11 +358,26 @@ def _make_search_handler(db_session):
     are not thread-safe, so concurrent ``commit()`` calls collide with
     "method 'commit()' is already in progress". Using a dedicated session per
     call (mirroring context_handler._search_single_kb) isolates them.
+
+    When the run collects citations (a registry is bound), every chunk the call
+    retrieves is registered under the next run-wide key, and the formatted
+    context is labelled with those keys instead of restarting at [1].
     """
     app = _get_flask_app()
     engine = db_session.get_bind()
 
     def _raw_handler(query, kb_configs, max_tokens, session_history):
+        registry = get_citation_registry()
+        register_items = None
+        if registry is not None:
+            call_id = get_current_tool_call_id()
+
+            def register_items(items):
+                return registry.register_many(
+                    kb_chunk_unit_from_item(item, tool_name=tool_name, call_id=call_id)
+                    for item in items
+                )
+
         call_session = Session(bind=engine)
         try:
             handler_id, result = create_and_execute(
@@ -336,6 +386,7 @@ def _make_search_handler(db_session):
                 knowledge_base_configs=kb_configs,
                 max_context_tokens=max_tokens,
                 session_history=session_history,
+                register_items=register_items,
             )
             # Commit the context_handler immediately so it's visible in the DB
             # even before the ReAct loop completes
@@ -927,6 +978,16 @@ def build_mcp_tools_for_agent(
     tools: dict[str, ToolDefinition] = {}
 
     for server in servers:
+        mapping = server.citation_mapping
+        mapping_error = citation_mapping_error(mapping) if mapping is not None else None
+        if mapping_error:
+            logger.warning(
+                "Ignoring invalid citation_mapping on MCP server %s for agent %s: %s",
+                server.name,
+                agent_id,
+                mapping_error,
+            )
+            mapping = None
         try:
             mcp_tools = discover_mcp_tools(server.url, server.headers or {})
         except Exception as e:
@@ -961,6 +1022,8 @@ def build_mcp_tools_for_agent(
             if default_max_result_chars is not None:
                 mcp_tool_def.max_result_chars = default_max_result_chars
             _wrap_tool_execute_with_billing(mcp_tool_def)
+            if mapping is not None:
+                _wrap_mcp_execute_with_citations(mcp_tool_def, mapping.get(mcp_tool.name))
             tools[tool_name] = mcp_tool_def
 
     return tools

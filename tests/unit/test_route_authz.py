@@ -835,6 +835,23 @@ class TestGetAgentRunOwnership:
         assert self._get(_agent_run(None), ..., service=True).status_code == 200
 
 
+class TestGetAgentRunCitationLoadFailure:
+    def test_unloadable_citation_units_are_null_not_empty(self):
+        """A failed load must be distinguishable from a run that has no units."""
+        app = _app_with(agents_route.agents_bp)
+        with (
+            _authed_as_service_role(),
+            patch.object(agents_route, "AgentRun") as agent_run_model,
+            patch.object(agents_route.db, "session", MagicMock()),
+            patch.object(agents_route, "fetch_citations_for_runs", side_effect=RuntimeError("x")),
+            app.test_client() as c,
+        ):
+            agent_run_model.query.filter_by.return_value.first.return_value = _agent_run(None)
+            resp = c.get("/api/agents/runs/run_1", headers=HEADERS)
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        assert resp.get_json()["citation_units"] is None
+
+
 # ---------------------------------------------------------------------------
 # GET /api/agents/<id>/sessions — an end user lists only their own sessions
 # ---------------------------------------------------------------------------

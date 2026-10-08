@@ -67,6 +67,7 @@ from agentic_project_service.db import db  # noqa: E402
 from agentic_project_service.main import create_app  # noqa: E402
 from agentic_project_service.services import billing_port  # noqa: E402
 from tests.support.billing import RecordingBillingAdapter  # noqa: E402
+from tests.support.citation_schema import ensure_citation_schema  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +94,9 @@ def app():
         # Create all ORM-defined tables (ai.sources, ai.agents, etc.)
         db.metadata.create_all(db.engine)
         db.session.commit()
+
+        # ai.message_citations has no ORM model; build it the way migrations do.
+        ensure_citation_schema(db.session)
 
     yield application
 
