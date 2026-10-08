@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/powabase-ai/powabase-ai/compare/v0.13.2...v0.14.0) (2026-10-08)
+
+
+### Features
+
+* run-wide citation keys for ReAct runs, with opt-in MCP result keying ([#108](https://github.com/powabase-ai/powabase-ai/issues/108)) ([7f47ba0](https://github.com/powabase-ai/powabase-ai/commit/7f47ba05286b55cfc2675a15fdfe06694e755399))
+
 ## [0.13.2](https://github.com/powabase-ai/powabase-ai/compare/v0.13.1...v0.13.2) (2026-10-06)
 
 
