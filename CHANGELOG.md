@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/powabase-ai/powabase-ai/compare/v0.14.0...v0.14.1) (2026-10-16)
+
+
+### Bug Fixes
+
+* download page texts concurrently ([#113](https://github.com/powabase-ai/powabase-ai/issues/113)) ([01ece00](https://github.com/powabase-ai/powabase-ai/commit/01ece00a5dcf1e7d73c5c53a528e947cd67bb00c))
+
 ## [0.14.0](https://github.com/powabase-ai/powabase-ai/compare/v0.13.2...v0.14.0) (2026-10-08)
 
 
