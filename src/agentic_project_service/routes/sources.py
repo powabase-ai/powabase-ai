@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import defusedxml.ElementTree as ET
 from urllib.parse import urlparse, urlunparse
@@ -34,6 +35,9 @@ from ..tasks.extraction import extract_source
 from ..tasks.url_extraction import extract_url_source
 
 logger = logging.getLogger(__name__)
+
+# Concurrent storage downloads for the all-pages form of GET page-texts.
+_PAGE_TEXT_DOWNLOAD_WORKERS = 16
 
 
 # Per-page estimate for pre-charge balance check at queue time. OCR is billed
@@ -1176,8 +1180,16 @@ def get_page_texts(source_id: str):
             return jsonify({"error": f"Failed to download page {requested_page}"}), 500
         return jsonify({"text": text_content, "page": requested_page, "count": len(pt_derivs)})
 
-    # Return all pages
-    page_texts = []
+    # Return all pages. One storage request per page: fetched one after
+    # another, a long document outlasts the gateway's upstream timeout.
+    def _download(parts: list[str]) -> str | None:
+        try:
+            return storage.download(parts[0], parts[1]).decode("utf-8")
+        except Exception as e:
+            logger.warning(f"Failed to download page_text derivative: {e}")
+            return None
+
+    paths = []
     for d in pt_derivs:
         sp = d.get("storage_path")
         if not sp:
@@ -1185,12 +1197,9 @@ def get_page_texts(source_id: str):
         parts = sp.split("/", 1)
         if len(parts) != 2:
             continue
-        try:
-            raw = storage.download(parts[0], parts[1])
-            page_texts.append(raw.decode("utf-8"))
-        except Exception as e:
-            logger.warning(f"Failed to download page_text derivative: {e}")
-            continue
+        paths.append(parts)
+    with ThreadPoolExecutor(max_workers=_PAGE_TEXT_DOWNLOAD_WORKERS) as pool:
+        page_texts = [t for t in pool.map(_download, paths) if t is not None]
     return jsonify({"page_texts": page_texts, "count": len(page_texts)})
 
 
