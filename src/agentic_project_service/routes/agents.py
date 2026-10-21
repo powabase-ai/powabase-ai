@@ -1782,6 +1782,7 @@ def run_agent(agent_id: str):
             model=agent_model,
             system_prompt=full_system_prompt,
             name=agent_name,
+            max_tokens=agent_settings.get("max_tokens"),
             api_key=provider_api_key,
             reasoning_effort=agent_settings.get("reasoning_effort"),
         )
@@ -2747,6 +2748,7 @@ def run_agent_stream(agent_id: str):
                 model=agent_model,
                 system_prompt=full_system_prompt,
                 name=agent_name,
+                max_tokens=agent_settings.get("max_tokens"),
                 api_key=provider_api_key,
                 reasoning_effort=agent_settings.get("reasoning_effort"),
             )
