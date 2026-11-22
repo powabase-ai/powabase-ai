@@ -116,6 +116,15 @@ def seed_indexed_sources_watchdog(**kwargs):
 
 
 @worker_ready.connect
+def seed_stale_runs_tick(**kwargs):
+    """Bootstrap the self-rescheduling stale-run cleanup. The project stack runs
+    no Celery beat, so the beat entry for cleanup_stale_runs never fires there."""
+    from .tasks.cleanup import stale_runs_tick
+
+    stale_runs_tick.delay()
+
+
+@worker_ready.connect
 def seed_stranded_extraction_recovery(**kwargs):
     """Schedule a sweep for extraction deliveries lost with a worker that died
     while they waited. A worker starting is often the replacement for one
