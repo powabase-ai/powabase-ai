@@ -282,6 +282,17 @@ def current_slot() -> SharedRelease:
     return g.get("run_slot", NO_RELEASE)
 
 
+def _ensure_stale_runs_chain() -> None:
+    """A run start is where a stale-run chain that died is noticed and
+    re-seeded (at most once a minute per process, off this thread)."""
+    try:
+        from ..tasks import cleanup
+
+        cleanup.ensure_stale_runs_chain_soon()
+    except Exception:
+        logger.debug("Stale-run chain check unavailable", exc_info=True)
+
+
 def _max_concurrent_runs() -> int:
     try:
         return int(get_setting("MAX_CONCURRENT_RUNS") or 0)
@@ -323,6 +334,7 @@ def admit_run(f):
 
     @wraps(f)
     def decorated(*args, **kwargs):
+        _ensure_stale_runs_chain()
         max_runs = _max_concurrent_runs()
         gate = default_gate
         admission = gate.try_acquire(max_runs)

@@ -335,6 +335,114 @@ def test_worker_ready_seeds_a_chain():
     seed.assert_called_once()
 
 
+# --- the chain never drops to zero ---
+
+
+def test_a_failed_seed_enqueue_restores_the_previous_generation(chain, monkeypatch):
+    chain.client.set("ref-a:stale_runs_chain", "old-generation", ex=900)
+
+    def broken_delay(generation):
+        raise ConnectionError("broker down")
+
+    monkeypatch.setattr(cleanup_mod.stale_runs_tick, "delay", broken_delay)
+    cleanup_mod.seed_stale_runs_chain()  # does not raise
+    assert chain.client.get("ref-a:stale_runs_chain") == b"old-generation"
+    assert 0 < chain.client.ttl("ref-a:stale_runs_chain") <= 900
+
+
+def test_a_failed_first_seed_enqueue_leaves_no_generation(chain, monkeypatch):
+    monkeypatch.setattr(
+        cleanup_mod.stale_runs_tick, "delay", MagicMock(side_effect=ConnectionError("down"))
+    )
+    cleanup_mod.seed_stale_runs_chain()
+    assert not chain.client.exists("ref-a:stale_runs_chain")
+
+
+def test_a_chain_that_cannot_re_enqueue_gives_up_its_generation(chain, monkeypatch):
+    monkeypatch.setattr(cleanup_mod, "run_stale_cleanup", dict)
+    monkeypatch.setattr(cleanup_mod.time, "sleep", lambda s: None)
+    cleanup_mod.seed_stale_runs_chain()
+    monkeypatch.setattr(
+        cleanup_mod.stale_runs_tick,
+        "apply_async",
+        MagicMock(side_effect=ConnectionError("broker down")),
+    )
+    _tick(chain.seeded[0])
+    assert cleanup_mod.stale_runs_tick.apply_async.call_count == 3
+    assert not chain.client.exists("ref-a:stale_runs_chain")
+
+
+@pytest.fixture
+def fresh_check(monkeypatch):
+    monkeypatch.setattr(cleanup_mod, "_last_chain_check", float("-inf"))
+
+
+def test_a_run_start_re_seeds_a_dead_chain(chain, fresh_check):
+    cleanup_mod.ensure_stale_runs_chain()
+    assert len(chain.seeded) == 1
+    assert chain.client.get("ref-a:stale_runs_chain").decode() == chain.seeded[0]
+
+
+def test_a_live_chain_is_left_alone(chain, fresh_check):
+    chain.client.set("ref-a:stale_runs_chain", "live", ex=900)
+    cleanup_mod.ensure_stale_runs_chain()
+    assert chain.seeded == []
+    assert chain.client.get("ref-a:stale_runs_chain") == b"live"
+
+
+def test_the_chain_check_runs_at_most_once_a_minute(chain, fresh_check, monkeypatch):
+    calls = []
+    real = chain.client.exists
+    monkeypatch.setattr(chain.client, "exists", lambda *k: calls.append(k) or real(*k))
+    chain.client.set("ref-a:stale_runs_chain", "live", ex=900)
+    for _ in range(5):
+        cleanup_mod.ensure_stale_runs_chain()
+    assert len(calls) == 1
+
+
+def test_the_chain_check_with_redis_down_does_nothing(monkeypatch, fresh_check):
+    monkeypatch.setenv("CELERY_BROKER_URL", "memory://")
+    with patch.object(cleanup_mod, "seed_stale_runs_chain") as seed:
+        cleanup_mod.ensure_stale_runs_chain()  # never raises
+    seed.assert_not_called()
+
+
+def test_every_run_start_asks_for_the_chain_check_off_the_request_thread(monkeypatch):
+    from flask import Flask
+
+    from agentic_project_service.services import run_gate as gate_mod
+
+    asked = []
+    monkeypatch.setattr(cleanup_mod, "ensure_stale_runs_chain_soon", lambda: asked.append(1))
+    monkeypatch.setattr(gate_mod, "get_setting", lambda key: 0)  # gate off
+    app = Flask(__name__)
+
+    @app.route("/run", methods=["POST"])
+    @gate_mod.admit_run
+    def run():
+        return {"ok": True}
+
+    with app.test_client() as c:
+        assert c.post("/run").status_code == 200
+    assert asked == [1]
+
+
+def test_ensure_soon_spawns_at_most_one_check_per_interval(monkeypatch, fresh_check):
+    started = []
+
+    class _Thread:
+        def __init__(self, target, name, daemon):
+            started.append(name)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(cleanup_mod.threading, "Thread", _Thread)
+    for _ in range(3):
+        cleanup_mod.ensure_stale_runs_chain_soon()
+    assert started == ["stale-runs-chain-check"]
+
+
 def test_the_beat_entry_stays_for_deployments_that_run_beat():
     from agentic_project_service.celery import celery_app
 
