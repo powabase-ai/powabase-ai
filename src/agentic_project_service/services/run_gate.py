@@ -300,3 +300,35 @@ def admit_run(f):
 
     decorated._admits_runs = True
     return decorated
+
+
+def health_fields() -> dict:
+    """``active_runs`` and ``max_concurrent_runs`` for /health?runs=1; each is
+    None when it cannot be read (never raises)."""
+    max_runs = None
+    try:
+        max_runs = int(get_setting("MAX_CONCURRENT_RUNS") or 0)
+    except Exception:
+        logger.warning("MAX_CONCURRENT_RUNS unreadable for /health", exc_info=True)
+    return {"active_runs": default_gate.active_runs(), "max_concurrent_runs": max_runs}
+
+
+class ActiveRunsCollector:
+    """Prometheus collector: admitted runs in this project across all pods,
+    read from Redis at scrape time. Every pod reports the same value, so
+    aggregate with ``max by (project_ref)``. No sample when Redis cannot say."""
+
+    def __init__(self, gate: RunGate | None = None):
+        self._gate = gate
+
+    def collect(self):
+        from prometheus_client.core import GaugeMetricFamily
+
+        gauge = GaugeMetricFamily(
+            "project_api_active_runs",
+            "Runs holding a MAX_CONCURRENT_RUNS slot in this project, across all pods.",
+        )
+        value = (self._gate or default_gate).active_runs()
+        if value is not None:
+            gauge.add_metric([], value)
+        yield gauge
