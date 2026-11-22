@@ -1,6 +1,7 @@
 """POST /api/agents/runs/<id>/approve when the run lives in another process."""
 
 import os
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -298,7 +299,8 @@ def test_a_dead_owner_listener_is_202_unconfirmed_until_it_reconnects(two_proces
     a, ctx = two_processes
     deaf = _Deaf(a._pubsub)
     a._pubsub = deaf  # the connection died without Redis or the listener noticing
-    time.sleep(0.15)
+    # Its read on the live subscription has finished once it reads from this one.
+    assert deaf.polled.wait(3)
     resp = _post()
     assert resp.status_code == 202
     assert resp.get_json() == UNCONFIRMED_BODY
@@ -313,8 +315,10 @@ class _Deaf:
 
     def __init__(self, inner):
         self.inner = inner
+        self.polled = threading.Event()  # the listener now reads from this one
 
     def get_message(self, timeout=0.0):
+        self.polled.set()
         time.sleep(min(timeout or 0.0, 0.05))
 
     def ping(self):

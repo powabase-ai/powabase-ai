@@ -420,8 +420,10 @@ class _Deaf:
 
     def __init__(self, inner):
         self.inner = inner
+        self.polled = threading.Event()  # the listener now reads from this one
 
     def get_message(self, timeout=0.0):
+        self.polled.set()
         time.sleep(min(timeout or 0.0, 0.05))
 
     def ping(self):
@@ -487,7 +489,9 @@ class TestLiveness:
 
         deaf = _Deaf(a._pubsub)
         a._pubsub = deaf
-        time.sleep(0.15)  # let the listener's current read on the live one finish
+        # The listener's read on the live subscription has finished once it
+        # reads from the deaf one: no sleep to guess that.
+        assert deaf.polled.wait(3)
         connect().delete("runs:owner:ref-a:run_1")
         # While deaf: Redis may still count the subscriber, but nothing acknowledges.
         assert (

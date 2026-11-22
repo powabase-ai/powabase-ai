@@ -84,12 +84,20 @@ def test_an_expired_lease_frees_its_slot(gate, monkeypatch):
     assert gate.try_acquire(1).admitted
 
 
-def test_renew_all_keeps_held_leases_alive(gate, monkeypatch):
-    monkeypatch.setattr(gate_mod, "LEASE_SECONDS", 0.4)
-    gate.try_acquire(1)
-    time.sleep(0.25)
+def _redis_now(client):
+    seconds, micros = client.time()
+    return seconds + micros / 1_000_000
+
+
+def test_renew_all_keeps_held_leases_alive(gate, client):
+    """Renewal moves a lease about to lapse a full LEASE_SECONDS out, by the
+    Redis clock. No sleeps: a slow CI runner cannot make it miss."""
+    held = gate.try_acquire(1)
+    about_to_lapse = _redis_now(client) + 0.5
+    client.zadd(gate.key(), {held.token: about_to_lapse})
     assert gate.renew_all() == 1
-    time.sleep(0.25)
+    expires = client.zscore(gate.key(), held.token)
+    assert expires >= _redis_now(client) + gate_mod.LEASE_SECONDS - 5
     assert not gate.try_acquire(1).admitted
 
 
