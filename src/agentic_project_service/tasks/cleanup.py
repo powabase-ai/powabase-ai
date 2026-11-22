@@ -7,19 +7,18 @@ from sqlalchemy import text
 from ..celery import celery_app
 from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
+from ..services.settings_registry import get_setting
 
 logger = logging.getLogger(__name__)
 
 
-@celery_app.task(name="cleanup_stale_runs")
-@billing.no_billing_context
-def cleanup_stale_runs():
-    """Mark runs stuck in 'running' for >10 minutes as failed.
+def run_stale_cleanup() -> dict:
+    """Mark runs 'running' for longer than RUN_STALE_AFTER_SECONDS as failed.
 
-    This handles the case where a pod restarts mid-run and the
-    in-process agent loop is lost. Covers both agent runs and
-    orchestration runs.
+    This handles a pod restart mid-run, which loses the in-process agent loop.
+    Covers both agent runs and orchestration runs.
     """
+    params = {"stale_after": int(get_setting("RUN_STALE_AFTER_SECONDS"))}
     agent_result = db.session.execute(
         text(f"""
             UPDATE "{AI_SCHEMA}".agent_runs
@@ -27,8 +26,9 @@ def cleanup_stale_runs():
                 error = 'Run interrupted (pod restart or timeout)',
                 completed_at = NOW()
             WHERE status = 'running'
-              AND started_at < NOW() - INTERVAL '10 minutes'
-        """)
+              AND started_at < NOW() - (:stale_after * INTERVAL '1 second')
+        """),
+        params,
     )
 
     orch_result = db.session.execute(
@@ -38,8 +38,9 @@ def cleanup_stale_runs():
                 error = 'Run interrupted (pod restart or timeout)',
                 completed_at = NOW()
             WHERE status = 'running'
-              AND started_at < NOW() - INTERVAL '10 minutes'
-        """)
+              AND started_at < NOW() - (:stale_after * INTERVAL '1 second')
+        """),
+        params,
     )
 
     db.session.commit()
@@ -52,3 +53,9 @@ def cleanup_stale_runs():
             orch_count,
         )
     return {"agent_runs": agent_count, "orchestration_runs": orch_count}
+
+
+@celery_app.task(name="cleanup_stale_runs")
+@billing.no_billing_context
+def cleanup_stale_runs():
+    return run_stale_cleanup()
