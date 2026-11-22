@@ -1,6 +1,8 @@
-"""Simple in-memory sliding-window rate limiter."""
+"""Rate limiters: a per-process window (RateLimiter) and the Redis window shared
+by every process of a project (RedisRateLimiter)."""
 
 import logging
+import math
 import os
 import threading
 import time
@@ -39,21 +41,25 @@ class RateLimiter:
             return True
 
 
-# Configured limit for workflow execution endpoints
-execution_limiter = RateLimiter(max_requests=20, window_seconds=60)
+# Workflow executions per user per minute, across every process of the project.
+EXECUTIONS_PER_MINUTE = 20
 
 
 def rate_limit_executions(f):
-    """Decorator that rate-limits workflow execution endpoints per user."""
+    """Rate-limit workflow execution endpoints per user, across every gunicorn
+    worker and replica of the project (Redis window; fail-open)."""
 
     @wraps(f)
     def decorated(*args, **kwargs):
         user_id = getattr(g, "user_id", None) or "anonymous"
-        if not execution_limiter.is_allowed(user_id):
-            return (
-                jsonify({"error": "Rate limit exceeded. Max 20 executions per minute."}),
-                429,
-            )
+        # external_limiter is defined below; it is resolved at call time.
+        wait = external_limiter.try_acquire(f"workflow-exec:{user_id}", EXECUTIONS_PER_MINUTE)
+        if wait is not None:
+            message = f"Rate limit exceeded. Max {EXECUTIONS_PER_MINUTE} executions per minute."
+            resp = jsonify({"error": message})
+            resp.status_code = 429
+            resp.headers["Retry-After"] = str(max(1, math.ceil(wait)))
+            return resp
         return f(*args, **kwargs)
 
     return decorated
