@@ -1,14 +1,20 @@
 """POST /api/agents/runs/<id>/approve when the run lives in another process."""
 
+import os
 import time
 from unittest.mock import patch
 
 import fakeredis
+import pytest
+import redis
 from agentic.execution.context import ExecutionContext
 from flask import Flask
 
 from agentic_project_service.routes import agents as agents_route
+from agentic_project_service.services import run_registry
 from agentic_project_service.services.run_registry import RemoteRun, RunRegistry
+
+_REAL_REDIS_URL = os.getenv("TEST_REDIS_URL")
 
 USER = "11111111-1111-4111-8111-111111111111"
 OTHER = "22222222-2222-4222-8222-222222222222"
@@ -134,30 +140,84 @@ def test_a_local_context_still_wins():
     assert ctx.get_approval_decision() == {"approved": True}
 
 
-def test_end_to_end_across_two_registries():
-    """The route on process B resumes a run that waits on process A."""
-    server = fakeredis.FakeServer()
-    a = RunRegistry(fakeredis.FakeStrictRedis(server=server), instance="pod-a")
-    b = RunRegistry(fakeredis.FakeStrictRedis(server=server), instance="pod-b", start_thread=False)
+@pytest.fixture(params=["fakeredis", "redis"])
+def connect(request):
+    """A factory of clients that all talk to the same Redis (real one with TEST_REDIS_URL)."""
+    if request.param == "fakeredis":
+        server = fakeredis.FakeServer()
+        yield lambda: fakeredis.FakeStrictRedis(server=server)
+        return
+    if not _REAL_REDIS_URL:
+        pytest.skip("TEST_REDIS_URL not set")
+    real = redis.from_url(_REAL_REDIS_URL)
+    real.flushdb()
+    yield lambda: redis.from_url(_REAL_REDIS_URL)
+    real.flushdb()
+
+
+@pytest.fixture
+def two_processes(connect):
+    """Process A runs the listener and holds the run; the route runs on process B."""
+    a = RunRegistry(connect(), instance="pod-a:1:aaaa")
+    b = RunRegistry(connect(), instance="pod-b:2:bbbb", start_thread=False)
     ctx = ExecutionContext(execution_id="run_1")
     ctx.reset_approval()
     a.register("run_1", ctx, owner_user_id=USER)
-    try:
-        assert _wait_until(lambda: b.lookup_remote("run_1") is not None)
-        with (
-            patch.object(agents_route, "get_active_run_context", b.context),
-            patch.object(agents_route, "get_active_run_owner", b.owner),
-            patch.object(agents_route, "lookup_remote_run", b.lookup_remote),
-            patch.object(agents_route, "deliver_approval", b.deliver_remote),
-            _as_user(),
-        ):
-            resp = _post(body={"approved": False, "reason": "no"})
-        assert resp.status_code == 200
-        assert ctx.get_approval_event().is_set()
-        assert ctx.get_approval_decision() == {"approved": False, "reason": "no"}
-    finally:
-        a.close()
-        b.close()
+    assert _wait_until(lambda: b.lookup_remote("run_1") is not None)
+    with (
+        patch.object(agents_route, "get_active_run_context", b.context),
+        patch.object(agents_route, "get_active_run_owner", b.owner),
+        patch.object(agents_route, "lookup_remote_run", b.lookup_remote),
+        patch.object(agents_route, "deliver_approval", b.deliver_remote),
+        _as_user(),
+    ):
+        yield a, ctx
+    a.close()
+    b.close()
+
+
+def test_end_to_end_across_two_registries(two_processes):
+    """The route on process B resumes a run that waits on process A."""
+    _, ctx = two_processes
+    resp = _post(body={"approved": False, "reason": "no"})
+    assert resp.status_code == 200
+    assert ctx.get_approval_event().is_set()
+    assert ctx.get_approval_decision() == {"approved": False, "reason": "no"}
+
+
+def test_a_dead_owner_listener_is_404_until_it_reconnects(two_processes, monkeypatch):
+    for name, value in (
+        ("HEARTBEAT_SECONDS", 0.2),
+        ("PONG_TIMEOUT_SECONDS", 0.3),
+        ("ACK_TIMEOUT_SECONDS", 0.5),
+        ("RESUBSCRIBE_BACKOFF_SECONDS", 0.05),
+    ):
+        monkeypatch.setattr(run_registry, name, value)
+    a, ctx = two_processes
+    deaf = _Deaf(a._pubsub)
+    a._pubsub = deaf  # the connection died without Redis or the listener noticing
+    time.sleep(0.15)
+    assert _post().status_code == 404
+    assert ctx.get_approval_decision() is None
+    assert _wait_until(lambda: a._pubsub not in (None, deaf) and a._subscribed.is_set())
+    assert _post().status_code == 200
+    assert ctx.get_approval_decision() == {"approved": True}
+
+
+class _Deaf:
+    """A subscription whose connection died silently: nothing arrives, no PONG."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def get_message(self, timeout=0.0):
+        time.sleep(min(timeout or 0.0, 0.05))
+
+    def ping(self):
+        pass
+
+    def close(self):
+        self.inner.close()
 
 
 def _wait_until(condition, timeout=3.0):
