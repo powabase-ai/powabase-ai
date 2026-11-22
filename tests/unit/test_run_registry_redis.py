@@ -23,6 +23,7 @@ from agentic.execution.context import ExecutionContext
 from agentic_project_service.services import run_registry as rr
 from agentic_project_service.services.run_registry import (
     OWNER_TTL_SECONDS,
+    Delivery,
     RemoteRun,
     RunRegistry,
 )
@@ -198,7 +199,7 @@ class TestForwarding:
         sender.start()
         assert a.step(timeout=1.0) is True
         sender.join(timeout=5)
-        assert result == {"ok": True}  # acknowledged by the owner
+        assert result == {"ok": Delivery.RESUMED}  # acknowledged by the owner
         assert ctx.get_approval_decision() == {"approved": True}
         assert ctx.get_approval_event().is_set()
 
@@ -208,14 +209,17 @@ class TestForwarding:
         ctx = self._waiting_context("run_1")
         a.register("run_1", ctx)
         assert _wait_until(lambda: b.lookup_remote("run_1") is not None)
-        assert b.deliver_remote("run_1", b.lookup_remote("run_1"), {"approved": False}) is True
+        assert (
+            b.deliver_remote("run_1", b.lookup_remote("run_1"), {"approved": False})
+            == Delivery.RESUMED
+        )
         assert ctx.get_approval_event().wait(timeout=3.0)
         assert ctx.get_approval_decision() == {"approved": False}
 
     def test_delivery_to_a_gone_process_reports_false(self, connect):
         b = _registry(connect, "pod-b:2:bbbb")
         gone = RemoteRun(instance="pod-dead:9:dead", owner_user_id=None)
-        assert b.deliver_remote("run_1", gone, {"approved": True}) is False
+        assert b.deliver_remote("run_1", gone, {"approved": True}) == Delivery.GONE
 
     def test_a_late_approval_for_an_ended_run_is_not_delivered(self, connect):
         a = _registry(connect, "pod-a:1:aaaa", start_thread=True)
@@ -226,7 +230,7 @@ class TestForwarding:
         late = RemoteRun(instance="pod-a:1:aaaa", owner_user_id=None)
         # a still listens, and answers that the run is not there any more.
         started = time.monotonic()
-        assert b.deliver_remote("run_1", late, {"approved": True}) is False
+        assert b.deliver_remote("run_1", late, {"approved": True}) == Delivery.GONE
         assert time.monotonic() - started < 1.0
 
     def test_a_subscriber_that_never_acknowledges_is_not_a_delivery(self, connect, monkeypatch):
@@ -239,7 +243,8 @@ class TestForwarding:
         )
         b = _registry(connect, "pod-b:2:bbbb")
         assert (
-            b.deliver_remote("run_1", RemoteRun("pod-a:1:aaaa", "u"), {"approved": True}) is False
+            b.deliver_remote("run_1", RemoteRun("pod-a:1:aaaa", "u"), {"approved": True})
+            == Delivery.UNCONFIRMED
         )
         deaf.close()
 
@@ -278,12 +283,15 @@ class TestForwarding:
         monkeypatch.setenv("PROJECT_REF", "ref-b")
         b = _registry(connect, "pod-b:2:bbbb")
         assert (
-            b.deliver_remote("run_1", RemoteRun("pod-a:1:aaaa", None), {"approved": True}) is False
+            b.deliver_remote("run_1", RemoteRun("pod-a:1:aaaa", None), {"approved": True})
+            == Delivery.GONE
         )
 
     def test_redis_down_delivery_is_false(self):
         b = RunRegistry(redis_client=_broken_client(), instance="pod-b", start_thread=False)
-        assert b.deliver_remote("run_1", RemoteRun("pod-a", None), {"approved": True}) is False
+        assert (
+            b.deliver_remote("run_1", RemoteRun("pod-a", None), {"approved": True}) == Delivery.GONE
+        )
 
     def test_redis_down_listener_thread_keeps_retrying(self, monkeypatch):
         monkeypatch.setattr(rr, "RESUBSCRIBE_BACKOFF_SECONDS", 0.01)
@@ -435,14 +443,18 @@ class TestLiveness:
         connect().delete("runs:owner:ref-a:run_1")
         # While deaf: Redis may still count the subscriber, but nothing acknowledges.
         assert (
-            b.deliver_remote("run_1", RemoteRun("pod-a:1:aaaa", "u"), {"approved": True}) is False
+            b.deliver_remote("run_1", RemoteRun("pod-a:1:aaaa", "u"), {"approved": True})
+            == Delivery.UNCONFIRMED
         )
         assert ctx.get_approval_decision() is None
 
         # A missing PONG drops it; the new subscription re-asserts the owner hash.
         assert _wait_until(lambda: a._pubsub not in (None, deaf) and a._subscribed.is_set())
         assert _wait_until(lambda: b.lookup_remote("run_1") is not None)
-        assert b.deliver_remote("run_1", b.lookup_remote("run_1"), {"approved": True}) is True
+        assert (
+            b.deliver_remote("run_1", b.lookup_remote("run_1"), {"approved": True})
+            == Delivery.RESUMED
+        )
         assert ctx.get_approval_event().wait(timeout=1)
 
     def test_a_killed_subscription_reconnects(self, real_redis, fast_liveness):
@@ -453,7 +465,10 @@ class TestLiveness:
         assert _wait_until(lambda: b.lookup_remote("run_1") is not None)
         real_redis().client_kill_filter(_type="pubsub")
         assert _wait_until(
-            lambda: b.deliver_remote("run_1", RemoteRun("pod-a:1:aaaa", "u"), {"approved": True}),
+            lambda: (
+                b.deliver_remote("run_1", RemoteRun("pod-a:1:aaaa", "u"), {"approved": True})
+                == Delivery.RESUMED
+            ),
             timeout=5,
         )
         assert ctx.get_approval_decision() == {"approved": True}

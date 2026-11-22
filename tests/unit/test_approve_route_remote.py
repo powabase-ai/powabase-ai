@@ -12,7 +12,7 @@ from flask import Flask
 
 from agentic_project_service.routes import agents as agents_route
 from agentic_project_service.services import run_registry
-from agentic_project_service.services.run_registry import RemoteRun, RunRegistry
+from agentic_project_service.services.run_registry import Delivery, RemoteRun, RunRegistry
 
 _REAL_REDIS_URL = os.getenv("TEST_REDIS_URL")
 
@@ -62,7 +62,7 @@ def test_forwards_to_the_owning_process():
     with (
         _not_local(),
         _remote(USER),
-        patch.object(agents_route, "deliver_approval", return_value=True) as deliver,
+        patch.object(agents_route, "deliver_approval", return_value=Delivery.RESUMED) as deliver,
         _as_user(),
     ):
         resp = _post()
@@ -97,7 +97,7 @@ def test_a_service_started_run_needs_the_service_role():
     with (
         _not_local(),
         _remote(None),
-        patch.object(agents_route, "deliver_approval", return_value=True) as deliver,
+        patch.object(agents_route, "deliver_approval", return_value=Delivery.RESUMED) as deliver,
     ):
         with _as_user():
             assert _post().status_code == 404
@@ -110,10 +110,37 @@ def test_owner_process_gone_is_404():
     with (
         _not_local(),
         _remote(USER),
-        patch.object(agents_route, "deliver_approval", return_value=False),
+        patch.object(agents_route, "deliver_approval", return_value=Delivery.GONE),
         _as_user(),
     ):
         assert _post().status_code == 404
+
+
+def test_an_unconfirmed_delivery_is_a_distinct_404():
+    with (
+        _not_local(),
+        _remote(USER),
+        patch.object(agents_route, "deliver_approval", return_value=Delivery.UNCONFIRMED),
+        _as_user(),
+    ):
+        resp = _post()
+    assert resp.status_code == 404
+    assert resp.get_json() == {
+        "error": "approval_unconfirmed",
+        "message": "The decision was sent but the run did not confirm it; "
+        "check the run before retrying.",
+    }
+
+
+def test_a_gone_owner_keeps_the_plain_404_body():
+    with (
+        _not_local(),
+        _remote(USER),
+        patch.object(agents_route, "deliver_approval", return_value=Delivery.GONE),
+        _as_user(),
+    ):
+        resp = _post()
+    assert resp.get_json() == {"error": "Run not found or not waiting for approval"}
 
 
 def test_an_invalid_body_is_400_before_any_lookup():
@@ -197,7 +224,9 @@ def test_a_dead_owner_listener_is_404_until_it_reconnects(two_processes, monkeyp
     deaf = _Deaf(a._pubsub)
     a._pubsub = deaf  # the connection died without Redis or the listener noticing
     time.sleep(0.15)
-    assert _post().status_code == 404
+    resp = _post()
+    assert resp.status_code == 404
+    assert resp.get_json()["error"] == "approval_unconfirmed"
     assert ctx.get_approval_decision() is None
     assert _wait_until(lambda: a._pubsub not in (None, deaf) and a._subscribed.is_set())
     assert _post().status_code == 200

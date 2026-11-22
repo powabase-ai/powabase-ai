@@ -94,6 +94,7 @@ from ..services.session import (
 from ..services import agent_sql, tool_registry
 from ..services.tool_caller import ToolCaller
 from ..services.run_registry import (
+    Delivery,
     deliver_approval,
     get_active_run_context,
     get_active_run_owner,
@@ -3193,7 +3194,14 @@ def approve_run(run_id: str):
 
     The run must be waiting for a human-in-the-loop approval in some
     project-api process of this project; a run held by another gunicorn worker
-    or replica is resumed through Redis.
+    or replica is resumed through Redis, and the answer is 200 only once that
+    process confirms it resumed the run.
+
+    404 ``{"error": "Run not found or not waiting for approval"}``: no such
+    run is waiting (or it is not the caller's). 404 ``{"error":
+    "approval_unconfirmed", ...}``: the decision was sent to the owning process
+    but it did not confirm within a few seconds, so the run may or may not have
+    resumed; check the run before retrying.
     """
     data = request.get_json(silent=True)
     if not data or "approved" not in data:
@@ -3217,8 +3225,18 @@ def approve_run(run_id: str):
         return jsonify({"error": "Run not found or not waiting for approval"}), 404
     if context is not None:
         context.set_approval_decision(data)
-    elif not deliver_approval(run_id, remote, data):
-        # The owning process is gone (restart, scale-down): the run cannot resume.
+        return jsonify({"status": "resumed"})
+    delivery = deliver_approval(run_id, remote, data)
+    if delivery is Delivery.UNCONFIRMED:
+        return jsonify(
+            {
+                "error": "approval_unconfirmed",
+                "message": "The decision was sent but the run did not confirm it; "
+                "check the run before retrying.",
+            }
+        ), 404
+    if delivery is not Delivery.RESUMED:
+        # The owning process is gone (restart, scale-down) or the run ended.
         return jsonify({"error": "Run not found or not waiting for approval"}), 404
     return jsonify({"status": "resumed"})
 

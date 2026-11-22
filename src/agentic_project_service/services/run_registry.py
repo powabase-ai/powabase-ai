@@ -30,6 +30,7 @@ loses a waiting run; the stale-run cleanup marks it failed.
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import os
@@ -81,6 +82,14 @@ def wire_decision(decision: dict) -> dict:
     if reason is not None:
         wire["reason"] = str(reason)[:REASON_MAX_CHARS]
     return wire
+
+
+class Delivery(enum.Enum):
+    """What became of a decision forwarded to another process."""
+
+    RESUMED = "resumed"  # the owner resumed the run
+    GONE = "gone"  # nothing to resume: no listener, run ended, or not sent
+    UNCONFIRMED = "unconfirmed"  # sent, but the owner never confirmed it
 
 
 @dataclass(frozen=True)
@@ -214,40 +223,50 @@ class RunRegistry:
             return None
         return RemoteRun(instance=fields["instance"], owner_user_id=fields.get("owner") or None)
 
-    def deliver_remote(self, run_id: str, remote: RemoteRun, decision: dict) -> bool:
+    def deliver_remote(self, run_id: str, remote: RemoteRun, decision: dict) -> Delivery:
         """Forward ``decision`` to the owning process.
 
-        True iff the owner acknowledged that it resumed the run. False when no
-        process listens on the owner's channel, when the owner no longer has
-        the run, or when no acknowledgement arrives within ACK_TIMEOUT_SECONDS
-        (a listener whose connection died without Redis noticing).
+        RESUMED when the owner acknowledged that it resumed the run. GONE when
+        nothing was delivered: no process listens on the owner's channel, the
+        owner no longer has the run, or the publish failed. UNCONFIRMED when the
+        decision was published but no acknowledgement arrived within
+        ACK_TIMEOUT_SECONDS (a listener whose connection died without Redis
+        noticing, or one that resumed the run but could not say so).
         """
         client = self._redis()
         if client is None:
-            return False
+            return Delivery.GONE
         token = uuid.uuid4().hex
         payload = json.dumps({"run_id": run_id, "decision": wire_decision(decision), "ack": token})
         try:
             if not client.publish(self.channel(remote.instance), payload):
-                return False
-            deadline = time.monotonic() + ACK_TIMEOUT_SECONDS
-            while True:
-                answer = client.get(self.ack_key(token))
-                if answer is not None:
-                    return _text(answer) == "1"
-                if time.monotonic() >= deadline:
-                    logger.warning(
-                        "Run registry: process %s did not acknowledge the approval of run %s",
-                        remote.instance,
-                        run_id,
-                    )
-                    return False
-                time.sleep(ACK_POLL_SECONDS)
+                return Delivery.GONE
         except Exception:
             logger.warning(
                 "Run registry: could not forward the approval of run %s", run_id, exc_info=True
             )
-            return False
+            return Delivery.GONE
+        deadline = time.monotonic() + ACK_TIMEOUT_SECONDS
+        while True:
+            try:
+                answer = client.get(self.ack_key(token))
+            except Exception:
+                logger.warning(
+                    "Run registry: could not read the acknowledgement for run %s",
+                    run_id,
+                    exc_info=True,
+                )
+                return Delivery.UNCONFIRMED
+            if answer is not None:
+                return Delivery.RESUMED if _text(answer) == "1" else Delivery.GONE
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "Run registry: process %s did not acknowledge the approval of run %s",
+                    remote.instance,
+                    run_id,
+                )
+                return Delivery.UNCONFIRMED
+            time.sleep(ACK_POLL_SECONDS)
 
     # -- the owning process: the listener --------------------------------------
 
@@ -455,5 +474,5 @@ def lookup_remote_run(run_id: str) -> RemoteRun | None:
     return _default.lookup_remote(run_id)
 
 
-def deliver_approval(run_id: str, remote: RemoteRun, decision: dict) -> bool:
+def deliver_approval(run_id: str, remote: RemoteRun, decision: dict) -> Delivery:
     return _default.deliver_remote(run_id, remote, decision)
