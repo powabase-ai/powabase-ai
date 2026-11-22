@@ -12,6 +12,7 @@ import uuid as _uuid
 import litellm
 from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from agentic.agent.rules import validate_condition
 from agentic.agent.hooks import (
@@ -59,6 +60,7 @@ from ..services.session import (
 )
 from ..services.tool_caller import ToolCaller
 from ._runtime_kb import validate_runtime_knowledge_bases
+from ._session_metadata import parse_session_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -694,6 +696,56 @@ def delete_orchestration_hook(orch_id, hook_id):
 # ---------------------------------------------------------------------------
 
 
+@orchestrations_bp.route("/<orch_id>/sessions", methods=["POST"])
+@require_service_role
+def create_orchestration_session(orch_id: str):
+    """Create an orchestration session. Service role only.
+
+    Body (optional): ``{user_id?, metadata?}``. ``user_id`` (a uuid) owns the
+    session to that end user, who can then list and continue it; without it
+    the session is ownerless and only the service role can use it.
+    ``metadata`` (a JSON object, at most 16 KiB serialised) is stored on the
+    session and returned by the session list. Answers 201 ``{session_id}``.
+    """
+    from ..services.orchestration import get_or_create_orchestration_session
+
+    # A non-uuid segment would raise 22P02 in the lookup; answer the 404 an
+    # unknown orchestration gets.
+    try:
+        orch_id = str(_uuid.UUID(orch_id))
+    except ValueError:
+        return jsonify({"error": "Orchestration not found"}), 404
+    data = request.get_json(silent=True)
+    if data is None:
+        if request.get_data().strip():
+            return jsonify({"error": "Request body must be valid JSON"}), 400
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+    metadata, metadata_error = parse_session_metadata(data)
+    if metadata_error:
+        return jsonify({"error": metadata_error}), 400
+    user_id = None
+    if data.get("user_id") is not None:
+        try:
+            user_id = str(_uuid.UUID(str(data["user_id"])))
+        except ValueError:
+            return jsonify({"error": "user_id must be a uuid"}), 400
+    if db.session.get(OrchestrationModel, orch_id) is None:
+        return jsonify({"error": "Orchestration not found"}), 404
+    _, session_id, _ = get_or_create_orchestration_session(
+        orch_id, user_id=user_id, metadata=metadata
+    )
+    # The check above is not a lock: the orchestration can be deleted before
+    # this commit, and its foreign key then rejects the insert.
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"error": "Orchestration not found"}), 404
+    return jsonify({"session_id": session_id}), 201
+
+
 @orchestrations_bp.route("/<orch_id>/sessions", methods=["GET"])
 @require_user_auth
 def list_orchestration_sessions(orch_id: str):
@@ -739,6 +791,7 @@ def list_orchestration_sessions(orch_id: str):
                 if last_run
                 else None,
                 "created_at": s.created_at.isoformat() if s.created_at else None,
+                "metadata": s.metadata_ or {},
             }
         )
 

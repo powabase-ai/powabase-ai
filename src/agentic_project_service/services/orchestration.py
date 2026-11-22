@@ -163,6 +163,7 @@ def get_or_create_orchestration_session(
     user_id: str | None = None,
     *,
     end_user_id: str | None = None,
+    metadata: dict | None = None,
 ) -> tuple[str, str, bool]:
     """Get or create an orchestration session.
 
@@ -172,6 +173,8 @@ def get_or_create_orchestration_session(
     owned by this user; anything else raises :class:`SessionNotAccessible`.
     End users never name a new session (see ``session_accessible_to`` in
     services/session.py for why).
+
+    ``metadata`` is stored on a newly created session only.
 
     Returns (db_session_uuid, session_id, is_new).
     """
@@ -192,6 +195,7 @@ def get_or_create_orchestration_session(
         session_id=new_session_id,
         orchestration_id=orchestration_id,
         user_id=user_id,
+        metadata_=metadata or {},
     )
     db.session.add(session)
     db.session.flush()
