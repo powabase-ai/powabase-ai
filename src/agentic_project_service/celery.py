@@ -119,9 +119,9 @@ def seed_indexed_sources_watchdog(**kwargs):
 def seed_stale_runs_tick(**kwargs):
     """Bootstrap the self-rescheduling stale-run cleanup. The project stack runs
     no Celery beat, so the beat entry for cleanup_stale_runs never fires there."""
-    from .tasks.cleanup import stale_runs_tick
+    from .tasks.cleanup import seed_stale_runs_chain
 
-    stale_runs_tick.delay()
+    seed_stale_runs_chain()
 
 
 @worker_ready.connect

@@ -1,6 +1,8 @@
-"""The stale-run cutoff is a project setting, bound into both UPDATEs, and the
+"""The stale-run cleanup fails only runs that are old and have no live owner, and
 cleanup runs from a self-rescheduling task (the project stack runs no beat)."""
 
+import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import fakeredis
@@ -180,108 +182,157 @@ def test_the_task_runs_the_cleanup(monkeypatch):
 # --- the self-rescheduling tick (the project stack runs no Celery beat) ---
 
 
-def test_tick_runs_cleanup_under_the_lock_and_reschedules():
-    fake_redis = MagicMock()
-    fake_redis.set.return_value = True
-    with (
-        patch.object(cleanup_mod, "_get_redis", return_value=(fake_redis, "ref-a:stale_runs_lock")),
-        patch.object(
-            cleanup_mod,
-            "run_stale_cleanup",
-            return_value={"agent_runs": 1, "orchestration_runs": 0},
-        ) as run,
-        patch.object(cleanup_mod.stale_runs_tick, "apply_async") as reschedule,
-    ):
-        cleanup_mod.stale_runs_tick.run()
-    fake_redis.set.assert_called_once_with("ref-a:stale_runs_lock", "1", nx=True, ex=60)
-    run.assert_called_once()
-    fake_redis.delete.assert_called_once_with("ref-a:stale_runs_lock")
-    assert reschedule.call_args.kwargs["countdown"] == 300
+_REAL_REDIS_URL = os.getenv("TEST_REDIS_URL")
 
 
-def test_tick_skips_work_when_another_worker_holds_the_lock():
-    fake_redis = MagicMock()
-    fake_redis.set.return_value = False
-    with (
-        patch.object(cleanup_mod, "_get_redis", return_value=(fake_redis, "k")),
-        patch.object(cleanup_mod, "run_stale_cleanup") as run,
-        patch.object(cleanup_mod.stale_runs_tick, "apply_async") as reschedule,
-    ):
-        cleanup_mod.stale_runs_tick.run()
-    run.assert_not_called()
-    fake_redis.delete.assert_not_called()
-    reschedule.assert_called_once()
-
-
-def test_tick_reschedules_even_when_cleanup_fails():
-    fake_redis = MagicMock()
-    fake_redis.set.return_value = True
-    with (
-        patch.object(cleanup_mod, "_get_redis", return_value=(fake_redis, "k")),
-        patch.object(cleanup_mod, "run_stale_cleanup", side_effect=RuntimeError("db down")),
-        patch.object(cleanup_mod.stale_runs_tick, "apply_async") as reschedule,
-    ):
-        cleanup_mod.stale_runs_tick.run()
-    fake_redis.delete.assert_called_once_with("k")
-    reschedule.assert_called_once()
-
-
-def test_tick_reschedules_when_redis_is_down():
-    broken = MagicMock()
-    broken.set.side_effect = redis.ConnectionError("down")
-    with (
-        patch.object(cleanup_mod, "_get_redis", return_value=(broken, "k")),
-        patch.object(cleanup_mod, "run_stale_cleanup") as run,
-        patch.object(cleanup_mod.stale_runs_tick, "apply_async") as reschedule,
-    ):
-        cleanup_mod.stale_runs_tick.run()
-    run.assert_not_called()
-    reschedule.assert_called_once()
-
-
-def test_tick_reschedules_when_no_redis_client_can_be_built(monkeypatch):
-    monkeypatch.setenv("CELERY_BROKER_URL", "memory://")
-    with (
-        patch.object(cleanup_mod, "run_stale_cleanup") as run,
-        patch.object(cleanup_mod.stale_runs_tick, "apply_async") as reschedule,
-    ):
-        cleanup_mod.stale_runs_tick.run()
-    run.assert_not_called()
-    reschedule.assert_called_once()
-
-
-def test_two_ticks_at_once_clean_up_once():
-    """Every worker seeds a chain; the lock keeps the work to one per tick."""
-    server = fakeredis.FakeServer()
-    held = fakeredis.FakeStrictRedis(server=server)
-    held.set("ref-a:stale_runs_lock", "1", nx=True, ex=60)  # another worker is mid-tick
-    with (
-        patch.object(
-            cleanup_mod,
-            "_get_redis",
-            return_value=(fakeredis.FakeStrictRedis(server=server), "ref-a:stale_runs_lock"),
-        ),
-        patch.object(cleanup_mod, "run_stale_cleanup") as run,
-        patch.object(cleanup_mod.stale_runs_tick, "apply_async"),
-    ):
-        cleanup_mod.stale_runs_tick.run()
-    run.assert_not_called()
-    assert 0 < held.ttl("ref-a:stale_runs_lock") <= 60
-
-
-def test_the_lock_key_carries_the_project_ref(monkeypatch):
+@pytest.fixture(params=["fakeredis", "redis"])
+def chain(request, monkeypatch):
+    """One Redis for the tick and its seed (fakeredis, and the real one when
+    TEST_REDIS_URL is set); enqueues are recorded, not sent."""
     monkeypatch.setenv("PROJECT_REF", "ref-a")
-    monkeypatch.setenv("CELERY_BROKER_URL", "redis://127.0.0.1:1/0")
-    _, key = cleanup_mod._get_redis()
-    assert key == "ref-a:stale_runs_lock"
+    if request.param == "fakeredis":
+        client = fakeredis.FakeStrictRedis()
+    else:
+        if not _REAL_REDIS_URL:
+            pytest.skip("TEST_REDIS_URL not set")
+        client = redis.from_url(_REAL_REDIS_URL)
+        client.flushdb()
+        request.addfinalizer(client.flushdb)
+    monkeypatch.setattr(cleanup_mod, "broker_client", lambda: client)
+    seeded, enqueued = [], []
+    monkeypatch.setattr(
+        cleanup_mod.stale_runs_tick, "delay", lambda generation: seeded.append(generation)
+    )
+    monkeypatch.setattr(
+        cleanup_mod.stale_runs_tick,
+        "apply_async",
+        lambda args, countdown: enqueued.append((args[0], countdown)),
+    )
+    return SimpleNamespace(client=client, seeded=seeded, enqueued=enqueued)
 
 
-def test_worker_ready_seeds_the_tick():
+def _tick(generation):
+    cleanup_mod.stale_runs_tick.run(generation)
+
+
+def test_n_worker_starts_leave_exactly_one_live_chain(chain, monkeypatch):
+    monkeypatch.setattr(cleanup_mod, "run_stale_cleanup", dict)
+    for _ in range(5):
+        cleanup_mod.seed_stale_runs_chain()
+    assert len(set(chain.seeded)) == 5
+    for generation in chain.seeded:  # every seeded chain ticks once
+        _tick(generation)
+    assert chain.enqueued == [(chain.seeded[-1], 300)]
+    # ... and the survivor keeps going.
+    _tick(chain.seeded[-1])
+    assert chain.enqueued[-1] == (chain.seeded[-1], 300)
+
+
+def test_the_current_chain_runs_the_cleanup_under_the_lock_and_reschedules(chain, monkeypatch):
+    seen = {}
+
+    def cleanup():
+        seen["lock_ttl"] = chain.client.ttl("ref-a:stale_runs_lock")
+        return {"agent_runs": 1, "orchestration_runs": 0}
+
+    monkeypatch.setattr(cleanup_mod, "run_stale_cleanup", cleanup)
+    cleanup_mod.seed_stale_runs_chain()
+    _tick(chain.seeded[0])
+    assert 0 < seen["lock_ttl"] <= 60
+    assert not chain.client.exists("ref-a:stale_runs_lock")
+    assert chain.enqueued == [(chain.seeded[0], 300)]
+    assert 0 < chain.client.ttl("ref-a:stale_runs_chain") <= 900
+
+
+def test_a_lost_chain_record_is_adopted_by_the_first_tick(chain, monkeypatch):
+    monkeypatch.setattr(cleanup_mod, "run_stale_cleanup", dict)
+    cleanup_mod.seed_stale_runs_chain()
+    cleanup_mod.seed_stale_runs_chain()
+    chain.client.flushdb()  # Redis restarted without persistence
+    first, second = chain.seeded
+    _tick(second)
+    _tick(first)
+    assert chain.enqueued == [(second, 300)]
+
+
+def test_a_tick_without_a_generation_never_displaces_a_chain(chain, monkeypatch):
+    run = MagicMock()
+    monkeypatch.setattr(cleanup_mod, "run_stale_cleanup", run)
+    cleanup_mod.seed_stale_runs_chain()
+    _tick(None)
+    run.assert_not_called()
+    assert chain.enqueued == []
+
+
+def test_the_lock_is_released_only_by_its_holder(chain, monkeypatch):
+    """A cleanup that outlived its lock must not delete the next holder's."""
+
+    def slow_cleanup():
+        chain.client.set("ref-a:stale_runs_lock", "another-worker", ex=60)
+
+    monkeypatch.setattr(cleanup_mod, "run_stale_cleanup", slow_cleanup)
+    cleanup_mod.seed_stale_runs_chain()
+    _tick(chain.seeded[0])
+    assert chain.client.get("ref-a:stale_runs_lock") == b"another-worker"
+
+
+def test_tick_skips_work_while_another_worker_holds_the_lock(chain, monkeypatch):
+    run = MagicMock()
+    monkeypatch.setattr(cleanup_mod, "run_stale_cleanup", run)
+    cleanup_mod.seed_stale_runs_chain()
+    chain.client.set("ref-a:stale_runs_lock", "other", ex=60)
+    _tick(chain.seeded[0])
+    run.assert_not_called()
+    assert chain.client.get("ref-a:stale_runs_lock") == b"other"
+    assert chain.enqueued == [(chain.seeded[0], 300)]
+
+
+def test_tick_reschedules_even_when_cleanup_fails(chain, monkeypatch):
+    monkeypatch.setattr(
+        cleanup_mod, "run_stale_cleanup", MagicMock(side_effect=RuntimeError("db down"))
+    )
+    cleanup_mod.seed_stale_runs_chain()
+    _tick(chain.seeded[0])
+    assert not chain.client.exists("ref-a:stale_runs_lock")
+    assert chain.enqueued == [(chain.seeded[0], 300)]
+
+
+def test_redis_down_keeps_the_chain_going_without_work(monkeypatch):
+    broken = MagicMock()
+    broken.get.side_effect = redis.ConnectionError("down")
+    broken.set.side_effect = redis.ConnectionError("down")
+    monkeypatch.setattr(cleanup_mod, "broker_client", lambda: broken)
+    run = MagicMock()
+    monkeypatch.setattr(cleanup_mod, "run_stale_cleanup", run)
+    with patch.object(cleanup_mod.stale_runs_tick, "apply_async") as reschedule:
+        _tick("gen-1")
+    run.assert_not_called()
+    assert reschedule.call_args.kwargs == {"args": ["gen-1"], "countdown": 300}
+
+
+def test_no_usable_redis_url_keeps_the_chain_going(monkeypatch):
+    monkeypatch.setenv("CELERY_BROKER_URL", "memory://")
+    run = MagicMock()
+    monkeypatch.setattr(cleanup_mod, "run_stale_cleanup", run)
+    with patch.object(cleanup_mod.stale_runs_tick, "apply_async") as reschedule:
+        _tick("gen-1")
+    run.assert_not_called()
+    reschedule.assert_called_once()
+
+
+def test_the_seed_still_starts_a_chain_when_redis_is_down(monkeypatch):
+    monkeypatch.setenv("CELERY_BROKER_URL", "memory://")
+    with patch.object(cleanup_mod.stale_runs_tick, "delay") as delay:
+        cleanup_mod.seed_stale_runs_chain()
+    delay.assert_called_once()
+
+
+def test_worker_ready_seeds_a_chain():
     from agentic_project_service import celery as celery_mod
 
-    with patch.object(cleanup_mod.stale_runs_tick, "delay") as delay:
+    with patch.object(cleanup_mod, "seed_stale_runs_chain") as seed:
         celery_mod.seed_stale_runs_tick()
-    delay.assert_called_once()
+    seed.assert_called_once()
 
 
 def test_the_beat_entry_stays_for_deployments_that_run_beat():
