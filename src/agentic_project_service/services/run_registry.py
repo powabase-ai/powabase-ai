@@ -14,6 +14,14 @@ process. That thread subscribes (and waits for the confirmation) before it
 writes any owner hash, so another process never sees an owner that nobody
 listens for.
 
+The owner hash lives only as long as a listener that answers: its TTL is
+short and only the heartbeat renews it (a PING on the subscription every
+HEARTBEAT_SECONDS; a PONG missing for PONG_TIMEOUT_SECONDS drops the
+subscription, which is then rebuilt and every local run's hash written again).
+And a forwarded decision counts as delivered only when the owner acknowledges
+that it resumed the run, so the approve endpoint never answers "resumed" for a
+run that cannot resume, even while Redis still counts a dead subscriber.
+
 Redis is advisory and fail-open: when it is unreachable a run is still
 registered locally, and an approval that reaches the owning process still
 resumes it, exactly as before this registry used Redis. A process restart still
@@ -36,9 +44,15 @@ from .broker_redis import REDIS_SOCKET_TIMEOUT_SECONDS, broker_client
 
 logger = logging.getLogger(__name__)
 
-# Longer than any approval wait (the approval hook's default timeout is 300 s);
-# the hash is deleted on unregister, the TTL only covers a process that died.
-OWNER_TTL_SECONDS = 7200
+# The owner hash outlives a few missed heartbeats, not a dead listener: it is
+# renewed on every PONG and deleted on unregister.
+OWNER_TTL_SECONDS = 60
+HEARTBEAT_SECONDS = 15
+PONG_TIMEOUT_SECONDS = 3
+# How long the approving process waits for the owner to acknowledge a decision.
+ACK_TIMEOUT_SECONDS = 3.0
+ACK_POLL_SECONDS = 0.02
+ACK_TTL_SECONDS = 30
 # How long one listener iteration waits for a message; also the most a new
 # registration waits before its owner hash is written.
 LOOP_TIMEOUT_SECONDS = 0.1
@@ -81,6 +95,8 @@ class RunRegistry:
         self._subscribed = threading.Event()
         self._backoff = RESUBSCRIBE_BACKOFF_SECONDS
         self._retry_at = 0.0
+        self._last_pong = 0.0
+        self._ping_sent_at: float | None = None
         self._thread: threading.Thread | None = None
         self._thread_lock = threading.Lock()
         self._stopped = threading.Event()
@@ -116,6 +132,10 @@ class RunRegistry:
     @staticmethod
     def channel(instance: str) -> str:
         return f"runs:approvals:{_project_ref()}:{instance}"
+
+    @staticmethod
+    def ack_key(token: str) -> str:
+        return f"runs:ack:{_project_ref()}:{token}"
 
     # -- request path: local maps only, no Redis I/O ---------------------------
 
@@ -180,19 +200,39 @@ class RunRegistry:
         return RemoteRun(instance=fields["instance"], owner_user_id=fields.get("owner") or None)
 
     def deliver_remote(self, run_id: str, remote: RemoteRun, decision: dict) -> bool:
-        """Publish ``decision`` to the owner's channel; True iff it was received."""
+        """Forward ``decision`` to the owning process.
+
+        True iff the owner acknowledged that it resumed the run. False when no
+        process listens on the owner's channel, when the owner no longer has
+        the run, or when no acknowledgement arrives within ACK_TIMEOUT_SECONDS
+        (a listener whose connection died without Redis noticing).
+        """
         client = self._redis()
         if client is None:
             return False
-        payload = json.dumps({"run_id": run_id, "decision": decision})
+        token = uuid.uuid4().hex
+        payload = json.dumps({"run_id": run_id, "decision": decision, "ack": token})
         try:
-            receivers = client.publish(self.channel(remote.instance), payload)
+            if not client.publish(self.channel(remote.instance), payload):
+                return False
+            deadline = time.monotonic() + ACK_TIMEOUT_SECONDS
+            while True:
+                answer = client.get(self.ack_key(token))
+                if answer is not None:
+                    return _text(answer) == "1"
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "Run registry: process %s did not acknowledge the approval of run %s",
+                        remote.instance,
+                        run_id,
+                    )
+                    return False
+                time.sleep(ACK_POLL_SECONDS)
         except Exception:
             logger.warning(
                 "Run registry: could not forward the approval of run %s", run_id, exc_info=True
             )
             return False
-        return int(receivers) > 0
 
     # -- the owning process: the listener --------------------------------------
 
@@ -219,6 +259,7 @@ class RunRegistry:
                 return False
         try:
             self._flush()
+            self._heartbeat()
             return self._read(timeout)
         except Exception:
             logger.warning(
@@ -250,6 +291,8 @@ class RunRegistry:
             raise
         self._pubsub = pubsub
         self._backoff = RESUBSCRIBE_BACKOFF_SECONDS
+        self._last_pong = time.monotonic()
+        self._ping_sent_at = None
         with self._lock:
             # Re-assert every local run: Redis may have lost or expired them
             # while this process was not listening.
@@ -280,9 +323,31 @@ class RunRegistry:
                 self._dirty.update(run_id for run_id in dirty if run_id in self._runs)
             raise
 
+    def _heartbeat(self) -> None:
+        """PING the subscription; a PONG that does not come means it is dead.
+
+        An idle subscriber never writes, so a connection lost without a FIN or
+        RST would otherwise go unnoticed for good.
+        """
+        now = time.monotonic()
+        if self._ping_sent_at is not None:
+            if now - self._ping_sent_at > PONG_TIMEOUT_SECONDS:
+                raise TimeoutError(f"no PONG on the approvals channel in {PONG_TIMEOUT_SECONDS}s")
+        elif now - self._last_pong >= HEARTBEAT_SECONDS:
+            self._pubsub.ping()
+            self._ping_sent_at = now
+
     def _read(self, timeout: float) -> bool:
         message = self._pubsub.get_message(timeout=timeout)
-        if message is None or message.get("type") != "message":
+        if message is None:
+            return False
+        if message.get("type") == "pong":
+            self._last_pong = time.monotonic()
+            self._ping_sent_at = None
+            with self._lock:
+                self._dirty.update(self._runs)  # renew every owner hash's TTL
+            return False
+        if message.get("type") != "message":
             return False
         return self._apply(message["data"])
 
@@ -299,9 +364,18 @@ class RunRegistry:
         context = self.context(run_id)
         if context is None:
             logger.info("Run registry: approval for run %s arrived after it ended", run_id)
-            return False
-        context.set_approval_decision(decision)
-        return True
+        else:
+            context.set_approval_decision(decision)
+        self._acknowledge(payload.get("ack"), resumed=context is not None)
+        return context is not None
+
+    def _acknowledge(self, token, resumed: bool) -> None:
+        if not isinstance(token, str) or len(token) != 32 or not token.isalnum():
+            return
+        try:
+            self._redis().set(self.ack_key(token), "1" if resumed else "0", ex=ACK_TTL_SECONDS)
+        except Exception:
+            logger.warning("Run registry: could not acknowledge an approval", exc_info=True)
 
     def _drop(self) -> None:
         self._subscribed.clear()

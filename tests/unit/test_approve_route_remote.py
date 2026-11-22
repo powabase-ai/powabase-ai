@@ -1,5 +1,6 @@
 """POST /api/agents/runs/<id>/approve when the run lives in another process."""
 
+import time
 from unittest.mock import patch
 
 import fakeredis
@@ -136,13 +137,13 @@ def test_a_local_context_still_wins():
 def test_end_to_end_across_two_registries():
     """The route on process B resumes a run that waits on process A."""
     server = fakeredis.FakeServer()
-    a = RunRegistry(fakeredis.FakeStrictRedis(server=server), instance="pod-a", start_thread=False)
+    a = RunRegistry(fakeredis.FakeStrictRedis(server=server), instance="pod-a")
     b = RunRegistry(fakeredis.FakeStrictRedis(server=server), instance="pod-b", start_thread=False)
     ctx = ExecutionContext(execution_id="run_1")
     ctx.reset_approval()
     a.register("run_1", ctx, owner_user_id=USER)
-    a.step(timeout=0)  # subscribe, then write the owner hash
     try:
+        assert _wait_until(lambda: b.lookup_remote("run_1") is not None)
         with (
             patch.object(agents_route, "get_active_run_context", b.context),
             patch.object(agents_route, "get_active_run_owner", b.owner),
@@ -152,8 +153,17 @@ def test_end_to_end_across_two_registries():
         ):
             resp = _post(body={"approved": False, "reason": "no"})
         assert resp.status_code == 200
-        assert a.step(timeout=1.0) is True
+        assert ctx.get_approval_event().is_set()
         assert ctx.get_approval_decision() == {"approved": False, "reason": "no"}
     finally:
         a.close()
         b.close()
+
+
+def _wait_until(condition, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return condition()

@@ -11,6 +11,7 @@ well.
 """
 
 import os
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -41,6 +42,17 @@ def connect(request):
         server = fakeredis.FakeServer()
         yield lambda: fakeredis.FakeStrictRedis(server=server)
         return
+    if not _REAL_REDIS_URL:
+        pytest.skip("TEST_REDIS_URL not set")
+    real = redis.from_url(_REAL_REDIS_URL)
+    real.flushdb()
+    yield lambda: redis.from_url(_REAL_REDIS_URL)
+    real.flushdb()
+
+
+@pytest.fixture
+def real_redis():
+    """Only for what fakeredis cannot do (CLIENT KILL)."""
     if not _REAL_REDIS_URL:
         pytest.skip("TEST_REDIS_URL not set")
     real = redis.from_url(_REAL_REDIS_URL)
@@ -179,8 +191,14 @@ class TestForwarding:
         _settle(a)
 
         remote = b.lookup_remote("run_1")
-        assert b.deliver_remote("run_1", remote, {"approved": True}) is True
+        result = {}
+        sender = threading.Thread(
+            target=lambda: result.update(ok=b.deliver_remote("run_1", remote, {"approved": True}))
+        )
+        sender.start()
         assert a.step(timeout=1.0) is True
+        sender.join(timeout=5)
+        assert result == {"ok": True}  # acknowledged by the owner
         assert ctx.get_approval_decision() == {"approved": True}
         assert ctx.get_approval_event().is_set()
 
@@ -199,16 +217,31 @@ class TestForwarding:
         gone = RemoteRun(instance="pod-dead:9:dead", owner_user_id=None)
         assert b.deliver_remote("run_1", gone, {"approved": True}) is False
 
-    def test_a_late_approval_for_an_ended_run_is_dropped(self, connect):
-        a = _registry(connect, "pod-a:1:aaaa")
+    def test_a_late_approval_for_an_ended_run_is_not_delivered(self, connect):
+        a = _registry(connect, "pod-a:1:aaaa", start_thread=True)
         b = _registry(connect, "pod-b:2:bbbb")
         a.register("run_1", self._waiting_context("run_1"))
-        _settle(a)
+        assert _wait_until(lambda: b.lookup_remote("run_1") is not None)
         a.unregister("run_1")
-        _settle(a)
         late = RemoteRun(instance="pod-a:1:aaaa", owner_user_id=None)
-        assert b.deliver_remote("run_1", late, {"approved": True}) is True  # a still listens
-        assert a.step(timeout=0.3) is False
+        # a still listens, and answers that the run is not there any more.
+        started = time.monotonic()
+        assert b.deliver_remote("run_1", late, {"approved": True}) is False
+        assert time.monotonic() - started < 1.0
+
+    def test_a_subscriber_that_never_acknowledges_is_not_a_delivery(self, connect, monkeypatch):
+        """A deaf owner (Redis still counts its subscription) must not read as resumed."""
+        monkeypatch.setattr(rr, "ACK_TIMEOUT_SECONDS", 0.3)
+        deaf = connect().pubsub()
+        deaf.subscribe(RunRegistry.channel("pod-a:1:aaaa"))
+        assert _wait_until(
+            lambda: (deaf.get_message(timeout=0.05) or {}).get("type") == "subscribe"
+        )
+        b = _registry(connect, "pod-b:2:bbbb")
+        assert (
+            b.deliver_remote("run_1", RemoteRun("pod-a:1:aaaa", "u"), {"approved": True}) is False
+        )
+        deaf.close()
 
     def test_a_malformed_message_is_ignored(self, connect):
         a = _registry(connect, "pod-a:1:aaaa")
@@ -309,8 +342,6 @@ class TestNeverWaitsForRedis:
         assert a.context("run_1") is None
 
     def test_concurrent_registers_do_not_queue_behind_redis(self):
-        import threading
-
         a = RunRegistry(redis_client=_SleepingRedis(), instance="pod-a")
         _open.append(a)
         took = {}
@@ -326,3 +357,103 @@ class TestNeverWaitsForRedis:
         for t in threads:
             t.join()
         assert max(took.values()) < 0.05
+
+
+class _Deaf:
+    """A subscription whose connection died silently: nothing arrives, no PONG."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def get_message(self, timeout=0.0):
+        time.sleep(min(timeout or 0.0, 0.05))
+
+    def ping(self):
+        pass
+
+    def close(self):
+        self.inner.close()
+
+
+@pytest.fixture
+def fast_liveness(monkeypatch):
+    monkeypatch.setattr(rr, "OWNER_TTL_SECONDS", 1)
+    monkeypatch.setattr(rr, "HEARTBEAT_SECONDS", 0.2)
+    monkeypatch.setattr(rr, "PONG_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(rr, "ACK_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(rr, "RESUBSCRIBE_BACKOFF_SECONDS", 0.05)
+
+
+class TestLiveness:
+    """The owner hash lives only as long as a listener that answers PINGs."""
+
+    def _waiting(self, run_id):
+        ctx = ExecutionContext(execution_id=run_id)
+        ctx.reset_approval()
+        return ctx
+
+    def test_owner_ttl_is_short_and_refreshed_by_the_heartbeat(self):
+        assert rr.OWNER_TTL_SECONDS == 60
+        assert rr.HEARTBEAT_SECONDS == 15
+        assert rr.PONG_TIMEOUT_SECONDS == 3
+        assert rr.OWNER_TTL_SECONDS > 3 * rr.HEARTBEAT_SECONDS
+
+    def test_the_heartbeat_keeps_a_waiting_run_reachable(self, connect, fast_liveness):
+        a = _registry(connect, "pod-a:1:aaaa", start_thread=True)
+        a.register("run_1", self._waiting("run_1"))
+        assert _wait_until(lambda: connect().exists("runs:owner:ref-a:run_1"))
+        time.sleep(2.5)  # well past the 1 s TTL
+        assert connect().exists("runs:owner:ref-a:run_1")
+
+    def test_the_owner_hash_expires_when_the_listener_stops(self, connect, fast_liveness):
+        a = _registry(connect, "pod-a:1:aaaa", start_thread=True)
+        a.register("run_1", self._waiting("run_1"))
+        assert _wait_until(lambda: connect().exists("runs:owner:ref-a:run_1"))
+        a._stopped.set()  # the listener dies; the run stays registered locally
+        a._thread.join(timeout=3)
+        assert a.context("run_1") is not None
+        assert _wait_until(lambda: not connect().exists("runs:owner:ref-a:run_1"), timeout=3)
+
+    def test_a_lost_owner_hash_is_written_again(self, connect, fast_liveness):
+        """Redis lost its data (restart without persistence, failover)."""
+        a = _registry(connect, "pod-a:1:aaaa", start_thread=True)
+        a.register("run_1", self._waiting("run_1"))
+        assert _wait_until(lambda: connect().exists("runs:owner:ref-a:run_1"))
+        connect().flushdb()
+        assert _wait_until(lambda: connect().exists("runs:owner:ref-a:run_1"))
+
+    def test_a_silently_dead_subscription_is_replaced(self, connect, fast_liveness):
+        a = _registry(connect, "pod-a:1:aaaa", start_thread=True)
+        b = _registry(connect, "pod-b:2:bbbb")
+        ctx = self._waiting("run_1")
+        a.register("run_1", ctx, owner_user_id="u")
+        assert _wait_until(lambda: b.lookup_remote("run_1") is not None)
+
+        deaf = _Deaf(a._pubsub)
+        a._pubsub = deaf
+        time.sleep(0.15)  # let the listener's current read on the live one finish
+        connect().delete("runs:owner:ref-a:run_1")
+        # While deaf: Redis may still count the subscriber, but nothing acknowledges.
+        assert (
+            b.deliver_remote("run_1", RemoteRun("pod-a:1:aaaa", "u"), {"approved": True}) is False
+        )
+        assert ctx.get_approval_decision() is None
+
+        # A missing PONG drops it; the new subscription re-asserts the owner hash.
+        assert _wait_until(lambda: a._pubsub not in (None, deaf) and a._subscribed.is_set())
+        assert _wait_until(lambda: b.lookup_remote("run_1") is not None)
+        assert b.deliver_remote("run_1", b.lookup_remote("run_1"), {"approved": True}) is True
+        assert ctx.get_approval_event().wait(timeout=1)
+
+    def test_a_killed_subscription_reconnects(self, real_redis, fast_liveness):
+        a = _registry(real_redis, "pod-a:1:aaaa", start_thread=True)
+        b = _registry(real_redis, "pod-b:2:bbbb")
+        ctx = self._waiting("run_1")
+        a.register("run_1", ctx, owner_user_id="u")
+        assert _wait_until(lambda: b.lookup_remote("run_1") is not None)
+        real_redis().client_kill_filter(_type="pubsub")
+        assert _wait_until(
+            lambda: b.deliver_remote("run_1", RemoteRun("pod-a:1:aaaa", "u"), {"approved": True}),
+            timeout=5,
+        )
+        assert ctx.get_approval_decision() == {"approved": True}
