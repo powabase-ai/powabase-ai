@@ -24,6 +24,7 @@ _ALLOWED_ENTRY_KEYS = {
     "filter_metadata",
     "source_ids",
     "max_context_tokens",
+    "agent_ids",
 }
 
 # Bounds mirror the settings registry's KB_DEFAULT_MAX_CONTEXT_TOKENS
@@ -59,7 +60,32 @@ def _parse_source_ids(value):
     return normalized, None
 
 
-def validate_runtime_knowledge_bases(data, db_session, ai_schema: str = AI_SCHEMA):
+def _parse_agent_ids(value):
+    """Validate+normalize an ``agent_ids`` list. Returns (normalized, error)."""
+    if not isinstance(value, list) or not value:
+        return None, "'agent_ids' must be a non-empty list of agent ids"
+    normalized = []
+    for raw_id in value:
+        try:
+            normalized.append(_normalize_uuid(raw_id))
+        except (ValueError, AttributeError, TypeError):
+            return None, f"invalid agent id: {raw_id!r}"
+    return normalized, None
+
+
+def validate_runtime_knowledge_bases(
+    data,
+    db_session,
+    ai_schema: str = AI_SCHEMA,
+    *,
+    allowed_agent_ids: set[str] | None = None,
+):
+    """Validate and normalize ``runtime_knowledge_bases``. Returns (entries, error).
+
+    ``allowed_agent_ids`` is given on orchestration runs only: the canonical ids
+    of the orchestration's agent entities. An entry's ``agent_ids`` must name
+    only those; on agent runs (``None``) the key is rejected.
+    """
     raw = data.get("runtime_knowledge_bases")
     if raw is None:
         return [], None
@@ -136,6 +162,19 @@ def validate_runtime_knowledge_bases(data, db_session, ai_schema: str = AI_SCHEM
             if err:
                 return [], err
             entry["source_ids"] = normalized_source_ids
+
+        # null means absent, like the other optional keys; never pass it on.
+        agent_ids = entry.pop("agent_ids", None)
+        if agent_ids is not None:
+            if allowed_agent_ids is None:
+                return [], "'agent_ids' is only accepted on orchestration runs"
+            normalized_agent_ids, err = _parse_agent_ids(agent_ids)
+            if err:
+                return [], err
+            unknown = [a for a in normalized_agent_ids if a not in allowed_agent_ids]
+            if unknown:
+                return [], f"agent_ids not in this orchestration: {', '.join(unknown)}"
+            entry["agent_ids"] = normalized_agent_ids
 
         normalized_entries.append(entry)
 
