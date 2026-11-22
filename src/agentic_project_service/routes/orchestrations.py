@@ -48,7 +48,7 @@ from ..services.ai_provider_keys_resolver import ProviderKeyDecryptDropped
 from ..services.context_handler import resolve_tool_call_image_refs
 from ..services.llm_availability import check_model_available
 from ..services.run_gate import admit_run, current_slot
-from ..services.run_lifetime import RunLifetime
+from ..services.run_lifetime import RunLifetime, start_carried_on
 from ..services.run_context import (
     reset_run_id,
     set_run_id,
@@ -1313,7 +1313,7 @@ def run_orchestration_stream(orch_id: str):
             worker = threading.Thread(
                 target=lambda: _captured_ctx.run(run_orchestration), daemon=True
             )
-            worker.start()
+            start_carried_on(worker, worker_let_go)
 
             # Yield events as they arrive (keeps the SSE stream alive).
             # Buffer-aware drain (β): content_delta accumulates into

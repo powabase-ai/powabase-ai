@@ -148,7 +148,7 @@ def test_a_failing_release_does_not_raise():
     client = MagicMock()
     client.zrem.side_effect = redis.ConnectionError("down")
     g = RunGate(redis_client=client, renew_in_background=False)
-    g._held["tok"] = time.monotonic()
+    g._held["tok"] = (time.monotonic(), gate_mod.MAX_HOLD_SECONDS)
     g.release("tok")
     assert not g._held
 
@@ -191,18 +191,61 @@ def test_the_renewer_thread_starts_on_the_first_admission(client, monkeypatch):
     g.release(other.token)
 
 
-def test_a_slot_held_past_the_ceiling_is_no_longer_renewed(gate, client, monkeypatch, caplog):
+def test_a_slot_held_past_its_ceiling_is_no_longer_renewed(gate, client, caplog):
     """A slot whose release never ran (a leak inside a live process) stops
-    being renewed after MAX_HOLD_SECONDS, so it frees itself one lease later."""
-    held = gate.try_acquire(1)
-    monkeypatch.setattr(gate_mod, "MAX_HOLD_SECONDS", 0)
+    being renewed after its hold ceiling, so it frees itself one lease later."""
+    held = gate.try_acquire(1, max_hold_seconds=0)
+    kept = gate.try_acquire(2, max_hold_seconds=3600)
     with caplog.at_level("WARNING", logger=gate_mod.logger.name):
-        assert gate.renew_all() == 0
+        assert gate.renew_all() == 1
     assert "held longer than" in caplog.text
-    assert not gate._held
+    assert list(gate._held) == [kept.token]
     # The lease is left to expire, not removed: the run may still be going.
     assert client.zscore(gate.key(), held.token) is not None
 
 
-def test_the_hold_ceiling_matches_the_longest_stale_run_cutoff():
-    assert gate_mod.MAX_HOLD_SECONDS == SETTINGS_REGISTRY["RUN_STALE_AFTER_SECONDS"].max
+def test_the_default_hold_ceiling_is_the_default_stale_run_cutoff():
+    """Not a day: a leaked slot must not lock a small project out for 24 hours."""
+    assert gate_mod.MAX_HOLD_SECONDS == SETTINGS_REGISTRY["RUN_STALE_AFTER_SECONDS"].default
+    assert gate_mod.MAX_HOLD_SECONDS <= 1800
+
+
+def test_admit_run_holds_a_slot_no_longer_than_the_stale_run_cutoff(gate, monkeypatch):
+    from flask import Flask
+
+    settings = {"MAX_CONCURRENT_RUNS": 1, "RUN_STALE_AFTER_SECONDS": 900}
+    monkeypatch.setattr(gate_mod, "get_setting", settings.__getitem__)
+    monkeypatch.setattr(gate_mod, "default_gate", gate)
+    seen = {}
+    app = Flask(__name__)
+
+    @app.route("/run", methods=["POST"])
+    @gate_mod.admit_run
+    def run():
+        ((_, ceiling),) = gate._held.values()
+        seen["ceiling"] = ceiling
+        return {"ok": True}
+
+    with app.test_client() as c:
+        assert c.post("/run").status_code == 200
+    assert seen == {"ceiling": 900}
+
+
+def test_an_unreadable_cutoff_falls_back_to_the_default_ceiling(gate, monkeypatch):
+    from flask import Flask
+
+    monkeypatch.setattr(gate_mod, "get_setting", {"MAX_CONCURRENT_RUNS": 1}.__getitem__)
+    monkeypatch.setattr(gate_mod, "default_gate", gate)
+    seen = {}
+    app = Flask(__name__)
+
+    @app.route("/run", methods=["POST"])
+    @gate_mod.admit_run
+    def run():
+        ((_, ceiling),) = gate._held.values()
+        seen["ceiling"] = ceiling
+        return {"ok": True}
+
+    with app.test_client() as c:
+        assert c.post("/run").status_code == 200
+    assert seen == {"ceiling": gate_mod.MAX_HOLD_SECONDS}

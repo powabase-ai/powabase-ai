@@ -119,3 +119,35 @@ def test_an_agent_streams_background_finish_lets_go_however_it_ends():
     with pytest.raises(RuntimeError):
         _carried_on(let_go, lambda f: f(), boom)
     let_go.assert_called_once()
+
+
+class _UnstartableThread:
+    def start(self):
+        raise RuntimeError("can't start new thread")
+
+
+def test_a_thread_that_cannot_start_lets_go_of_its_hold():
+    """Under thread exhaustion start() raises; the hold carry_on() took must
+    not stay taken (the slot would be renewed for hours)."""
+    release = MagicMock()
+    life = RunLifetime(SharedRelease(release))
+    let_go = life.carry_on()
+    try:
+        lt.start_carried_on(_UnstartableThread(), let_go)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("the start error must propagate")
+    release.assert_called_once()
+
+
+def test_a_started_thread_keeps_its_hold():
+    release = MagicMock()
+    life = RunLifetime(SharedRelease(release))
+    let_go = life.carry_on()
+    done = threading.Event()
+    lt.start_carried_on(threading.Thread(target=done.set), let_go)
+    assert done.wait(2)
+    release.assert_not_called()
+    let_go()
+    release.assert_called_once()

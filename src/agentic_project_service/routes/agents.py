@@ -45,7 +45,7 @@ from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
 from ..services.llm_availability import check_model_available
 from ..services.run_gate import admit_run, current_slot
-from ..services.run_lifetime import RunLifetime
+from ..services.run_lifetime import RunLifetime, start_carried_on
 from ..services.run_context import (
     reset_run_id,
     set_run_id,
@@ -2437,7 +2437,7 @@ def run_agent_stream(agent_id: str):
                 # abort signal; it holds the run's gate slot until then.
                 worker_let_go = run_life.carry_on()
                 worker = threading.Thread(target=lambda: _captured_ctx.run(run_agent), daemon=True)
-                worker.start()
+                start_carried_on(worker, worker_let_go)
                 react_started = True
 
                 # Drain events from the queue and yield them live.
@@ -2931,7 +2931,7 @@ def run_agent_stream(agent_id: str):
                         ),
                         daemon=True,
                     )
-                    t.start()
+                    start_carried_on(t, _carry_on)
                     return
 
             while naive_delta_buf:
@@ -3105,7 +3105,7 @@ def run_agent_stream(agent_id: str):
                     ),
                     daemon=True,
                 )
-                t.start()
+                start_carried_on(t, _carry_on)
             elif run_persisted:
                 # Run exists in DB — update it to FAILED
                 try:

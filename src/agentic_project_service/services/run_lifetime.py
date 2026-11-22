@@ -75,7 +75,8 @@ class RunLifetime:
     The streaming generator is one holder of the liveness record (``end()``
     in its ``finally``); admit_run holds the slot for the response. A thread
     that carries the run on after a disconnect calls ``carry_on()`` before it
-    starts and the returned callable when it finishes.
+    starts, is started with ``start_carried_on``, and calls the returned
+    callable when it finishes.
     """
 
     def __init__(self, slot: SharedRelease):
@@ -100,3 +101,17 @@ class RunLifetime:
 
     def end(self) -> None:
         self._generator_hold()
+
+
+def start_carried_on(thread: threading.Thread, let_go: Callable[[], None]) -> None:
+    """Start a thread that carries a run on, holding what ``carry_on()`` took.
+
+    The thread lets go when it finishes; if it never starts (``RuntimeError:
+    can't start new thread`` under load), let go here instead, or the slot
+    would be renewed until its hold ceiling.
+    """
+    try:
+        thread.start()
+    except BaseException:
+        let_go()
+        raise

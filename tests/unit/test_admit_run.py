@@ -54,7 +54,8 @@ def gate(monkeypatch):
 
 
 def _limit(monkeypatch, n):
-    monkeypatch.setattr(gate_mod, "get_setting", lambda key: {"MAX_CONCURRENT_RUNS": n}[key])
+    settings = {"MAX_CONCURRENT_RUNS": n, "RUN_STALE_AFTER_SECONDS": 1800}
+    monkeypatch.setattr(gate_mod, "get_setting", settings.__getitem__)
 
 
 def _service_role():

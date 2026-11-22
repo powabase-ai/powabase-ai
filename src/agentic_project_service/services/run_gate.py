@@ -42,11 +42,13 @@ RETRY_AFTER_SECONDS = 2
 # /health?runs=1 and the metrics scrape read the count with a tighter bound
 # than the request path, so a stuck Redis cannot stall a probe or a scrape.
 HEALTH_SOCKET_TIMEOUT_SECONDS = 0.25
-# A live process stops renewing a slot it has held this long. A slot whose
-# release never ran (a leak) then frees itself one lease later instead of at
-# the next restart. The longest RUN_STALE_AFTER_SECONDS: by then the stale-run
-# cleanup has failed the run anyway.
-MAX_HOLD_SECONDS = 86400
+# A live process stops renewing a slot it has held longer than the project's
+# RUN_STALE_AFTER_SECONDS (read when the slot is taken; this default when the
+# setting cannot be read). A slot whose release never ran (a leak) then frees
+# itself one lease later instead of at the next restart. A run that really
+# lasts that long keeps running, but no longer counts against
+# MAX_CONCURRENT_RUNS.
+MAX_HOLD_SECONDS = 1800
 
 # -1 when a slot was taken, else the number of live holders.
 _ACQUIRE_LUA = (
@@ -110,7 +112,8 @@ class RunGate:
         self._client_unavailable = False
         self._renew_in_background = renew_in_background
         self._scripts: dict[tuple[str, int], object] = {}
-        self._held: dict[str, float] = {}  # token -> monotonic acquire time
+        # token -> (monotonic acquire time, hold ceiling in seconds)
+        self._held: dict[str, tuple[float, float]] = {}
         self._lock = threading.Lock()
         self._renewer: threading.Thread | None = None
 
@@ -150,7 +153,7 @@ class RunGate:
             script = self._scripts[cache_key] = client.register_script(source)
         return script
 
-    def try_acquire(self, max_runs: int) -> Admission:
+    def try_acquire(self, max_runs: int, max_hold_seconds: float = MAX_HOLD_SECONDS) -> Admission:
         if max_runs <= 0:
             return Admission(admitted=True)
         token = uuid.uuid4().hex
@@ -169,7 +172,7 @@ class RunGate:
         if result >= 0:
             return Admission(admitted=False, active_runs=result)
         with self._lock:
-            self._held[token] = time.monotonic()
+            self._held[token] = (time.monotonic(), max_hold_seconds)
         self._ensure_renewer()
         return Admission(admitted=True, token=token)
 
@@ -194,16 +197,20 @@ class RunGate:
         """Extend every lease this process holds. Returns how many were renewed."""
         with self._lock:
             now = time.monotonic()
-            expired = [t for t, since in self._held.items() if now - since > MAX_HOLD_SECONDS]
+            expired = {
+                token: ceiling
+                for token, (since, ceiling) in self._held.items()
+                if now - since > ceiling
+            }
             for token in expired:
                 del self._held[token]
             tokens = list(self._held)
-        for token in expired:
+        for token, ceiling in expired.items():
             logger.warning(
-                "Run slot %s held longer than %ss; no longer renewing it (a release "
-                "was probably missed)",
+                "Run slot %s held longer than %ss (RUN_STALE_AFTER_SECONDS); no longer "
+                "renewing it (a release was missed, or the run outlived the cutoff)",
                 token,
-                MAX_HOLD_SECONDS,
+                ceiling,
             )
         if not tokens:
             return 0
@@ -301,6 +308,19 @@ def _max_concurrent_runs() -> int:
         return 0
 
 
+def _max_hold_seconds() -> int:
+    """How long a slot is renewed at most: the project's stale-run cutoff."""
+    try:
+        return int(get_setting("RUN_STALE_AFTER_SECONDS"))
+    except Exception:
+        logger.warning(
+            "RUN_STALE_AFTER_SECONDS unreadable; holding run slots at most %ss",
+            MAX_HOLD_SECONDS,
+            exc_info=True,
+        )
+        return MAX_HOLD_SECONDS
+
+
 class _ReleaseOnClose:
     """A response body that runs ``release`` once the inner body is closed,
     whether or not that close raises."""
@@ -337,7 +357,9 @@ def admit_run(f):
         _ensure_stale_runs_chain()
         max_runs = _max_concurrent_runs()
         gate = default_gate
-        admission = gate.try_acquire(max_runs)
+        # The gate off reads nothing more.
+        max_hold = _max_hold_seconds() if max_runs > 0 else MAX_HOLD_SECONDS
+        admission = gate.try_acquire(max_runs, max_hold)
         if not admission.admitted:
             resp = jsonify(
                 {
