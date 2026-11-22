@@ -11,6 +11,7 @@ well.
 """
 
 import os
+import time
 from unittest.mock import MagicMock
 
 import fakeredis
@@ -48,8 +49,21 @@ def connect(request):
     real.flushdb()
 
 
-def _registry(connect, name):
-    return RunRegistry(redis_client=connect(), instance=name, start_thread=False)
+_open: list[RunRegistry] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_registries():
+    """A registry left subscribed would hear the next test's messages."""
+    yield
+    while _open:
+        _open.pop().close()
+
+
+def _registry(connect, name, start_thread=False):
+    registry = RunRegistry(redis_client=connect(), instance=name, start_thread=start_thread)
+    _open.append(registry)
+    return registry
 
 
 def _broken_client():
@@ -123,6 +137,99 @@ class TestInstanceId:
         child_pid = os.getpid() + 1
         monkeypatch.setattr(rr.os, "getpid", lambda: child_pid)
         assert registry.instance_id() != parent
+
+
+def _wait_until(condition, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return condition()
+
+
+class TestForwarding:
+    def _waiting_context(self, run_id):
+        ctx = ExecutionContext(execution_id=run_id)
+        ctx.reset_approval()  # what the approval hook does before it waits
+        return ctx
+
+    def test_approval_posted_to_b_resumes_the_run_on_a(self, connect):
+        a = _registry(connect, "pod-a:1:aaaa")
+        b = _registry(connect, "pod-b:2:bbbb")
+        ctx = self._waiting_context("run_1")
+        a.register("run_1", ctx, owner_user_id="user-1")
+
+        remote = b.lookup_remote("run_1")
+        assert b.deliver_remote("run_1", remote, {"approved": True}) is True
+        assert a.poll_once(timeout=1.0) is True
+        assert ctx.get_approval_decision() == {"approved": True}
+        assert ctx.get_approval_event().is_set()
+
+    def test_the_listener_thread_resumes_the_run(self, connect):
+        a = _registry(connect, "pod-a:1:aaaa", start_thread=True)
+        b = _registry(connect, "pod-b:2:bbbb")
+        ctx = self._waiting_context("run_1")
+        a.register("run_1", ctx)
+        assert b.deliver_remote("run_1", b.lookup_remote("run_1"), {"approved": False}) is True
+        assert ctx.get_approval_event().wait(timeout=3.0)
+        assert ctx.get_approval_decision() == {"approved": False}
+
+    def test_delivery_to_a_gone_process_reports_false(self, connect):
+        b = _registry(connect, "pod-b:2:bbbb")
+        gone = RemoteRun(instance="pod-dead:9:dead", owner_user_id=None)
+        assert b.deliver_remote("run_1", gone, {"approved": True}) is False
+
+    def test_a_late_approval_for_an_ended_run_is_dropped(self, connect):
+        a = _registry(connect, "pod-a:1:aaaa")
+        b = _registry(connect, "pod-b:2:bbbb")
+        a.register("run_1", self._waiting_context("run_1"))
+        a.unregister("run_1")
+        late = RemoteRun(instance="pod-a:1:aaaa", owner_user_id=None)
+        assert b.deliver_remote("run_1", late, {"approved": True}) is True  # a still listens
+        assert a.poll_once(timeout=0.3) is False
+
+    def test_a_malformed_message_is_ignored(self, connect):
+        a = _registry(connect, "pod-a:1:aaaa")
+        ctx = self._waiting_context("run_1")
+        a.register("run_1", ctx)
+        connect().publish(a.channel("pod-a:1:aaaa"), "not json")
+        assert a.poll_once(timeout=0.3) is False
+        assert ctx.get_approval_decision() is None
+
+    def test_subscription_exists_before_the_owner_hash(self, connect):
+        """No window where another process sees the owner but nobody listens."""
+        a = _registry(connect, "pod-a:1:aaaa")
+        a.register("run_1", self._waiting_context("run_1"))
+        assert connect().publish(a.channel("pod-a:1:aaaa"), "probe") == 1
+
+    def test_channels_are_project_scoped(self, connect, monkeypatch):
+        a = _registry(connect, "pod-a:1:aaaa")
+        a.register("run_1", self._waiting_context("run_1"))
+        monkeypatch.setenv("PROJECT_REF", "ref-b")
+        b = _registry(connect, "pod-b:2:bbbb")
+        assert (
+            b.deliver_remote("run_1", RemoteRun("pod-a:1:aaaa", None), {"approved": True}) is False
+        )
+
+    def test_redis_down_delivery_is_false(self):
+        b = RunRegistry(redis_client=_broken_client(), instance="pod-b", start_thread=False)
+        assert b.deliver_remote("run_1", RemoteRun("pod-a", None), {"approved": True}) is False
+
+    def test_redis_down_listener_thread_keeps_retrying(self, monkeypatch):
+        monkeypatch.setattr(rr, "RESUBSCRIBE_BACKOFF_SECONDS", 0.01)
+        broken = _broken_client()
+        a = RunRegistry(redis_client=broken, instance="pod-a")
+        _open.append(a)
+        a.register("run_1", ExecutionContext(execution_id="run_1"))
+        assert a.context("run_1") is not None
+        assert _wait_until(lambda: broken.pubsub.call_count >= 3)
+
+    def test_close_stops_listening(self, connect):
+        a = _registry(connect, "pod-a:1:aaaa", start_thread=True)
+        a.register("run_1", self._waiting_context("run_1"))
+        a.close()
+        assert connect().publish(a.channel("pod-a:1:aaaa"), "probe") == 0
 
 
 def test_module_functions_keep_their_contract():
