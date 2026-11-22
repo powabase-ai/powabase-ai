@@ -365,6 +365,21 @@ def _build_registry() -> dict[str, SettingDef]:
             ),
         ),
         SettingDef(
+            key="WORKFLOW_EXECUTIONS_PER_MINUTE",
+            category=cat,
+            label="Workflow Executions (per minute)",
+            type="int",
+            default=120,
+            min=1,
+            max=5000,
+            advanced=True,
+            description=(
+                "Max workflow executions per minute for this project with the service "
+                "role key, across every API process. End users are limited to 20 per "
+                "minute each."
+            ),
+        ),
+        SettingDef(
             key="EXA_RATE_LIMIT_PER_MINUTE",
             category=cat,
             label="Exa Rate Limit (per minute)",

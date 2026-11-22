@@ -1,5 +1,9 @@
 """The workflow execution limit is shared by every process of the project.
 
+End users (a JWT with a user id) get 20 per minute each; the service role, which
+is what the execute routes accept today, gets one per-project bucket whose size
+is the WORKFLOW_EXECUTIONS_PER_MINUTE setting (default 120).
+
 Runs against fakeredis with Lua. Set ``TEST_REDIS_URL`` (a database this suite
 may flush, e.g. ``redis://localhost:6379/15``) to run the Redis-backed tests
 against a real Redis as well.
@@ -117,3 +121,97 @@ def test_an_unusable_broker_url_fails_open(monkeypatch):
     monkeypatch.setattr(rl, "external_limiter", rl.RedisRateLimiter())
     with _app().test_client() as c:
         assert all(c.post("/exec").status_code == 200 for _ in range(25))
+
+
+# ---------------------------------------------------------------------------
+# The real routes: both execute endpoints take the service role key, whose
+# token carries no end-user id, so they share one per-project service bucket.
+# ---------------------------------------------------------------------------
+
+
+def _workflows_app():
+    from agentic_project_service.routes import workflows as workflows_route
+
+    app = Flask(__name__)
+    app.register_blueprint(workflows_route.workflows_bp)
+    return app, workflows_route
+
+
+def _service_role_calls(monkeypatch, limiter, n, paths):
+    """POST ``n`` times, cycling over ``paths``; the workflow itself is never found."""
+    from unittest.mock import patch
+
+    app, workflows_route = _workflows_app()
+    monkeypatch.setattr(rl, "external_limiter", limiter)
+    codes = []
+    with (
+        patch.object(workflows_route, "_workflow_pre_check"),
+        patch.object(workflows_route, "build_workflow_from_db", return_value=None),
+        patch(
+            "agentic_project_service.auth.decode_jwt",
+            return_value={"role": "service_role", "is_service_role": True},
+        ),
+        app.test_client() as c,
+    ):
+        for i in range(n):
+            resp = c.post(paths[i % len(paths)], json={}, headers={"Authorization": "Bearer x"})
+            codes.append((resp.status_code, resp.headers.get("Retry-After")))
+    return codes
+
+
+_BOTH = ["/api/workflows/wf-1/execute", "/api/workflows/wf-1/execute/stream"]
+
+
+def test_the_service_role_gets_its_own_project_bucket(connect, monkeypatch):
+    limiter = rl.RedisRateLimiter(connect())
+    codes = _service_role_calls(
+        monkeypatch, limiter, rl.DEFAULT_SERVICE_EXECUTIONS_PER_MINUTE + 1, _BOTH
+    )
+    assert all(code == 404 for code, _ in codes[:-1])  # past the limiter, workflow missing
+    assert codes[-1][0] == 429
+    assert 1 <= int(codes[-1][1]) <= 60
+    assert connect().exists("ratelimit:workflow-exec:service:ref-a")
+    assert not connect().exists("ratelimit:workflow-exec:anonymous:ref-a")
+
+
+def test_both_execute_routes_share_the_service_bucket(connect, monkeypatch):
+    monkeypatch.setattr(rl, "get_setting", lambda key: 4)
+    limiter = rl.RedisRateLimiter(connect())
+    assert [c for c, _ in _service_role_calls(monkeypatch, limiter, 2, _BOTH[:1])] == [404, 404]
+    codes = [c for c, _ in _service_role_calls(monkeypatch, limiter, 3, _BOTH[1:])]
+    assert codes == [404, 404, 429]
+
+
+def test_the_configured_service_limit_is_honoured(connect, monkeypatch):
+    seen = []
+
+    def fake_get_setting(key):
+        seen.append(key)
+        return 3
+
+    monkeypatch.setattr(rl, "get_setting", fake_get_setting)
+    limiter = rl.RedisRateLimiter(connect())
+    codes = [c for c, _ in _service_role_calls(monkeypatch, limiter, 4, _BOTH)]
+    assert codes == [404, 404, 404, 429]
+    assert set(seen) == {"WORKFLOW_EXECUTIONS_PER_MINUTE"}
+
+
+def test_the_service_429_names_the_configured_limit(connect, monkeypatch):
+    monkeypatch.setattr(rl, "get_setting", lambda key: 1)
+    monkeypatch.setattr(rl, "external_limiter", rl.RedisRateLimiter(connect()))
+    app, workflows_route = _workflows_app()
+    from unittest.mock import patch
+
+    with (
+        patch.object(workflows_route, "_workflow_pre_check"),
+        patch.object(workflows_route, "build_workflow_from_db", return_value=None),
+        patch(
+            "agentic_project_service.auth.decode_jwt",
+            return_value={"role": "service_role", "is_service_role": True},
+        ),
+        app.test_client() as c,
+    ):
+        c.post(_BOTH[0], json={}, headers={"Authorization": "Bearer x"})
+        resp = c.post(_BOTH[0], json={}, headers={"Authorization": "Bearer x"})
+    assert resp.status_code == 429
+    assert resp.get_json() == {"error": "Rate limit exceeded. Max 1 executions per minute."}

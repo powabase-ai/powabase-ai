@@ -11,6 +11,9 @@ from functools import wraps
 import redis
 from flask import g, jsonify
 
+from ..auth import is_service_role_request
+from .settings_registry import get_setting
+
 
 class RateLimiter:
     """Per-key sliding-window rate limiter.
@@ -41,21 +44,31 @@ class RateLimiter:
             return True
 
 
-# Workflow executions per user per minute, across every process of the project.
+# Workflow executions per minute, across every process of the project: each end
+# user (a JWT with a user id) has their own window, and the service role key one
+# window per project, sized by the WORKFLOW_EXECUTIONS_PER_MINUTE setting.
 EXECUTIONS_PER_MINUTE = 20
+DEFAULT_SERVICE_EXECUTIONS_PER_MINUTE = 120
+
+
+def _execution_bucket() -> tuple[str, int]:
+    if is_service_role_request():
+        return "workflow-exec:service", get_setting("WORKFLOW_EXECUTIONS_PER_MINUTE")
+    user_id = getattr(g, "user_id", None) or "anonymous"
+    return f"workflow-exec:{user_id}", EXECUTIONS_PER_MINUTE
 
 
 def rate_limit_executions(f):
-    """Rate-limit workflow execution endpoints per user, across every gunicorn
-    worker and replica of the project (Redis window; fail-open)."""
+    """Rate-limit workflow execution endpoints across every gunicorn worker and
+    replica of the project (Redis window; fail-open)."""
 
     @wraps(f)
     def decorated(*args, **kwargs):
-        user_id = getattr(g, "user_id", None) or "anonymous"
+        bucket, limit = _execution_bucket()
         # external_limiter is defined below; it is resolved at call time.
-        wait = external_limiter.try_acquire(f"workflow-exec:{user_id}", EXECUTIONS_PER_MINUTE)
+        wait = external_limiter.try_acquire(bucket, limit)
         if wait is not None:
-            message = f"Rate limit exceeded. Max {EXECUTIONS_PER_MINUTE} executions per minute."
+            message = f"Rate limit exceeded. Max {limit} executions per minute."
             resp = jsonify({"error": message})
             resp.status_code = 429
             resp.headers["Retry-After"] = str(max(1, math.ceil(wait)))
