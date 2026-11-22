@@ -10,6 +10,7 @@ from ..celery import celery_app
 from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
 from ..services.broker_redis import broker_client
+from ..services.run_registry import RunRegistry
 from ..services.settings_registry import get_setting
 
 logger = logging.getLogger(__name__)
@@ -19,47 +20,87 @@ STALE_LOCK_KEY = "stale_runs_lock"
 STALE_LOCK_TTL = 60  # seconds
 
 
-def run_stale_cleanup() -> dict:
-    """Mark runs 'running' for longer than RUN_STALE_AFTER_SECONDS as failed.
+INTERRUPTED_ERROR = "Run interrupted (pod restart or timeout)"
+# At most this many runs of each kind are failed per sweep; the next sweep
+# takes the rest.
+STALE_SWEEP_LIMIT = 1000
 
-    This handles a pod restart mid-run, which loses the in-process agent loop.
+_TABLES = ("agent_runs", "orchestration_runs")
+
+
+def _live_run_ids(client, run_ids: list[str]) -> set[str]:
+    """The run ids that have an owner record: a process is running them and
+    its registry listener renews the record (services/run_registry.py)."""
+    pipe = client.pipeline(transaction=False)
+    for run_id in run_ids:
+        pipe.exists(RunRegistry.owner_key(run_id))
+    return {run_id for run_id, live in zip(run_ids, pipe.execute(), strict=True) if live}
+
+
+def run_stale_cleanup() -> dict:
+    """Fail runs still 'running' after RUN_STALE_AFTER_SECONDS whose process is gone.
+
+    This handles a pod restart mid-run, which loses the in-process run. A run
+    is only failed when no process holds an owner record for it: a run that
+    is merely long (a slow model, a long approval wait) keeps streaming. When
+    Redis cannot say which runs are alive, nothing is failed this sweep.
     Covers both agent runs and orchestration runs.
     """
-    params = {"stale_after": int(get_setting("RUN_STALE_AFTER_SECONDS"))}
-    agent_result = db.session.execute(
-        text(f"""
-            UPDATE "{AI_SCHEMA}".agent_runs
-            SET status = 'failed',
-                error = 'Run interrupted (pod restart or timeout)',
-                completed_at = NOW()
-            WHERE status = 'running'
-              AND started_at < NOW() - (:stale_after * INTERVAL '1 second')
-        """),
-        params,
-    )
+    params = {
+        "stale_after": int(get_setting("RUN_STALE_AFTER_SECONDS")),
+        "limit": STALE_SWEEP_LIMIT,
+    }
+    candidates = {}
+    for table in _TABLES:
+        candidates[table] = db.session.execute(
+            text(f"""
+                SELECT id, run_id FROM "{AI_SCHEMA}".{table}
+                WHERE status = 'running'
+                  AND started_at < NOW() - (:stale_after * INTERVAL '1 second')
+                ORDER BY started_at
+                LIMIT :limit
+            """),
+            params,
+        ).fetchall()
+    counts = {"agent_runs": 0, "orchestration_runs": 0}
+    if not any(candidates.values()):
+        return counts
 
-    orch_result = db.session.execute(
-        text(f"""
-            UPDATE "{AI_SCHEMA}".orchestration_runs
-            SET status = 'failed',
-                error = 'Run interrupted (pod restart or timeout)',
-                completed_at = NOW()
-            WHERE status = 'running'
-              AND started_at < NOW() - (:stale_after * INTERVAL '1 second')
-        """),
-        params,
-    )
+    run_ids = [row[1] for rows in candidates.values() for row in rows if row[1]]
+    try:
+        live = _live_run_ids(broker_client(), run_ids) if run_ids else set()
+    except Exception:
+        logger.warning(
+            "Stale-run cleanup: cannot tell which runs are alive (Redis unavailable); "
+            "skipping this sweep",
+            exc_info=True,
+        )
+        return counts
 
+    for table in _TABLES:
+        dead = [str(row[0]) for row in candidates[table] if row[1] not in live]
+        if not dead:
+            continue
+        result = db.session.execute(
+            text(f"""
+                UPDATE "{AI_SCHEMA}".{table}
+                SET status = 'failed',
+                    error = :error,
+                    completed_at = NOW()
+                WHERE id = ANY(CAST(:ids AS uuid[]))
+                  AND status = 'running'
+            """),
+            {"ids": dead, "error": INTERRUPTED_ERROR},
+        )
+        counts[table] = result.rowcount
     db.session.commit()
-    agent_count = agent_result.rowcount
-    orch_count = orch_result.rowcount
-    if agent_count > 0 or orch_count > 0:
+    if counts["agent_runs"] or counts["orchestration_runs"]:
         logger.info(
             "Cleaned up %d stale agent runs and %d stale orchestration runs",
-            agent_count,
-            orch_count,
+            counts["agent_runs"],
+            counts["orchestration_runs"],
         )
-    return {"agent_runs": agent_count, "orchestration_runs": orch_count}
+    return counts
 
 
 @celery_app.task(name="cleanup_stale_runs")
