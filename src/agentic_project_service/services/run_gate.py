@@ -365,6 +365,11 @@ class ActiveRunsCollector:
     def __init__(self, gate: RunGate | None = None):
         self._gate = gate
 
+    def describe(self):
+        # Without describe() the registry calls collect() at register time,
+        # which would read Redis during app startup.
+        return []
+
     def collect(self):
         from prometheus_client.core import GaugeMetricFamily
 

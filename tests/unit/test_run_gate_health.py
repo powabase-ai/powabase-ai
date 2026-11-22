@@ -118,3 +118,13 @@ def test_metrics_exposes_the_gauge(app, monkeypatch):
 def test_a_second_app_does_not_register_the_collector_twice():
     main.create_app(testing=True)
     main.create_app(testing=True)  # raises if the second registration is not tolerated
+
+
+def test_registering_the_collector_does_not_read_redis():
+    """The default registry calls collect() at register time unless the
+    collector describes itself; app startup must not wait on Redis."""
+    from prometheus_client import CollectorRegistry
+
+    gate = MagicMock()
+    CollectorRegistry(auto_describe=True).register(ActiveRunsCollector(gate))
+    gate.active_runs.assert_not_called()
