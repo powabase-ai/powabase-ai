@@ -899,6 +899,23 @@ def get_orchestration_session_messages(orch_id: str, session_id: str):
 # ---------------------------------------------------------------------------
 
 
+def _wants_agent_scoped_kbs(data) -> bool:
+    raw = data.get("runtime_knowledge_bases")
+    return isinstance(raw, list) and any(isinstance(e, dict) and "agent_ids" in e for e in raw)
+
+
+def _orchestration_agent_ids(orch_id: str) -> set[str]:
+    """Canonical ids of the orchestration's agent entities."""
+    try:
+        orch_id = str(_uuid.UUID(str(orch_id)))
+    except ValueError:
+        return set()
+    rows = OrchestrationEntityModel.query.filter_by(
+        orchestration_id=orch_id, entity_type="agent"
+    ).all()
+    return {str(r.entity_ref_id) for r in rows}
+
+
 @orchestrations_bp.route("/<orch_id>/run/stream", methods=["POST"])
 @require_user_auth
 @admit_run
@@ -907,7 +924,7 @@ def run_orchestration_stream(orch_id: str):
 
     `runtime_knowledge_bases` (optional): a list of up to 10 objects,
     ``{id, top_k?, retrieval_method?, similarity_threshold?, filter_metadata?,
-    source_ids?, max_context_tokens?}``. Each entry joins the run's
+    source_ids?, max_context_tokens?, agent_ids?}``. Each entry joins the run's
     ``knowledge_search`` tool for THIS request only — nothing is persisted,
     so follow-up messages must re-send it. An entry naming a knowledge base
     that is also attached to a sub-agent overrides that attachment's config
@@ -919,7 +936,10 @@ def run_orchestration_stream(orch_id: str):
     the `KB_DEFAULT_MAX_CONTEXT_TOKENS` setting) — and the request 400s
     before the stream opens if any id is malformed/unknown, any knob is out
     of range or the wrong type, any entry carries an unknown key (typos like
-    `top_K` are rejected, not ignored), or the list exceeds 10 entries. Combinable
+    `top_K` are rejected, not ignored), or the list exceeds 10 entries. An
+    entry may carry `agent_ids` (ids of this orchestration's agent entities;
+    any other id 400s): it then reaches only those sub-agents. Entries without
+    it reach every sub-agent. Combinable
     with the context fields; combined with the preload `knowledge_bases`
     field, BOTH retrievals run (no dedup) and the run's `context_handler_id`
     still points at the preload one. `max_context_tokens` is honored only
@@ -953,7 +973,12 @@ def run_orchestration_stream(orch_id: str):
         if session_id and not _end_user_may_run_in_session(session_id, orch_id, user_id):
             return jsonify({"error": "Session not found"}), 404
 
-    runtime_kb_configs, runtime_kb_error = validate_runtime_knowledge_bases(data, db.session)
+    allowed_agent_ids = (
+        _orchestration_agent_ids(orch_id) if _wants_agent_scoped_kbs(data) else set()
+    )
+    runtime_kb_configs, runtime_kb_error = validate_runtime_knowledge_bases(
+        data, db.session, allowed_agent_ids=allowed_agent_ids
+    )
     if runtime_kb_error:
         return jsonify({"error": runtime_kb_error}), 400
 

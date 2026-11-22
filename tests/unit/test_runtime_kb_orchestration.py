@@ -139,3 +139,111 @@ def test_build_orchestration_defaults_runtime_kb_configs_to_none(monkeypatch):
     assert len(load_tools_calls) == 2
     for _agent_id, kwargs in load_tools_calls:
         assert kwargs["runtime_kb_configs"] is None
+
+
+_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+_KB = "33333333-3333-3333-3333-333333333333"
+_ORCH = "4a8b2d3f-6c8e-4f22-8b4d-9e3a7c5f2b81"
+
+
+def _scoped_setup(monkeypatch):
+    entities = [_FakeEntity(_A, 0), _FakeEntity(_B, 1)]
+    agent_rows = {_A: _FakeAgentRow(_A), _B: _FakeAgentRow(_B)}
+    calls: list = []
+    _install_fakes(monkeypatch, entities, agent_rows, calls)
+    return calls
+
+
+def test_agent_scoped_entries_reach_only_the_named_agent(monkeypatch):
+    calls = _scoped_setup(monkeypatch)
+    runtime = [{"id": "kb-shared"}, {"id": "kb-a-only", "agent_ids": [_A]}]
+    orch_service.build_orchestration(
+        "orch-1", runtime_kb_configs=runtime, caller=ToolCaller.service()
+    )
+    by_agent = {agent_id: kwargs["runtime_kb_configs"] for agent_id, kwargs in calls}
+    assert by_agent[_A] == [{"id": "kb-shared"}, {"id": "kb-a-only"}]
+    assert by_agent[_B] == [{"id": "kb-shared"}]
+    assert runtime[1] == {"id": "kb-a-only", "agent_ids": [_A]}  # caller's list untouched
+
+
+def test_an_agent_with_no_matching_entry_gets_none(monkeypatch):
+    calls = _scoped_setup(monkeypatch)
+    runtime = [{"id": "kb-a-only", "agent_ids": [_A]}]
+    orch_service.build_orchestration(
+        "orch-1", runtime_kb_configs=runtime, caller=ToolCaller.service()
+    )
+    by_agent = {agent_id: kwargs["runtime_kb_configs"] for agent_id, kwargs in calls}
+    assert by_agent[_A] == [{"id": "kb-a-only"}]
+    assert by_agent[_B] is None
+
+
+def test_an_entry_naming_both_agents_reaches_both(monkeypatch):
+    calls = _scoped_setup(monkeypatch)
+    runtime = [{"id": "kb-both", "agent_ids": [_A, _B]}]
+    orch_service.build_orchestration(
+        "orch-1", runtime_kb_configs=runtime, caller=ToolCaller.service()
+    )
+    for _agent_id, kwargs in calls:
+        assert kwargs["runtime_kb_configs"] == [{"id": "kb-both"}]
+
+
+def _run_stream(body, **patches):
+    from unittest.mock import patch
+
+    from flask import Flask
+
+    from agentic_project_service.routes import orchestrations as orchestrations_route
+
+    app = Flask(__name__)
+    app.testing = True  # let the sentinel below propagate
+    app.register_blueprint(orchestrations_route.orchestrations_bp)
+    fake_session = MagicMock()
+    fake_session.execute.return_value = [(_KB,)]
+    with (
+        patch.object(orchestrations_route.db, "session", fake_session),
+        patch.object(orchestrations_route.billing, "check_balance") as check_balance,
+        patch(
+            "agentic_project_service.auth.decode_jwt",
+            return_value={"sub": "service", "role": "service_role", "is_service_role": True},
+        ),
+        patch.object(orchestrations_route, "_orchestration_agent_ids", **patches) as agent_ids,
+        app.test_client() as c,
+    ):
+        check_balance.side_effect = RuntimeError("stop after validation")
+        try:
+            resp = c.post(
+                f"/api/orchestrations/{_ORCH}/run/stream",
+                json=body,
+                headers={"Authorization": "Bearer fake"},
+            )
+        except RuntimeError:
+            resp = None  # validation passed and the handler went on
+    return resp, agent_ids
+
+
+def test_the_route_rejects_an_agent_outside_the_orchestration():
+    body = {"message": "hi", "runtime_knowledge_bases": [{"id": _KB, "agent_ids": [_A]}]}
+    resp, agent_ids = _run_stream(body, return_value={_B})
+    assert resp.status_code == 400
+    assert resp.get_json() == {"error": f"agent_ids not in this orchestration: {_A}"}
+    agent_ids.assert_called_once_with(_ORCH)
+
+
+def test_the_route_accepts_an_agent_of_the_orchestration():
+    body = {"message": "hi", "runtime_knowledge_bases": [{"id": _KB, "agent_ids": [_A]}]}
+    resp, _ = _run_stream(body, return_value={_A, _B})
+    assert resp is None
+
+
+def test_the_route_reads_the_entities_only_for_scoped_entries():
+    body = {"message": "hi", "runtime_knowledge_bases": [{"id": _KB}]}
+    resp, agent_ids = _run_stream(body, return_value={_A})
+    assert resp is None
+    agent_ids.assert_not_called()
+
+
+def test_orchestration_agent_ids_of_a_malformed_id_is_empty():
+    from agentic_project_service.routes import orchestrations as orchestrations_route
+
+    assert orchestrations_route._orchestration_agent_ids("not-a-uuid") == set()

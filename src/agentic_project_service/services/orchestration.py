@@ -31,6 +31,20 @@ from ..services.tool_registry import load_all_tools_for_agent
 logger = logging.getLogger(__name__)
 
 
+def _runtime_kbs_for_agent(configs: list[dict] | None, agent_id: str) -> list[dict] | None:
+    """The runtime KB entries a sub-agent gets: those naming no agent, plus
+    those whose ``agent_ids`` include it. ``agent_ids`` is routing only and
+    never reaches the tool builder."""
+    if configs is None:
+        return None
+    scoped = [
+        {k: v for k, v in c.items() if k != "agent_ids"}
+        for c in configs
+        if not c.get("agent_ids") or agent_id in c["agent_ids"]
+    ]
+    return scoped or None
+
+
 def build_orchestration(
     orch_id: str,
     runtime_kb_configs: list[dict] | None = None,
@@ -120,7 +134,7 @@ def build_orchestration(
                 db.session,
                 max_tool_output_length=get_setting("MAX_TOOL_OUTPUT_LENGTH"),
                 default_max_result_chars=get_setting("DEFAULT_MAX_RESULT_CHARS"),
-                runtime_kb_configs=runtime_kb_configs,
+                runtime_kb_configs=_runtime_kbs_for_agent(runtime_kb_configs, str(agent_row.id)),
                 caller=caller,
             )
 
