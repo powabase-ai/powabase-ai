@@ -67,6 +67,8 @@ REASON_MAX_CHARS = 2000
 # How long one listener iteration waits for a message; also the most a new
 # registration waits before its owner hash is written.
 LOOP_TIMEOUT_SECONDS = 0.1
+# How many waiting messages a late PONG check reads before it gives up.
+DRAIN_MAX_MESSAGES = 100
 RESUBSCRIBE_BACKOFF_SECONDS = 1.0
 MAX_RESUBSCRIBE_BACKOFF_SECONDS = 30.0
 # A failed owner-hash or liveness write (e.g. OOM under noeviction) is retried
@@ -158,7 +160,8 @@ class RunRegistry:
         return self._redis() is not None
 
     def instance_id(self) -> str:
-        """``<HOSTNAME>:<pid>:<8 hex>``, regenerated in a forked child."""
+        """``<HOSTNAME>:<pid>:<8 hex>``, regenerated in a forked child (see
+        ``_after_fork_in_child``)."""
         pid = os.getpid()
         if self._instance is None or (self._instance_pid is not None and self._instance_pid != pid):
             self._instance = f"{os.getenv('HOSTNAME', 'local')}:{pid}:{uuid.uuid4().hex[:8]}"
@@ -491,6 +494,15 @@ class RunRegistry:
         now = time.monotonic()
         if self._ping_sent_at is not None:
             if now - self._ping_sent_at > PONG_TIMEOUT_SECONDS:
+                # A slow flush can bring this check late, past a PONG that is
+                # already waiting: read what has arrived before calling it dead.
+                for _ in range(DRAIN_MAX_MESSAGES):
+                    message = self._pubsub.get_message(timeout=0)
+                    if message is None:
+                        break
+                    self._handle(message)
+                    if self._ping_sent_at is None:
+                        return
                 raise TimeoutError(f"no PONG on the approvals channel in {PONG_TIMEOUT_SECONDS}s")
         elif now - self._last_pong >= HEARTBEAT_SECONDS:
             self._pubsub.ping()
@@ -498,8 +510,9 @@ class RunRegistry:
 
     def _read(self, timeout: float) -> bool:
         message = self._pubsub.get_message(timeout=timeout)
-        if message is None:
-            return False
+        return False if message is None else self._handle(message)
+
+    def _handle(self, message: dict) -> bool:
         if message.get("type") == "pong":
             self._last_pong = time.monotonic()
             self._ping_sent_at = None
@@ -579,6 +592,24 @@ class RunRegistry:
         pubsub, self._pubsub = self._pubsub, None
         self._close_quietly(pubsub)
 
+    def _after_fork_in_child(self) -> None:
+        """Start a forked child clean. Its parent's subscription socket is
+        shared, so it is dropped without closing it (a close would shut the
+        parent's connection); the runs and the listener thread are the
+        parent's, not the child's."""
+        self._lock = threading.Lock()
+        self._thread_lock = threading.Lock()
+        self._runs, self._owners, self._live = {}, {}, set()
+        self._dirty, self._removed = set(), set()
+        self._alive_dirty, self._alive_removed = set(), set()
+        self._pubsub = None
+        self._subscribed = threading.Event()
+        self._thread = None
+        self._instance = None
+        self._backoff = RESUBSCRIBE_BACKOFF_SECONDS
+        self._retry_at = self._write_retry_at = self._alive_retry_at = self._alive_due = 0.0
+        self._ping_sent_at = None
+
     def close(self) -> None:
         """Stop listening for forwarded approvals (tests; process shutdown)."""
         self._stopped.set()
@@ -591,6 +622,9 @@ class RunRegistry:
 
 
 _default = RunRegistry()
+# gunicorn runs without --preload today, so no worker forks with a live
+# registry; this keeps that true if it ever does.
+os.register_at_fork(after_in_child=lambda: _default._after_fork_in_child())
 
 
 def register_run(run_id: str, context: ExecutionContext, owner_user_id: str | None = None):

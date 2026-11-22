@@ -257,3 +257,11 @@ def test_an_unreadable_cutoff_falls_back_to_the_default_ceiling(gate, monkeypatc
     with app.test_client() as c:
         assert c.post("/run").status_code == 200
     assert seen == {"ceiling": gate_mod.MAX_HOLD_SECONDS}
+
+
+def test_a_forked_child_holds_no_slots(gate):
+    """The child did not take the parent's slots; it must not renew them."""
+    held = gate.try_acquire(1)
+    gate._after_fork_in_child()
+    assert not gate._held and gate._renewer is None
+    gate.release(held.token)

@@ -509,8 +509,8 @@ def save_graph(workflow_id: str):
 
 @workflows_bp.route("/<workflow_id>/execute", methods=["POST"])
 @require_service_role
-@rate_limit_executions
 @admit_run
+@rate_limit_executions
 def execute_workflow(workflow_id: str):
     """Execute a workflow synchronously and return the result."""
     data = request.get_json() or {}
@@ -701,8 +701,8 @@ def execute_workflow(workflow_id: str):
 
 @workflows_bp.route("/<workflow_id>/execute/stream", methods=["POST"])
 @require_service_role
-@rate_limit_executions
 @admit_run
+@rate_limit_executions
 def execute_workflow_stream(workflow_id: str):
     """Execute a workflow with streaming (SSE)."""
     data = request.get_json() or {}

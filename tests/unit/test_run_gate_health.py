@@ -26,6 +26,31 @@ def _broken_gate():
     return RunGate(redis_client=broken, renew_in_background=False)
 
 
+def test_the_collector_describes_itself_without_reading_redis():
+    """describe() must name the gauge, or prometheus_client cannot see that a
+    second create_app() registers it twice, and the scrape then carries the
+    gauge twice and is rejected."""
+    from prometheus_client import CollectorRegistry
+
+    gate = MagicMock()
+    registry = CollectorRegistry()
+    registry.register(ActiveRunsCollector(gate))
+    with pytest.raises(ValueError):
+        registry.register(ActiveRunsCollector(gate))
+    gate.active_runs.assert_not_called()
+    assert [m.name for m in ActiveRunsCollector(gate).describe()] == ["project_api_active_runs"]
+
+
+def test_two_apps_in_one_process_expose_the_gauge_once(monkeypatch):
+    from prometheus_client import REGISTRY, generate_latest
+
+    monkeypatch.setattr(gate_mod, "default_gate", _broken_gate())
+    main.create_app(testing=True)
+    main.create_app(testing=True)
+    exposition = generate_latest(REGISTRY).decode()
+    assert exposition.count("# TYPE project_api_active_runs gauge") == 1
+
+
 def test_plain_health_has_no_run_fields():
     assert main.health_body(False) == {"status": "healthy", "service": "project-service"}
 

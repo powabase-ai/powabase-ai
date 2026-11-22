@@ -151,3 +151,21 @@ def test_a_started_thread_keeps_its_hold():
     release.assert_not_called()
     let_go()
     release.assert_called_once()
+
+
+def test_mark_live_twice_keeps_one_hold(monkeypatch):
+    """A second mark_live must not replace the first hold (which would then
+    never be let go, and the liveness record never removed)."""
+    live, gone = [], []
+    monkeypatch.setattr(lt, "register_live_run", live.append)
+    monkeypatch.setattr(lt, "unregister_run", gone.append)
+    life = RunLifetime(NO_RELEASE)
+    life.mark_live("run_1")
+    first = life._live
+    life.mark_live("run_1")
+    assert life._live is first and live == ["run_1"]
+    carried = life.carry_on()
+    life.end()
+    assert gone == []  # the carried-on thread still holds it
+    carried()
+    assert gone == ["run_1"]

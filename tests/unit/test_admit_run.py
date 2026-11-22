@@ -225,6 +225,44 @@ def test_workflow_execute_429_comes_before_the_balance_check(gate, monkeypatch):
     check_balance.assert_not_called()
 
 
+def test_a_gate_429_spends_no_workflow_rate_limit_token(gate, monkeypatch):
+    """The gate refuses before the per-minute limiter counts the request."""
+    from agentic_project_service.routes import workflows as workflows_route
+    from agentic_project_service.services import rate_limit as rl
+
+    _full(gate, monkeypatch)
+    limiter = MagicMock()
+    limiter.try_acquire.return_value = None
+    monkeypatch.setattr(rl, "external_limiter", limiter)
+    monkeypatch.setattr(rl, "get_setting", lambda key: 120)
+    app = Flask(__name__)
+    app.register_blueprint(workflows_route.workflows_bp)
+    with _service_role(), app.test_client() as c:
+        for path in (
+            f"/api/workflows/{WORKFLOW_ID}/execute",
+            f"/api/workflows/{WORKFLOW_ID}/execute/stream",
+        ):
+            assert c.post(path, json={}, headers=HEADERS).status_code == 429
+    limiter.try_acquire.assert_not_called()
+
+
+def test_a_rate_limited_request_gives_its_slot_back(gate, monkeypatch):
+    from agentic_project_service.routes import workflows as workflows_route
+    from agentic_project_service.services import rate_limit as rl
+
+    _limit(monkeypatch, 1)
+    monkeypatch.setattr(rl, "external_limiter", MagicMock(try_acquire=lambda *a: 30.0))
+    monkeypatch.setattr(rl, "get_setting", lambda key: 120)
+    app = Flask(__name__)
+    app.register_blueprint(workflows_route.workflows_bp)
+    with _service_role(), app.test_client() as c:
+        resp = c.post(f"/api/workflows/{WORKFLOW_ID}/execute", json={}, headers=HEADERS)
+        assert resp.status_code == 429
+        assert "Rate limit exceeded" in resp.get_json()["error"]
+        resp.close()  # what the WSGI server does once the body is sent
+    assert gate.active_runs() == 0
+
+
 def test_auth_answers_before_the_gate(gate, monkeypatch):
     """A caller that may not run anything is told so, and takes no slot."""
     from agentic_project_service.routes import workflows as workflows_route

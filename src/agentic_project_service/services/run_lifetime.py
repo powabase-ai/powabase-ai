@@ -85,6 +85,10 @@ class RunLifetime:
         self._generator_hold: Callable[[], None] = _noop
 
     def mark_live(self, run_id: str) -> None:
+        """Publish the run as live; the generator holds it until ``end()``.
+        Idempotent: a second call would orphan the first hold."""
+        if self._live is not None:
+            return
         register_live_run(run_id)
         self._live = SharedRelease(partial(unregister_run, run_id))
         self._generator_hold = self._live.hold()

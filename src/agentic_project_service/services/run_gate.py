@@ -271,6 +271,12 @@ class RunGate:
             )
             self._renewer.start()
 
+    def _after_fork_in_child(self) -> None:
+        """A forked child holds none of the parent's slots, and has no renewer."""
+        self._lock = threading.Lock()
+        self._held = {}
+        self._renewer = None
+
     def _renew_forever(self) -> None:
         while True:
             time.sleep(RENEW_SECONDS)
@@ -281,6 +287,7 @@ class RunGate:
 
 
 default_gate = RunGate()
+os.register_at_fork(after_in_child=lambda: default_gate._after_fork_in_child())
 
 
 def current_slot() -> SharedRelease:
@@ -351,9 +358,11 @@ class _ReleaseOnClose:
 def admit_run(f):
     """Hold one MAX_CONCURRENT_RUNS slot for the life of the request.
 
-    Goes directly above the view, below the auth decorators, so an unauthorized
-    caller is answered first and takes no slot, and the 429 comes before the
-    view's balance check and before any SSE response exists. The slot is freed
+    Goes directly below the auth decorators, so an unauthorized caller is
+    answered first and takes no slot, and the 429 comes before the view's
+    balance check and before any SSE response exists. On the workflow routes
+    it sits above the per-minute rate limiter, so a refused run spends no
+    rate-limit token (a rate-limited request gives its slot back at once). The slot is freed
     when the response is closed (end of stream or client disconnect) or when
     the view raises, unless the view handed the run to a thread that still
     holds it (see ``current_slot``): then it is freed when that run ends.
@@ -448,21 +457,24 @@ class ActiveRunsCollector:
     read from Redis at scrape time. Every pod reports the same value, so
     aggregate with ``max by (project_ref)``. No sample when Redis cannot say."""
 
+    _HELP = "Runs holding a MAX_CONCURRENT_RUNS slot in this project, across all pods."
+
     def __init__(self, gate: RunGate | None = None):
         self._gate = gate
 
     def describe(self):
         # Without describe() the registry calls collect() at register time,
-        # which would read Redis during app startup.
-        return []
+        # which would read Redis during app startup. It names the gauge, so
+        # registering a second collector raises instead of exposing the gauge
+        # twice (a scrape Prometheus rejects).
+        from prometheus_client.core import GaugeMetricFamily
+
+        yield GaugeMetricFamily("project_api_active_runs", self._HELP)
 
     def collect(self):
         from prometheus_client.core import GaugeMetricFamily
 
-        gauge = GaugeMetricFamily(
-            "project_api_active_runs",
-            "Runs holding a MAX_CONCURRENT_RUNS slot in this project, across all pods.",
-        )
+        gauge = GaugeMetricFamily("project_api_active_runs", self._HELP)
         value = (self._gate or default_gate).active_runs()
         if value is not None:
             gauge.add_metric([], value)

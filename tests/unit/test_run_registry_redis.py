@@ -171,6 +171,27 @@ class TestInstanceId:
         assert pid == str(os.getpid())
         assert len(suffix) == 8
 
+    def test_a_forked_child_starts_clean(self, connect):
+        """A child must not share the parent's subscription socket, claim the
+        parent's runs, or think its listener thread is running."""
+        a = _registry(connect, "pod-a:1:aaaa", start_thread=True)
+        a.register("run_1", ExecutionContext(execution_id="run_1"))
+        a.register_live("orch_run_1")
+        assert _wait_until(a._subscribed.is_set)
+        parent_pubsub = a._pubsub
+        a._after_fork_in_child()
+        assert a._pubsub is None and not a._subscribed.is_set()
+        assert a._thread is None
+        assert a.context("run_1") is None and not a._live
+        assert not (a._dirty or a._removed or a._alive_dirty or a._alive_removed)
+        assert a.instance_id() != "pod-a:1:aaaa"
+        parent_pubsub.close()  # what the parent would still own
+
+    def test_the_default_registry_resets_in_a_forked_child(self):
+        import inspect
+
+        assert "register_at_fork" in inspect.getsource(rr)
+
     def test_a_forked_child_gets_its_own_id(self, monkeypatch):
         registry = RunRegistry(start_thread=False)
         parent = registry.instance_id()
@@ -508,6 +529,20 @@ class TestLiveness:
             == Delivery.RESUMED
         )
         assert ctx.get_approval_event().wait(timeout=1)
+
+    def test_a_waiting_pong_counts_even_when_the_check_runs_late(self, connect):
+        """A slow flush can push the PONG deadline check past a PONG that has
+        already arrived: read what is waiting before calling it dead."""
+        a = _registry(connect, "pod-a:1:aaaa")
+        a.register("run_1", self._waiting("run_1"))
+        _settle(a)
+        pubsub = a._pubsub
+        pubsub.ping()
+        a._ping_sent_at = time.monotonic() - 10 * rr.PONG_TIMEOUT_SECONDS
+        time.sleep(0.05)  # the PONG reaches the socket buffer
+        a.step(timeout=0.01)
+        assert a._pubsub is pubsub
+        assert a._ping_sent_at is None
 
     def test_a_killed_subscription_reconnects(self, real_redis, fast_liveness):
         a = _registry(real_redis, "pod-a:1:aaaa", start_thread=True)
