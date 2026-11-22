@@ -136,6 +136,10 @@ class RedisRateLimiter:
                 return None
         return self._client
 
+    def client_available(self) -> bool:
+        """False when no Redis client can be built: the limiter then fails open."""
+        return self._redis() is not None
+
     def _get_script(self):
         if self._script is None:
             client = self._redis()

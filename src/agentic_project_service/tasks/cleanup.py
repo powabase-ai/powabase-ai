@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 
+import redis
 from sqlalchemy import text
 
 from ..celery import celery_app
@@ -289,8 +290,13 @@ def _check_chain() -> None:
         _, chain_key = _keys()
         if broker_client().exists(chain_key):
             return
-    except Exception:
+    except redis.RedisError:
         logger.debug("Stale-run chain check: Redis unavailable", exc_info=True)
+        return
+    except Exception:
+        # Not debug: on a project without beat this check is the only thing
+        # that restarts a dead chain.
+        logger.warning("Stale-run chain check failed", exc_info=True)
         return
     logger.warning("Stale-run chain: no live generation found; starting a new chain")
     seed_stale_runs_chain()

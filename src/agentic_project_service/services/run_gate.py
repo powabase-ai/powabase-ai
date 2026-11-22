@@ -138,6 +138,11 @@ class RunGate:
             self._client = self._build()
         return self._client
 
+    def client_available(self) -> bool:
+        """False when no Redis client can be built: runs are then admitted
+        ungated for the life of the process."""
+        return self._redis() is not None
+
     def _health_redis(self):
         if self._health_client is None:
             self._health_client = self._build(
@@ -297,7 +302,9 @@ def _ensure_stale_runs_chain() -> None:
 
         cleanup.ensure_stale_runs_chain_soon()
     except Exception:
-        logger.debug("Stale-run chain check unavailable", exc_info=True)
+        # Not debug: on a project without beat this check is the only thing
+        # that restarts a dead chain.
+        logger.warning("Stale-run chain check could not start", exc_info=True)
 
 
 def _max_concurrent_runs() -> int:
@@ -397,15 +404,43 @@ def admit_run(f):
     return decorated
 
 
+def _coordination_disabled() -> list[str]:
+    """The Redis-backed parts that turned themselves off in this process
+    because no client could be built (an unusable broker URL). Builds no
+    connection; never raises."""
+    from . import rate_limit, run_registry
+
+    disabled = []
+    for name, available in (
+        ("approvals", run_registry.client_available),
+        ("rate_limit", rate_limit.external_limiter.client_available),
+        ("run_gate", default_gate.client_available),
+    ):
+        try:
+            ok = available()
+        except Exception:
+            logger.warning("Could not tell whether %s has a Redis client", name, exc_info=True)
+            ok = False
+        if not ok:
+            disabled.append(name)
+    return disabled
+
+
 def health_fields() -> dict:
-    """``active_runs`` and ``max_concurrent_runs`` for /health?runs=1; each is
-    None when it cannot be read (never raises)."""
+    """For /health?runs=1: ``active_runs`` and ``max_concurrent_runs``, each
+    None when it cannot be read, and ``coordination_disabled``, the parts that
+    run process-local or ungated because no Redis client could be built
+    (empty when all is well). Never raises."""
     max_runs = None
     try:
         max_runs = int(get_setting("MAX_CONCURRENT_RUNS") or 0)
     except Exception:
         logger.warning("MAX_CONCURRENT_RUNS unreadable for /health", exc_info=True)
-    return {"active_runs": default_gate.active_runs(), "max_concurrent_runs": max_runs}
+    return {
+        "active_runs": default_gate.active_runs(),
+        "max_concurrent_runs": max_runs,
+        "coordination_disabled": _coordination_disabled(),
+    }
 
 
 class ActiveRunsCollector:

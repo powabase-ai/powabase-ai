@@ -258,6 +258,33 @@ class TestForwarding:
         )
         deaf.close()
 
+    def test_a_failing_resume_keeps_the_subscription_and_answers_not_resumed(self, connect, caplog):
+        """An error applying one decision is that decision's problem, not a
+        broken channel: log it, say not resumed, keep listening."""
+        a = _registry(connect, "pod-a:1:aaaa", start_thread=True)
+        b = _registry(connect, "pod-b:2:bbbb")
+        broken = MagicMock()
+        broken.set_approval_decision.side_effect = RuntimeError("hook state")
+        a.register("run_bad", broken)
+        ok = self._waiting_context("run_ok")
+        a.register("run_ok", ok)
+        assert _wait_until(lambda: b.lookup_remote("run_ok") is not None)
+        pubsub = a._pubsub
+        with caplog.at_level("ERROR", logger=rr.logger.name):
+            assert (
+                b.deliver_remote("run_bad", b.lookup_remote("run_bad"), {"approved": True})
+                == Delivery.GONE
+            )
+        assert any(
+            r.levelname == "ERROR" and r.exc_info and "run_bad" in r.getMessage()
+            for r in caplog.records
+        )
+        assert a._pubsub is pubsub  # not torn down
+        assert (
+            b.deliver_remote("run_ok", b.lookup_remote("run_ok"), {"approved": True})
+            == Delivery.RESUMED
+        )
+
     def test_a_malformed_message_is_ignored(self, connect):
         a = _registry(connect, "pod-a:1:aaaa")
         ctx = self._waiting_context("run_1")

@@ -30,7 +30,22 @@ def test_plain_health_has_no_run_fields():
     assert main.health_body(False) == {"status": "healthy", "service": "project-service"}
 
 
-def test_health_with_runs(monkeypatch):
+@pytest.fixture
+def usable_broker(monkeypatch):
+    """Every Redis-backed component can build its client."""
+    from agentic_project_service.services import rate_limit, run_registry
+
+    monkeypatch.setattr(
+        run_registry,
+        "_default",
+        run_registry.RunRegistry(redis_client=fakeredis.FakeStrictRedis(), start_thread=False),
+    )
+    monkeypatch.setattr(
+        rate_limit, "external_limiter", rate_limit.RedisRateLimiter(fakeredis.FakeStrictRedis())
+    )
+
+
+def test_health_with_runs(monkeypatch, usable_broker):
     _gate_with(3, monkeypatch)
     monkeypatch.setattr(gate_mod, "get_setting", lambda key: {"MAX_CONCURRENT_RUNS": 8}[key])
     assert main.health_body(True) == {
@@ -38,7 +53,22 @@ def test_health_with_runs(monkeypatch):
         "service": "project-service",
         "active_runs": 3,
         "max_concurrent_runs": 8,
+        "coordination_disabled": [],
     }
+
+
+def test_a_bad_broker_url_shows_on_health(monkeypatch):
+    """An unusable CELERY_BROKER_URL turns the gate, the limiter and remote
+    approvals off for the life of the process; /health?runs=1 says so."""
+    from agentic_project_service.services import rate_limit, run_registry
+
+    monkeypatch.setenv("CELERY_BROKER_URL", "memory://")
+    monkeypatch.setattr(gate_mod, "default_gate", RunGate(renew_in_background=False))
+    monkeypatch.setattr(run_registry, "_default", run_registry.RunRegistry(start_thread=False))
+    monkeypatch.setattr(rate_limit, "external_limiter", rate_limit.RedisRateLimiter())
+    monkeypatch.setattr(gate_mod, "get_setting", lambda key: 0)
+    body = main.health_body(True)
+    assert body["coordination_disabled"] == ["approvals", "rate_limit", "run_gate"]
 
 
 def test_health_with_runs_is_null_on_errors(monkeypatch):

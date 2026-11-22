@@ -152,6 +152,11 @@ class RunRegistry:
         self._thread_lock = threading.Lock()
         self._stopped = threading.Event()
 
+    def client_available(self) -> bool:
+        """False when no Redis client can be built (an unusable broker URL):
+        approvals are then process-local for the life of the process."""
+        return self._redis() is not None
+
     def instance_id(self) -> str:
         """``<HOSTNAME>:<pid>:<8 hex>``, regenerated in a forked child."""
         pid = os.getpid()
@@ -516,12 +521,19 @@ class RunRegistry:
             logger.warning("Run registry: ignoring a malformed approval message")
             return False
         context = self.context(run_id)
+        resumed = False
         if context is None:
             logger.info("Run registry: approval for run %s arrived after it ended", run_id)
         else:
-            context.set_approval_decision(decision)
-        self._acknowledge(payload.get("ack"), resumed=context is not None)
-        return context is not None
+            # A failure here belongs to this decision, not to the channel: the
+            # subscription stays, and the approver hears "not resumed".
+            try:
+                context.set_approval_decision(decision)
+                resumed = True
+            except Exception:
+                logger.exception("Run registry: could not resume run %s", run_id)
+        self._acknowledge(payload.get("ack"), resumed=resumed)
+        return resumed
 
     def _acknowledge(self, token, resumed: bool) -> None:
         if not isinstance(token, str) or len(token) != 32 or not token.isalnum():
@@ -608,3 +620,7 @@ def lookup_remote_run(run_id: str) -> RemoteRun | None:
 
 def deliver_approval(run_id: str, remote: RemoteRun, decision: dict) -> Delivery:
     return _default.deliver_remote(run_id, remote, decision)
+
+
+def client_available() -> bool:
+    return _default.client_available()

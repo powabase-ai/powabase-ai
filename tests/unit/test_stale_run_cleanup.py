@@ -574,6 +574,35 @@ def test_the_chain_check_with_redis_down_does_nothing(monkeypatch, fresh_check):
     seed.assert_not_called()
 
 
+def test_a_redis_error_in_the_chain_check_stays_at_debug(monkeypatch, fresh_check, caplog):
+    broken = MagicMock()
+    broken.exists.side_effect = redis.ConnectionError("down")
+    monkeypatch.setattr(cleanup_mod, "broker_client", lambda: broken)
+    with caplog.at_level("DEBUG", logger=cleanup_mod.logger.name):
+        cleanup_mod.ensure_stale_runs_chain()
+    assert [r.levelname for r in caplog.records] == ["DEBUG"]
+
+
+def test_any_other_chain_check_error_is_a_warning(monkeypatch, fresh_check, caplog):
+    """The check is the only thing that restarts a dead chain on a project
+    without beat; a bug in it must be seen."""
+    monkeypatch.setattr(cleanup_mod, "_keys", MagicMock(side_effect=RuntimeError("bug")))
+    with caplog.at_level("DEBUG", logger=cleanup_mod.logger.name):
+        cleanup_mod.ensure_stale_runs_chain()
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
+
+
+def test_a_failing_chain_check_hand_off_is_a_warning(monkeypatch, caplog):
+    from agentic_project_service.services import run_gate as gate_mod
+
+    monkeypatch.setattr(
+        cleanup_mod, "ensure_stale_runs_chain_soon", MagicMock(side_effect=RuntimeError("bug"))
+    )
+    with caplog.at_level("DEBUG", logger=gate_mod.logger.name):
+        gate_mod._ensure_stale_runs_chain()  # never raises
+    assert [r.levelname for r in caplog.records if r.name == gate_mod.logger.name] == ["WARNING"]
+
+
 def test_every_run_start_asks_for_the_chain_check_off_the_request_thread(monkeypatch):
     from flask import Flask
 
