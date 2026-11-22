@@ -299,7 +299,11 @@ def _build_registry() -> dict[str, SettingDef]:
             description=(
                 "Maximum agent, orchestration and workflow run requests in flight at "
                 "once in this project, across every API process. Over the limit a run "
-                "request is answered 429 with Retry-After. 0 turns the limit off."
+                "request is answered 429 with Retry-After. 0 turns the limit off. The "
+                "limit is per project, but a run holds a request thread for its whole "
+                "length and each API pod has 8 (2 workers x 4 threads), shared with "
+                "every other request: keep it at or below pods x 8 minus headroom, or "
+                "one pod can still run out of threads below the limit."
             ),
         ),
         SettingDef(

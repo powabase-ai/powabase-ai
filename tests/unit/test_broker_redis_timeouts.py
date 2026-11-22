@@ -92,3 +92,31 @@ def test_an_unusable_broker_url_warns_once_and_fails_open(monkeypatch, caplog):
         assert all(limiter.try_acquire("workflow-exec:service", 1) is None for _ in range(3))
     warnings = [r for r in caplog.records if r.name == rl.logger.name]
     assert len(warnings) == 1
+
+
+def test_one_client_per_process_for_each_url_and_timeouts(monkeypatch):
+    """The broker Redis is shared by every project: one connection pool per
+    process, not one per component and per sweep."""
+    monkeypatch.setenv("CELERY_BROKER_URL", "redis://127.0.0.1:1/0")
+    first = broker_redis.broker_client()
+    assert broker_redis.broker_client() is first
+    assert broker_redis.broker_client(socket_timeout=0.25, connect_timeout=0.25) is not first
+    monkeypatch.setenv("CELERY_BROKER_URL", "redis://127.0.0.1:1/1")
+    assert broker_redis.broker_client() is not first
+
+
+def test_the_registry_gate_limiter_and_sweep_share_that_client(monkeypatch):
+    from agentic_project_service.services.run_gate import RunGate
+
+    monkeypatch.setenv("CELERY_BROKER_URL", "redis://127.0.0.1:1/0")
+    shared = broker_redis.broker_client()
+    assert RunRegistry(start_thread=False)._redis() is shared
+    assert RunGate(renew_in_background=False)._redis() is shared
+    assert rl.RedisRateLimiter()._redis() is shared
+
+
+def test_an_unusable_url_is_not_cached(monkeypatch):
+    monkeypatch.setenv("CELERY_BROKER_URL", "memory://")
+    for _ in range(2):
+        with pytest.raises(ValueError):
+            broker_redis.broker_client()
