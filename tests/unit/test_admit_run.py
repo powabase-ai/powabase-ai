@@ -235,3 +235,43 @@ def test_auth_answers_before_the_gate(gate, monkeypatch):
         resp = c.post(f"/api/workflows/{WORKFLOW_ID}/execute", json={})
     assert resp.status_code == 401
     assert gate.active_runs() == 1
+
+
+def _raising_close_app():
+    app = Flask(__name__)
+
+    @app.route("/stream", methods=["POST"])
+    @gate_mod.admit_run
+    def stream():
+        def gen():
+            try:
+                yield "data: 1\n\n"
+                yield "data: 2\n\n"
+            finally:
+                raise RuntimeError("cleanup failed")
+
+        return Response(gen(), mimetype="text/event-stream")
+
+    return app
+
+
+def test_a_stream_whose_close_raises_still_frees_its_slot(gate, monkeypatch):
+    """Werkzeug runs call_on_close callbacks only after the body's close()
+    returns, so the release must not depend on that close succeeding."""
+    _limit(monkeypatch, 1)
+    with _raising_close_app().test_client() as c:
+        resp = c.post("/stream", buffered=False)
+        assert gate.active_runs() == 1
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            resp.close()  # a disconnect: the generator is closed mid-stream
+    assert gate.active_runs() == 0
+    assert not gate._held
+
+
+def test_a_plain_response_keeps_its_content_length(gate, monkeypatch):
+    _limit(monkeypatch, 1)
+    with _app().test_client() as c:
+        resp = c.post("/run")
+        assert resp.headers.get("Content-Length") == str(len(resp.get_data()))
+        resp.close()
+    assert gate.active_runs() == 0

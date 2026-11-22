@@ -148,7 +148,7 @@ def test_a_failing_release_does_not_raise():
     client = MagicMock()
     client.zrem.side_effect = redis.ConnectionError("down")
     g = RunGate(redis_client=client, renew_in_background=False)
-    g._held.add("tok")
+    g._held["tok"] = time.monotonic()
     g.release("tok")
     assert not g._held
 
@@ -189,3 +189,20 @@ def test_the_renewer_thread_starts_on_the_first_admission(client, monkeypatch):
     # held token would be "renewed" against a database later tests flush.
     g.release(held.token)
     g.release(other.token)
+
+
+def test_a_slot_held_past_the_ceiling_is_no_longer_renewed(gate, client, monkeypatch, caplog):
+    """A slot whose release never ran (a leak inside a live process) stops
+    being renewed after MAX_HOLD_SECONDS, so it frees itself one lease later."""
+    held = gate.try_acquire(1)
+    monkeypatch.setattr(gate_mod, "MAX_HOLD_SECONDS", 0)
+    with caplog.at_level("WARNING", logger=gate_mod.logger.name):
+        assert gate.renew_all() == 0
+    assert "held longer than" in caplog.text
+    assert not gate._held
+    # The lease is left to expire, not removed: the run may still be going.
+    assert client.zscore(gate.key(), held.token) is not None
+
+
+def test_the_hold_ceiling_matches_the_longest_stale_run_cutoff():
+    assert gate_mod.MAX_HOLD_SECONDS == SETTINGS_REGISTRY["RUN_STALE_AFTER_SECONDS"].max

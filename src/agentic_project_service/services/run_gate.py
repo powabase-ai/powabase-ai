@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from functools import wraps
+from functools import partial, wraps
 
 from flask import current_app, jsonify
 
@@ -41,6 +41,11 @@ RETRY_AFTER_SECONDS = 2
 # /health?runs=1 and the metrics scrape read the count with a tighter bound
 # than the request path, so a stuck Redis cannot stall a probe or a scrape.
 HEALTH_SOCKET_TIMEOUT_SECONDS = 0.25
+# A live process stops renewing a slot it has held this long. A slot whose
+# release never ran (a leak) then frees itself one lease later instead of at
+# the next restart. The longest RUN_STALE_AFTER_SECONDS: by then the stale-run
+# cleanup has failed the run anyway.
+MAX_HOLD_SECONDS = 86400
 
 # -1 when a slot was taken, else the number of live holders.
 _ACQUIRE_LUA = (
@@ -104,7 +109,7 @@ class RunGate:
         self._client_unavailable = False
         self._renew_in_background = renew_in_background
         self._scripts: dict[tuple[str, int], object] = {}
-        self._held: set[str] = set()
+        self._held: dict[str, float] = {}  # token -> monotonic acquire time
         self._lock = threading.Lock()
         self._renewer: threading.Thread | None = None
 
@@ -163,7 +168,7 @@ class RunGate:
         if result >= 0:
             return Admission(admitted=False, active_runs=result)
         with self._lock:
-            self._held.add(token)
+            self._held[token] = time.monotonic()
         self._ensure_renewer()
         return Admission(admitted=True, token=token)
 
@@ -171,7 +176,7 @@ class RunGate:
         if token is None:
             return
         with self._lock:
-            self._held.discard(token)
+            self._held.pop(token, None)
         try:
             client = self._redis()
             if client is not None:
@@ -187,7 +192,18 @@ class RunGate:
     def renew_all(self) -> int:
         """Extend every lease this process holds. Returns how many were renewed."""
         with self._lock:
+            now = time.monotonic()
+            expired = [t for t, since in self._held.items() if now - since > MAX_HOLD_SECONDS]
+            for token in expired:
+                del self._held[token]
             tokens = list(self._held)
+        for token in expired:
+            logger.warning(
+                "Run slot %s held longer than %ss; no longer renewing it (a release "
+                "was probably missed)",
+                token,
+                MAX_HOLD_SECONDS,
+            )
         if not tokens:
             return 0
         client = self._redis()
@@ -210,7 +226,7 @@ class RunGate:
             with self._lock:
                 # Released while this pass ran: not a lost lease.
                 was_held = token in self._held
-                self._held.discard(token)
+                self._held.pop(token, None)
             if was_held:
                 logger.warning(
                     "Run slot %s expired before renewal; the project may briefly "
@@ -262,6 +278,26 @@ def _max_concurrent_runs() -> int:
         return 0
 
 
+class _ReleaseOnClose:
+    """A response body that runs ``release`` once the inner body is closed,
+    whether or not that close raises."""
+
+    def __init__(self, inner, release):
+        self._inner = inner
+        self._release = release
+
+    def __iter__(self):
+        return iter(self._inner)
+
+    def close(self):
+        try:
+            close = getattr(self._inner, "close", None)
+            if close is not None:
+                close()
+        finally:
+            self._release()
+
+
 def admit_run(f):
     """Hold one MAX_CONCURRENT_RUNS slot for the life of the request.
 
@@ -295,7 +331,15 @@ def admit_run(f):
         except BaseException:
             gate.release(admission.token)
             raise
-        resp.call_on_close(lambda: gate.release(admission.token))
+        release = partial(gate.release, admission.token)
+        if resp.is_sequence:
+            # A buffered body has no close() of its own that could fail.
+            resp.call_on_close(release)
+        else:
+            # Werkzeug runs call_on_close callbacks only after the body's own
+            # close() returns, so a generator whose cleanup raises would skip
+            # them. Release in a finally around that close instead.
+            resp.response = _ReleaseOnClose(resp.response, release)
         return resp
 
     decorated._admits_runs = True
