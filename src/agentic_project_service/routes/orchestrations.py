@@ -46,6 +46,7 @@ from ..services import billing_port as billing
 from ..services.ai_provider_keys_resolver import ProviderKeyDecryptDropped
 from ..services.context_handler import resolve_tool_call_image_refs
 from ..services.llm_availability import check_model_available
+from ..services.run_gate import admit_run
 from ..services.run_context import (
     reset_run_id,
     set_run_id,
@@ -900,6 +901,7 @@ def get_orchestration_session_messages(orch_id: str, session_id: str):
 
 @orchestrations_bp.route("/<orch_id>/run/stream", methods=["POST"])
 @require_user_auth
+@admit_run
 def run_orchestration_stream(orch_id: str):
     """Run an orchestration with SSE streaming.
 

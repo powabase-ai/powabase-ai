@@ -22,9 +22,13 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from functools import wraps
+
+from flask import current_app, jsonify
 
 from .broker_redis import broker_client
 from .extraction_gate import _REDIS_NOW
+from .settings_registry import get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -248,3 +252,51 @@ class RunGate:
 
 
 default_gate = RunGate()
+
+
+def _max_concurrent_runs() -> int:
+    try:
+        return int(get_setting("MAX_CONCURRENT_RUNS") or 0)
+    except Exception:
+        logger.warning("MAX_CONCURRENT_RUNS unreadable; admitting ungated", exc_info=True)
+        return 0
+
+
+def admit_run(f):
+    """Hold one MAX_CONCURRENT_RUNS slot for the life of the request.
+
+    Goes directly above the view, below the auth decorators, so an unauthorized
+    caller is answered first and takes no slot, and the 429 comes before the
+    view's balance check and before any SSE response exists. The slot is freed
+    when the response is closed (end of stream or client disconnect) or when
+    the view raises.
+    """
+
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        max_runs = _max_concurrent_runs()
+        gate = default_gate
+        admission = gate.try_acquire(max_runs)
+        if not admission.admitted:
+            resp = jsonify(
+                {
+                    "error": "Too many concurrent runs",
+                    "active_runs": admission.active_runs,
+                    "max_concurrent_runs": max_runs,
+                }
+            )
+            resp.status_code = 429
+            resp.headers["Retry-After"] = str(RETRY_AFTER_SECONDS)
+            return resp
+        if admission.token is None:
+            return f(*args, **kwargs)
+        try:
+            resp = current_app.make_response(f(*args, **kwargs))
+        except BaseException:
+            gate.release(admission.token)
+            raise
+        resp.call_on_close(lambda: gate.release(admission.token))
+        return resp
+
+    decorated._admits_runs = True
+    return decorated

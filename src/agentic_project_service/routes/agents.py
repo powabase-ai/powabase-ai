@@ -44,6 +44,7 @@ from ..auth import (
 from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
 from ..services.llm_availability import check_model_available
+from ..services.run_gate import admit_run
 from ..services.run_context import (
     reset_run_id,
     set_run_id,
@@ -1531,6 +1532,7 @@ def delete_session_for_agent(agent_id: str, session_id: str):
 
 @agents_bp.route("/<agent_id>/run", methods=["POST"])
 @require_user_auth
+@admit_run
 def run_agent(agent_id: str):
     """
     Run an agent (non-streaming).
@@ -1934,6 +1936,7 @@ def run_agent(agent_id: str):
 
 @agents_bp.route("/<agent_id>/run/stream", methods=["POST"])
 @require_user_auth
+@admit_run
 def run_agent_stream(agent_id: str):
     """
     Stream an agent's response using Server-Sent Events (SSE).

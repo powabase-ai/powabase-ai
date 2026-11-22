@@ -15,6 +15,7 @@ from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
 from ..services.llm_availability import check_model_available
 from ..services.rate_limit import rate_limit_executions
+from ..services.run_gate import admit_run
 from ..services.run_context import (
     reset_run_id,
     set_run_id,
@@ -509,6 +510,7 @@ def save_graph(workflow_id: str):
 @workflows_bp.route("/<workflow_id>/execute", methods=["POST"])
 @require_service_role
 @rate_limit_executions
+@admit_run
 def execute_workflow(workflow_id: str):
     """Execute a workflow synchronously and return the result."""
     data = request.get_json() or {}
@@ -700,6 +702,7 @@ def execute_workflow(workflow_id: str):
 @workflows_bp.route("/<workflow_id>/execute/stream", methods=["POST"])
 @require_service_role
 @rate_limit_executions
+@admit_run
 def execute_workflow_stream(workflow_id: str):
     """Execute a workflow with streaming (SSE)."""
     data = request.get_json() or {}
