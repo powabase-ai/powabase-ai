@@ -1359,8 +1359,9 @@ def create_session_for_agent(agent_id: str):
     (timestamps, name, tool_calls) is dropped, and every run is re-stamped with
     a fresh id and import-time timestamps. Top-level `metadata` (a JSON
     object, at most 16 KiB serialised) is stored on the session and returned by
-    the session list. Top-level `session_id` is not accepted: this endpoint
-    always creates.
+    the session list. It is caller-written and untrusted: an end user may set it
+    on their own session, so do not treat it as written by the backend.
+    Top-level `session_id` is not accepted: this endpoint always creates.
     """
     # agents.id is a uuid column: a non-uuid path segment would make the
     # existence check itself raise 22P02 and poison the transaction, so parse

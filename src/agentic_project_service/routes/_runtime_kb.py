@@ -82,8 +82,8 @@ def validate_runtime_knowledge_bases(
 ):
     """Validate and normalize ``runtime_knowledge_bases``. Returns (entries, error).
 
-    ``allowed_agent_ids`` is given on orchestration runs only: the canonical ids
-    of the orchestration's agent entities. An entry's ``agent_ids`` must name
+    ``allowed_agent_ids`` is given on orchestration runs only: the canonical
+    agent ids (``agents.id``) of the agents in the orchestration. An entry's ``agent_ids`` must name
     only those; on agent runs (``None``) the key is rejected.
     """
     raw = data.get("runtime_knowledge_bases")

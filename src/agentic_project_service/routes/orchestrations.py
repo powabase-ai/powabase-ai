@@ -992,8 +992,9 @@ def run_orchestration_stream(orch_id: str):
     before the stream opens if any id is malformed/unknown, any knob is out
     of range or the wrong type, any entry carries an unknown key (typos like
     `top_K` are rejected, not ignored), or the list exceeds 10 entries. An
-    entry may carry `agent_ids` (ids of this orchestration's agent entities;
-    any other id 400s): it then reaches only those sub-agents. Entries without
+    entry may carry `agent_ids` (the agent ids, i.e. `agents.id`, of agents in
+    this orchestration; any other id 400s): it then reaches only those
+    sub-agents. Entries without
     it reach every sub-agent. Combinable
     with the context fields; combined with the preload `knowledge_bases`
     field, BOTH retrievals run (no dedup) and the run's `context_handler_id`

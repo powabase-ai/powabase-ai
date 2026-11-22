@@ -51,15 +51,28 @@ def test_parse_session_metadata():
 
 @pytest.mark.parametrize(
     "bad",
-    [{"n": float("nan")}, {"n": float("inf")}, {"s": "a\u0000b"}, {"a\u0000": 1}],
+    [
+        {"n": float("nan")},
+        {"n": float("inf")},
+        {"s": "a\u0000b"},
+        {"a\u0000": 1},
+        {"s": "\ud800"},
+        {"\udfff": 1},
+    ],
 )
 def test_metadata_postgres_jsonb_cannot_store_is_rejected(bad):
-    """NaN/Infinity (Flask's parser accepts them) and NUL characters would
-    make the jsonb INSERT fail with a 500."""
+    """NaN/Infinity (Flask's parser accepts them), NUL characters and lone
+    surrogates would make the jsonb INSERT fail with a 500."""
     assert parse_session_metadata({"metadata": bad}) == (
         None,
-        "metadata must be JSON without NaN, Infinity or NUL characters",
+        "metadata must be JSON without NaN, Infinity, NUL characters or lone surrogates",
     )
+
+
+def test_a_lone_surrogate_in_a_request_body_is_400():
+    resp, create = _create(None, raw='{"metadata": {"s": "\\ud800"}}')
+    assert resp.status_code == 400
+    create.assert_not_called()
 
 
 def test_metadata_size_limit_is_on_serialised_bytes():
@@ -75,7 +88,7 @@ def test_metadata_size_limit_is_on_serialised_bytes():
     assert parse_session_metadata({"metadata": wide})[1] is not None
 
 
-def _create(body, auth=None):
+def _create(body, auth=None, raw=None):
     fake_session = MagicMock()
     fake_session.execute.return_value.fetchone.return_value = ("gpt-4o-mini",)
     with (
@@ -86,7 +99,15 @@ def _create(body, auth=None):
         auth or _service(),
         _app(agents_route.agents_bp).test_client() as c,
     ):
-        resp = c.post(f"/api/agents/{AGENT_ID}/sessions", json=body, headers=HEADERS)
+        if raw is not None:
+            resp = c.post(
+                f"/api/agents/{AGENT_ID}/sessions",
+                data=raw,
+                content_type="application/json",
+                headers=HEADERS,
+            )
+        else:
+            resp = c.post(f"/api/agents/{AGENT_ID}/sessions", json=body, headers=HEADERS)
     return resp, create
 
 
