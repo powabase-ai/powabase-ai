@@ -457,3 +457,37 @@ class TestLiveness:
             timeout=5,
         )
         assert ctx.get_approval_decision() == {"approved": True}
+
+
+class TestWhatIsForwarded:
+    def test_only_the_decision_fields_go_to_redis(self, connect, monkeypatch):
+        """The hook reads ``approved`` and ``reason``; nothing else is published."""
+        import json
+
+        monkeypatch.setattr(rr, "ACK_TIMEOUT_SECONDS", 0.2)
+        listener = connect().pubsub()
+        listener.subscribe(RunRegistry.channel("pod-a:1:aaaa"))
+        assert _wait_until(
+            lambda: (listener.get_message(timeout=0.05) or {}).get("type") == "subscribe"
+        )
+        b = _registry(connect, "pod-b:2:bbbb")
+        body = {"approved": True, "reason": "r" * 5000, "padding": "x" * 1_000_000}
+        b.deliver_remote("run_1", RemoteRun("pod-a:1:aaaa", None), body)
+        published = None
+        deadline = time.monotonic() + 3
+        while published is None and time.monotonic() < deadline:
+            message = listener.get_message(timeout=0.05)
+            if message is not None and message.get("type") == "message":
+                published = message
+        listener.close()
+        payload = json.loads(published["data"])
+        assert payload["decision"] == {"approved": True, "reason": "r" * rr.REASON_MAX_CHARS}
+        assert rr.REASON_MAX_CHARS == 2000
+
+    def test_a_decision_without_a_reason_stays_without_one(self):
+        assert rr.wire_decision({"approved": False, "extra": 1}) == {"approved": False}
+        assert rr.wire_decision({"approved": True, "reason": None}) == {"approved": True}
+        assert rr.wire_decision({"approved": True, "reason": 42}) == {
+            "approved": True,
+            "reason": "42",
+        }

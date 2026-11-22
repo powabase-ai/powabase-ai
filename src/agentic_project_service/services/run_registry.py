@@ -53,6 +53,8 @@ PONG_TIMEOUT_SECONDS = 3
 ACK_TIMEOUT_SECONDS = 3.0
 ACK_POLL_SECONDS = 0.02
 ACK_TTL_SECONDS = 30
+# The approval hook reads only ``approved`` and ``reason``.
+REASON_MAX_CHARS = 2000
 # How long one listener iteration waits for a message; also the most a new
 # registration waits before its owner hash is written.
 LOOP_TIMEOUT_SECONDS = 0.1
@@ -66,6 +68,19 @@ def _project_ref() -> str:
 
 def _text(value) -> str:
     return value.decode() if isinstance(value, bytes) else value
+
+
+def wire_decision(decision: dict) -> dict:
+    """The part of an approval body the approval hook reads, bounded in size.
+
+    Only this goes to Redis: the request body is otherwise unbounded, and a
+    large publish on the shared Redis could make it drop the subscriber.
+    """
+    wire = {"approved": bool(decision.get("approved"))}
+    reason = decision.get("reason")
+    if reason is not None:
+        wire["reason"] = str(reason)[:REASON_MAX_CHARS]
+    return wire
 
 
 @dataclass(frozen=True)
@@ -211,7 +226,7 @@ class RunRegistry:
         if client is None:
             return False
         token = uuid.uuid4().hex
-        payload = json.dumps({"run_id": run_id, "decision": decision, "ack": token})
+        payload = json.dumps({"run_id": run_id, "decision": wire_decision(decision), "ack": token})
         try:
             if not client.publish(self.channel(remote.instance), payload):
                 return False
