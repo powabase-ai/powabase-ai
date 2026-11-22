@@ -108,6 +108,7 @@ from ..services.ai_provider_keys_resolver import (
     resolve_api_key_or_raise_for_drop,
 )
 from ._runtime_kb import validate_runtime_knowledge_bases
+from ._session_metadata import parse_session_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -1227,12 +1228,13 @@ def list_sessions(agent_id: str):
                      WHERE first_run.session_id = s.id
                      ORDER BY first_run.created_at ASC
                      LIMIT 1
-                   ) as first_message
+                   ) as first_message,
+                   s.metadata as metadata
             FROM "{AI_SCHEMA}".agent_sessions s
             LEFT JOIN "{AI_SCHEMA}".agent_runs r ON r.session_id = s.id
             WHERE s.agent_id = :agent_id
             {extra_where}
-            GROUP BY s.id, s.session_id, s.created_at
+            GROUP BY s.id, s.session_id, s.created_at, s.metadata
             {having_sql}
             ORDER BY last_activity_at DESC NULLS LAST
             LIMIT :limit OFFSET :offset
@@ -1249,6 +1251,7 @@ def list_sessions(agent_id: str):
                 "last_activity_at": row[2].isoformat() if row[2] else None,
                 "created_at": row[3].isoformat() if row[3] else None,
                 "first_message": row[4],
+                "metadata": row[5] or {},
             }
         )
 
@@ -1344,8 +1347,10 @@ def create_session_for_agent(agent_id: str):
 
     Seed messages keep `role` and `content` only — anything else on a message
     (timestamps, name, tool_calls) is dropped, and every run is re-stamped with
-    a fresh id and import-time timestamps. Top-level `session_id` and
-    `metadata` are not accepted: this endpoint always creates.
+    a fresh id and import-time timestamps. Top-level `metadata` (a JSON
+    object, at most 16 KiB serialised) is stored on the session and returned by
+    the session list. Top-level `session_id` is not accepted: this endpoint
+    always creates.
     """
     # agents.id is a uuid column: a non-uuid path segment would make the
     # existence check itself raise 22P02 and poison the transaction, so parse
@@ -1399,6 +1404,10 @@ def create_session_for_agent(agent_id: str):
     if invalid:
         return jsonify({"error": invalid}), 400
 
+    metadata, metadata_error = parse_session_metadata(data)
+    if metadata_error:
+        return jsonify({"error": metadata_error}), 400
+
     # An import or handoff is performed *for* a user by a service-role caller
     # whose own JWT `sub` is not that user — and, for a service token, is not a
     # uuid at all, so it can never stand in as the owner of a column that is
@@ -1445,11 +1454,10 @@ def create_session_for_agent(agent_id: str):
     if not agent_row:
         return jsonify({"error": "Agent not found"}), 404
 
-    db_session_uuid, session_id, _ = get_or_create_session(
-        db_session=db.session,
-        agent_id=agent_id,
-        user_id=user_id,
-    )
+    create_kwargs = {"db_session": db.session, "agent_id": agent_id, "user_id": user_id}
+    if metadata is not None:
+        create_kwargs["metadata"] = metadata
+    db_session_uuid, session_id, _ = get_or_create_session(**create_kwargs)
     if initial:
         seed_session_runs(
             db.session, db_session_uuid, initial, agent_id=agent_id, model=agent_row[0]
