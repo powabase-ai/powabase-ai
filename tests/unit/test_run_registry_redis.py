@@ -506,3 +506,55 @@ class TestWhatIsForwarded:
             "approved": True,
             "reason": "42",
         }
+
+
+class TestOwnerHashWriteFailures:
+    """A failing hash write (OOM under noeviction) is not a dead subscription."""
+
+    def test_a_failing_write_keeps_the_subscription_and_is_retried(
+        self, connect, monkeypatch, caplog
+    ):
+        import json
+
+        a = _registry(connect, "pod-a:1:aaaa")
+        ctx = ExecutionContext(execution_id="run_1")
+        ctx.reset_approval()
+        a.register("run_1", ctx)
+        real_pipeline = a._client.pipeline
+
+        def oom_pipeline(*args, **kwargs):
+            pipe = real_pipeline(*args, **kwargs)
+            pipe.execute = MagicMock(
+                side_effect=redis.ResponseError(
+                    "OOM command not allowed when used memory > 'maxmemory'."
+                )
+            )
+            return pipe
+
+        monkeypatch.setattr(a._client, "pipeline", oom_pipeline)
+        with caplog.at_level("WARNING", logger=rr.logger.name):
+            for _ in range(5):
+                a.step(timeout=0.01)
+                a._write_retry_at = 0.0  # skip the retry delay
+        pubsub = a._pubsub
+        assert pubsub is not None
+        assert a._subscribed.is_set()
+        assert not connect().exists("runs:owner:ref-a:run_1")
+        warnings = [r for r in caplog.records if r.name == rr.logger.name]
+        assert len(warnings) == 1  # rate-limited
+        assert "owner" in warnings[0].getMessage()
+
+        # The subscription still carries decisions.
+        connect().publish(
+            a.channel("pod-a:1:aaaa"),
+            json.dumps({"run_id": "run_1", "decision": {"approved": True}}),
+        )
+        assert a.step(timeout=1.0) is True
+        assert a._pubsub is pubsub
+
+        # Once Redis accepts writes again, the pending hash is written.
+        monkeypatch.setattr(a._client, "pipeline", real_pipeline)
+        a._write_retry_at = 0.0
+        a.step(timeout=0.01)
+        assert connect().exists("runs:owner:ref-a:run_1")
+        assert a._pubsub is pubsub

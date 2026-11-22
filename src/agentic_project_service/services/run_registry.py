@@ -61,6 +61,10 @@ REASON_MAX_CHARS = 2000
 LOOP_TIMEOUT_SECONDS = 0.1
 RESUBSCRIBE_BACKOFF_SECONDS = 1.0
 MAX_RESUBSCRIBE_BACKOFF_SECONDS = 30.0
+# A failed owner-hash write (e.g. OOM under noeviction) is retried after this
+# delay and warned about at most once per WRITE_WARNING_INTERVAL_SECONDS.
+WRITE_RETRY_SECONDS = 1.0
+WRITE_WARNING_INTERVAL_SECONDS = 60.0
 
 
 def _project_ref() -> str:
@@ -121,6 +125,8 @@ class RunRegistry:
         self._retry_at = 0.0
         self._last_pong = 0.0
         self._ping_sent_at: float | None = None
+        self._write_retry_at = 0.0
+        self._write_warned_at: float | None = None
         self._thread: threading.Thread | None = None
         self._thread_lock = threading.Lock()
         self._stopped = threading.Event()
@@ -275,7 +281,8 @@ class RunRegistry:
         hashes, then wait up to ``timeout`` for one forwarded decision.
 
         Returns True iff a forwarded decision resumed a local run. Never raises:
-        a Redis failure drops the subscription and schedules a resubscribe.
+        a failure of the subscription (connect, subscribe, PING, read) drops it and
+        schedules a resubscribe; a failed owner-hash write is only retried.
         """
         timeout = LOOP_TIMEOUT_SECONDS if timeout is None else timeout
         if self._pubsub is None:
@@ -334,6 +341,14 @@ class RunRegistry:
         self._subscribed.set()
 
     def _flush(self) -> None:
+        """Write pending owner hashes and deletes.
+
+        A failure here is a command-side problem (Redis out of memory, a
+        command connection reset), not a dead subscription: the changes stay
+        pending and are retried, and the subscription keeps carrying decisions.
+        """
+        if time.monotonic() < self._write_retry_at:
+            return
         with self._lock:
             dirty = {
                 run_id: self._owners.get(run_id) for run_id in self._dirty if run_id in self._runs
@@ -355,7 +370,22 @@ class RunRegistry:
         except Exception:
             with self._lock:
                 self._dirty.update(run_id for run_id in dirty if run_id in self._runs)
-            raise
+                self._removed.update(removed)
+            self._write_retry_at = time.monotonic() + WRITE_RETRY_SECONDS
+            now = time.monotonic()
+            if (
+                self._write_warned_at is None
+                or now - self._write_warned_at >= WRITE_WARNING_INTERVAL_SECONDS
+            ):
+                self._write_warned_at = now
+                logger.warning(
+                    "Run registry: could not write run owner hashes; retrying (warned at "
+                    "most every %.0fs)",
+                    WRITE_WARNING_INTERVAL_SECONDS,
+                    exc_info=True,
+                )
+            else:
+                logger.debug("Run registry: owner hash write failed again", exc_info=True)
 
     def _heartbeat(self) -> None:
         """PING the subscription; a PONG that does not come means it is dead.
