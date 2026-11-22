@@ -148,7 +148,8 @@ class TestOwnerHash:
         assert a.step() is False  # fails open, schedules a resubscribe
         assert a.context("run_1") is ctx
         assert a.owner("run_1") == "user-1"
-        assert a.lookup_remote("run_1") is None
+        with pytest.raises(rr.RegistryUnavailable):
+            a.lookup_remote("run_1")  # Redis cannot say: not the same as "no such run"
         a.unregister("run_1")
         assert a.context("run_1") is None
 
@@ -296,10 +297,21 @@ class TestForwarding:
             == Delivery.GONE
         )
 
-    def test_redis_down_delivery_is_false(self):
+    def test_redis_down_delivery_is_unavailable_not_gone(self):
         b = RunRegistry(redis_client=_broken_client(), instance="pod-b", start_thread=False)
         assert (
-            b.deliver_remote("run_1", RemoteRun("pod-a", None), {"approved": True}) == Delivery.GONE
+            b.deliver_remote("run_1", RemoteRun("pod-a", None), {"approved": True})
+            == Delivery.UNAVAILABLE
+        )
+
+    def test_an_ack_read_error_after_the_publish_is_unconfirmed(self, connect, monkeypatch):
+        """Once published, the run may resume: never report it unavailable."""
+        b = _registry(connect, "pod-b:2:bbbb")
+        monkeypatch.setattr(b._client, "publish", lambda channel, payload: 1)
+        monkeypatch.setattr(b._client, "get", MagicMock(side_effect=redis.ConnectionError("down")))
+        assert (
+            b.deliver_remote("run_1", RemoteRun("pod-a", None), {"approved": True})
+            == Delivery.UNCONFIRMED
         )
 
     def test_redis_down_listener_thread_keeps_retrying(self, monkeypatch):

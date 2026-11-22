@@ -100,9 +100,14 @@ def wire_decision(decision: dict) -> dict:
 class Delivery(enum.Enum):
     """What became of a decision forwarded to another process."""
 
-    RESUMED = "resumed"  # the owner resumed the run
-    GONE = "gone"  # nothing to resume: no listener, run ended, or not sent
+    RESUMED = "resumed"  # the owner handed the decision to the run
+    GONE = "gone"  # nothing to resume: no listener, or the owner no longer has the run
     UNCONFIRMED = "unconfirmed"  # sent, but the owner never confirmed it
+    UNAVAILABLE = "unavailable"  # not sent: Redis did not take the publish
+
+
+class RegistryUnavailable(Exception):
+    """Redis could not say who owns a run: not the same as "no such run"."""
 
 
 @dataclass(frozen=True)
@@ -249,17 +254,23 @@ class RunRegistry:
     # -- the approving process -------------------------------------------------
 
     def lookup_remote(self, run_id: str) -> RemoteRun | None:
-        """The process that owns ``run_id`` according to Redis, or None."""
+        """The process that owns ``run_id`` according to Redis, or None when
+        no process does (or no Redis is configured: approvals are then
+        process-local).
+
+        Raises:
+            RegistryUnavailable: Redis did not answer.
+        """
         client = self._redis()
         if client is None:
             return None
         try:
             data = client.hgetall(self.owner_key(run_id))
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "Run registry: could not read the owner of run %s", run_id, exc_info=True
             )
-            return None
+            raise RegistryUnavailable(f"could not read the owner of run {run_id}") from exc
         fields = {_text(k): _text(v) for k, v in (data or {}).items()}
         if not fields.get("instance"):
             return None
@@ -268,16 +279,19 @@ class RunRegistry:
     def deliver_remote(self, run_id: str, remote: RemoteRun, decision: dict) -> Delivery:
         """Forward ``decision`` to the owning process.
 
-        RESUMED when the owner acknowledged that it resumed the run. GONE when
-        nothing was delivered: no process listens on the owner's channel, the
-        owner no longer has the run, or the publish failed. UNCONFIRMED when the
-        decision was published but no acknowledgement arrived within
-        ACK_TIMEOUT_SECONDS (a listener whose connection died without Redis
-        noticing, or one that resumed the run but could not say so).
+        RESUMED when the owner acknowledged that it handed the decision to the
+        run (it holds the run's context; whether the run was at an approval
+        gate is the hook's business, as on the local path). GONE when nothing
+        was delivered: no process listens on the owner's channel, or the owner
+        no longer has the run. UNAVAILABLE when the publish itself failed.
+        UNCONFIRMED when the decision was published but no acknowledgement
+        arrived within ACK_TIMEOUT_SECONDS (a listener whose connection died
+        without Redis noticing, or one that resumed the run but could not say
+        so, or an acknowledgement that could not be read).
         """
         client = self._redis()
         if client is None:
-            return Delivery.GONE
+            return Delivery.UNAVAILABLE
         token = uuid.uuid4().hex
         payload = json.dumps({"run_id": run_id, "decision": wire_decision(decision), "ack": token})
         try:
@@ -287,7 +301,7 @@ class RunRegistry:
             logger.warning(
                 "Run registry: could not forward the approval of run %s", run_id, exc_info=True
             )
-            return Delivery.GONE
+            return Delivery.UNAVAILABLE
         deadline = time.monotonic() + ACK_TIMEOUT_SECONDS
         while True:
             try:

@@ -2,7 +2,7 @@
 
 import os
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import fakeredis
 import pytest
@@ -12,7 +12,12 @@ from flask import Flask
 
 from agentic_project_service.routes import agents as agents_route
 from agentic_project_service.services import run_registry
-from agentic_project_service.services.run_registry import Delivery, RemoteRun, RunRegistry
+from agentic_project_service.services.run_registry import (
+    Delivery,
+    RegistryUnavailable,
+    RemoteRun,
+    RunRegistry,
+)
 
 _REAL_REDIS_URL = os.getenv("TEST_REDIS_URL")
 
@@ -116,7 +121,15 @@ def test_owner_process_gone_is_404():
         assert _post().status_code == 404
 
 
-def test_an_unconfirmed_delivery_is_a_distinct_404():
+UNCONFIRMED_BODY = {
+    "status": "unconfirmed",
+    "message": "The decision was sent but the run has not confirmed it yet; "
+    "check the run before retrying.",
+}
+
+
+def test_an_unconfirmed_delivery_is_202_not_404():
+    """The run may have resumed: a 404 would tell a client it is gone."""
     with (
         _not_local(),
         _remote(USER),
@@ -124,12 +137,74 @@ def test_an_unconfirmed_delivery_is_a_distinct_404():
         _as_user(),
     ):
         resp = _post()
-    assert resp.status_code == 404
-    assert resp.get_json() == {
-        "error": "approval_unconfirmed",
-        "message": "The decision was sent but the run did not confirm it; "
-        "check the run before retrying.",
-    }
+    assert resp.status_code == 202
+    assert resp.get_json() == UNCONFIRMED_BODY
+
+
+def _assert_unavailable(resp):
+    assert resp.status_code == 503
+    assert resp.headers["Retry-After"] == "2"
+    assert resp.get_json() == {"error": "approvals_unavailable"}
+
+
+def test_a_redis_error_on_the_owner_lookup_is_503_with_retry_after():
+    with (
+        _not_local(),
+        patch.object(
+            agents_route, "lookup_remote_run", side_effect=RegistryUnavailable("hgetall failed")
+        ),
+        patch.object(agents_route, "deliver_approval") as deliver,
+        _as_user(),
+    ):
+        _assert_unavailable(_post())
+    deliver.assert_not_called()
+
+
+def test_a_redis_error_on_the_publish_is_503_with_retry_after():
+    with (
+        _not_local(),
+        _remote(USER),
+        patch.object(agents_route, "deliver_approval", return_value=Delivery.UNAVAILABLE),
+        _as_user(),
+    ):
+        _assert_unavailable(_post())
+
+
+def test_the_ownership_check_still_comes_before_the_publish():
+    """Another user's run is 404 even though the publish would fail."""
+    with (
+        _not_local(),
+        _remote(OTHER),
+        patch.object(agents_route, "deliver_approval", return_value=Delivery.UNAVAILABLE),
+        _as_user(),
+    ):
+        assert _post().status_code == 404
+
+
+def test_a_broken_redis_end_to_end_is_503_not_404():
+    """The registry itself, on a Redis that refuses every command."""
+    broken = MagicMock()
+    broken.hgetall.side_effect = redis.ConnectionError("down")
+    registry = RunRegistry(redis_client=broken, instance="pod-b", start_thread=False)
+    with (
+        patch.object(agents_route, "get_active_run_context", registry.context),
+        patch.object(agents_route, "lookup_remote_run", registry.lookup_remote),
+        patch.object(agents_route, "deliver_approval", registry.deliver_remote),
+        _as_user(),
+    ):
+        _assert_unavailable(_post())
+
+    found = MagicMock()
+    found.hgetall.return_value = {b"instance": b"pod-a", b"owner": USER.encode()}
+    found.publish.side_effect = redis.ConnectionError("down")
+    registry = RunRegistry(redis_client=found, instance="pod-b", start_thread=False)
+    with (
+        patch.object(agents_route, "get_active_run_context", registry.context),
+        patch.object(agents_route, "lookup_remote_run", registry.lookup_remote),
+        patch.object(agents_route, "deliver_approval", registry.deliver_remote),
+        _as_user(),
+    ):
+        _assert_unavailable(_post())
 
 
 def test_a_gone_owner_keeps_the_plain_404_body():
@@ -212,7 +287,7 @@ def test_end_to_end_across_two_registries(two_processes):
     assert ctx.get_approval_decision() == {"approved": False, "reason": "no"}
 
 
-def test_a_dead_owner_listener_is_404_until_it_reconnects(two_processes, monkeypatch):
+def test_a_dead_owner_listener_is_202_unconfirmed_until_it_reconnects(two_processes, monkeypatch):
     for name, value in (
         ("HEARTBEAT_SECONDS", 0.2),
         ("PONG_TIMEOUT_SECONDS", 0.3),
@@ -225,8 +300,8 @@ def test_a_dead_owner_listener_is_404_until_it_reconnects(two_processes, monkeyp
     a._pubsub = deaf  # the connection died without Redis or the listener noticing
     time.sleep(0.15)
     resp = _post()
-    assert resp.status_code == 404
-    assert resp.get_json()["error"] == "approval_unconfirmed"
+    assert resp.status_code == 202
+    assert resp.get_json() == UNCONFIRMED_BODY
     assert ctx.get_approval_decision() is None
     assert _wait_until(lambda: a._pubsub not in (None, deaf) and a._subscribed.is_set())
     assert _post().status_code == 200

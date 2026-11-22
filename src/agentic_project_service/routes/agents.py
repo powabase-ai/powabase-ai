@@ -97,6 +97,7 @@ from ..services import agent_sql, tool_registry
 from ..services.tool_caller import ToolCaller
 from ..services.run_registry import (
     Delivery,
+    RegistryUnavailable,
     deliver_approval,
     get_active_run_context,
     get_active_run_owner,
@@ -3226,21 +3227,46 @@ def run_agent_stream(agent_id: str):
     )
 
 
+_APPROVAL_UNCONFIRMED = {
+    "status": "unconfirmed",
+    "message": "The decision was sent but the run has not confirmed it yet; "
+    "check the run before retrying.",
+}
+
+
+def _approvals_unavailable():
+    resp = jsonify({"error": "approvals_unavailable"})
+    resp.status_code = 503
+    resp.headers["Retry-After"] = "2"
+    return resp
+
+
 @agents_bp.route("/runs/<run_id>/approve", methods=["POST"])
 @require_user_auth
 def approve_run(run_id: str):
     """Resume a paused ReAct run by supplying an approval decision.
 
-    The run must be waiting for a human-in-the-loop approval in some
-    project-api process of this project; a run held by another gunicorn worker
-    or replica is resumed through Redis, and the answer is 200 only once that
-    process confirms it resumed the run.
+    The run must be in progress in some project-api process of this project; a
+    run held by another gunicorn worker or replica is reached through Redis.
 
-    404 ``{"error": "Run not found or not waiting for approval"}``: no such
-    run is waiting (or it is not the caller's). 404 ``{"error":
-    "approval_unconfirmed", ...}``: the decision was sent to the owning process
-    but it did not confirm within a few seconds, so the run may or may not have
-    resumed; check the run before retrying.
+    * 200 ``{"status": "resumed"}``: the process running the run handed it
+      the decision. As on a single process, that means the process holds the
+      run, not that the run was waiting at an approval gate (a decision for a
+      run that is not at a gate is dropped when it reaches its next one).
+    * 202 ``{"status": "unconfirmed", "message": ...}``: the decision was sent
+      to the process running the run, but it did not confirm within a few
+      seconds. The run may or may not have resumed; check the run before
+      retrying.
+    * 404 ``{"error": "Run not found or not waiting for approval"}``: no
+      process of this project has the run (it never existed, it ended, or its
+      process is gone), or it is not the caller's.
+    * 503 ``{"error": "approvals_unavailable"}`` with ``Retry-After: 2``:
+      Redis could not say which process has the run, or could not take the
+      decision. Nothing was sent; retrying is safe.
+
+    Reaching another process can take up to about 6 s when Redis is slow (a
+    bounded owner lookup and publish, then up to 3 s for the confirmation),
+    and holds a request thread for that time.
     """
     data = request.get_json(silent=True)
     if not data or "approved" not in data:
@@ -3253,7 +3279,10 @@ def approve_run(run_id: str):
         owner = get_active_run_owner(run_id)
     else:
         # Another gunicorn worker or replica may hold the run; Redis says which.
-        remote = lookup_remote_run(run_id)
+        try:
+            remote = lookup_remote_run(run_id)
+        except RegistryUnavailable:
+            return _approvals_unavailable()
         if remote is None:
             return jsonify({"error": "Run not found or not waiting for approval"}), 404
         owner = remote.owner_user_id
@@ -3266,14 +3295,10 @@ def approve_run(run_id: str):
         context.set_approval_decision(data)
         return jsonify({"status": "resumed"})
     delivery = deliver_approval(run_id, remote, data)
+    if delivery is Delivery.UNAVAILABLE:
+        return _approvals_unavailable()
     if delivery is Delivery.UNCONFIRMED:
-        return jsonify(
-            {
-                "error": "approval_unconfirmed",
-                "message": "The decision was sent but the run did not confirm it; "
-                "check the run before retrying.",
-            }
-        ), 404
+        return jsonify(_APPROVAL_UNCONFIRMED), 202
     if delivery is not Delivery.RESUMED:
         # The owning process is gone (restart, scale-down) or the run ended.
         return jsonify({"error": "Run not found or not waiting for approval"}), 404
