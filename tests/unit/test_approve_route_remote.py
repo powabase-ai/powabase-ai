@@ -141,6 +141,7 @@ def test_end_to_end_across_two_registries():
     ctx = ExecutionContext(execution_id="run_1")
     ctx.reset_approval()
     a.register("run_1", ctx, owner_user_id=USER)
+    a.step(timeout=0)  # subscribe, then write the owner hash
     try:
         with (
             patch.object(agents_route, "get_active_run_context", b.context),
@@ -151,7 +152,7 @@ def test_end_to_end_across_two_registries():
         ):
             resp = _post(body={"approved": False, "reason": "no"})
         assert resp.status_code == 200
-        assert a.poll_once(timeout=1.0) is True
+        assert a.step(timeout=1.0) is True
         assert ctx.get_approval_decision() == {"approved": False, "reason": "no"}
     finally:
         a.close()

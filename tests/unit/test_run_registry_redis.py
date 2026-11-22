@@ -66,6 +66,15 @@ def _registry(connect, name, start_thread=False):
     return registry
 
 
+def _settle(registry):
+    """Drive a thread-less registry until its Redis side has caught up."""
+    for _ in range(50):
+        registry.step(timeout=0.01)
+        if registry._subscribed.is_set() and not registry._dirty and not registry._removed:
+            return
+    raise AssertionError("registry did not settle")
+
+
 def _broken_client():
     broken = MagicMock()
     for name in ("hset", "expire", "delete", "hgetall", "pubsub", "publish", "pipeline"):
@@ -77,6 +86,7 @@ class TestOwnerHash:
     def test_register_records_instance_and_owner_with_ttl(self, connect):
         a = _registry(connect, "pod-a:1:aaaa")
         a.register("run_1", ExecutionContext(execution_id="run_1"), owner_user_id="user-1")
+        _settle(a)
         r = connect()
         assert r.hgetall("runs:owner:ref-a:run_1") == {
             b"instance": b"pod-a:1:aaaa",
@@ -87,19 +97,25 @@ class TestOwnerHash:
     def test_unregister_deletes_the_hash_and_the_local_context(self, connect):
         a = _registry(connect, "pod-a:1:aaaa")
         a.register("run_1", ExecutionContext(execution_id="run_1"))
+        _settle(a)
+        assert connect().exists("runs:owner:ref-a:run_1")
         a.unregister("run_1")
+        _settle(a)
         assert not connect().exists("runs:owner:ref-a:run_1")
         assert a.context("run_1") is None
 
     def test_another_registry_finds_the_owner(self, connect):
         a = _registry(connect, "pod-a:1:aaaa")
         a.register("run_1", ExecutionContext(execution_id="run_1"), owner_user_id=None)
+        _settle(a)
         b = _registry(connect, "pod-b:2:bbbb")
         assert b.lookup_remote("run_1") == RemoteRun(instance="pod-a:1:aaaa", owner_user_id=None)
         assert b.lookup_remote("run_missing") is None
 
     def test_keys_are_project_scoped(self, connect, monkeypatch):
-        _registry(connect, "pod-a").register("run_1", ExecutionContext(execution_id="run_1"))
+        a = _registry(connect, "pod-a")
+        a.register("run_1", ExecutionContext(execution_id="run_1"))
+        _settle(a)
         monkeypatch.setenv("PROJECT_REF", "ref-b")
         assert _registry(connect, "pod-b").lookup_remote("run_1") is None
 
@@ -107,6 +123,7 @@ class TestOwnerHash:
         a = RunRegistry(redis_client=_broken_client(), instance="pod-a", start_thread=False)
         ctx = ExecutionContext(execution_id="run_1")
         a.register("run_1", ctx, owner_user_id="user-1")
+        assert a.step() is False  # fails open, schedules a resubscribe
         assert a.context("run_1") is ctx
         assert a.owner("run_1") == "user-1"
         assert a.lookup_remote("run_1") is None
@@ -159,10 +176,11 @@ class TestForwarding:
         b = _registry(connect, "pod-b:2:bbbb")
         ctx = self._waiting_context("run_1")
         a.register("run_1", ctx, owner_user_id="user-1")
+        _settle(a)
 
         remote = b.lookup_remote("run_1")
         assert b.deliver_remote("run_1", remote, {"approved": True}) is True
-        assert a.poll_once(timeout=1.0) is True
+        assert a.step(timeout=1.0) is True
         assert ctx.get_approval_decision() == {"approved": True}
         assert ctx.get_approval_event().is_set()
 
@@ -171,6 +189,7 @@ class TestForwarding:
         b = _registry(connect, "pod-b:2:bbbb")
         ctx = self._waiting_context("run_1")
         a.register("run_1", ctx)
+        assert _wait_until(lambda: b.lookup_remote("run_1") is not None)
         assert b.deliver_remote("run_1", b.lookup_remote("run_1"), {"approved": False}) is True
         assert ctx.get_approval_event().wait(timeout=3.0)
         assert ctx.get_approval_decision() == {"approved": False}
@@ -184,28 +203,45 @@ class TestForwarding:
         a = _registry(connect, "pod-a:1:aaaa")
         b = _registry(connect, "pod-b:2:bbbb")
         a.register("run_1", self._waiting_context("run_1"))
+        _settle(a)
         a.unregister("run_1")
+        _settle(a)
         late = RemoteRun(instance="pod-a:1:aaaa", owner_user_id=None)
         assert b.deliver_remote("run_1", late, {"approved": True}) is True  # a still listens
-        assert a.poll_once(timeout=0.3) is False
+        assert a.step(timeout=0.3) is False
 
     def test_a_malformed_message_is_ignored(self, connect):
         a = _registry(connect, "pod-a:1:aaaa")
         ctx = self._waiting_context("run_1")
         a.register("run_1", ctx)
+        _settle(a)
         connect().publish(a.channel("pod-a:1:aaaa"), "not json")
-        assert a.poll_once(timeout=0.3) is False
+        assert a.step(timeout=0.3) is False
         assert ctx.get_approval_decision() is None
 
     def test_subscription_exists_before_the_owner_hash(self, connect):
         """No window where another process sees the owner but nobody listens."""
         a = _registry(connect, "pod-a:1:aaaa")
         a.register("run_1", self._waiting_context("run_1"))
+        _settle(a)
         assert connect().publish(a.channel("pod-a:1:aaaa"), "probe") == 1
+
+    def test_no_subscription_means_no_owner_hash(self, connect, monkeypatch):
+        a = _registry(connect, "pod-a:1:aaaa")
+        a.register("run_1", self._waiting_context("run_1"))
+        monkeypatch.setattr(a, "_connect", MagicMock(side_effect=redis.ConnectionError("down")))
+        assert a.step() is False
+        assert not connect().exists("runs:owner:ref-a:run_1")
+        monkeypatch.undo()
+        monkeypatch.setenv("PROJECT_REF", "ref-a")
+        a._retry_at = 0.0
+        _settle(a)
+        assert connect().exists("runs:owner:ref-a:run_1")
 
     def test_channels_are_project_scoped(self, connect, monkeypatch):
         a = _registry(connect, "pod-a:1:aaaa")
         a.register("run_1", self._waiting_context("run_1"))
+        _settle(a)
         monkeypatch.setenv("PROJECT_REF", "ref-b")
         b = _registry(connect, "pod-b:2:bbbb")
         assert (
@@ -228,6 +264,7 @@ class TestForwarding:
     def test_close_stops_listening(self, connect):
         a = _registry(connect, "pod-a:1:aaaa", start_thread=True)
         a.register("run_1", self._waiting_context("run_1"))
+        assert _wait_until(a._subscribed.is_set)
         a.close()
         assert connect().publish(a.channel("pod-a:1:aaaa"), "probe") == 0
 
@@ -239,3 +276,53 @@ def test_module_functions_keep_their_contract():
     assert rr.get_active_run_owner("run_mod") == "user-1"
     rr.unregister_run("run_mod")
     assert rr.get_active_run_context("run_mod") is None
+
+
+class _SleepingRedis:
+    """A Redis that hangs on every call (a blackhole with a 2 s socket timeout)."""
+
+    def __init__(self, seconds=2.0):
+        self.seconds = seconds
+
+    def __getattr__(self, name):
+        def call(*args, **kwargs):
+            time.sleep(self.seconds)
+            raise redis.TimeoutError(f"{name} timed out")
+
+        return call
+
+
+class TestNeverWaitsForRedis:
+    """Run start and end sit on the request path: they must not wait on Redis."""
+
+    def test_register_and_unregister_return_immediately(self):
+        a = RunRegistry(redis_client=_SleepingRedis(), instance="pod-a")
+        _open.append(a)
+        ctx = ExecutionContext(execution_id="run_1")
+        started = time.monotonic()
+        a.register("run_1", ctx, owner_user_id="user-1")
+        assert time.monotonic() - started < 0.05
+        assert a.context("run_1") is ctx
+        started = time.monotonic()
+        a.unregister("run_1")
+        assert time.monotonic() - started < 0.05
+        assert a.context("run_1") is None
+
+    def test_concurrent_registers_do_not_queue_behind_redis(self):
+        import threading
+
+        a = RunRegistry(redis_client=_SleepingRedis(), instance="pod-a")
+        _open.append(a)
+        took = {}
+
+        def go(i):
+            started = time.monotonic()
+            a.register(f"run_{i}", ExecutionContext(execution_id=f"run_{i}"))
+            took[i] = time.monotonic() - started
+
+        threads = [threading.Thread(target=go, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert max(took.values()) < 0.05
