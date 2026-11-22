@@ -47,7 +47,8 @@ from ..services import billing_port as billing
 from ..services.ai_provider_keys_resolver import ProviderKeyDecryptDropped
 from ..services.context_handler import resolve_tool_call_image_refs
 from ..services.llm_availability import check_model_available
-from ..services.run_gate import admit_run
+from ..services.run_gate import admit_run, current_slot
+from ..services.run_lifetime import RunLifetime
 from ..services.run_context import (
     reset_run_id,
     set_run_id,
@@ -1063,6 +1064,10 @@ def run_orchestration_stream(orch_id: str):
         for sub_agent_model in _load_sub_agent_models(orch_id):
             check_model_available(sub_agent_model)
 
+    # The run's gate slot and liveness record last until the orchestration
+    # worker ends, which after a client disconnect is later than the response.
+    run_life = RunLifetime(current_slot())
+
     def generate_sse():
         run_id = None
         abort_event = threading.Event()
@@ -1168,6 +1173,8 @@ def run_orchestration_stream(orch_id: str):
                 reasoning_requested=reasoning_requested_flag,
             )
             db.session.commit()
+            # Alive while this record exists: the stale-run cleanup skips it.
+            run_life.mark_live(run_id)
             start_event = {
                 "event": "start",
                 "run_id": run_id,
@@ -1285,6 +1292,7 @@ def run_orchestration_stream(orch_id: str):
                 finally:
                     reset_run_id(_orch_run_id_token)
                     event_queue.put(None)  # sentinel to signal completion
+                    worker_let_go()
 
             # Propagate Flask before_request contextvars (current_byok_providers,
             # byok_lookup_degraded, run_id_var, etc.) into the worker
@@ -1298,6 +1306,9 @@ def run_orchestration_stream(orch_id: str):
             # Same pattern as agentic.agent.agent + agentic.orchestration.
             # strategies which already use copy_context().run.
             _captured_ctx = contextvars.copy_context()
+            # After a disconnect the worker runs on until it sees the abort
+            # signal; it holds the gate slot and the liveness record until then.
+            worker_let_go = run_life.carry_on()
             worker = threading.Thread(
                 target=lambda: _captured_ctx.run(run_orchestration), daemon=True
             )
@@ -1496,6 +1507,8 @@ def run_orchestration_stream(orch_id: str):
             except Exception:
                 logger.exception("Failed to persist orchestration error")
             yield f"data: {json.dumps({'event': 'error', 'error': error_msg})}\n\n"
+        finally:
+            run_life.end()
 
     return Response(stream_with_context(generate_sse()), mimetype="text/event-stream")
 

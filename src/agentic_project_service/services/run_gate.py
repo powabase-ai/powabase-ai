@@ -24,10 +24,11 @@ import uuid
 from dataclasses import dataclass
 from functools import partial, wraps
 
-from flask import current_app, jsonify
+from flask import current_app, g, has_app_context, jsonify
 
 from .broker_redis import broker_client
 from .extraction_gate import _REDIS_NOW
+from .run_lifetime import NO_RELEASE, SharedRelease
 from .settings_registry import get_setting
 
 logger = logging.getLogger(__name__)
@@ -270,6 +271,17 @@ class RunGate:
 default_gate = RunGate()
 
 
+def current_slot() -> SharedRelease:
+    """The MAX_CONCURRENT_RUNS slot of the current request, for a view whose
+    run carries on after its response: ``hold()`` it before handing the run to
+    a thread, and call the returned callable when the run ends. Outside a
+    gated request (gate off, fail-open, no request) holding it does nothing.
+    Capture it in the view body: a streaming generator may run without ``g``."""
+    if not has_app_context():
+        return NO_RELEASE
+    return g.get("run_slot", NO_RELEASE)
+
+
 def _max_concurrent_runs() -> int:
     try:
         return int(get_setting("MAX_CONCURRENT_RUNS") or 0)
@@ -305,7 +317,8 @@ def admit_run(f):
     caller is answered first and takes no slot, and the 429 comes before the
     view's balance check and before any SSE response exists. The slot is freed
     when the response is closed (end of stream or client disconnect) or when
-    the view raises.
+    the view raises, unless the view handed the run to a thread that still
+    holds it (see ``current_slot``): then it is freed when that run ends.
     """
 
     @wraps(f)
@@ -326,20 +339,24 @@ def admit_run(f):
             return resp
         if admission.token is None:
             return f(*args, **kwargs)
+        # The response is one holder of the slot; a view whose run carries on
+        # after the response takes another through current_slot().
+        slot = SharedRelease(partial(gate.release, admission.token))
+        response_hold = slot.hold()
+        g.run_slot = slot
         try:
             resp = current_app.make_response(f(*args, **kwargs))
         except BaseException:
-            gate.release(admission.token)
+            response_hold()
             raise
-        release = partial(gate.release, admission.token)
         if resp.is_sequence:
             # A buffered body has no close() of its own that could fail.
-            resp.call_on_close(release)
+            resp.call_on_close(response_hold)
         else:
             # Werkzeug runs call_on_close callbacks only after the body's own
             # close() returns, so a generator whose cleanup raises would skip
             # them. Release in a finally around that close instead.
-            resp.response = _ReleaseOnClose(resp.response, release)
+            resp.response = _ReleaseOnClose(resp.response, response_hold)
         return resp
 
     decorated._admits_runs = True

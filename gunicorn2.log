@@ -1,0 +1,114 @@
+[2026-11-22 02:40:28 -0500] [3544449] [INFO] Starting gunicorn 26.0.0
+[2026-11-22 02:40:28 -0500] [3544449] [INFO] Listening at: http://127.0.0.1:58124 (3544449)
+[2026-11-22 02:40:28 -0500] [3544449] [INFO] Using worker: gthread
+[2026-11-22 02:40:28 -0500] [3544451] [INFO] Booting worker with pid: 3544451
+[2026-11-22 02:40:28 -0500] [3544451] [ERROR] Exception in worker process
+Traceback (most recent call last):
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/arbiter.py", line 713, in spawn_worker
+    worker.init_process()
+    ~~~~~~~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/workers/gthread.py", line 243, in init_process
+    super().init_process()
+    ~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/workers/base.py", line 136, in init_process
+    self.load_wsgi()
+    ~~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/workers/base.py", line 148, in load_wsgi
+    self.wsgi = self.app.wsgi()
+                ~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/app/base.py", line 66, in wsgi
+    self.callable = self.load()
+                    ~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/app/wsgiapp.py", line 57, in load
+    return self.load_wsgiapp()
+           ~~~~~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/app/wsgiapp.py", line 47, in load_wsgiapp
+    return util.import_app(self.app_uri)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/util.py", line 411, in import_app
+    mod = importlib.import_module(module)
+  File "/home/hunterz/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py", line 88, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1395, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1324, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'gate_app'
+No module named 'gate_app'
+[2026-11-22 02:40:28 -0500] [3544451] [INFO] Worker exiting (pid: 3544451)
+[2026-11-22 02:40:28 -0500] [3544452] [INFO] Booting worker with pid: 3544452
+[2026-11-22 02:40:28 -0500] [3544452] [ERROR] Exception in worker process
+Traceback (most recent call last):
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/arbiter.py", line 713, in spawn_worker
+    worker.init_process()
+    ~~~~~~~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/workers/gthread.py", line 243, in init_process
+    super().init_process()
+    ~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/workers/base.py", line 136, in init_process
+    self.load_wsgi()
+    ~~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/workers/base.py", line 148, in load_wsgi
+    self.wsgi = self.app.wsgi()
+                ~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/app/base.py", line 66, in wsgi
+    self.callable = self.load()
+                    ~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/app/wsgiapp.py", line 57, in load
+    return self.load_wsgiapp()
+           ~~~~~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/app/wsgiapp.py", line 47, in load_wsgiapp
+    return util.import_app(self.app_uri)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/util.py", line 411, in import_app
+    mod = importlib.import_module(module)
+  File "/home/hunterz/.local/share/uv/python/cpython-3.13.13-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py", line 88, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1395, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1324, in _find_and_load_unlocked
+ModuleNotFoundError: No module named 'gate_app'
+No module named 'gate_app'
+[2026-11-22 02:40:28 -0500] [3544452] [INFO] Worker exiting (pid: 3544452)
+[2026-11-22 02:40:28 -0500] [3544449] [ERROR] Worker (pid:3544451) exited with code 3.
+[2026-11-22 02:40:28 -0500] [3544449] [INFO] Control socket listening at /run/user/1000/gunicorn.ctl
+[2026-11-22 02:40:30 -0500] [3544449] [ERROR] Worker (pid:3544452) exited with code 3.
+Traceback (most recent call last):
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/arbiter.py", line 246, in run
+    handler()
+    ~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/arbiter.py", line 271, in handle_chld
+    self.reap_workers()
+    ~~~~~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/arbiter.py", line 641, in reap_workers
+    raise HaltServer(reason, self.WORKER_BOOT_ERROR)
+gunicorn.errors.HaltServer: <HaltServer 'Worker failed to boot.' 3>
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/bin/gunicorn", line 10, in <module>
+    sys.exit(run())
+             ~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/app/wsgiapp.py", line 66, in run
+    WSGIApplication("%(prog)s [OPTIONS] [APP_MODULE]", prog=prog).run()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/app/base.py", line 235, in run
+    super().run()
+    ~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/app/base.py", line 71, in run
+    Arbiter(self).run()
+    ~~~~~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/arbiter.py", line 254, in run
+    self.halt(reason=inst.reason, exit_status=inst.exit_status)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/arbiter.py", line 378, in halt
+    self.stop()
+    ~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/arbiter.py", line 458, in stop
+    self.reap_workers()
+    ~~~~~~~~~~~~~~~~~^^
+  File "/home/hunterz/Documents/Agentic/Code/powabase-ai-p0/.venv/lib/python3.13/site-packages/gunicorn/arbiter.py", line 641, in reap_workers
+    raise HaltServer(reason, self.WORKER_BOOT_ERROR)
+gunicorn.errors.HaltServer: <HaltServer 'Worker failed to boot.' 3>

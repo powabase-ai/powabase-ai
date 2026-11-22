@@ -44,7 +44,8 @@ from ..auth import (
 from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
 from ..services.llm_availability import check_model_available
-from ..services.run_gate import admit_run
+from ..services.run_gate import admit_run, current_slot
+from ..services.run_lifetime import RunLifetime
 from ..services.run_context import (
     reset_run_id,
     set_run_id,
@@ -250,6 +251,15 @@ def _resolve_context_items(
                 )
 
     return [item for item in resolved if item is not None]
+
+
+def _carried_on(let_go, run, *args, **kwargs):
+    """Run a disconnected stream's continuation, then let go of what it held
+    (the run's gate slot and liveness record), however it ends."""
+    try:
+        return run(*args, **kwargs)
+    finally:
+        let_go()
 
 
 def _finish_run_in_background(
@@ -2102,6 +2112,9 @@ def run_agent_stream(agent_id: str):
 
     # Capture app reference for background thread context
     app = current_app._get_current_object()
+    # The run's gate slot and liveness record last until the run ends, which
+    # after a client disconnect is later than the response (see run_lifetime).
+    run_life = RunLifetime(current_slot())
 
     def generate_sse():
         """Generator function for SSE stream."""
@@ -2408,6 +2421,7 @@ def run_agent_stream(agent_id: str):
                         reset_run_id(_worker_run_id_token)
                         unregister_run(run_id)
                         event_queue.put(None)  # sentinel
+                        worker_let_go()
 
                 # Propagate Flask before_request contextvars into the worker
                 # thread (BYOK provider set, byok_lookup_degraded, billing run
@@ -2418,6 +2432,9 @@ def run_agent_stream(agent_id: str):
                 # fix as orchestrations.py:972; mirrors copy_context().run
                 # pattern used in agentic.agent.agent + agentic.orchestration.
                 _captured_ctx = contextvars.copy_context()
+                # The loop keeps running after a disconnect until it sees the
+                # abort signal; it holds the run's gate slot until then.
+                worker_let_go = run_life.carry_on()
                 worker = threading.Thread(target=lambda: _captured_ctx.run(run_agent), daemon=True)
                 worker.start()
                 react_started = True
@@ -2796,6 +2813,9 @@ def run_agent_stream(agent_id: str):
             )
             db.session.commit()
             run_persisted = True
+            # No approval gate on this path, so publish only that it is alive:
+            # the stale-run cleanup skips it while this record exists.
+            run_life.mark_live(run_id)
 
             # Cache once — used by start event, persistence, and the background
             # finisher.
@@ -2890,8 +2910,11 @@ def run_agent_stream(agent_id: str):
                     _finish_kwargs = {
                         "citation_map": citation_map if citation_map else None,
                     }
+                    _carry_on = run_life.carry_on()
                     t = threading.Thread(
-                        target=lambda: _disconnect_ctx.run(
+                        target=lambda: _carried_on(
+                            _carry_on,
+                            _disconnect_ctx.run,
                             _finish_run_in_background,
                             app,
                             run_id,
@@ -3061,8 +3084,11 @@ def run_agent_stream(agent_id: str):
                 _predisconnect_kwargs = {
                     "citation_map": citation_map if citation_map else None,
                 }
+                _carry_on = run_life.carry_on()
                 t = threading.Thread(
-                    target=lambda: _predisconnect_ctx.run(
+                    target=lambda: _carried_on(
+                        _carry_on,
+                        _predisconnect_ctx.run,
                         _finish_run_in_background,
                         app,
                         run_id,
@@ -3187,6 +3213,7 @@ def run_agent_stream(agent_id: str):
             # next unrelated request on this same worker thread doesn't
             # inherit a stale id. Runs on client disconnect as well.
             reset_run_id(_stream_run_id_token)
+            run_life.end()
 
     return Response(
         stream_with_context(generate_sse()),

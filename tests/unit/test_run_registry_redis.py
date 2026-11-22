@@ -558,3 +558,67 @@ class TestOwnerHashWriteFailures:
         a.step(timeout=0.01)
         assert connect().exists("runs:owner:ref-a:run_1")
         assert a._pubsub is pubsub
+
+
+class TestLiveOnlyRuns:
+    """Runs without an approval gate (plain agent streams, orchestrations)
+    still publish an owner record, so the stale-run cleanup can tell a run
+    that is alive from one whose process is gone. They are never approval
+    targets."""
+
+    def test_a_live_run_has_an_owner_record_with_a_ttl(self, connect):
+        a = _registry(connect, "pod-a:1:aaaa")
+        a.register_live("orch_run_1")
+        _settle(a)
+        r = connect()
+        assert r.hgetall("runs:owner:ref-a:orch_run_1") == {
+            b"instance": b"pod-a:1:aaaa",
+            b"owner": b"",
+            b"approvable": b"0",
+        }
+        assert 0 < r.ttl("runs:owner:ref-a:orch_run_1") <= OWNER_TTL_SECONDS
+
+    def test_a_live_run_is_not_an_approval_target(self, connect):
+        a = _registry(connect, "pod-a:1:aaaa")
+        a.register_live("orch_run_1")
+        _settle(a)
+        assert a.context("orch_run_1") is None
+        assert _registry(connect, "pod-b:2:bbbb").lookup_remote("orch_run_1") is None
+
+    def test_unregister_deletes_a_live_runs_record(self, connect):
+        a = _registry(connect, "pod-a:1:aaaa")
+        a.register_live("orch_run_1")
+        _settle(a)
+        a.unregister("orch_run_1")
+        _settle(a)
+        assert not connect().exists("runs:owner:ref-a:orch_run_1")
+
+    def test_the_heartbeat_keeps_a_live_run_alive(self, connect, fast_liveness):
+        a = _registry(connect, "pod-a:1:aaaa", start_thread=True)
+        a.register_live("orch_run_1")
+        assert _wait_until(lambda: connect().exists("runs:owner:ref-a:orch_run_1"))
+        time.sleep(2.5)  # well past the 1 s TTL
+        assert connect().exists("runs:owner:ref-a:orch_run_1")
+
+    def test_a_lost_live_record_is_rewritten_on_resubscribe(self, connect):
+        a = _registry(connect, "pod-a:1:aaaa")
+        a.register_live("orch_run_1")
+        _settle(a)
+        connect().delete("runs:owner:ref-a:orch_run_1")
+        a._drop()
+        a._retry_at = 0.0  # skip the resubscribe backoff
+        _settle(a)
+        assert connect().exists("runs:owner:ref-a:orch_run_1")
+
+
+def test_register_live_run_module_function():
+    reg = RunRegistry(redis_client=fakeredis.FakeStrictRedis(), instance="x", start_thread=False)
+    original = rr._default
+    rr._default = reg
+    try:
+        rr.register_live_run("run_live")
+        assert "run_live" in reg._live
+        rr.unregister_run("run_live")
+        assert "run_live" not in reg._live
+    finally:
+        rr._default = original

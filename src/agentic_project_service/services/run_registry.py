@@ -116,6 +116,9 @@ class RunRegistry:
         self._lock = threading.Lock()
         self._runs: dict[str, ExecutionContext] = {}
         self._owners: dict[str, str | None] = {}
+        # Runs with no approval gate: an owner record says they are alive (for
+        # the stale-run cleanup) but they are never approval targets.
+        self._live: set[str] = set()
         self._dirty: set[str] = set()  # owner hashes to (re)write
         self._removed: set[str] = set()  # owner hashes to delete
         # Owned by the listener thread (or by a test calling step()).
@@ -179,9 +182,21 @@ class RunRegistry:
             self._removed.discard(run_id)
         self._ensure_listener()
 
+    def register_live(self, run_id: str) -> None:
+        """Publish that ``run_id`` is running in this process, without making it
+        approvable (the record carries ``approvable=0``)."""
+        with self._lock:
+            self._live.add(run_id)
+            self._dirty.add(run_id)
+            self._removed.discard(run_id)
+        self._ensure_listener()
+
     def unregister(self, run_id: str) -> None:
         with self._lock:
             known = self._runs.pop(run_id, None) is not None
+            if run_id in self._live:
+                self._live.discard(run_id)
+                known = True
             self._owners.pop(run_id, None)
             self._dirty.discard(run_id)
             # Without a subscription the hash was either never written or is
@@ -225,7 +240,7 @@ class RunRegistry:
             )
             return None
         fields = {_text(k): _text(v) for k, v in (data or {}).items()}
-        if not fields.get("instance"):
+        if not fields.get("instance") or fields.get("approvable") == "0":
             return None
         return RemoteRun(instance=fields["instance"], owner_user_id=fields.get("owner") or None)
 
@@ -338,6 +353,7 @@ class RunRegistry:
             # Re-assert every local run: Redis may have lost or expired them
             # while this process was not listening.
             self._dirty.update(self._runs)
+            self._dirty.update(self._live)
         self._subscribed.set()
 
     def _flush(self) -> None:
@@ -353,9 +369,10 @@ class RunRegistry:
             dirty = {
                 run_id: self._owners.get(run_id) for run_id in self._dirty if run_id in self._runs
             }
+            live = {run_id for run_id in self._dirty if run_id in self._live}
             removed = self._removed
             self._dirty, self._removed = set(), set()
-        if not dirty and not removed:
+        if not dirty and not live and not removed:
             return
         try:
             pipe = self._redis().pipeline()
@@ -364,12 +381,17 @@ class RunRegistry:
                 key = self.owner_key(run_id)
                 pipe.hset(key, mapping={"instance": instance, "owner": owner or ""})
                 pipe.expire(key, OWNER_TTL_SECONDS)
+            for run_id in live:
+                key = self.owner_key(run_id)
+                pipe.hset(key, mapping={"instance": instance, "owner": "", "approvable": "0"})
+                pipe.expire(key, OWNER_TTL_SECONDS)
             for run_id in removed:
                 pipe.delete(self.owner_key(run_id))
             pipe.execute()
         except Exception:
             with self._lock:
                 self._dirty.update(run_id for run_id in dirty if run_id in self._runs)
+                self._dirty.update(run_id for run_id in live if run_id in self._live)
                 self._removed.update(removed)
             self._write_retry_at = time.monotonic() + WRITE_RETRY_SECONDS
             now = time.monotonic()
@@ -410,6 +432,7 @@ class RunRegistry:
             self._ping_sent_at = None
             with self._lock:
                 self._dirty.update(self._runs)  # renew every owner hash's TTL
+                self._dirty.update(self._live)
             return False
         if message.get("type") != "message":
             return False
@@ -486,6 +509,11 @@ _default = RunRegistry()
 
 def register_run(run_id: str, context: ExecutionContext, owner_user_id: str | None = None):
     _default.register(run_id, context, owner_user_id)
+
+
+def register_live_run(run_id: str):
+    """Publish a run that has no approval gate as alive (see RunRegistry.register_live)."""
+    _default.register_live(run_id)
 
 
 def get_active_run_context(run_id: str) -> ExecutionContext | None:

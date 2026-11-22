@@ -275,3 +275,54 @@ def test_a_plain_response_keeps_its_content_length(gate, monkeypatch):
         assert resp.headers.get("Content-Length") == str(len(resp.get_data()))
         resp.close()
     assert gate.active_runs() == 0
+
+
+def test_a_run_carried_on_after_the_response_keeps_its_slot(gate, monkeypatch):
+    """A stream route that hands the run to a thread on disconnect takes a hold
+    on the slot first, so the gate caps runs, not open connections."""
+    import threading
+
+    _limit(monkeypatch, 1)
+    finish = threading.Event()
+    finished = threading.Event()
+    app = Flask(__name__)
+
+    @app.route("/stream", methods=["POST"])
+    @gate_mod.admit_run
+    def stream():
+        slot = gate_mod.current_slot()
+
+        def gen():
+            try:
+                yield "data: start\n\n"
+                yield "data: more\n\n"
+            except GeneratorExit:
+                let_go = slot.hold()
+
+                def carry_on():
+                    finish.wait(5)
+                    let_go()
+                    finished.set()
+
+                threading.Thread(target=carry_on, daemon=True).start()
+                raise
+
+        return Response(gen(), mimetype="text/event-stream")
+
+    with app.test_client() as c:
+        resp = c.post("/stream", buffered=False)
+        next(resp.response)  # the client reads "start", then disconnects
+        resp.close()
+        assert gate.active_runs() == 1
+        assert c.post("/stream").status_code == 429
+    finish.set()
+    assert finished.wait(5)
+    assert gate.active_runs() == 0
+    assert not gate._held
+
+
+def test_current_slot_outside_a_gated_request_is_a_no_op():
+    gate_mod.current_slot().hold()()
+    app = Flask(__name__)
+    with app.test_request_context():
+        gate_mod.current_slot().hold()()
