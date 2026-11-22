@@ -94,8 +94,10 @@ from ..services.session import (
 from ..services import agent_sql, tool_registry
 from ..services.tool_caller import ToolCaller
 from ..services.run_registry import (
+    deliver_approval,
     get_active_run_context,
     get_active_run_owner,
+    lookup_remote_run,
     register_run,
     unregister_run,
 )
@@ -3189,8 +3191,9 @@ def run_agent_stream(agent_id: str):
 def approve_run(run_id: str):
     """Resume a paused ReAct run by supplying an approval decision.
 
-    The run must be currently registered in the in-memory run registry,
-    meaning it is actively waiting for a human-in-the-loop approval.
+    The run must be waiting for a human-in-the-loop approval in some
+    project-api process of this project; a run held by another gunicorn worker
+    or replica is resumed through Redis.
     """
     data = request.get_json(silent=True)
     if not data or "approved" not in data:
@@ -3198,16 +3201,25 @@ def approve_run(run_id: str):
     if not isinstance(data["approved"], bool):
         return jsonify({"error": "'approved' must be a boolean"}), 400
     context = get_active_run_context(run_id)
-    if not context:
-        return jsonify({"error": "Run not found or not waiting for approval"}), 404
-    if not is_service_role_request():
-        # Only the end user who started the run may resume it. A run started
-        # with the service key is registered with no owner, even when it runs
-        # in a user's session, so only the service key can approve it.
+    remote = None
+    if context is not None:
         owner = get_active_run_owner(run_id)
-        if owner is None or owner != get_current_user_id():
+    else:
+        # Another gunicorn worker or replica may hold the run; Redis says which.
+        remote = lookup_remote_run(run_id)
+        if remote is None:
             return jsonify({"error": "Run not found or not waiting for approval"}), 404
-    context.set_approval_decision(data)
+        owner = remote.owner_user_id
+    # Only the end user who started the run may resume it. A run started with
+    # the service key is registered with no owner, even when it runs in a
+    # user's session, so only the service key can approve it.
+    if not is_service_role_request() and (owner is None or owner != get_current_user_id()):
+        return jsonify({"error": "Run not found or not waiting for approval"}), 404
+    if context is not None:
+        context.set_approval_decision(data)
+    elif not deliver_approval(run_id, remote, data):
+        # The owning process is gone (restart, scale-down): the run cannot resume.
+        return jsonify({"error": "Run not found or not waiting for approval"}), 404
     return jsonify({"status": "resumed"})
 
 
