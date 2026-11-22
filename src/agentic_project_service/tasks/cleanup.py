@@ -22,6 +22,13 @@ STALE_LOCK_KEY = "stale_runs_lock"
 STALE_LOCK_TTL = 60  # seconds
 STALE_CHAIN_KEY = "stale_runs_chain"
 STALE_CHAIN_TTL = 3 * STALE_TICK_INTERVAL  # outlives a missed tick or two
+# A new chain's first tick waits this long. A worker starts with a deploy or a
+# restart, when API processes may still be rewriting liveness records they lost
+# (that takes up to OWNER_TTL_SECONDS + HEARTBEAT_SECONDS), and when, in a
+# rolling deploy, old API pods that write no records at all are still being
+# replaced. With the two-sweep rule a run is failed no sooner than
+# FIRST_TICK_COUNTDOWN + STALE_TICK_INTERVAL (10 minutes) after a worker starts.
+FIRST_TICK_COUNTDOWN = STALE_TICK_INTERVAL
 
 
 INTERRUPTED_ERROR = "Run interrupted (pod restart or timeout)"
@@ -219,7 +226,8 @@ def seed_stale_runs_chain() -> None:
 
     The generation is recorded before the first tick is enqueued (a tick that
     ran first would find the old generation and stop). If the enqueue fails,
-    the previous generation is put back, so its chain keeps running.
+    the previous generation is put back, so its chain keeps running. The
+    first tick runs FIRST_TICK_COUNTDOWN later, not at once.
     """
     generation = uuid.uuid4().hex
     _, chain_key = _keys()
@@ -234,7 +242,7 @@ def seed_stale_runs_chain() -> None:
             exc_info=True,
         )
     try:
-        stale_runs_tick.delay(generation)
+        _enqueue_first_tick(generation)
     except Exception:
         logger.exception("Stale-run chain: could not enqueue its first tick")
         if recorded:
@@ -251,6 +259,10 @@ def seed_stale_runs_chain() -> None:
                 logger.warning(
                     "Stale-run chain: could not restore the previous generation", exc_info=True
                 )
+
+
+def _enqueue_first_tick(generation: str) -> None:
+    stale_runs_tick.apply_async(args=[generation], countdown=FIRST_TICK_COUNTDOWN)
 
 
 def _text(value) -> str:

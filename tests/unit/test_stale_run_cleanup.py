@@ -333,9 +333,7 @@ def chain(request, monkeypatch):
         request.addfinalizer(client.flushdb)
     monkeypatch.setattr(cleanup_mod, "broker_client", lambda: client)
     seeded, enqueued = [], []
-    monkeypatch.setattr(
-        cleanup_mod.stale_runs_tick, "delay", lambda generation: seeded.append(generation)
-    )
+    monkeypatch.setattr(cleanup_mod, "_enqueue_first_tick", seeded.append)
     monkeypatch.setattr(
         cleanup_mod.stale_runs_tick,
         "apply_async",
@@ -455,9 +453,45 @@ def test_no_usable_redis_url_keeps_the_chain_going(monkeypatch):
 
 def test_the_seed_still_starts_a_chain_when_redis_is_down(monkeypatch):
     monkeypatch.setenv("CELERY_BROKER_URL", "memory://")
-    with patch.object(cleanup_mod.stale_runs_tick, "delay") as delay:
+    with patch.object(cleanup_mod.stale_runs_tick, "apply_async") as enqueue:
         cleanup_mod.seed_stale_runs_chain()
-    delay.assert_called_once()
+    enqueue.assert_called_once()
+
+
+# --- a worker that just started sweeps nothing yet ---
+
+
+def test_the_first_tick_waits_out_a_lapsed_record_and_a_rolling_deploy(monkeypatch):
+    """A worker that starts (a deploy, a crash restart) must not sweep at
+    once: API processes may be rewriting records they lost, and during a
+    rolling deploy old API pods write no liveness records at all."""
+    from agentic_project_service.services import run_registry as rr
+
+    monkeypatch.setattr(cleanup_mod, "broker_client", fakeredis.FakeStrictRedis)
+    with patch.object(cleanup_mod.stale_runs_tick, "apply_async") as enqueue:
+        cleanup_mod.seed_stale_runs_chain()
+    (call,) = enqueue.call_args_list
+    countdown = call.kwargs["countdown"]
+    assert countdown == cleanup_mod.FIRST_TICK_COUNTDOWN
+    assert countdown >= rr.OWNER_TTL_SECONDS + rr.HEARTBEAT_SECONDS
+    assert countdown >= cleanup_mod.STALE_TICK_INTERVAL
+    # The generation outlives the wait, so a run start does not seed again.
+    assert cleanup_mod.STALE_CHAIN_TTL > countdown
+
+
+def test_a_run_on_an_old_pod_survives_a_new_workers_first_sweep(owners, monkeypatch, clock):
+    """An old API pod writes no liveness record. The first sweep after a
+    worker starts only marks the run; it is failed no sooner than a tick
+    later, FIRST_TICK_COUNTDOWN + STALE_TICK_INTERVAL after the worker
+    started, by when a rolling deploy has replaced the old pods."""
+    fake = _install(monkeypatch, [AGENT_DEAD])
+    monkeypatch.setattr(cleanup_mod.stale_runs_tick, "apply_async", lambda **kwargs: None)
+    cleanup_mod.seed_stale_runs_chain()
+    generation = owners.get("ref-a:stale_runs_chain").decode()
+    clock.now += cleanup_mod.FIRST_TICK_COUNTDOWN
+    cleanup_mod.stale_runs_tick.run(generation)
+    assert fake.updates() == []
+    assert cleanup_mod.FIRST_TICK_COUNTDOWN + cleanup_mod.STALE_TICK_INTERVAL >= 600
 
 
 def test_worker_ready_seeds_a_chain():
@@ -474,10 +508,10 @@ def test_worker_ready_seeds_a_chain():
 def test_a_failed_seed_enqueue_restores_the_previous_generation(chain, monkeypatch):
     chain.client.set("ref-a:stale_runs_chain", "old-generation", ex=900)
 
-    def broken_delay(generation):
+    def broken_enqueue(generation):
         raise ConnectionError("broker down")
 
-    monkeypatch.setattr(cleanup_mod.stale_runs_tick, "delay", broken_delay)
+    monkeypatch.setattr(cleanup_mod, "_enqueue_first_tick", broken_enqueue)
     cleanup_mod.seed_stale_runs_chain()  # does not raise
     assert chain.client.get("ref-a:stale_runs_chain") == b"old-generation"
     assert 0 < chain.client.ttl("ref-a:stale_runs_chain") <= 900
@@ -485,7 +519,7 @@ def test_a_failed_seed_enqueue_restores_the_previous_generation(chain, monkeypat
 
 def test_a_failed_first_seed_enqueue_leaves_no_generation(chain, monkeypatch):
     monkeypatch.setattr(
-        cleanup_mod.stale_runs_tick, "delay", MagicMock(side_effect=ConnectionError("down"))
+        cleanup_mod, "_enqueue_first_tick", MagicMock(side_effect=ConnectionError("down"))
     )
     cleanup_mod.seed_stale_runs_chain()
     assert not chain.client.exists("ref-a:stale_runs_chain")
