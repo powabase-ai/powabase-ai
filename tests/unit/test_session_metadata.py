@@ -49,6 +49,19 @@ def test_parse_session_metadata():
     assert parse_session_metadata({"metadata": "x"}) == (None, "metadata must be a JSON object")
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [{"n": float("nan")}, {"n": float("inf")}, {"s": "a\u0000b"}, {"a\u0000": 1}],
+)
+def test_metadata_postgres_jsonb_cannot_store_is_rejected(bad):
+    """NaN/Infinity (Flask's parser accepts them) and NUL characters would
+    make the jsonb INSERT fail with a 500."""
+    assert parse_session_metadata({"metadata": bad}) == (
+        None,
+        "metadata must be JSON without NaN, Infinity or NUL characters",
+    )
+
+
 def test_metadata_size_limit_is_on_serialised_bytes():
     at_limit = {"k": "x" * (MAX_SESSION_METADATA_BYTES - len('{"k":""}'))}
     assert parse_session_metadata({"metadata": at_limit}) == (at_limit, None)
@@ -165,7 +178,9 @@ def test_orchestration_session_service_stores_metadata(monkeypatch):
     assert made["metadata_"] == {}
 
 
-def _orch_create(body=None, raw=None, orch_exists=True, auth=None, commit_error=None):
+def _orch_create(
+    body=None, raw=None, orch_exists=True, auth=None, commit_error=None, create_error=None
+):
     from agentic_project_service.routes import orchestrations as orchestrations_route
     from agentic_project_service.services import orchestration as orch_service
 
@@ -183,6 +198,7 @@ def _orch_create(body=None, raw=None, orch_exists=True, auth=None, commit_error=
             orch_service,
             "get_or_create_orchestration_session",
             return_value=("u", "orch_sess_1", True),
+            side_effect=create_error,
         ) as create,
         patch.object(orchestrations_route.db, "session", fake_session),
         auth or _service(),
@@ -222,11 +238,19 @@ def test_orchestration_session_create_malformed_id_is_404():
     assert resp.status_code == 404
 
 
-def test_orchestration_session_create_race_with_a_delete_is_404():
+@pytest.mark.parametrize("where", ["flush", "commit"])
+def test_orchestration_session_create_race_with_a_delete_is_404(where):
+    """The FK is not deferred, so a concurrent delete fails the INSERT at the
+    service's flush; a commit-time failure is handled the same way."""
     from sqlalchemy.exc import IntegrityError
 
-    resp, _, fake_session = _orch_create({}, commit_error=IntegrityError("x", {}, Exception()))
+    error = IntegrityError("x", {}, Exception())
+    if where == "flush":
+        resp, _, fake_session = _orch_create({}, create_error=error)
+    else:
+        resp, _, fake_session = _orch_create({}, commit_error=error)
     assert resp.status_code == 404
+    assert resp.get_json() == {"error": "Orchestration not found"}
     fake_session.rollback.assert_called_once()
 
 
@@ -290,3 +314,14 @@ def test_orchestration_session_list_returns_metadata():
     listed = resp.get_json()["sessions"]
     assert listed[0]["metadata"] == {"conversation_id": "c1"}
     assert listed[1]["metadata"] == {}
+
+
+def test_the_text_of_an_escape_is_fine():
+    meta = {"s": "\\u0000 is just text here"}
+    assert parse_session_metadata({"metadata": meta}) == (meta, None)
+
+
+def test_agent_session_create_rejects_nan_metadata():
+    resp, create = _create({"metadata": {"n": float("nan")}})
+    assert resp.status_code == 400
+    create.assert_not_called()

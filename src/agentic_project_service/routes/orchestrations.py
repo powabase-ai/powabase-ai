@@ -733,12 +733,13 @@ def create_orchestration_session(orch_id: str):
             return jsonify({"error": "user_id must be a uuid"}), 400
     if db.session.get(OrchestrationModel, orch_id) is None:
         return jsonify({"error": "Orchestration not found"}), 404
-    _, session_id, _ = get_or_create_orchestration_session(
-        orch_id, user_id=user_id, metadata=metadata
-    )
     # The check above is not a lock: the orchestration can be deleted before
-    # this commit, and its foreign key then rejects the insert.
+    # the insert, and its foreign key (not deferred) then rejects it at the
+    # service's flush, or at the commit.
     try:
+        _, session_id, _ = get_or_create_orchestration_session(
+            orch_id, user_id=user_id, metadata=metadata
+        )
         db.session.commit()
     except IntegrityError:
         db.session.rollback()
