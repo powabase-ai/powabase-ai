@@ -287,6 +287,21 @@ def _build_registry() -> dict[str, SettingDef]:
             max=50,
             description="Maximum ReAct steps for a DelegateTool sub-agent.",
         ),
+        SettingDef(
+            key="MAX_CONCURRENT_RUNS",
+            category=cat,
+            label="Max Concurrent Runs",
+            type="int",
+            default=0,
+            min=0,
+            max=10000,
+            advanced=True,
+            description=(
+                "Maximum agent, orchestration and workflow run requests in flight at "
+                "once in this project, across every API process. Over the limit a run "
+                "request is answered 429 with Retry-After. 0 turns the limit off."
+            ),
+        ),
     ]
 
     # =========================================================================

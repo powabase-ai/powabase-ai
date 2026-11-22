@@ -1,6 +1,6 @@
 """Redis clients for request-path state on the Celery broker's Redis.
 
-The approvals registry and the rate limiter talk to Redis while a request
+The approvals registry, the rate limiter and the run gate talk to Redis while a request
 waits, and both are advisory: a Redis error must fail open. A refused
 connection fails fast on its own, but a Redis that accepts connections and
 never answers (node loss, a dropped route, a long fork) would block a request
@@ -22,13 +22,16 @@ def broker_url() -> str:
     return os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
 
 
-def broker_client() -> redis.Redis:
+def broker_client(
+    socket_timeout: float = REDIS_SOCKET_TIMEOUT_SECONDS,
+    connect_timeout: float = REDIS_CONNECT_TIMEOUT_SECONDS,
+) -> redis.Redis:
     """A client on the broker Redis with bounded timeouts. Raises ValueError
     for a URL that is not a Redis URL (``memory://`` in the unit tests)."""
     return redis.from_url(
         broker_url(),
-        socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
-        socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+        socket_connect_timeout=connect_timeout,
+        socket_timeout=socket_timeout,
         socket_keepalive=True,
         retry=Retry(NoBackoff(), 0),
     )
