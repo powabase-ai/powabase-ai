@@ -83,7 +83,13 @@ def _settle(registry):
     """Drive a thread-less registry until its Redis side has caught up."""
     for _ in range(50):
         registry.step(timeout=0.01)
-        if registry._subscribed.is_set() and not registry._dirty and not registry._removed:
+        if (
+            registry._subscribed.is_set()
+            and not registry._dirty
+            and not registry._removed
+            and not registry._alive_dirty
+            and not registry._alive_removed
+        ):
             return
     raise AssertionError("registry did not settle")
 
@@ -106,6 +112,8 @@ class TestOwnerHash:
             b"owner": b"user-1",
         }
         assert 0 < r.ttl("runs:owner:ref-a:run_1") <= OWNER_TTL_SECONDS
+        assert r.get("runs:alive:ref-a:run_1") == b"pod-a:1:aaaa"
+        assert 0 < r.ttl("runs:alive:ref-a:run_1") <= OWNER_TTL_SECONDS
 
     def test_unregister_deletes_the_hash_and_the_local_context(self, connect):
         a = _registry(connect, "pod-a:1:aaaa")
@@ -115,6 +123,7 @@ class TestOwnerHash:
         a.unregister("run_1")
         _settle(a)
         assert not connect().exists("runs:owner:ref-a:run_1")
+        assert not connect().exists("runs:alive:ref-a:run_1")
         assert a.context("run_1") is None
 
     def test_another_registry_finds_the_owner(self, connect):
@@ -535,14 +544,14 @@ class TestOwnerHashWriteFailures:
         with caplog.at_level("WARNING", logger=rr.logger.name):
             for _ in range(5):
                 a.step(timeout=0.01)
-                a._write_retry_at = 0.0  # skip the retry delay
+                a._write_retry_at = a._alive_retry_at = 0.0  # skip the retry delays
         pubsub = a._pubsub
         assert pubsub is not None
         assert a._subscribed.is_set()
         assert not connect().exists("runs:owner:ref-a:run_1")
         warnings = [r for r in caplog.records if r.name == rr.logger.name]
-        assert len(warnings) == 1  # rate-limited
-        assert "owner" in warnings[0].getMessage()
+        assert len(warnings) == 1  # rate-limited, across owner and liveness writes
+        assert "could not write" in warnings[0].getMessage()
 
         # The subscription still carries decisions.
         connect().publish(
@@ -554,29 +563,27 @@ class TestOwnerHashWriteFailures:
 
         # Once Redis accepts writes again, the pending hash is written.
         monkeypatch.setattr(a._client, "pipeline", real_pipeline)
-        a._write_retry_at = 0.0
+        a._write_retry_at = a._alive_retry_at = 0.0
         a.step(timeout=0.01)
         assert connect().exists("runs:owner:ref-a:run_1")
+        assert connect().exists("runs:alive:ref-a:run_1")
         assert a._pubsub is pubsub
 
 
 class TestLiveOnlyRuns:
     """Runs without an approval gate (plain agent streams, orchestrations)
-    still publish an owner record, so the stale-run cleanup can tell a run
+    publish only a liveness record, so the stale-run cleanup can tell a run
     that is alive from one whose process is gone. They are never approval
     targets."""
 
-    def test_a_live_run_has_an_owner_record_with_a_ttl(self, connect):
+    def test_a_live_run_has_a_liveness_record_with_a_ttl_and_no_owner_hash(self, connect):
         a = _registry(connect, "pod-a:1:aaaa")
         a.register_live("orch_run_1")
         _settle(a)
         r = connect()
-        assert r.hgetall("runs:owner:ref-a:orch_run_1") == {
-            b"instance": b"pod-a:1:aaaa",
-            b"owner": b"",
-            b"approvable": b"0",
-        }
-        assert 0 < r.ttl("runs:owner:ref-a:orch_run_1") <= OWNER_TTL_SECONDS
+        assert r.get("runs:alive:ref-a:orch_run_1") == b"pod-a:1:aaaa"
+        assert 0 < r.ttl("runs:alive:ref-a:orch_run_1") <= OWNER_TTL_SECONDS
+        assert not r.exists("runs:owner:ref-a:orch_run_1")
 
     def test_a_live_run_is_not_an_approval_target(self, connect):
         a = _registry(connect, "pod-a:1:aaaa")
@@ -591,24 +598,107 @@ class TestLiveOnlyRuns:
         _settle(a)
         a.unregister("orch_run_1")
         _settle(a)
-        assert not connect().exists("runs:owner:ref-a:orch_run_1")
+        assert not connect().exists("runs:alive:ref-a:orch_run_1")
 
     def test_the_heartbeat_keeps_a_live_run_alive(self, connect, fast_liveness):
         a = _registry(connect, "pod-a:1:aaaa", start_thread=True)
         a.register_live("orch_run_1")
-        assert _wait_until(lambda: connect().exists("runs:owner:ref-a:orch_run_1"))
+        assert _wait_until(lambda: connect().exists("runs:alive:ref-a:orch_run_1"))
         time.sleep(2.5)  # well past the 1 s TTL
-        assert connect().exists("runs:owner:ref-a:orch_run_1")
+        assert connect().exists("runs:alive:ref-a:orch_run_1")
 
-    def test_a_lost_live_record_is_rewritten_on_resubscribe(self, connect):
+    def test_a_lost_live_record_is_rewritten_at_the_next_refresh(self, connect):
         a = _registry(connect, "pod-a:1:aaaa")
         a.register_live("orch_run_1")
         _settle(a)
-        connect().delete("runs:owner:ref-a:orch_run_1")
-        a._drop()
-        a._retry_at = 0.0  # skip the resubscribe backoff
+        connect().delete("runs:alive:ref-a:orch_run_1")
+        a._alive_due = 0.0  # the refresh is due
         _settle(a)
-        assert connect().exists("runs:owner:ref-a:orch_run_1")
+        assert connect().exists("runs:alive:ref-a:orch_run_1")
+
+    def test_a_run_registered_both_ways_stays_approvable(self, connect):
+        """register then register_live (or the reverse) must not make a run
+        that waits for an approval unreachable."""
+        a = _registry(connect, "pod-a:1:aaaa")
+        a.register("run_1", ExecutionContext(execution_id="run_1"), owner_user_id="u")
+        a.register_live("run_1")
+        _settle(a)
+        b = _registry(connect, "pod-b:2:bbbb")
+        assert b.lookup_remote("run_1") == RemoteRun("pod-a:1:aaaa", "u")
+
+
+class TestLivenessWithoutTheSubscription:
+    """The liveness record says the process is alive, not that it can take
+    approvals, so it is written with plain commands even when the approvals
+    subscription cannot be made (pub/sub refused by an ACL or a proxy) or has
+    dropped."""
+
+    def _no_pubsub(self, registry, monkeypatch):
+        monkeypatch.setattr(
+            registry, "_connect", MagicMock(side_effect=redis.ConnectionError("no pubsub"))
+        )
+
+    def test_records_are_written_while_the_subscription_fails(self, connect, monkeypatch):
+        a = _registry(connect, "pod-a:1:aaaa")
+        self._no_pubsub(a, monkeypatch)
+        a.register("run_1", ExecutionContext(execution_id="run_1"))
+        a.register_live("orch_run_1")
+        assert a.step() is False
+        r = connect()
+        assert r.get("runs:alive:ref-a:run_1") == b"pod-a:1:aaaa"
+        assert r.get("runs:alive:ref-a:orch_run_1") == b"pod-a:1:aaaa"
+        assert not r.exists("runs:owner:ref-a:run_1")  # not reachable for approvals
+
+    def test_they_are_refreshed_while_the_subscription_fails(self, connect, monkeypatch):
+        a = _registry(connect, "pod-a:1:aaaa")
+        self._no_pubsub(a, monkeypatch)
+        a.register_live("orch_run_1")
+        a.step()
+        connect().delete("runs:alive:ref-a:orch_run_1")
+        a._alive_due = 0.0
+        a._retry_at = 0.0
+        a.step()
+        assert connect().exists("runs:alive:ref-a:orch_run_1")
+
+    def test_unregister_deletes_the_record_without_a_subscription(self, connect, monkeypatch):
+        a = _registry(connect, "pod-a:1:aaaa")
+        self._no_pubsub(a, monkeypatch)
+        a.register_live("orch_run_1")
+        a.step()
+        a.unregister("orch_run_1")
+        a._retry_at = 0.0
+        a.step()
+        assert not connect().exists("runs:alive:ref-a:orch_run_1")
+
+    def test_the_listener_thread_writes_them_while_the_subscription_fails(
+        self, connect, monkeypatch, fast_liveness
+    ):
+        a = _registry(connect, "pod-a:1:aaaa")
+        self._no_pubsub(a, monkeypatch)
+        a._start_thread = True
+        a.register_live("orch_run_1")
+        assert _wait_until(lambda: connect().exists("runs:alive:ref-a:orch_run_1"))
+        time.sleep(2.5)  # past the 1 s TTL: refreshed though never subscribed
+        assert connect().exists("runs:alive:ref-a:orch_run_1")
+
+    def test_a_failing_write_is_retried(self, connect, monkeypatch):
+        a = _registry(connect, "pod-a:1:aaaa")
+        self._no_pubsub(a, monkeypatch)
+        real_pipeline = a._client.pipeline
+
+        def oom_pipeline(*args, **kwargs):
+            pipe = real_pipeline(*args, **kwargs)
+            pipe.execute = MagicMock(side_effect=redis.ResponseError("OOM"))
+            return pipe
+
+        monkeypatch.setattr(a._client, "pipeline", oom_pipeline)
+        a.register_live("orch_run_1")
+        a.step()
+        assert not connect().exists("runs:alive:ref-a:orch_run_1")
+        monkeypatch.setattr(a._client, "pipeline", real_pipeline)
+        a._alive_retry_at = 0.0
+        a.step()
+        assert connect().exists("runs:alive:ref-a:orch_run_1")
 
 
 def test_register_live_run_module_function():

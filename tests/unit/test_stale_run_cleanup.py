@@ -12,6 +12,8 @@ import redis
 from agentic_project_service.services.settings_registry import SETTINGS_REGISTRY
 from agentic_project_service.tasks import cleanup as cleanup_mod
 
+_REAL_REDIS_URL = os.getenv("TEST_REDIS_URL")
+
 
 def test_setting_registered():
     d = SETTINGS_REGISTRY["RUN_STALE_AFTER_SECONDS"]
@@ -49,14 +51,31 @@ class _FakeDb:
         return [(sql, params) for sql, params in self.calls if "UPDATE" in sql]
 
 
+class _Clock:
+    """The Redis clock the sweep reads, moved by hand."""
+
+    def __init__(self):
+        self.now = 1_000_000
+
+    def __call__(self, client):
+        return self.now
+
+
 @pytest.fixture
-def owners(monkeypatch):
-    """A fake Redis holding the owner records of live runs."""
+def clock(monkeypatch):
+    c = _Clock()
+    monkeypatch.setattr(cleanup_mod, "_redis_now", c)
+    return c
+
+
+@pytest.fixture
+def owners(monkeypatch, clock):
+    """A fake Redis holding the liveness records of live runs."""
     monkeypatch.setenv("PROJECT_REF", "ref-a")
     client = fakeredis.FakeStrictRedis()
     monkeypatch.setattr(cleanup_mod, "broker_client", lambda: client)
     monkeypatch.setattr(
-        cleanup_mod, "get_setting", lambda key: {"RUN_STALE_AFTER_SECONDS": 2400}[key]
+        cleanup_mod, "get_setting_strict", lambda key: {"RUN_STALE_AFTER_SECONDS": 2400}[key]
     )
     return client
 
@@ -65,6 +84,13 @@ def _install(monkeypatch, agent_rows=(), orch_rows=()):
     fake = _FakeDb(list(agent_rows), list(orch_rows))
     monkeypatch.setattr(cleanup_mod, "db", fake)
     return fake
+
+
+def _sweep_twice(clock, gap=None):
+    """Two sweeps ``gap`` seconds apart (default: one tick); the second's counts."""
+    cleanup_mod.run_stale_cleanup()
+    clock.now += cleanup_mod.STALE_TICK_INTERVAL if gap is None else gap
+    return cleanup_mod.run_stale_cleanup()
 
 
 def test_the_cutoff_is_bound_into_both_candidate_queries(owners, monkeypatch):
@@ -80,15 +106,12 @@ def test_the_cutoff_is_bound_into_both_candidate_queries(owners, monkeypatch):
     assert fake.updates() == []  # nothing old enough: no UPDATE
 
 
-def test_a_long_running_run_with_a_live_owner_survives(owners, monkeypatch):
-    owners.hset("runs:owner:ref-a:run_live", mapping={"instance": "pod-a", "owner": ""})
-    owners.hset(
-        "runs:owner:ref-a:orch_run_live",
-        mapping={"instance": "pod-a", "owner": "", "approvable": "0"},
-    )
+def test_a_long_running_run_with_a_live_owner_survives(owners, monkeypatch, clock):
+    owners.set("runs:alive:ref-a:run_live", "pod-a")
+    owners.set("runs:alive:ref-a:orch_run_live", "pod-a")
     fake = _install(monkeypatch, [AGENT_LIVE, AGENT_DEAD], [ORCH_LIVE, ORCH_DEAD])
 
-    assert cleanup_mod.run_stale_cleanup() == {"agent_runs": 1, "orchestration_runs": 1}
+    assert _sweep_twice(clock) == {"agent_runs": 1, "orchestration_runs": 1}
 
     (agent_sql, agent_params), (orch_sql, orch_params) = fake.updates()
     assert ".agent_runs" in agent_sql and agent_params["ids"] == [AGENT_DEAD[0]]
@@ -98,17 +121,61 @@ def test_a_long_running_run_with_a_live_owner_survives(owners, monkeypatch):
         assert "status = 'running'" in sql  # still running when it is failed
         assert cleanup_mod.INTERRUPTED_ERROR.replace("'", "''") not in sql  # bound, not inlined
     assert agent_params["error"] == cleanup_mod.INTERRUPTED_ERROR
-    fake.session.commit.assert_called_once()
+    assert fake.session.commit.call_count == 2
 
 
-def test_an_ownerless_old_run_is_failed(owners, monkeypatch):
+def test_an_ownerless_old_run_is_failed_on_the_second_sweep(owners, monkeypatch, clock):
     fake = _install(monkeypatch, [AGENT_DEAD])
+    assert cleanup_mod.run_stale_cleanup() == {"agent_runs": 0, "orchestration_runs": 0}
+    assert fake.updates() == []  # one sweep without a record is not enough
+    clock.now += cleanup_mod.STALE_TICK_INTERVAL
     assert cleanup_mod.run_stale_cleanup() == {"agent_runs": 1, "orchestration_runs": 0}
     assert [params["ids"] for _, params in fake.updates()] == [[AGENT_DEAD[0]]]
 
 
+def test_a_record_back_by_the_next_sweep_saves_the_run(owners, monkeypatch, clock):
+    """A live process whose record lapsed (a Redis outage, a full Redis)
+    writes it back well within a tick."""
+    fake = _install(monkeypatch, [AGENT_LIVE])
+    cleanup_mod.run_stale_cleanup()
+    owners.set("runs:alive:ref-a:run_live", "pod-a")
+    clock.now += cleanup_mod.STALE_TICK_INTERVAL
+    assert cleanup_mod.run_stale_cleanup() == {"agent_runs": 0, "orchestration_runs": 0}
+    # ... and the absence count starts again: one more miss is not enough.
+    owners.delete("runs:alive:ref-a:run_live")
+    clock.now += cleanup_mod.STALE_TICK_INTERVAL
+    assert cleanup_mod.run_stale_cleanup() == {"agent_runs": 0, "orchestration_runs": 0}
+    assert fake.updates() == []
+
+
+def test_two_sweeps_close_together_count_as_one(owners, monkeypatch, clock):
+    """The beat entry and the chain can sweep moments apart; the second miss
+    must come later than a live process takes to rewrite its record."""
+    fake = _install(monkeypatch, [AGENT_DEAD])
+    gap = cleanup_mod.ABSENCE_CONFIRM_SECONDS - 1
+    assert _sweep_twice(clock, gap=gap) == {"agent_runs": 0, "orchestration_runs": 0}
+    assert fake.updates() == []
+    clock.now += 1
+    assert cleanup_mod.run_stale_cleanup() == {"agent_runs": 1, "orchestration_runs": 0}
+
+
+def test_the_confirmation_outlasts_a_lapsed_record():
+    from agentic_project_service.services import run_registry as rr
+
+    assert cleanup_mod.ABSENCE_CONFIRM_SECONDS >= rr.OWNER_TTL_SECONDS + rr.HEARTBEAT_SECONDS
+    assert cleanup_mod.SUSPECT_TTL > cleanup_mod.STALE_TICK_INTERVAL
+
+
+def test_a_failed_run_does_not_carry_its_mark_into_a_later_run_of_the_row(
+    owners, monkeypatch, clock
+):
+    _install(monkeypatch, [AGENT_DEAD])
+    _sweep_twice(clock)
+    assert not owners.keys("*stale_run_suspect*")
+
+
 def test_redis_down_fails_no_run(monkeypatch, caplog):
-    monkeypatch.setattr(cleanup_mod, "get_setting", lambda key: 1800)
+    monkeypatch.setattr(cleanup_mod, "get_setting_strict", lambda key: 1800)
     broken = MagicMock()
     broken.pipeline.side_effect = redis.ConnectionError("down")
     monkeypatch.setattr(cleanup_mod, "broker_client", lambda: broken)
@@ -119,16 +186,49 @@ def test_redis_down_fails_no_run(monkeypatch, caplog):
     assert "skipping this sweep" in caplog.text
 
 
+def test_a_redis_that_refuses_writes_fails_no_run(owners, monkeypatch, clock):
+    """Out of memory under noeviction: the reads work, the marks cannot be
+    written, so no absence is ever confirmed."""
+    fake = _install(monkeypatch, [AGENT_DEAD])
+    real_pipeline = owners.pipeline
+
+    def oom_on_write(*args, **kwargs):
+        pipe = real_pipeline(*args, **kwargs)
+        pipe.set = MagicMock(side_effect=redis.ResponseError("OOM command not allowed"))
+        return pipe
+
+    monkeypatch.setattr(owners, "pipeline", oom_on_write)
+    for _ in range(3):
+        assert cleanup_mod.run_stale_cleanup() == {"agent_runs": 0, "orchestration_runs": 0}
+        clock.now += cleanup_mod.STALE_TICK_INTERVAL
+    assert fake.updates() == []
+
+
+def test_unreadable_settings_skip_the_sweep(monkeypatch, caplog):
+    """The 1800 s default is not a safe guess: an operator may have raised it."""
+    from agentic_project_service.services.settings_registry import SettingsUnreadable
+
+    def unreadable(key):
+        raise SettingsUnreadable("ai.project_settings could not be read")
+
+    monkeypatch.setattr(cleanup_mod, "get_setting_strict", unreadable)
+    fake = _install(monkeypatch, [AGENT_DEAD])
+    with caplog.at_level("WARNING", logger=cleanup_mod.logger.name):
+        assert cleanup_mod.run_stale_cleanup() == {"agent_runs": 0, "orchestration_runs": 0}
+    assert fake.calls == []  # not even the candidate SELECTs
+    assert "skipping this sweep" in caplog.text
+
+
 def test_no_usable_redis_url_fails_no_run(monkeypatch):
     monkeypatch.setenv("CELERY_BROKER_URL", "memory://")
-    monkeypatch.setattr(cleanup_mod, "get_setting", lambda key: 1800)
+    monkeypatch.setattr(cleanup_mod, "get_setting_strict", lambda key: 1800)
     fake = _install(monkeypatch, [AGENT_DEAD])
     assert cleanup_mod.run_stale_cleanup() == {"agent_runs": 0, "orchestration_runs": 0}
     assert fake.updates() == []
 
 
 def test_without_candidates_redis_is_not_asked(monkeypatch):
-    monkeypatch.setattr(cleanup_mod, "get_setting", lambda key: 1800)
+    monkeypatch.setattr(cleanup_mod, "get_setting_strict", lambda key: 1800)
     client = MagicMock()
     monkeypatch.setattr(cleanup_mod, "broker_client", lambda: client)
     _install(monkeypatch)
@@ -136,11 +236,47 @@ def test_without_candidates_redis_is_not_asked(monkeypatch):
     client.pipeline.assert_not_called()
 
 
-def test_counts_are_logged(owners, monkeypatch, caplog):
+def test_counts_are_logged(owners, monkeypatch, caplog, clock):
     _install(monkeypatch, [AGENT_DEAD], [ORCH_DEAD])
     with caplog.at_level("INFO", logger=cleanup_mod.logger.name):
-        assert cleanup_mod.run_stale_cleanup() == {"agent_runs": 1, "orchestration_runs": 1}
+        assert _sweep_twice(clock) == {"agent_runs": 1, "orchestration_runs": 1}
     assert "Cleaned up 1 stale agent runs and 1 stale orchestration runs" in caplog.text
+
+
+@pytest.fixture(params=["fakeredis", "redis"])
+def shared_redis(request, monkeypatch):
+    """One Redis for an API process's registry and the worker's sweep."""
+    monkeypatch.setenv("PROJECT_REF", "ref-a")
+    if request.param == "fakeredis":
+        server = fakeredis.FakeServer()
+        connect = lambda: fakeredis.FakeStrictRedis(server=server)
+    else:
+        if not _REAL_REDIS_URL:
+            pytest.skip("TEST_REDIS_URL not set")
+        connect = lambda: redis.from_url(_REAL_REDIS_URL)
+        connect().flushdb()
+        request.addfinalizer(lambda: connect().flushdb())
+    monkeypatch.setattr(cleanup_mod, "broker_client", connect)
+    monkeypatch.setattr(cleanup_mod, "get_setting_strict", lambda key: 1800)
+    return connect
+
+
+def test_the_sweep_reads_the_record_the_registry_writes(shared_redis, monkeypatch, clock):
+    """End to end on one Redis: a run the API process registered as live is
+    never failed; the one it never registered is, on the second sweep."""
+    from agentic_project_service.services.run_registry import RunRegistry
+
+    api = RunRegistry(redis_client=shared_redis(), instance="pod-a:1:aaaa", start_thread=False)
+    try:
+        api.register_live(AGENT_LIVE[1])
+        api.register(ORCH_LIVE[1], MagicMock(), owner_user_id=None)
+        for _ in range(5):
+            api.step(timeout=0.01)
+        fake = _install(monkeypatch, [AGENT_LIVE, AGENT_DEAD], [ORCH_LIVE])
+        assert _sweep_twice(clock) == {"agent_runs": 1, "orchestration_runs": 0}
+        assert [params["ids"] for _, params in fake.updates()] == [[AGENT_DEAD[0]]]
+    finally:
+        api.close()
 
 
 def test_a_completed_agent_run_drops_a_stale_interrupt_error():
@@ -180,9 +316,6 @@ def test_the_task_runs_the_cleanup(monkeypatch):
 
 
 # --- the self-rescheduling tick (the project stack runs no Celery beat) ---
-
-
-_REAL_REDIS_URL = os.getenv("TEST_REDIS_URL")
 
 
 @pytest.fixture(params=["fakeredis", "redis"])

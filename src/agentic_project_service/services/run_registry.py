@@ -22,6 +22,13 @@ And a forwarded decision counts as delivered only when the owner acknowledges
 that it resumed the run, so the approve endpoint never answers "resumed" for a
 run that cannot resume, even while Redis still counts a dead subscriber.
 
+Separately, every run this process is running, approvable or not, has a
+liveness record ``runs:alive:{PROJECT_REF}:{run_id}`` (value: the instance),
+which the stale-run cleanup reads (tasks/cleanup.py). It says only that the
+process is alive, so it does not wait for the subscription: the same thread
+writes it with plain commands every HEARTBEAT_SECONDS, with a TTL of
+OWNER_TTL_SECONDS, whether or not pub/sub works.
+
 Redis is advisory and fail-open: when it is unreachable a run is still
 registered locally, and an approval that reaches the owning process still
 resumes it, exactly as before this registry used Redis. A process restart still
@@ -46,7 +53,8 @@ from .broker_redis import REDIS_SOCKET_TIMEOUT_SECONDS, broker_client
 logger = logging.getLogger(__name__)
 
 # The owner hash outlives a few missed heartbeats, not a dead listener: it is
-# renewed on every PONG and deleted on unregister.
+# renewed on every PONG and deleted on unregister. The liveness record has the
+# same TTL and is rewritten every HEARTBEAT_SECONDS.
 OWNER_TTL_SECONDS = 60
 HEARTBEAT_SECONDS = 15
 PONG_TIMEOUT_SECONDS = 3
@@ -61,8 +69,9 @@ REASON_MAX_CHARS = 2000
 LOOP_TIMEOUT_SECONDS = 0.1
 RESUBSCRIBE_BACKOFF_SECONDS = 1.0
 MAX_RESUBSCRIBE_BACKOFF_SECONDS = 30.0
-# A failed owner-hash write (e.g. OOM under noeviction) is retried after this
-# delay and warned about at most once per WRITE_WARNING_INTERVAL_SECONDS.
+# A failed owner-hash or liveness write (e.g. OOM under noeviction) is retried
+# after this delay and warned about at most once per
+# WRITE_WARNING_INTERVAL_SECONDS.
 WRITE_RETRY_SECONDS = 1.0
 WRITE_WARNING_INTERVAL_SECONDS = 60.0
 
@@ -116,11 +125,13 @@ class RunRegistry:
         self._lock = threading.Lock()
         self._runs: dict[str, ExecutionContext] = {}
         self._owners: dict[str, str | None] = {}
-        # Runs with no approval gate: an owner record says they are alive (for
-        # the stale-run cleanup) but they are never approval targets.
+        # Runs with no approval gate: a liveness record says they are alive
+        # (for the stale-run cleanup) but they are never approval targets.
         self._live: set[str] = set()
         self._dirty: set[str] = set()  # owner hashes to (re)write
         self._removed: set[str] = set()  # owner hashes to delete
+        self._alive_dirty: set[str] = set()  # liveness records to write now
+        self._alive_removed: set[str] = set()  # liveness records to delete
         # Owned by the listener thread (or by a test calling step()).
         self._pubsub = None
         self._subscribed = threading.Event()
@@ -129,6 +140,8 @@ class RunRegistry:
         self._last_pong = 0.0
         self._ping_sent_at: float | None = None
         self._write_retry_at = 0.0
+        self._alive_due = 0.0  # when every liveness record is next rewritten
+        self._alive_retry_at = 0.0
         self._write_warned_at: float | None = None
         self._thread: threading.Thread | None = None
         self._thread_lock = threading.Lock()
@@ -163,6 +176,10 @@ class RunRegistry:
         return f"runs:owner:{_project_ref()}:{run_id}"
 
     @staticmethod
+    def alive_key(run_id: str) -> str:
+        return f"runs:alive:{_project_ref()}:{run_id}"
+
+    @staticmethod
     def channel(instance: str) -> str:
         return f"runs:approvals:{_project_ref()}:{instance}"
 
@@ -180,29 +197,33 @@ class RunRegistry:
             self._owners[run_id] = owner_user_id
             self._dirty.add(run_id)
             self._removed.discard(run_id)
+            self._alive_dirty.add(run_id)
+            self._alive_removed.discard(run_id)
         self._ensure_listener()
 
     def register_live(self, run_id: str) -> None:
         """Publish that ``run_id`` is running in this process, without making it
-        approvable (the record carries ``approvable=0``)."""
+        approvable: it gets a liveness record and no owner hash."""
         with self._lock:
             self._live.add(run_id)
-            self._dirty.add(run_id)
-            self._removed.discard(run_id)
+            self._alive_dirty.add(run_id)
+            self._alive_removed.discard(run_id)
         self._ensure_listener()
 
     def unregister(self, run_id: str) -> None:
         with self._lock:
-            known = self._runs.pop(run_id, None) is not None
-            if run_id in self._live:
-                self._live.discard(run_id)
-                known = True
+            approvable = self._runs.pop(run_id, None) is not None
+            known = approvable or run_id in self._live
+            self._live.discard(run_id)
             self._owners.pop(run_id, None)
             self._dirty.discard(run_id)
+            self._alive_dirty.discard(run_id)
             # Without a subscription the hash was either never written or is
             # rewritten from scratch after the next subscribe; it expires anyway.
-            if known and self._subscribed.is_set():
+            if approvable and self._subscribed.is_set():
                 self._removed.add(run_id)
+            if known:
+                self._alive_removed.add(run_id)
 
     def context(self, run_id: str) -> ExecutionContext | None:
         return self._runs.get(run_id)
@@ -240,7 +261,7 @@ class RunRegistry:
             )
             return None
         fields = {_text(k): _text(v) for k, v in (data or {}).items()}
-        if not fields.get("instance") or fields.get("approvable") == "0":
+        if not fields.get("instance"):
             return None
         return RemoteRun(instance=fields["instance"], owner_user_id=fields.get("owner") or None)
 
@@ -292,14 +313,17 @@ class RunRegistry:
     # -- the owning process: the listener --------------------------------------
 
     def step(self, timeout: float | None = None) -> bool:
-        """One listener iteration: (re)subscribe if needed, write pending owner
-        hashes, then wait up to ``timeout`` for one forwarded decision.
+        """One listener iteration: write due liveness records, (re)subscribe if
+        needed, write pending owner hashes, then wait up to ``timeout`` for one
+        forwarded decision.
 
         Returns True iff a forwarded decision resumed a local run. Never raises:
         a failure of the subscription (connect, subscribe, PING, read) drops it and
-        schedules a resubscribe; a failed owner-hash write is only retried.
+        schedules a resubscribe; a failed owner-hash or liveness write is only
+        retried.
         """
         timeout = LOOP_TIMEOUT_SECONDS if timeout is None else timeout
+        self._write_liveness()
         if self._pubsub is None:
             if time.monotonic() < self._retry_at:
                 return False
@@ -350,10 +374,9 @@ class RunRegistry:
         self._last_pong = time.monotonic()
         self._ping_sent_at = None
         with self._lock:
-            # Re-assert every local run: Redis may have lost or expired them
-            # while this process was not listening.
+            # Re-assert every approvable run: Redis may have lost or expired
+            # their hashes while this process was not listening.
             self._dirty.update(self._runs)
-            self._dirty.update(self._live)
         self._subscribed.set()
 
     def _flush(self) -> None:
@@ -369,10 +392,9 @@ class RunRegistry:
             dirty = {
                 run_id: self._owners.get(run_id) for run_id in self._dirty if run_id in self._runs
             }
-            live = {run_id for run_id in self._dirty if run_id in self._live}
             removed = self._removed
             self._dirty, self._removed = set(), set()
-        if not dirty and not live and not removed:
+        if not dirty and not removed:
             return
         try:
             pipe = self._redis().pipeline()
@@ -381,33 +403,65 @@ class RunRegistry:
                 key = self.owner_key(run_id)
                 pipe.hset(key, mapping={"instance": instance, "owner": owner or ""})
                 pipe.expire(key, OWNER_TTL_SECONDS)
-            for run_id in live:
-                key = self.owner_key(run_id)
-                pipe.hset(key, mapping={"instance": instance, "owner": "", "approvable": "0"})
-                pipe.expire(key, OWNER_TTL_SECONDS)
             for run_id in removed:
                 pipe.delete(self.owner_key(run_id))
             pipe.execute()
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - logged by _warn_write_failure
             with self._lock:
                 self._dirty.update(run_id for run_id in dirty if run_id in self._runs)
-                self._dirty.update(run_id for run_id in live if run_id in self._live)
                 self._removed.update(removed)
             self._write_retry_at = time.monotonic() + WRITE_RETRY_SECONDS
-            now = time.monotonic()
-            if (
-                self._write_warned_at is None
-                or now - self._write_warned_at >= WRITE_WARNING_INTERVAL_SECONDS
-            ):
-                self._write_warned_at = now
-                logger.warning(
-                    "Run registry: could not write run owner hashes; retrying (warned at "
-                    "most every %.0fs)",
-                    WRITE_WARNING_INTERVAL_SECONDS,
-                    exc_info=True,
-                )
-            else:
-                logger.debug("Run registry: owner hash write failed again", exc_info=True)
+            self._warn_write_failure("run owner hashes", exc)
+
+    def _write_liveness(self) -> None:
+        """Write the liveness records of new runs, delete those of ended ones,
+        and rewrite them all every HEARTBEAT_SECONDS. Plain commands only, so
+        it works without the subscription. Never raises; a failure is retried."""
+        now = time.monotonic()
+        if now < self._alive_retry_at:
+            return
+        refresh = now >= self._alive_due
+        with self._lock:
+            local = set(self._runs) | self._live
+            alive = local if refresh else self._alive_dirty & local
+            removed = self._alive_removed - local
+            self._alive_dirty, self._alive_removed = set(), set()
+        if alive or removed:
+            client = self._redis()
+            if client is None:
+                return
+            try:
+                pipe = client.pipeline(transaction=False)
+                instance = self.instance_id()
+                for run_id in alive:
+                    pipe.set(self.alive_key(run_id), instance, ex=OWNER_TTL_SECONDS)
+                for run_id in removed:
+                    pipe.delete(self.alive_key(run_id))
+                pipe.execute()
+            except Exception as exc:  # noqa: BLE001 - logged by _warn_write_failure
+                with self._lock:
+                    self._alive_dirty.update(alive)
+                    self._alive_removed.update(removed)
+                self._alive_retry_at = time.monotonic() + WRITE_RETRY_SECONDS
+                self._warn_write_failure("run liveness records", exc)
+                return
+        if refresh:
+            self._alive_due = now + HEARTBEAT_SECONDS
+
+    def _warn_write_failure(self, what: str, exc: BaseException) -> None:
+        now = time.monotonic()
+        if self._write_warned_at is None or now - self._write_warned_at >= (
+            WRITE_WARNING_INTERVAL_SECONDS
+        ):
+            self._write_warned_at = now
+            logger.warning(
+                "Run registry: could not write %s; retrying (warned at most every %.0fs)",
+                what,
+                WRITE_WARNING_INTERVAL_SECONDS,
+                exc_info=exc,
+            )
+        else:
+            logger.debug("Run registry: %s write failed again", what, exc_info=exc)
 
     def _heartbeat(self) -> None:
         """PING the subscription; a PONG that does not come means it is dead.
@@ -432,7 +486,6 @@ class RunRegistry:
             self._ping_sent_at = None
             with self._lock:
                 self._dirty.update(self._runs)  # renew every owner hash's TTL
-                self._dirty.update(self._live)
             return False
         if message.get("type") != "message":
             return False
@@ -488,7 +541,14 @@ class RunRegistry:
         while not self._stopped.is_set():
             self.step()
             if self._pubsub is None:
-                self._stopped.wait(max(self._retry_at - time.monotonic(), LOOP_TIMEOUT_SECONDS))
+                # Not subscribed: wake for the next resubscribe or liveness
+                # write, whichever is first.
+                now = time.monotonic()
+                wake = min(self._retry_at, max(self._alive_due, self._alive_retry_at))
+                with self._lock:
+                    if self._alive_dirty or self._alive_removed:
+                        wake = min(wake, max(now, self._alive_retry_at))
+                self._stopped.wait(max(wake - now, LOOP_TIMEOUT_SECONDS))
         # close() may have run while this thread was still connecting.
         pubsub, self._pubsub = self._pubsub, None
         self._close_quietly(pubsub)
