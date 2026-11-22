@@ -83,3 +83,12 @@ def test_a_redis_timeout_fails_the_limiter_open():
     slow = MagicMock()
     slow.register_script.return_value = MagicMock(side_effect=redis.TimeoutError("timed out"))
     assert rl.RedisRateLimiter(slow).try_acquire("workflow-exec:service", 1) is None
+
+
+def test_an_unusable_broker_url_warns_once_and_fails_open(monkeypatch, caplog):
+    monkeypatch.setenv("CELERY_BROKER_URL", "memory://")
+    limiter = rl.RedisRateLimiter()
+    with caplog.at_level("WARNING", logger=rl.logger.name):
+        assert all(limiter.try_acquire("workflow-exec:service", 1) is None for _ in range(3))
+    warnings = [r for r in caplog.records if r.name == rl.logger.name]
+    assert len(warnings) == 1

@@ -118,16 +118,30 @@ class RedisRateLimiter:
 
     def __init__(self, redis_client=None):
         self._client = redis_client
+        self._client_unavailable = False
         self._script = None
 
     def _redis(self):
+        """The Redis client, or None when none can be built (warned once)."""
         if self._client is None:
-            self._client = broker_client()
+            if self._client_unavailable:
+                return None  # an unusable URL never becomes usable
+            try:
+                self._client = broker_client()
+            except Exception:
+                self._client_unavailable = True
+                logger.warning(
+                    "Rate limiter: Redis client unavailable; failing open", exc_info=True
+                )
+                return None
         return self._client
 
     def _get_script(self):
         if self._script is None:
-            self._script = self._redis().register_script(_SLIDING_WINDOW_LUA)
+            client = self._redis()
+            if client is None:
+                return None
+            self._script = client.register_script(_SLIDING_WINDOW_LUA)
         return self._script
 
     def try_acquire(self, service: str, max_per_minute: int) -> float | None:
@@ -135,7 +149,10 @@ class RedisRateLimiter:
         project_ref = os.getenv("PROJECT_REF", "default")
         key = f"ratelimit:{service}:{project_ref}"
         try:
-            result = self._get_script()(
+            script = self._get_script()
+            if script is None:
+                return None
+            result = script(
                 keys=[key, f"{key}:seq"],
                 args=[time.time(), _WINDOW_SECONDS, max_per_minute],
             )
