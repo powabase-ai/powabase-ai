@@ -643,3 +643,25 @@ def test_the_beat_entry_stays_for_deployments_that_run_beat():
     from agentic_project_service.celery import celery_app
 
     assert celery_app.conf.beat_schedule["cleanup-stale-runs"]["task"] == "cleanup_stale_runs"
+
+
+def test_the_cutoff_description_matches_what_the_sweep_does():
+    """It once named an approval-timeout setting that does not exist and left
+    out that a run whose process is alive is never failed."""
+    import re
+
+    description = SETTINGS_REGISTRY["RUN_STALE_AFTER_SECONDS"].description
+    assert "approval timeout" not in description
+    assert "alive" in description and "never" in description
+    for name in re.findall(r"\b[A-Z][A-Z_]{4,}\b", description):
+        assert name in SETTINGS_REGISTRY, name
+
+
+def test_the_docs_name_the_chain_check_run_starts_call():
+    import inspect
+
+    for doc in (
+        inspect.getdoc(cleanup_mod.seed_stale_runs_chain),
+        inspect.getsource(cleanup_mod.stale_runs_tick),
+    ):
+        assert "ensure_stale_runs_chain_soon" in doc

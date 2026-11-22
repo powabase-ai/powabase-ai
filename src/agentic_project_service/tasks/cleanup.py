@@ -219,7 +219,7 @@ def seed_stale_runs_chain() -> None:
     """Start a stale-run chain that replaces every earlier one.
 
     Called on worker_ready, and by a run start that finds no live chain
-    (ensure_stale_runs_chain). Queued countdown ticks survive worker restarts,
+    (ensure_stale_runs_chain_soon). Queued countdown ticks survive worker restarts,
     so a seed that only enqueued would add a chain per worker start. Instead
     each seed records a new generation, and a tick whose generation is no
     longer the recorded one stops instead of re-enqueueing: however many
@@ -305,7 +305,8 @@ def _check_chain() -> None:
 def ensure_stale_runs_chain() -> None:
     """Re-seed the chain when no live generation is recorded (a chain whose
     re-enqueue kept failing gives its generation up). At most once per
-    CHAIN_CHECK_INTERVAL per process; never raises."""
+    CHAIN_CHECK_INTERVAL per process; never raises. Synchronous, so the tests
+    can watch it; run starts call ensure_stale_runs_chain_soon."""
     if _claim_chain_check():
         _check_chain()
 
@@ -375,7 +376,7 @@ def stale_runs_tick(generation: str | None = None):
             else:
                 time.sleep(1)
     # This chain ends here. Give up its generation, so the next run start
-    # (ensure_stale_runs_chain) finds none and seeds a new chain.
+    # (ensure_stale_runs_chain_soon) finds none and seeds a new chain.
     if client is not None and generation is not None:
         try:
             client.eval(_RESTORE_GENERATION_LUA, 1, chain_key, generation, "", STALE_CHAIN_TTL)

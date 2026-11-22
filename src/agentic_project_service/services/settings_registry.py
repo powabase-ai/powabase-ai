@@ -316,9 +316,12 @@ def _build_registry() -> dict[str, SettingDef]:
             max=86400,
             advanced=True,
             description=(
-                "A run still 'running' this long after it started is marked failed "
-                "(its process restarted mid-run). Keep it above the longest agent "
-                "timeout_seconds plus approval timeout you use."
+                "An agent or orchestration run still 'running' this long after it "
+                "started is marked failed when no API process is running it any more "
+                "(its process restarted mid-run): its liveness record must be missing "
+                "at two cleanup sweeps in a row. A run whose process is alive is never "
+                "failed, however long it runs. Also the longest a run holds a "
+                "MAX_CONCURRENT_RUNS slot. Workflow runs are not swept."
             ),
         ),
     ]
