@@ -17,6 +17,7 @@ from sqlalchemy import text
 from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
 from ..services.llm_availability import check_model_available
+from ..services.run_gate import admit_run
 from ..services.run_context import (
     reset_run_id,
     set_run_id,
@@ -82,6 +83,15 @@ def trigger_webhook(webhook_id: str):
     if not expected_secret or not hmac.compare_digest(provided_token, expected_secret):
         return jsonify({"error": "Unauthorized"}), 401
 
+    return _run_triggered_workflow(workflow_id)
+
+
+@admit_run
+def _run_triggered_workflow(workflow_id):
+    """Steps 3 onwards of trigger_webhook, under MAX_CONCURRENT_RUNS like
+    /execute: after the secret check, so a caller without the secret takes no
+    slot, and before the single-use arm is consumed, so a refused (429) run
+    leaves the webhook armed."""
     # 3. Check workflow deployment state
     wf_row = db.session.execute(
         text(f'SELECT state, webhook_armed_until FROM "{AI_SCHEMA}".workflows WHERE id = :id'),

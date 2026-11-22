@@ -326,3 +326,60 @@ def test_current_slot_outside_a_gated_request_is_a_no_op():
     app = Flask(__name__)
     with app.test_request_context():
         gate_mod.current_slot().hold()()
+
+
+# --- webhook-triggered workflow runs ---
+
+WEBHOOK_ID = "11111111-1111-1111-1111-111111111111"
+
+
+def _webhook_session(statements):
+    """Answers the block lookup (secret 's3cret') and an armed, undeployed
+    workflow; records every statement."""
+
+    def execute(statement, params=None):
+        sql = str(statement)
+        statements.append(sql)
+        result = MagicMock()
+        if "workflow_blocks" in sql:
+            result.fetchone.return_value = ("block-1", WORKFLOW_ID, {"webhook_secret": "s3cret"})
+        elif "SELECT state" in sql:
+            from datetime import UTC, datetime, timedelta
+
+            result.fetchone.return_value = ("internal", datetime.now(UTC) + timedelta(minutes=5))
+        return result
+
+    session = MagicMock()
+    session.execute.side_effect = execute
+    return session
+
+
+def test_a_webhook_run_is_gated_after_its_secret_and_before_its_arm(gate, monkeypatch):
+    from agentic_project_service.routes import webhooks as webhooks_route
+
+    _full(gate, monkeypatch)
+    app = Flask(__name__)
+    app.register_blueprint(webhooks_route.webhooks_bp)
+    statements: list[str] = []
+    with (
+        patch.object(webhooks_route.db, "session", _webhook_session(statements)),
+        app.test_client() as c,
+    ):
+        refused = c.post(
+            f"/api/webhooks/{WEBHOOK_ID}", json={}, headers={"Authorization": "Bearer s3cret"}
+        )
+        unauthorized = c.post(
+            f"/api/webhooks/{WEBHOOK_ID}", json={}, headers={"Authorization": "Bearer nope"}
+        )
+    assert refused.status_code == 429
+    assert refused.headers["Retry-After"] == "2"
+    assert unauthorized.status_code == 401  # a bad secret is told so, not 429
+    # A refused run leaves the single-use arm in place.
+    assert not any("webhook_armed_until = NULL" in sql for sql in statements)
+    assert gate.active_runs() == 1
+
+
+def test_the_webhook_run_path_is_gated():
+    from agentic_project_service.routes import webhooks as webhooks_route
+
+    assert getattr(webhooks_route._run_triggered_workflow, "_admits_runs", False)
