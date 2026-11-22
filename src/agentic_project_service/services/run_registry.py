@@ -24,28 +24,20 @@ import time
 import uuid
 from dataclasses import dataclass
 
-import redis
 from agentic.execution.context import ExecutionContext
+
+from .broker_redis import REDIS_SOCKET_TIMEOUT_SECONDS, broker_client
 
 logger = logging.getLogger(__name__)
 
 # Longer than any approval wait (the approval hook's default timeout is 300 s);
 # the hash is deleted on unregister, the TTL only covers a process that died.
 OWNER_TTL_SECONDS = 7200
-REDIS_SOCKET_TIMEOUT_SECONDS = 2
 RESUBSCRIBE_BACKOFF_SECONDS = 1.0
 
 
 def _project_ref() -> str:
     return os.getenv("PROJECT_REF", "default")
-
-
-def _broker_client():
-    return redis.from_url(
-        os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"),
-        socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
-        socket_connect_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
-    )
 
 
 def _text(value) -> str:
@@ -87,7 +79,7 @@ class RunRegistry:
             if self._client_unavailable:
                 return None  # an unusable URL never becomes usable; warn once
             try:
-                self._client = _broker_client()
+                self._client = broker_client()
             except Exception:
                 self._client_unavailable = True
                 logger.warning(

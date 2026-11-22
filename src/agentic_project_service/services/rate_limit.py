@@ -8,10 +8,10 @@ import threading
 import time
 from functools import wraps
 
-import redis
 from flask import g, jsonify
 
 from ..auth import is_service_role_request
+from .broker_redis import broker_client
 from .settings_registry import get_setting
 
 
@@ -120,14 +120,14 @@ class RedisRateLimiter:
         self._client = redis_client
         self._script = None
 
+    def _redis(self):
+        if self._client is None:
+            self._client = broker_client()
+        return self._client
+
     def _get_script(self):
         if self._script is None:
-            client = self._client
-            if client is None:
-                broker_url = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
-                client = redis.from_url(broker_url)
-                self._client = client
-            self._script = client.register_script(_SLIDING_WINDOW_LUA)
+            self._script = self._redis().register_script(_SLIDING_WINDOW_LUA)
         return self._script
 
     def try_acquire(self, service: str, max_per_minute: int) -> float | None:
