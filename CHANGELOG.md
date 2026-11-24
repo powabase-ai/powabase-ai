@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/powabase-ai/powabase-ai/compare/v0.14.2...v0.15.0) (2026-11-24)
+
+
+### Features
+
+* multi-replica project-api — cross-process approvals, run admission control, session metadata, stale-run cleanup ([#123](https://github.com/powabase-ai/powabase-ai/issues/123)) ([e108280](https://github.com/powabase-ai/powabase-ai/commit/e108280577fa8a362403f682db1ba2472002ef21))
+
 ## [0.14.2](https://github.com/powabase-ai/powabase-ai/compare/v0.14.1...v0.14.2) (2026-11-10)
 
 
