@@ -17,3 +17,15 @@ def test_exa_rate_limit_setting():
     assert d.type == "int"
     assert d.default == 60
     assert d.category == "tools"
+
+
+def test_workflow_executions_setting():
+    d = SETTINGS_REGISTRY.get("WORKFLOW_EXECUTIONS_PER_MINUTE")
+    assert d is not None, "WORKFLOW_EXECUTIONS_PER_MINUTE not registered"
+    assert d.type == "int"
+    assert d.default == 120
+    assert (d.min, d.max) == (1, 5000)
+    assert d.advanced is True
+    from agentic_project_service.services import rate_limit
+
+    assert d.default == rate_limit.DEFAULT_SERVICE_EXECUTIONS_PER_MINUTE

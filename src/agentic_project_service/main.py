@@ -66,6 +66,17 @@ def set_up_agent_tool_logins() -> None:
         logger.exception("Could not reconcile the agent tool database logins")
 
 
+def health_body(include_runs: bool) -> dict:
+    """The /health payload. The readiness probe calls it without ``runs=1``,
+    so the probe never touches Redis or the database."""
+    body = {"status": "healthy", "service": "project-service"}
+    if include_runs:
+        from .services import run_gate
+
+        body.update(run_gate.health_fields())
+    return body
+
+
 def create_app(testing: bool = False):
     """Create and configure the Flask application.
 
@@ -110,6 +121,15 @@ def create_app(testing: bool = False):
             defaults_prefix="project_api",
             group_by="endpoint",
         )
+
+        from prometheus_client import REGISTRY
+
+        from .services.run_gate import ActiveRunsCollector
+
+        try:
+            REGISTRY.register(ActiveRunsCollector())
+        except ValueError:
+            pass  # already registered by an earlier create_app() in this process
     except ImportError:
         # prometheus-flask-exporter is a soft dep; skip /metrics if unavailable.
         pass
@@ -197,7 +217,8 @@ def create_app(testing: bool = False):
     # Health check endpoint
     @app.route("/health")
     def health():
-        return jsonify({"status": "healthy", "service": "project-service"})
+        # ?runs=1 adds active_runs and max_concurrent_runs (null when unreadable).
+        return jsonify(health_body(request.args.get("runs") == "1"))
 
     @app.route("/")
     def index():

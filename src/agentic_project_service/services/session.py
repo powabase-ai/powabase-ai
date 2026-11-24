@@ -980,6 +980,10 @@ def update_agent_run(
     if error is not None:
         updates.append("error = :error")
         params["error"] = error
+    elif status is AgentRunStatus.COMPLETED:
+        # A completed run has no error, including one the stale-run cleanup
+        # may have written while the run was in fact still going.
+        updates.append("error = NULL")
     if completed_at is not None:
         updates.append("completed_at = :completed_at")
         params["completed_at"] = completed_at

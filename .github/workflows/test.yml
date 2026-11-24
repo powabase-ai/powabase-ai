@@ -150,6 +150,10 @@ jobs:
       # error store tests pin what a real database error shows the model. The
       # route tests boot the app, whose migrations grant to the Supabase roles,
       # so those roles are created first.
+      #
+      # tests/test_stale_runs_store.py pins the stale-run sweep's SELECT and its
+      # uuid[] UPDATE, and the session list's metadata grouping, which the unit
+      # tier only sees as strings.
       - name: Create the Supabase roles the migrations grant to
         env:
           PGPASSWORD: postgres
@@ -183,6 +187,7 @@ jobs:
             tests/test_citation_units_store.py \
             tests/test_agent_mcp_citation_mapping.py \
             tests/route/test_agent_streaming_citations.py \
+            tests/test_stale_runs_store.py \
             -q -rs | tee pytest-store.log
           if grep -Eq "[0-9]+ (skipped|deselected|xfailed|xpassed)" pytest-store.log; then
             echo "::error::the store tier did not run every test; this job must run all of them"

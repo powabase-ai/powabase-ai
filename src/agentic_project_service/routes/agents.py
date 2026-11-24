@@ -44,6 +44,8 @@ from ..auth import (
 from ..db import db, AI_SCHEMA
 from ..services import billing_port as billing
 from ..services.llm_availability import check_model_available
+from ..services.run_gate import admit_run, current_slot
+from ..services.run_lifetime import RunLifetime, start_carried_on
 from ..services.run_context import (
     reset_run_id,
     set_run_id,
@@ -94,8 +96,12 @@ from ..services.session import (
 from ..services import agent_sql, tool_registry
 from ..services.tool_caller import ToolCaller
 from ..services.run_registry import (
+    Delivery,
+    RegistryUnavailable,
+    deliver_approval,
     get_active_run_context,
     get_active_run_owner,
+    lookup_remote_run,
     register_run,
     unregister_run,
 )
@@ -104,6 +110,7 @@ from ..services.ai_provider_keys_resolver import (
     resolve_api_key_or_raise_for_drop,
 )
 from ._runtime_kb import validate_runtime_knowledge_bases
+from ._session_metadata import parse_session_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +252,15 @@ def _resolve_context_items(
                 )
 
     return [item for item in resolved if item is not None]
+
+
+def _carried_on(let_go, run, *args, **kwargs):
+    """Run a disconnected stream's continuation, then let go of what it held
+    (the run's gate slot and liveness record), however it ends."""
+    try:
+        return run(*args, **kwargs)
+    finally:
+        let_go()
 
 
 def _finish_run_in_background(
@@ -1223,12 +1239,13 @@ def list_sessions(agent_id: str):
                      WHERE first_run.session_id = s.id
                      ORDER BY first_run.created_at ASC
                      LIMIT 1
-                   ) as first_message
+                   ) as first_message,
+                   s.metadata as metadata
             FROM "{AI_SCHEMA}".agent_sessions s
             LEFT JOIN "{AI_SCHEMA}".agent_runs r ON r.session_id = s.id
             WHERE s.agent_id = :agent_id
             {extra_where}
-            GROUP BY s.id, s.session_id, s.created_at
+            GROUP BY s.id, s.session_id, s.created_at, s.metadata
             {having_sql}
             ORDER BY last_activity_at DESC NULLS LAST
             LIMIT :limit OFFSET :offset
@@ -1245,6 +1262,7 @@ def list_sessions(agent_id: str):
                 "last_activity_at": row[2].isoformat() if row[2] else None,
                 "created_at": row[3].isoformat() if row[3] else None,
                 "first_message": row[4],
+                "metadata": row[5] or {},
             }
         )
 
@@ -1340,8 +1358,11 @@ def create_session_for_agent(agent_id: str):
 
     Seed messages keep `role` and `content` only — anything else on a message
     (timestamps, name, tool_calls) is dropped, and every run is re-stamped with
-    a fresh id and import-time timestamps. Top-level `session_id` and
-    `metadata` are not accepted: this endpoint always creates.
+    a fresh id and import-time timestamps. Top-level `metadata` (a JSON
+    object, at most 16 KiB serialised) is stored on the session and returned by
+    the session list. It is caller-written and untrusted: an end user may set it
+    on their own session, so do not treat it as written by the backend.
+    Top-level `session_id` is not accepted: this endpoint always creates.
     """
     # agents.id is a uuid column: a non-uuid path segment would make the
     # existence check itself raise 22P02 and poison the transaction, so parse
@@ -1395,6 +1416,10 @@ def create_session_for_agent(agent_id: str):
     if invalid:
         return jsonify({"error": invalid}), 400
 
+    metadata, metadata_error = parse_session_metadata(data)
+    if metadata_error:
+        return jsonify({"error": metadata_error}), 400
+
     # An import or handoff is performed *for* a user by a service-role caller
     # whose own JWT `sub` is not that user — and, for a service token, is not a
     # uuid at all, so it can never stand in as the owner of a column that is
@@ -1441,11 +1466,10 @@ def create_session_for_agent(agent_id: str):
     if not agent_row:
         return jsonify({"error": "Agent not found"}), 404
 
-    db_session_uuid, session_id, _ = get_or_create_session(
-        db_session=db.session,
-        agent_id=agent_id,
-        user_id=user_id,
-    )
+    create_kwargs = {"db_session": db.session, "agent_id": agent_id, "user_id": user_id}
+    if metadata is not None:
+        create_kwargs["metadata"] = metadata
+    db_session_uuid, session_id, _ = get_or_create_session(**create_kwargs)
     if initial:
         seed_session_runs(
             db.session, db_session_uuid, initial, agent_id=agent_id, model=agent_row[0]
@@ -1528,6 +1552,7 @@ def delete_session_for_agent(agent_id: str, session_id: str):
 
 @agents_bp.route("/<agent_id>/run", methods=["POST"])
 @require_user_auth
+@admit_run
 def run_agent(agent_id: str):
     """
     Run an agent (non-streaming).
@@ -1931,6 +1956,7 @@ def run_agent(agent_id: str):
 
 @agents_bp.route("/<agent_id>/run/stream", methods=["POST"])
 @require_user_auth
+@admit_run
 def run_agent_stream(agent_id: str):
     """
     Stream an agent's response using Server-Sent Events (SSE).
@@ -2088,6 +2114,9 @@ def run_agent_stream(agent_id: str):
 
     # Capture app reference for background thread context
     app = current_app._get_current_object()
+    # The run's gate slot and liveness record last until the run ends, which
+    # after a client disconnect is later than the response (see run_lifetime).
+    run_life = RunLifetime(current_slot())
 
     def generate_sse():
         """Generator function for SSE stream."""
@@ -2394,6 +2423,7 @@ def run_agent_stream(agent_id: str):
                         reset_run_id(_worker_run_id_token)
                         unregister_run(run_id)
                         event_queue.put(None)  # sentinel
+                        worker_let_go()
 
                 # Propagate Flask before_request contextvars into the worker
                 # thread (BYOK provider set, byok_lookup_degraded, billing run
@@ -2404,8 +2434,11 @@ def run_agent_stream(agent_id: str):
                 # fix as orchestrations.py:972; mirrors copy_context().run
                 # pattern used in agentic.agent.agent + agentic.orchestration.
                 _captured_ctx = contextvars.copy_context()
+                # The loop keeps running after a disconnect until it sees the
+                # abort signal; it holds the run's gate slot until then.
+                worker_let_go = run_life.carry_on()
                 worker = threading.Thread(target=lambda: _captured_ctx.run(run_agent), daemon=True)
-                worker.start()
+                start_carried_on(worker, worker_let_go)
                 react_started = True
 
                 # Drain events from the queue and yield them live.
@@ -2782,6 +2815,9 @@ def run_agent_stream(agent_id: str):
             )
             db.session.commit()
             run_persisted = True
+            # No approval gate on this path, so publish only that it is alive:
+            # the stale-run cleanup skips it while this record exists.
+            run_life.mark_live(run_id)
 
             # Cache once — used by start event, persistence, and the background
             # finisher.
@@ -2876,8 +2912,11 @@ def run_agent_stream(agent_id: str):
                     _finish_kwargs = {
                         "citation_map": citation_map if citation_map else None,
                     }
+                    _carry_on = run_life.carry_on()
                     t = threading.Thread(
-                        target=lambda: _disconnect_ctx.run(
+                        target=lambda: _carried_on(
+                            _carry_on,
+                            _disconnect_ctx.run,
                             _finish_run_in_background,
                             app,
                             run_id,
@@ -2893,7 +2932,7 @@ def run_agent_stream(agent_id: str):
                         ),
                         daemon=True,
                     )
-                    t.start()
+                    start_carried_on(t, _carry_on)
                     return
 
             while naive_delta_buf:
@@ -3047,8 +3086,11 @@ def run_agent_stream(agent_id: str):
                 _predisconnect_kwargs = {
                     "citation_map": citation_map if citation_map else None,
                 }
+                _carry_on = run_life.carry_on()
                 t = threading.Thread(
-                    target=lambda: _predisconnect_ctx.run(
+                    target=lambda: _carried_on(
+                        _carry_on,
+                        _predisconnect_ctx.run,
                         _finish_run_in_background,
                         app,
                         run_id,
@@ -3064,7 +3106,7 @@ def run_agent_stream(agent_id: str):
                     ),
                     daemon=True,
                 )
-                t.start()
+                start_carried_on(t, _carry_on)
             elif run_persisted:
                 # Run exists in DB — update it to FAILED
                 try:
@@ -3173,6 +3215,7 @@ def run_agent_stream(agent_id: str):
             # next unrelated request on this same worker thread doesn't
             # inherit a stale id. Runs on client disconnect as well.
             reset_run_id(_stream_run_id_token)
+            run_life.end()
 
     return Response(
         stream_with_context(generate_sse()),
@@ -3184,13 +3227,46 @@ def run_agent_stream(agent_id: str):
     )
 
 
+_APPROVAL_UNCONFIRMED = {
+    "status": "unconfirmed",
+    "message": "The decision was sent but the run has not confirmed it yet; "
+    "check the run before retrying.",
+}
+
+
+def _approvals_unavailable():
+    resp = jsonify({"error": "approvals_unavailable"})
+    resp.status_code = 503
+    resp.headers["Retry-After"] = "2"
+    return resp
+
+
 @agents_bp.route("/runs/<run_id>/approve", methods=["POST"])
 @require_user_auth
 def approve_run(run_id: str):
     """Resume a paused ReAct run by supplying an approval decision.
 
-    The run must be currently registered in the in-memory run registry,
-    meaning it is actively waiting for a human-in-the-loop approval.
+    The run must be in progress in some project-api process of this project; a
+    run held by another gunicorn worker or replica is reached through Redis.
+
+    * 200 ``{"status": "resumed"}``: the process running the run handed it
+      the decision. As on a single process, that means the process holds the
+      run, not that the run was waiting at an approval gate (a decision for a
+      run that is not at a gate is dropped when it reaches its next one).
+    * 202 ``{"status": "unconfirmed", "message": ...}``: the decision was sent
+      to the process running the run, but it did not confirm within a few
+      seconds. The run may or may not have resumed; check the run before
+      retrying.
+    * 404 ``{"error": "Run not found or not waiting for approval"}``: no
+      process of this project has the run (it never existed, it ended, or its
+      process is gone), or it is not the caller's.
+    * 503 ``{"error": "approvals_unavailable"}`` with ``Retry-After: 2``:
+      Redis could not say which process has the run, or could not take the
+      decision. Nothing was sent; retrying is safe.
+
+    Reaching another process can take up to about 6 s when Redis is slow (a
+    bounded owner lookup and publish, then up to 3 s for the confirmation),
+    and holds a request thread for that time.
     """
     data = request.get_json(silent=True)
     if not data or "approved" not in data:
@@ -3198,16 +3274,34 @@ def approve_run(run_id: str):
     if not isinstance(data["approved"], bool):
         return jsonify({"error": "'approved' must be a boolean"}), 400
     context = get_active_run_context(run_id)
-    if not context:
-        return jsonify({"error": "Run not found or not waiting for approval"}), 404
-    if not is_service_role_request():
-        # Only the end user who started the run may resume it. A run started
-        # with the service key is registered with no owner, even when it runs
-        # in a user's session, so only the service key can approve it.
+    remote = None
+    if context is not None:
         owner = get_active_run_owner(run_id)
-        if owner is None or owner != get_current_user_id():
+    else:
+        # Another gunicorn worker or replica may hold the run; Redis says which.
+        try:
+            remote = lookup_remote_run(run_id)
+        except RegistryUnavailable:
+            return _approvals_unavailable()
+        if remote is None:
             return jsonify({"error": "Run not found or not waiting for approval"}), 404
-    context.set_approval_decision(data)
+        owner = remote.owner_user_id
+    # Only the end user who started the run may resume it. A run started with
+    # the service key is registered with no owner, even when it runs in a
+    # user's session, so only the service key can approve it.
+    if not is_service_role_request() and (owner is None or owner != get_current_user_id()):
+        return jsonify({"error": "Run not found or not waiting for approval"}), 404
+    if context is not None:
+        context.set_approval_decision(data)
+        return jsonify({"status": "resumed"})
+    delivery = deliver_approval(run_id, remote, data)
+    if delivery is Delivery.UNAVAILABLE:
+        return _approvals_unavailable()
+    if delivery is Delivery.UNCONFIRMED:
+        return jsonify(_APPROVAL_UNCONFIRMED), 202
+    if delivery is not Delivery.RESUMED:
+        # The owning process is gone (restart, scale-down) or the run ended.
+        return jsonify({"error": "Run not found or not waiting for approval"}), 404
     return jsonify({"status": "resumed"})
 
 

@@ -1,13 +1,18 @@
-"""Simple in-memory sliding-window rate limiter."""
+"""Rate limiters: a per-process window (RateLimiter) and the Redis window shared
+by every process of a project (RedisRateLimiter)."""
 
 import logging
+import math
 import os
 import threading
 import time
 from functools import wraps
 
-import redis
 from flask import g, jsonify
+
+from ..auth import is_service_role_request
+from .broker_redis import broker_client
+from .settings_registry import get_setting
 
 
 class RateLimiter:
@@ -39,21 +44,35 @@ class RateLimiter:
             return True
 
 
-# Configured limit for workflow execution endpoints
-execution_limiter = RateLimiter(max_requests=20, window_seconds=60)
+# Workflow executions per minute, across every process of the project: each end
+# user (a JWT with a user id) has their own window, and the service role key one
+# window per project, sized by the WORKFLOW_EXECUTIONS_PER_MINUTE setting.
+EXECUTIONS_PER_MINUTE = 20
+DEFAULT_SERVICE_EXECUTIONS_PER_MINUTE = 120
+
+
+def _execution_bucket() -> tuple[str, int]:
+    if is_service_role_request():
+        return "workflow-exec:service", get_setting("WORKFLOW_EXECUTIONS_PER_MINUTE")
+    user_id = getattr(g, "user_id", None) or "anonymous"
+    return f"workflow-exec:{user_id}", EXECUTIONS_PER_MINUTE
 
 
 def rate_limit_executions(f):
-    """Decorator that rate-limits workflow execution endpoints per user."""
+    """Rate-limit workflow execution endpoints across every gunicorn worker and
+    replica of the project (Redis window; fail-open)."""
 
     @wraps(f)
     def decorated(*args, **kwargs):
-        user_id = getattr(g, "user_id", None) or "anonymous"
-        if not execution_limiter.is_allowed(user_id):
-            return (
-                jsonify({"error": "Rate limit exceeded. Max 20 executions per minute."}),
-                429,
-            )
+        bucket, limit = _execution_bucket()
+        # external_limiter is defined below; it is resolved at call time.
+        wait = external_limiter.try_acquire(bucket, limit)
+        if wait is not None:
+            message = f"Rate limit exceeded. Max {limit} executions per minute."
+            resp = jsonify({"error": message})
+            resp.status_code = 429
+            resp.headers["Retry-After"] = str(max(1, math.ceil(wait)))
+            return resp
         return f(*args, **kwargs)
 
     return decorated
@@ -99,15 +118,33 @@ class RedisRateLimiter:
 
     def __init__(self, redis_client=None):
         self._client = redis_client
+        self._client_unavailable = False
         self._script = None
+
+    def _redis(self):
+        """The Redis client, or None when none can be built (warned once)."""
+        if self._client is None:
+            if self._client_unavailable:
+                return None  # an unusable URL never becomes usable
+            try:
+                self._client = broker_client()
+            except Exception:
+                self._client_unavailable = True
+                logger.warning(
+                    "Rate limiter: Redis client unavailable; failing open", exc_info=True
+                )
+                return None
+        return self._client
+
+    def client_available(self) -> bool:
+        """False when no Redis client can be built: the limiter then fails open."""
+        return self._redis() is not None
 
     def _get_script(self):
         if self._script is None:
-            client = self._client
+            client = self._redis()
             if client is None:
-                broker_url = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
-                client = redis.from_url(broker_url)
-                self._client = client
+                return None
             self._script = client.register_script(_SLIDING_WINDOW_LUA)
         return self._script
 
@@ -116,7 +153,10 @@ class RedisRateLimiter:
         project_ref = os.getenv("PROJECT_REF", "default")
         key = f"ratelimit:{service}:{project_ref}"
         try:
-            result = self._get_script()(
+            script = self._get_script()
+            if script is None:
+                return None
+            result = script(
                 keys=[key, f"{key}:seq"],
                 args=[time.time(), _WINDOW_SECONDS, max_per_minute],
             )

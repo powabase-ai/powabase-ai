@@ -31,6 +31,20 @@ from ..services.tool_registry import load_all_tools_for_agent
 logger = logging.getLogger(__name__)
 
 
+def _runtime_kbs_for_agent(configs: list[dict] | None, agent_id: str) -> list[dict] | None:
+    """The runtime KB entries a sub-agent gets: those naming no agent, plus
+    those whose ``agent_ids`` include it. ``agent_ids`` is routing only and
+    never reaches the tool builder."""
+    if configs is None:
+        return None
+    scoped = [
+        {k: v for k, v in c.items() if k != "agent_ids"}
+        for c in configs
+        if not c.get("agent_ids") or agent_id in c["agent_ids"]
+    ]
+    return scoped or None
+
+
 def build_orchestration(
     orch_id: str,
     runtime_kb_configs: list[dict] | None = None,
@@ -120,7 +134,7 @@ def build_orchestration(
                 db.session,
                 max_tool_output_length=get_setting("MAX_TOOL_OUTPUT_LENGTH"),
                 default_max_result_chars=get_setting("DEFAULT_MAX_RESULT_CHARS"),
-                runtime_kb_configs=runtime_kb_configs,
+                runtime_kb_configs=_runtime_kbs_for_agent(runtime_kb_configs, str(agent_row.id)),
                 caller=caller,
             )
 
@@ -149,6 +163,7 @@ def get_or_create_orchestration_session(
     user_id: str | None = None,
     *,
     end_user_id: str | None = None,
+    metadata: dict | None = None,
 ) -> tuple[str, str, bool]:
     """Get or create an orchestration session.
 
@@ -158,6 +173,8 @@ def get_or_create_orchestration_session(
     owned by this user; anything else raises :class:`SessionNotAccessible`.
     End users never name a new session (see ``session_accessible_to`` in
     services/session.py for why).
+
+    ``metadata`` is stored on a newly created session only.
 
     Returns (db_session_uuid, session_id, is_new).
     """
@@ -178,6 +195,7 @@ def get_or_create_orchestration_session(
         session_id=new_session_id,
         orchestration_id=orchestration_id,
         user_id=user_id,
+        metadata_=metadata or {},
     )
     db.session.add(session)
     db.session.flush()
@@ -322,6 +340,10 @@ def update_orchestration_run(
     if error is not None:
         updates.append("error = :error")
         params["error"] = error
+    elif status == "completed":
+        # A completed run has no error, including one the stale-run cleanup
+        # may have written while the run was in fact still going.
+        updates.append("error = NULL")
     if model is not None:
         updates.append("model = :model")
         params["model"] = model

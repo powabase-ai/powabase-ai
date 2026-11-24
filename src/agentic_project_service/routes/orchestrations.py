@@ -12,6 +12,7 @@ import uuid as _uuid
 import litellm
 from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from agentic.agent.rules import validate_condition
 from agentic.agent.hooks import (
@@ -46,6 +47,8 @@ from ..services import billing_port as billing
 from ..services.ai_provider_keys_resolver import ProviderKeyDecryptDropped
 from ..services.context_handler import resolve_tool_call_image_refs
 from ..services.llm_availability import check_model_available
+from ..services.run_gate import admit_run, current_slot
+from ..services.run_lifetime import RunLifetime, start_carried_on
 from ..services.run_context import (
     reset_run_id,
     set_run_id,
@@ -58,6 +61,7 @@ from ..services.session import (
 )
 from ..services.tool_caller import ToolCaller
 from ._runtime_kb import validate_runtime_knowledge_bases
+from ._session_metadata import parse_session_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -693,6 +697,57 @@ def delete_orchestration_hook(orch_id, hook_id):
 # ---------------------------------------------------------------------------
 
 
+@orchestrations_bp.route("/<orch_id>/sessions", methods=["POST"])
+@require_service_role
+def create_orchestration_session(orch_id: str):
+    """Create an orchestration session. Service role only.
+
+    Body (optional): ``{user_id?, metadata?}``. ``user_id`` (a uuid) owns the
+    session to that end user, who can then list and continue it; without it
+    the session is ownerless and only the service role can use it.
+    ``metadata`` (a JSON object, at most 16 KiB serialised) is stored on the
+    session and returned by the session list. Answers 201 ``{session_id}``.
+    """
+    from ..services.orchestration import get_or_create_orchestration_session
+
+    # A non-uuid segment would raise 22P02 in the lookup; answer the 404 an
+    # unknown orchestration gets.
+    try:
+        orch_id = str(_uuid.UUID(orch_id))
+    except ValueError:
+        return jsonify({"error": "Orchestration not found"}), 404
+    data = request.get_json(silent=True)
+    if data is None:
+        if request.get_data().strip():
+            return jsonify({"error": "Request body must be valid JSON"}), 400
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+    metadata, metadata_error = parse_session_metadata(data)
+    if metadata_error:
+        return jsonify({"error": metadata_error}), 400
+    user_id = None
+    if data.get("user_id") is not None:
+        try:
+            user_id = str(_uuid.UUID(str(data["user_id"])))
+        except ValueError:
+            return jsonify({"error": "user_id must be a uuid"}), 400
+    if db.session.get(OrchestrationModel, orch_id) is None:
+        return jsonify({"error": "Orchestration not found"}), 404
+    # The check above is not a lock: the orchestration can be deleted before
+    # the insert, and its foreign key (not deferred) then rejects it at the
+    # service's flush, or at the commit.
+    try:
+        _, session_id, _ = get_or_create_orchestration_session(
+            orch_id, user_id=user_id, metadata=metadata
+        )
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"error": "Orchestration not found"}), 404
+    return jsonify({"session_id": session_id}), 201
+
+
 @orchestrations_bp.route("/<orch_id>/sessions", methods=["GET"])
 @require_user_auth
 def list_orchestration_sessions(orch_id: str):
@@ -738,6 +793,7 @@ def list_orchestration_sessions(orch_id: str):
                 if last_run
                 else None,
                 "created_at": s.created_at.isoformat() if s.created_at else None,
+                "metadata": s.metadata_ or {},
             }
         )
 
@@ -898,14 +954,32 @@ def get_orchestration_session_messages(orch_id: str, session_id: str):
 # ---------------------------------------------------------------------------
 
 
+def _wants_agent_scoped_kbs(data) -> bool:
+    raw = data.get("runtime_knowledge_bases")
+    return isinstance(raw, list) and any(isinstance(e, dict) and "agent_ids" in e for e in raw)
+
+
+def _orchestration_agent_ids(orch_id: str) -> set[str]:
+    """Canonical ids of the orchestration's agent entities."""
+    try:
+        orch_id = str(_uuid.UUID(str(orch_id)))
+    except ValueError:
+        return set()
+    rows = OrchestrationEntityModel.query.filter_by(
+        orchestration_id=orch_id, entity_type="agent"
+    ).all()
+    return {str(r.entity_ref_id) for r in rows}
+
+
 @orchestrations_bp.route("/<orch_id>/run/stream", methods=["POST"])
 @require_user_auth
+@admit_run
 def run_orchestration_stream(orch_id: str):
     """Run an orchestration with SSE streaming.
 
     `runtime_knowledge_bases` (optional): a list of up to 10 objects,
     ``{id, top_k?, retrieval_method?, similarity_threshold?, filter_metadata?,
-    source_ids?, max_context_tokens?}``. Each entry joins the run's
+    source_ids?, max_context_tokens?, agent_ids?}``. Each entry joins the run's
     ``knowledge_search`` tool for THIS request only — nothing is persisted,
     so follow-up messages must re-send it. An entry naming a knowledge base
     that is also attached to a sub-agent overrides that attachment's config
@@ -917,7 +991,11 @@ def run_orchestration_stream(orch_id: str):
     the `KB_DEFAULT_MAX_CONTEXT_TOKENS` setting) — and the request 400s
     before the stream opens if any id is malformed/unknown, any knob is out
     of range or the wrong type, any entry carries an unknown key (typos like
-    `top_K` are rejected, not ignored), or the list exceeds 10 entries. Combinable
+    `top_K` are rejected, not ignored), or the list exceeds 10 entries. An
+    entry may carry `agent_ids` (the agent ids, i.e. `agents.id`, of agents in
+    this orchestration; any other id 400s): it then reaches only those
+    sub-agents. Entries without
+    it reach every sub-agent. Combinable
     with the context fields; combined with the preload `knowledge_bases`
     field, BOTH retrievals run (no dedup) and the run's `context_handler_id`
     still points at the preload one. `max_context_tokens` is honored only
@@ -951,7 +1029,12 @@ def run_orchestration_stream(orch_id: str):
         if session_id and not _end_user_may_run_in_session(session_id, orch_id, user_id):
             return jsonify({"error": "Session not found"}), 404
 
-    runtime_kb_configs, runtime_kb_error = validate_runtime_knowledge_bases(data, db.session)
+    allowed_agent_ids = (
+        _orchestration_agent_ids(orch_id) if _wants_agent_scoped_kbs(data) else set()
+    )
+    runtime_kb_configs, runtime_kb_error = validate_runtime_knowledge_bases(
+        data, db.session, allowed_agent_ids=allowed_agent_ids
+    )
     if runtime_kb_error:
         return jsonify({"error": runtime_kb_error}), 400
 
@@ -981,6 +1064,10 @@ def run_orchestration_stream(orch_id: str):
         # mid-delegation rather than at run entry.
         for sub_agent_model in _load_sub_agent_models(orch_id):
             check_model_available(sub_agent_model)
+
+    # The run's gate slot and liveness record last until the orchestration
+    # worker ends, which after a client disconnect is later than the response.
+    run_life = RunLifetime(current_slot())
 
     def generate_sse():
         run_id = None
@@ -1087,6 +1174,8 @@ def run_orchestration_stream(orch_id: str):
                 reasoning_requested=reasoning_requested_flag,
             )
             db.session.commit()
+            # Alive while this record exists: the stale-run cleanup skips it.
+            run_life.mark_live(run_id)
             start_event = {
                 "event": "start",
                 "run_id": run_id,
@@ -1204,6 +1293,7 @@ def run_orchestration_stream(orch_id: str):
                 finally:
                     reset_run_id(_orch_run_id_token)
                     event_queue.put(None)  # sentinel to signal completion
+                    worker_let_go()
 
             # Propagate Flask before_request contextvars (current_byok_providers,
             # byok_lookup_degraded, run_id_var, etc.) into the worker
@@ -1217,10 +1307,13 @@ def run_orchestration_stream(orch_id: str):
             # Same pattern as agentic.agent.agent + agentic.orchestration.
             # strategies which already use copy_context().run.
             _captured_ctx = contextvars.copy_context()
+            # After a disconnect the worker runs on until it sees the abort
+            # signal; it holds the gate slot and the liveness record until then.
+            worker_let_go = run_life.carry_on()
             worker = threading.Thread(
                 target=lambda: _captured_ctx.run(run_orchestration), daemon=True
             )
-            worker.start()
+            start_carried_on(worker, worker_let_go)
 
             # Yield events as they arrive (keeps the SSE stream alive).
             # Buffer-aware drain (β): content_delta accumulates into
@@ -1415,6 +1508,8 @@ def run_orchestration_stream(orch_id: str):
             except Exception:
                 logger.exception("Failed to persist orchestration error")
             yield f"data: {json.dumps({'event': 'error', 'error': error_msg})}\n\n"
+        finally:
+            run_life.end()
 
     return Response(stream_with_context(generate_sse()), mimetype="text/event-stream")
 

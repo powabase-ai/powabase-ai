@@ -287,6 +287,43 @@ def _build_registry() -> dict[str, SettingDef]:
             max=50,
             description="Maximum ReAct steps for a DelegateTool sub-agent.",
         ),
+        SettingDef(
+            key="MAX_CONCURRENT_RUNS",
+            category=cat,
+            label="Max Concurrent Runs",
+            type="int",
+            default=0,
+            min=0,
+            max=10000,
+            advanced=True,
+            description=(
+                "Maximum agent, orchestration and workflow run requests in flight at "
+                "once in this project, across every API process. Over the limit a run "
+                "request is answered 429 with Retry-After. 0 turns the limit off. The "
+                "limit is per project, but a run holds a request thread for its whole "
+                "length and each API pod has 8 (2 workers x 4 threads), shared with "
+                "every other request: keep it at or below pods x 8 minus headroom, or "
+                "one pod can still run out of threads below the limit."
+            ),
+        ),
+        SettingDef(
+            key="RUN_STALE_AFTER_SECONDS",
+            category=cat,
+            label="Stale Run Cutoff (seconds)",
+            type="int",
+            default=1800,
+            min=600,
+            max=86400,
+            advanced=True,
+            description=(
+                "An agent or orchestration run still 'running' this long after it "
+                "started is marked failed when no API process is running it any more "
+                "(its process restarted mid-run): its liveness record must be missing "
+                "at two cleanup sweeps in a row. A run whose process is alive is never "
+                "failed, however long it runs. Also the longest a run holds a "
+                "MAX_CONCURRENT_RUNS slot. Workflow runs are not swept."
+            ),
+        ),
     ]
 
     # =========================================================================
@@ -362,6 +399,21 @@ def _build_registry() -> dict[str, SettingDef]:
             description=(
                 "Max Firecrawl requests per minute for this project. "
                 "Keeps concurrent scrapes within the shared account's plan limit."
+            ),
+        ),
+        SettingDef(
+            key="WORKFLOW_EXECUTIONS_PER_MINUTE",
+            category=cat,
+            label="Workflow Executions (per minute)",
+            type="int",
+            default=120,
+            min=1,
+            max=5000,
+            advanced=True,
+            description=(
+                "Max workflow executions per minute for this project with the service "
+                "role key, across every API process. End users are limited to 20 per "
+                "minute each."
             ),
         ),
         SettingDef(
