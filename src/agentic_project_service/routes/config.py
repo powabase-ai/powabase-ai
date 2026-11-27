@@ -122,8 +122,11 @@ def kb_defaults():
                         "description": "High-accuracy structural extraction.",
                     },
                     {
+                        # Value kept as "fitz": stored KB/source configs use
+                        # it, and powabase-agentic accepts it as an alias of
+                        # its PDFium method (PyMuPDF was removed, AGPL).
                         "value": "fitz",
-                        "label": "PyMuPDF (fitz)",
+                        "label": "PDFium",
                         "description": "Fast, good for text-based PDFs.",
                     },
                     {

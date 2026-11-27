@@ -1646,3 +1646,21 @@ def test_an_unknown_size_is_logged_when_it_is_gated(monkeypatch, mock_db_session
         _run_task(monkeypatch, _task_source("pending", "task-1"), size=None)
 
     assert "size" in caplog.text.lower() and "unknown" in caplog.text.lower()
+
+
+@pytest.mark.parametrize("method", ["pdfium", "fitz", "pdfplumber", "opendataloader"])
+def test_a_text_layer_method_with_almost_no_text_asks_for_ocr(monkeypatch, mock_db_session, method):
+    """powabase-agentic >=0.7.1 reports its PDFium text-layer method as
+    "pdfium" where earlier versions said "fitz"; a scanned PDF read by either
+    is flagged for re-extraction with OCR."""
+    mock_db_session.execute.return_value.scalar.return_value = "extracting"
+
+    async def blank():
+        return {}, {"extraction_method": method, "page_count": 5, "char_count": 10}
+
+    _run_task(monkeypatch, _task_source("pending", "task-1"), run=blank)
+
+    ((args, _kw),) = _run_task.writes
+    _source_id, _derivatives, _auto_metadata, status, warning = args[:5]
+    assert status == "attention_required"
+    assert "Consider re-extracting with OCR" in warning

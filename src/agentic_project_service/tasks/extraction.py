@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # Extraction methods that perform cloud OCR (billed per page). Standard cloud
 # OCR bills as ``ocr_pages``; LlamaParse bills against the higher-priced,
 # separate ``advanced_ocr`` category (see _ADVANCED_OCR_EXTRACTION_METHODS).
-# Non-OCR methods (fitz, pdfplumber, opendataloader, txt-native, etc.) are
+# Non-OCR methods (pdfium, pdfplumber, opendataloader, txt-native, etc.) are
 # not billed at the extraction layer — they are CPU-only and bundled into
 # the indexing charge that follows.
 _OCR_EXTRACTION_METHODS: frozenset[str] = frozenset({"mistral_ocr", "paddleocr_vl", "lighton_ocr"})
@@ -835,7 +835,9 @@ def extract_source(
 
         if (
             not warning_msg
-            and method in ("fitz", "pdfplumber", "opendataloader")
+            # "pdfium" is what powabase-agentic >=0.7.1 reports for the
+            # text-layer method that earlier versions reported as "fitz".
+            and method in ("pdfium", "fitz", "pdfplumber", "opendataloader")
             and page_count >= 3
         ):
             avg_chars = char_count / page_count if page_count else 0
@@ -868,7 +870,7 @@ def extract_source(
             storage, bucket_id, source_id, source.get("derivatives"), derivatives
         )
 
-        # Bill OCR when OCR was performed. Non-OCR extraction (fitz, pdfplumber,
+        # Bill OCR when OCR was performed. Non-OCR extraction (pdfium, pdfplumber,
         # opendataloader, txt-native, ...) is CPU-only and not separately billed
         # at the extraction layer. The billing-configured check now lives in the
         # adapter (no-op when unconfigured), so the guard is just the method.
