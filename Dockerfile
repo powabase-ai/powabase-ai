@@ -1,4 +1,4 @@
-# powabase-ai — the OSS AI backend service. Installs the powabase-agentic
+# powabase-ai — the self-hosted AI backend service. Installs the powabase-agentic
 # library from PyPI (the import module is `agentic`) and ships no billing or
 # charging logic of any kind.
 #   docker build -t powabase-ai .
@@ -34,6 +34,8 @@ COPY src/ src/
 RUN uv sync --locked --no-editable
 
 FROM python:3.13-slim
+# Source-available under PolyForm Noncommercial 1.0.0; see LICENSE and LICENSING.md.
+LABEL org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
 WORKDIR /app
 ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:$PATH" \
     FLASK_APP=agentic_project_service.main:create_app
