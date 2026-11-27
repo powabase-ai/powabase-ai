@@ -7,6 +7,8 @@ name = "agentic-project-service"
 version = "0.15.0"
 description = "Per-project service for AI features: sources, knowledge bases, agents, and background tasks"
 readme = "README.md"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.13"
 dependencies = [
     "flask>=3.0.0",

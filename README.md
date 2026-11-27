@@ -1,6 +1,8 @@
 # powabase-ai
 
-The AI backend service of the [Powabase](https://github.com/powabase-ai) OSS
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](LICENSING.md)
+
+The AI backend service of the self-hosted [Powabase](https://github.com/powabase-ai)
 edition — the per-project service for AI features: sources, knowledge bases,
 agents, workflows, and background task processing. It is published as the
 container image `ghcr.io/powabase-ai/powabase-ai` and builds on the
@@ -296,3 +298,12 @@ reachable from a tool.
 - `GET /api/agents` - List agents
 - `POST /api/agents` - Create agent
 - `POST /api/agents/<id>/run` - Execute agent
+
+## License
+
+This service is source-available under the
+[PolyForm Noncommercial License 1.0.0](LICENSE) (SPDX:
+`PolyForm-Noncommercial-1.0.0`). Government, research, educational, charitable
+and personal noncommercial use is free; commercial use requires a Powabase
+enterprise agreement — see [LICENSING.md](LICENSING.md). Releases up to and
+including v0.15.0 remain available under the Apache License 2.0.
