@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.16.0](https://github.com/powabase-ai/powabase-ai/compare/v0.15.0...v0.16.0) (2026-11-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* relicense under PolyForm Noncommercial 1.0.0 ([#125](https://github.com/powabase-ai/powabase-ai/issues/125))
+
+### Features
+
+* relicense under PolyForm Noncommercial 1.0.0 ([#125](https://github.com/powabase-ai/powabase-ai/issues/125)) ([212e7c1](https://github.com/powabase-ai/powabase-ai/commit/212e7c17cb5a596ec372e0d76108cff5ccab167b))
+
 ## [0.15.0](https://github.com/powabase-ai/powabase-ai/compare/v0.14.2...v0.15.0) (2026-11-24)
 
 
